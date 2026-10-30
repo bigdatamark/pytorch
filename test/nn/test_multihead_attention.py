@@ -1,4 +1,10 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for torch.nn.MultiheadAttention. Contains a CPU test class that compares
+# the module and the functional multi_head_attention_forward against a numpy reference
+# implementation and checks shape-validation errors, plus a device-generic class covering the
+# fast path (BetterTransformer), dtypes and bias/weight edge cases. Import-time side effects:
+# optionally imports numpy, instantiates the device-type tests into module globals and
+# instantiates the parametrized tests.
 import contextlib
 import random
 import unittest
@@ -34,6 +40,9 @@ if TEST_NUMPY:
 
 
 class TestMultiheadAttentionNN(NNTestCase):
+    # [CLASS DOC] CPU-oriented NNTestCase for MultiheadAttention. When CUDA is available it
+    # turns on the class-level CUDA memory leak check and non-default-stream flags. No
+    # instance state; each test builds its own module and tensors.
     if TEST_CUDA:
         _do_cuda_memory_leak_check = True
         _do_cuda_non_default_stream = True
@@ -41,6 +50,14 @@ class TestMultiheadAttentionNN(NNTestCase):
     @unittest.skipIf(not TEST_NUMPY, "numpy not found")
     @parametrize_test("average_attn_weights", [True, False])
     def test_multihead_attention(self, average_attn_weights):
+        # [FUNCTION DOC] Parametrized over average_attn_weights. Defines numpy reference
+        # helpers (scaled dot attention, batched matmul, softmax, head split/combine, linear
+        # map) and a nested driver that repeats 100 random trials, builds a
+        # MultiheadAttention, runs the functional forward and compares output and attention
+        # weights with the numpy reference using an absolute tolerance. Then runs nested
+        # scenarios (bias_kv, zero_attn, key padding mask, saved kv, same embed dim). The
+        # scenario mixing bias_kv with static kv is expected to raise an AssertionError about
+        # bias on a static key. Skipped without numpy.
         def _scaled_dot_attn_ref(
             Q,
             K,
@@ -50,6 +67,12 @@ class TestMultiheadAttentionNN(NNTestCase):
             key_padding_mask=None,
             average_attn_weights=average_attn_weights,
         ):
+            # [FUNCTION DOC] HELPER: Numpy reference for scaled dot product attention over 4-D
+            # arrays. Divides keys by the square root of the head size, multiplies queries by
+            # transposed keys, sets masked positions to negative infinity (positions where the
+            # unseen mask is zero or the key padding mask is set), applies softmax and
+            # multiplies by values. Returns the attended values and the attention weights,
+            # averaged over heads when average_attn_weights is true.
             """Numpy-based reference implementation of scaled dot attention
             for testing"""
 
@@ -81,6 +104,9 @@ class TestMultiheadAttentionNN(NNTestCase):
             return reference, ref_attn_weight
 
         def _batchmatmul(a, b):  # batchmatmul over 4 dim matrix
+            # [FUNCTION DOC] HELPER: Numpy batched matrix multiply of two 4-D arrays. Raises
+            # AssertionError if the first two dimensions differ. Loops over batch and head
+            # indices and returns a float32 array.
             """Numpy-based batch matrix multiply over 4 dim matrix"""
             if a.shape[0] != b.shape[0]:
                 raise AssertionError(
@@ -99,6 +125,10 @@ class TestMultiheadAttentionNN(NNTestCase):
             return retval
 
         def _softmax(x):  # softmax over 4 dim matrix
+            # [FUNCTION DOC] HELPER: Numpy softmax over the last axis of a 4-D array, computed
+            # with a loop per row with max subtraction for stability. Silences numpy
+            # invalid-value warnings globally via seterr. Returns a float64 array; fully
+            # masked rows yield nan.
             """Numpy-based reference softmax over 4 dim matrix"""
             np.seterr(invalid="ignore")
             output = np.zeros(x.shape, dtype=np.float64)
@@ -111,6 +141,9 @@ class TestMultiheadAttentionNN(NNTestCase):
             return output
 
         def _split_heads_ref(X, dims, nheads, d_head):
+            # [FUNCTION DOC] HELPER: Reference head split. Reshapes a (batch, seq, features)
+            # array into heads and transposes so the result has shape batch, heads, seq, head
+            # size. The dims argument is a list whose first two entries are batch and seq.
             X_split = np.reshape(X, dims[:2] + [nheads, d_head])
             X_split_transposed = np.transpose(X_split, [0, 2, 1, 3])
             reference = np.reshape(
@@ -119,16 +152,24 @@ class TestMultiheadAttentionNN(NNTestCase):
             return reference
 
         def _combine_heads_ref(X, dims, nheads, d_head):
+            # [FUNCTION DOC] HELPER: Reference head merge. Transposes a (batch, heads, seq,
+            # head size) array back and reshapes it to batch, seq, heads times head size.
             X_transposed = np.transpose(X, [0, 2, 1, 3])
             reference = np.reshape(X_transposed, dims[:2] + [nheads * d_head])
             return reference
 
         def _fc(X, X_weight, X_bias):
+            # [FUNCTION DOC] HELPER: Applies a linear layer in numpy: multiplies the input by
+            # the transposed weight and adds the bias; weight and bias are detached torch
+            # tensors converted to numpy.
             X_fc_b = X_bias.detach().numpy()
             X_fc_w = X_weight.detach().numpy()
             return np.matmul(X, np.transpose(X_fc_w)) + X_fc_b
 
         def _create_src_lengths_mask(batch_size, src_lengths):
+            # [FUNCTION DOC] HELPER: Builds an integer mask of shape batch size by maximum
+            # source length that is 1 where the position index is below the sequence length.
+            # Not called anywhere in this test (dead code).
             """
             Generate boolean mask to prevent attention beyond the end of source
             Inputs:
@@ -152,6 +193,13 @@ class TestMultiheadAttentionNN(NNTestCase):
             same_embed_dim=False,
             average_attn_weights=average_attn_weights,
         ):
+            # [FUNCTION DOC] HELPER: Randomized comparison driver. For 100 trials picks random
+            # batch, sequence, head count and head size, optionally uses a different key/value
+            # dimension, saved static k/v, key padding mask, bias_kv and zero_attn, builds a
+            # MultiheadAttention and calls the functional forward with either the packed or
+            # the separate projection weights. Recomputes the same result with the numpy
+            # reference and asserts output shape and values (tolerance 1e-5) and attention
+            # weight shape and values. Raises AssertionError on mismatch.
             for _ in range(100):
                 batch_sz, seq_len = (random.randint(2, 10) for r in range(2))
                 d_head = random.randint(3, 10)
@@ -410,31 +458,45 @@ class TestMultiheadAttentionNN(NNTestCase):
                 np.testing.assert_allclose(result_weight, ref_attn_weight, atol=1e-5)
 
         def test_multihead_attn_add_bias_kv():
+            # [FUNCTION DOC] HELPER: Runs the comparison driver with bias_kv enabled.
             _multihead_attn_test_helper(add_bias_kv=True)
 
         def test_multihead_attn_add_zero_attn():
+            # [FUNCTION DOC] HELPER: Runs the comparison driver with zero_attn enabled.
             _multihead_attn_test_helper(add_zero_attn=True)
 
         def test_multihead_attn_no_masking():
+            # [FUNCTION DOC] HELPER: Runs the comparison driver with no optional features.
             _multihead_attn_test_helper()
 
         def test_multihead_attn_key_padding_mask():
+            # [FUNCTION DOC] HELPER: Runs the comparison driver with a random key padding
+            # mask.
             _multihead_attn_test_helper(add_key_padding_mask=True)
 
         def test_multihead_attn_saved_kv():
+            # [FUNCTION DOC] HELPER: Runs the comparison driver with saved static key and
+            # value tensors.
             _multihead_attn_test_helper(saved_kv=True)
 
         def test_multihead_attn_add_bias_kv_zero_attn():
+            # [FUNCTION DOC] HELPER: Runs the comparison driver with key padding mask, bias_kv
+            # and zero_attn together.
             _multihead_attn_test_helper(
                 add_key_padding_mask=True, add_bias_kv=True, add_zero_attn=True
             )
 
         def test_multihead_attn_all_arguments1():
+            # [FUNCTION DOC] HELPER: Runs the comparison driver with key padding mask,
+            # zero_attn and saved kv.
             _multihead_attn_test_helper(
                 add_key_padding_mask=True, add_zero_attn=True, saved_kv=True
             )
 
         def test_multihead_attn_all_arguments2():
+            # [FUNCTION DOC] HELPER: Runs the comparison driver with key padding mask,
+            # bias_kv, zero_attn and saved kv. The caller expects this to raise AssertionError
+            # because bias cannot be added to a static key.
             _multihead_attn_test_helper(
                 add_key_padding_mask=True,
                 add_bias_kv=True,
@@ -443,6 +505,8 @@ class TestMultiheadAttentionNN(NNTestCase):
             )
 
         def test_multihead_attn_all_arguments3():
+            # [FUNCTION DOC] HELPER: Runs the comparison driver with key padding mask,
+            # zero_attn, saved kv and equal embedding dimensions for key and value.
             _multihead_attn_test_helper(
                 add_key_padding_mask=True,
                 add_zero_attn=True,
@@ -464,6 +528,10 @@ class TestMultiheadAttentionNN(NNTestCase):
         test_multihead_attn_all_arguments3()  # Test MultiheadAttention with all the argument.
 
     def test_multihead_attn_3d_attn_mask(self):
+        # [FUNCTION DOC] Checks that a 3-D attention mask (one mask per batch and head) gives
+        # the same output as running each batch element separately with its own 2-D mask.
+        # Masks hold negative infinity or zero; the 3-D mask is built by repeating each batch
+        # mask once per head.
         embed_dim = 8
         num_heads = 4
         batch_size = 8
@@ -506,6 +574,8 @@ class TestMultiheadAttentionNN(NNTestCase):
             self.assertEqual(output_3d[i].unsqueeze(0).transpose(0, 1), output_2d)
 
     def test_multihead_attn_no_bias(self):
+        # [FUNCTION DOC] Checks that constructing MultiheadAttention with bias disabled leaves
+        # both the input projection bias and the output projection bias as None.
         embed_dim = 8
         num_heads = 4
         mha = torch.nn.MultiheadAttention(embed_dim, num_heads, bias=False)
@@ -515,6 +585,11 @@ class TestMultiheadAttentionNN(NNTestCase):
         self.assertIsNone(mha.out_proj.bias)
 
     def _test_multihead_attn_invalid_shape_impl(self, mha):
+        # [FUNCTION DOC] HELPER: Shared body for the invalid shape tests. For the given
+        # module, calls it with 3-D (batched) and 2-D (unbatched) inputs that have a wrongly
+        # shaped key, value, key padding mask or attention mask, and asserts each call raises
+        # AssertionError with the expected message about expected dimensionality or the
+        # expected 3-D attention mask shape.
         # Batched (3D) query cases
         query = torch.randn(4, 4, 4)
         key = torch.randn(4, 4, 4)
@@ -604,6 +679,8 @@ class TestMultiheadAttentionNN(NNTestCase):
             )
 
     def test_multihead_attn_invalid_shape(self):
+        # [FUNCTION DOC] Runs the shared invalid shape checks on a fresh module in training
+        # mode, and again on the same module in eval mode under no_grad.
         mha = torch.nn.MultiheadAttention(4, 4)
         self._test_multihead_attn_invalid_shape_impl(mha)
         # Give the test a chance to hit the fast path. (Right now, it
@@ -613,6 +690,10 @@ class TestMultiheadAttentionNN(NNTestCase):
 
     @torch.no_grad()
     def test_multihead_attn_fast_path_invalid_shape(self):
+        # [FUNCTION DOC] Same invalid shape checks for an eval-mode batch_first module under
+        # no_grad with need_weights disabled, where the fast path is eligible. Batched cases
+        # fall back to the slow path and give the usual messages; the unbatched cases give the
+        # regular-path messages because the fast path does not support 2-D input.
         mha = torch.nn.MultiheadAttention(4, 4, batch_first=True).eval()
 
         # Batched (3D) query cases
@@ -711,6 +792,12 @@ class TestMultiheadAttentionNN(NNTestCase):
             )
 
     def test_multihead_attn_nested_tensor_outside_fast_path(self):
+        # [FUNCTION DOC] Checks NestedTensor handling. With grad enabled and parameters
+        # requiring grad the module must raise AssertionError (message depends on whether a
+        # torch function override is present, in which case the test returns early). Works
+        # under no_grad and inference mode, and also once the nested tensor and all projection
+        # parameters have requires_grad turned off. Mutates the module parameters
+        # requires_grad flags.
         mha = torch.nn.MultiheadAttention(4, 4, batch_first=True).eval()
         nt = torch.nested.nested_tensor([torch.randn(4, 4)])
         # One tested platform (linux-bionic-py3.7-clang) has a torch_function for one
@@ -754,7 +841,14 @@ class TestMultiheadAttentionNN(NNTestCase):
 
 
 class TestMultiheadAttentionNNDeviceType(NNTestCase):
+    # [CLASS DOC] Device-generic tests for MultiheadAttention, instantiated per device by the
+    # device-type test machinery. Has no state of its own; each test takes device (and
+    # sometimes dtype) arguments.
     def test_multihead_self_attn_two_masks_fast_path(self, device):
+        # [FUNCTION DOC] Under no_grad, runs a batch_first eval module with both an attention
+        # mask and a key padding mask (fast path) and compares to the functional slow path
+        # implementation. Rows completely masked out are nan, so they are zeroed in both
+        # results before comparing with assertEqual.
         """
         Multihead self-attention should give the same result on the fast path (BetterTransformer) as on the slow path
         when both attention mask (mask type 0) and key padding mask (mask type 1) are provided
@@ -838,6 +932,10 @@ class TestMultiheadAttentionNNDeviceType(NNTestCase):
         "CrossRef turns on TorchFunctionMode, and so disables fastpath.",
     )
     def test_multihead_self_attn_two_masks_fast_path_mock(self, device):
+        # [FUNCTION DOC] Patches the native multi head attention op with a mock and runs an
+        # eval batch_first module with both masks, then asserts the mock was called, proving
+        # the fast path was taken. Skips on devices other than cpu, cuda, xpu or the
+        # private-use backend; skipped under CrossRef. Autocast is disabled during the call.
         """
         Multihead self-attention should take fast path when both attention mask (mask type 0)
         and key padding mask (mask type 1) are provided at the same time on CPU and CUDA and PrivateUse1
@@ -886,6 +984,9 @@ class TestMultiheadAttentionNNDeviceType(NNTestCase):
     @onlyOn(["cuda", "xpu", torch._C._get_privateuse1_backend_name()])
     @dtypes(torch.half, torch.float, torch.double)
     def test_multihead_attention_dtype(self, device, dtype):
+        # [FUNCTION DOC] Runs a default (sequence-first) module cast to the given dtype and
+        # moved to the device, on random q, k, v, and asserts the output keeps the query size
+        # and dtype. Runs only on cuda, xpu or private-use devices for half, float and double.
         embed_dim = 128
         num_heads = 8
         sl = 10
@@ -901,6 +1002,9 @@ class TestMultiheadAttentionNNDeviceType(NNTestCase):
     @onlyOn(["cuda", "xpu", torch._C._get_privateuse1_backend_name()])
     @dtypes(torch.half, torch.float, torch.double)
     def test_multihead_attention_dtype_batch_first(self, device, dtype):
+        # [FUNCTION DOC] Same dtype and size check for a batch_first module, run once in
+        # training mode and once in eval mode under no_grad (fast path eligible, need_weights
+        # disabled).
         embed_dim = 128
         num_heads = 8
         sl = 10
@@ -933,6 +1037,9 @@ class TestMultiheadAttentionNNDeviceType(NNTestCase):
     def test_multihead_attn_fast_path_query_and_bias_have_different_dtypes(
         self, device, dtype
     ):
+        # [FUNCTION DOC] Smoke test (no assertions beyond not raising): replaces the input
+        # projection bias with a half precision parameter while query is double, then runs the
+        # eval batch_first module under no_grad.
         mha = torch.nn.MultiheadAttention(
             4, 4, batch_first=True, dtype=dtype, device=device
         ).eval()
@@ -945,6 +1052,8 @@ class TestMultiheadAttentionNNDeviceType(NNTestCase):
     @dtypes(torch.double)
     @torch.no_grad()
     def test_multihead_attn_fast_path_small_test(self, device, dtype):
+        # [FUNCTION DOC] Smoke test: runs a small eval batch_first double module under no_grad
+        # on random input; passes if no exception is raised.
         mha = torch.nn.MultiheadAttention(
             4, 4, batch_first=True, dtype=dtype, device=device
         ).eval()
@@ -954,6 +1063,10 @@ class TestMultiheadAttentionNNDeviceType(NNTestCase):
     @dtypes(torch.double)
     @xfailIfNoAcceleratorTriton
     def test_fast_path_check_with_mask_does_not_break_in_compile(self, device, dtype):
+        # [FUNCTION DOC] Compiles an eval TransformerEncoder with fullgraph and calls it with
+        # a source key padding mask, to ensure the fast path mask check (left alignment) does
+        # not break torch.compile. Passes if no exception is raised; marked xfail when no
+        # accelerator Triton is available. Related to issue 163640.
         # Test TransformerEncoder fast path determination with src_key_padding_mask set.
         # Specifically, ensure the mask left-align check doesn't fail in torch.compile.
         # See https://github.com/pytorch/pytorch/issues/163640
@@ -975,6 +1088,8 @@ class TestMultiheadAttentionNNDeviceType(NNTestCase):
     @dtypes(torch.double)
     @torch.no_grad()
     def test_multihead_attn_in_proj_bias_none(self, device, dtype):
+        # [FUNCTION DOC] Smoke test: module built without bias must run forward under no_grad
+        # (in_proj_bias is None).
         mha = torch.nn.MultiheadAttention(2, 2, bias=False, dtype=dtype, device=device)
         query = torch.rand(2, 2, 2, dtype=dtype, device=device)
         mha(query, query, query)
@@ -982,6 +1097,9 @@ class TestMultiheadAttentionNNDeviceType(NNTestCase):
     @dtypes(torch.double)
     @torch.no_grad()
     def test_multihead_attn_in_proj_weight_none(self, device, dtype):
+        # [FUNCTION DOC] Smoke test: with key and value dims different from the embedding dim
+        # the module uses separate projection weights and the packed weight is None; forward
+        # must still run under no_grad.
         # Setting kdim == vdim == 2 means that vdim != embed_dim
         # will cause the logic to use per-input project weights, thereby
         # forcing self.in_proj_weight = None

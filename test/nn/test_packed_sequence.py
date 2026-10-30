@@ -1,4 +1,8 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for the packed-sequence utilities in torch.nn.utils.rnn (pad_sequence,
+# unpad_sequence, pack_sequence, unpack_sequence, pack_padded_sequence, pad_packed_sequence
+# and PackedSequence type/device conversion). One test class, run through the standard test
+# runner. No import-time side effects beyond imports.
 import itertools
 import random
 import sys
@@ -14,6 +18,11 @@ from torch.testing._internal.common_utils import (
 
 
 class PackedSequenceTest(TestCase):
+    # [CLASS DOC] Test case for PackedSequence and the rnn padding/packing helpers. The class
+    # attribute _type_by_name maps legacy tensor type names to a pair of tensor class and
+    # PackedSequence cast method name (half is deliberately omitted because
+    # pad_packed_sequence fails on it). Instance state set in the constructor: batch_size (5)
+    # and max_length (6), used to generate random sequences.
     _type_by_name = {
         "torch.DoubleTensor": (torch.DoubleTensor, "double"),
         "torch.FloatTensor": (torch.FloatTensor, "float"),
@@ -28,11 +37,17 @@ class PackedSequenceTest(TestCase):
     }
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Forwards all arguments to the base test case constructor,
+        # then sets the batch size to 5 and the maximum sequence length to 6.
         super().__init__(*args, **kwargs)
         self.batch_size = 5
         self.max_length = 6
 
     def _ordered_sequence(self, tensor_type):
+        # [FUNCTION DOC] HELPER: Builds batch_size random 1-D sequences of the given legacy
+        # tensor type, each with a random length between 1 and max_length, filled with random
+        # integers (0..255 for byte tensors, -128..127 otherwise), and returns them sorted by
+        # length in decreasing order.
         """Create ordered list of random sequences"""
         seqs = [
             tensor_type(random.randint(1, self.max_length))
@@ -46,6 +61,9 @@ class PackedSequenceTest(TestCase):
         return ordered
 
     def _padded_sequence(self, tensor_type):
+        # [FUNCTION DOC] HELPER: Creates an ordered list of random sequences for the tensor
+        # type, pads it with pad_sequence (sequence-first layout) and returns the padded
+        # tensor together with the list of original lengths.
         """Create Tensor of random padded sequences"""
         ordered = self._ordered_sequence(tensor_type)
         lengths = [len(i) for i in ordered]
@@ -57,6 +75,10 @@ class PackedSequenceTest(TestCase):
         "Frame Handling Difference between Python versions",
     )
     def test_type_casts(self):
+        # [FUNCTION DOC] For every source tensor type, every target type and both values of
+        # enforce_sorted, packs a padded batch, applies the target cast method on the
+        # PackedSequence, unpacks with pad_packed_sequence and asserts the unpacked tensor has
+        # the target type string. Skipped under TorchDynamo on Python older than 3.12.
         """Test type casting of `PackedSequence` against type casting of tensor"""
         for input_type, _ in self._type_by_name.values():
             for expected_type_str, (_, cast_str) in self._type_by_name.items():
@@ -71,6 +93,8 @@ class PackedSequenceTest(TestCase):
                     self.assertEqual(unpacked.type(), expected_type_str)
 
     def test_wrong_order(self):
+        # [FUNCTION DOC] Packs a batch whose lengths are in increasing order with
+        # enforce_sorted true and asserts RuntimeError is raised.
         a = torch.ones(25, 300)
         b = torch.ones(22, 300)
         b_a = rnn_utils.pad_sequence([b, a])
@@ -80,6 +104,8 @@ class PackedSequenceTest(TestCase):
         )
 
     def test_pad_sequence_with_tensor_sequences(self):
+        # [FUNCTION DOC] Checks pad_sequence gives identical results for a tuple of 2-D
+        # tensors and for one stacked 3-D tensor, and that the output shape is 1 by 2 by 2.
         seq_tuple_input = torch.nn.utils.rnn.pad_sequence(
             (torch.tensor([[7, 6]]), torch.tensor([[-7, -1]]))
         )
@@ -90,6 +116,8 @@ class PackedSequenceTest(TestCase):
         self.assertEqual(seq_tuple_input.shape, torch.Size([1, 2, 2]))
 
     def test_pad_sequence_with_non_iterable_sequences(self):
+        # [FUNCTION DOC] Asserts pad_sequence raises RuntimeError mentioning an expected
+        # iterable when given a non-iterable (an integer).
         msg = r"Expected iterable for input sequences, but got arg of type"
         with self.assertRaisesRegex(RuntimeError, msg):
             torch.nn.utils.rnn.pad_sequence(5)
@@ -99,6 +127,14 @@ class PackedSequenceTest(TestCase):
         "Frame Handling Difference between Python versions",
     )
     def test_total_length(self):
+        # [FUNCTION DOC] Checks the total_length argument of pad_packed_sequence. Values below
+        # the longest sequence must raise ValueError (for both batch layouts), and larger
+        # values must give outputs of that padded length, the same lengths, and contents equal
+        # to the unpadded output extended with zeros. Skipped under TorchDynamo on Python
+        # older than 3.12.
+        # KNOWN ISSUE: the assertRaisesRegex call is dedented out of the inner batch_first
+        # loop, so only the last closure per total_length value is exercised and
+        # batch_first=True is never checked for the error.
         padded, lengths = self._padded_sequence(torch.FloatTensor)
         max_length = max(lengths)
         packed = rnn_utils.pack_padded_sequence(padded, lengths)
@@ -107,6 +143,9 @@ class PackedSequenceTest(TestCase):
             for batch_first in (True, False):
 
                 def err_fn():
+                    # [FUNCTION DOC] HELPER: Closure that calls pad_packed_sequence on the packed
+                    # batch with the current batch_first and total_length loop values, expected to
+                    # raise ValueError. Returns nothing.
                     rnn_utils.pad_packed_sequence(
                         packed, batch_first=batch_first, total_length=total_length
                     )
@@ -148,6 +187,11 @@ class PackedSequenceTest(TestCase):
         "Frame Handling Difference between Python versions",
     )
     def test_to(self):
+        # [FUNCTION DOC] For both enforce_sorted values, moves a packed int batch to cpu and
+        # checks that to and cpu with no-op arguments return the same object while a dtype
+        # conversion compares equal to the long conversion. If CUDA is available, also checks
+        # the same identity and equality properties for transfers to cuda devices and back.
+        # Skipped under TorchDynamo on Python older than 3.13.
         for enforce_sorted in (True, False):
             padded, lengths = self._padded_sequence(torch.IntTensor)
             a = rnn_utils.pack_padded_sequence(
@@ -174,6 +218,9 @@ class PackedSequenceTest(TestCase):
                     self.assertEqual(b.long(), b.to(dtype=torch.int64))
 
     def test_to_memory_format(self):
+        # [FUNCTION DOC] Converts a Conv2d module to channels_last memory format and checks
+        # every 4-D parameter is contiguous in that format. Does not involve packed sequences
+        # at all.
         m = torch.nn.Conv2d(in_channels=16, out_channels=32, kernel_size=2, bias=True)
         m = m.to(memory_format=torch.channels_last)
         for param in m.parameters():
@@ -181,7 +228,14 @@ class PackedSequenceTest(TestCase):
                 self.assertTrue(param.is_contiguous(memory_format=torch.channels_last))
 
     def test_pad_sequence(self):
+        # [FUNCTION DOC] Checks pad_sequence for 1-D sequences and for random
+        # multi-dimensional sequences: batch_first layout, default sequence-first layout, left
+        # and right padding_side, a non-zero padding value, and already sorted input. Compares
+        # against hand-built expected tensors.
         def pad(tensor, length):
+            # [FUNCTION DOC] HELPER: Reference right-padding. Appends zeros to a tensor along
+            # its first dimension up to the given length, using the tensor data; returns the
+            # concatenated tensor.
             return torch.cat(
                 [
                     tensor.data,
@@ -270,6 +324,11 @@ class PackedSequenceTest(TestCase):
             self.assertEqual(padded, expected.transpose(0, 1))
 
     def test_unpad_sequence(self):
+        # [FUNCTION DOC] Round-trip check: pads sequences with pad_sequence for both batch
+        # layouts and verifies unpad_sequence with the original lengths returns lists equal to
+        # the originals, for 1-D sequences and for random multi-dimensional sequences.
+        # KNOWN ISSUE: in the multi-dimensional part the batch_first variable is left over
+        # from the earlier loop, so only the last layout (sequence-first) is exercised there.
         # single dimensional
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([4, 5])
@@ -306,7 +365,17 @@ class PackedSequenceTest(TestCase):
             self.assertEqual(sequences, unpadded_sequences)
 
     def test_pack_sequence(self):
+        # [FUNCTION DOC] Checks pack_sequence: for 1-D sequences verifies the packed data,
+        # batch_sizes, sorted_indices and unsorted_indices both for unsorted input with
+        # enforce_sorted false and for sorted input with enforce_sorted true (indices are
+        # None). Asserts RuntimeError with the expected messages for unsorted input with
+        # enforce_sorted true. Then checks compatibility with pad_sequence,
+        # pad_packed_sequence and pack_padded_sequence on random multi-dimensional data.
         def _compatibility_test(sequences, lengths, batch_first, enforce_sorted=False):
+            # [FUNCTION DOC] HELPER: Asserts that pack_sequence on the sequences, after
+            # unpacking, equals pad_sequence of the sequences, and that the packed result
+            # equals pack_padded_sequence of the padded tensor with the given lengths, batch
+            # layout and enforce_sorted flag.
             padded = rnn_utils.pad_sequence(sequences, batch_first)
             packed = rnn_utils.pack_sequence(sequences, enforce_sorted)
             unpacked = rnn_utils.pad_packed_sequence(packed, batch_first)
@@ -371,6 +440,9 @@ class PackedSequenceTest(TestCase):
                 )
 
     def test_unpack_sequence(self):
+        # [FUNCTION DOC] Round-trip check: packs sequences with pack_sequence (enforce_sorted
+        # false) and verifies unpack_sequence returns lists equal to the originals, for 1-D
+        # sequences and random multi-dimensional sequences.
         # single dimensional
         a = torch.tensor([1, 2, 3])
         b = torch.tensor([4, 5])
@@ -396,8 +468,21 @@ class PackedSequenceTest(TestCase):
             self.assertEqual(sequences, unpacked_sequences)
 
     def test_pack_padded_sequence(self):
+        # [FUNCTION DOC] Checks pack_padded_sequence and pad_packed_sequence on generated
+        # cases (sorted and shuffled lengths, both batch layouts): packed data, batch_sizes
+        # and unsorted_indices against expectations, the inverse unpack equals the source and
+        # lengths, and gradients flow back to the padded input with zero gradient at padded
+        # positions. Finally asserts RuntimeError for unsorted lengths with enforce_sorted
+        # default and for empty input.
         def generate_test_case(sorted_lengths, should_shuffle):
+            # [FUNCTION DOC] HELPER: Builds a test case from decreasing lengths. Returns the
+            # padded sequence-first float tensor requiring grad (each sequence filled with
+            # predictable values), the lengths (shuffled into a tensor when requested, with
+            # the matching unsorted_indices tensor, otherwise the input list and None), the
+            # expected packed data, and the expected batch_sizes list.
             def pad(tensor, length):
+                # [FUNCTION DOC] HELPER: Pads a tensor with zeros along its first dimension up
+                # to the given length and returns the concatenation.
                 return torch.cat(
                     [
                         tensor,
@@ -510,6 +595,9 @@ class PackedSequenceTest(TestCase):
             )
 
     def test_empty_packed_sequence(self):
+        # [FUNCTION DOC] Regression test for the empty-tensor crash (issue 149622): building a
+        # PackedSequence from empty data and empty batch sizes and calling pad_packed_sequence
+        # or unpack_sequence must raise RuntimeError instead of crashing.
         """
         Regression test for https://github.com/pytorch/pytorch/issues/149622
         Tests that pad_packed_sequence and unpack_sequence handle empty tensors

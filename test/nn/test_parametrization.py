@@ -1,4 +1,11 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for torch.nn.utils.parametrize and the parametrizations built on it
+# (spectral_norm, orthogonal, weight_norm). Contains a CPU class with many tests of
+# registering, removing, nesting, caching, transferring, serializing and deep copying
+# parametrizations (most run with the swap_tensors conversion setting both on and off),
+# spectral norm and orthogonal behavior, plus a device-generic weight_norm test. Many nested
+# module classes act as small parametrizations. Import-time side effects: instantiates the
+# device-type tests and the parametrized tests into module globals.
 import pickle
 from copy import deepcopy
 from itertools import product
@@ -29,6 +36,9 @@ from torch.testing._internal.two_tensor import TwoTensor
 
 
 class TestNNParametrization(NNTestCase):
+    # [CLASS DOC] Main CPU test case for the parametrize utilities. Class attributes mark
+    # generic hardware classification and turn on the CUDA memory leak check and non-default
+    # stream checks. No instance state; each test builds its own small modules.
     hw_classification = HardwareClassification.GENERIC
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
@@ -39,6 +49,13 @@ class TestNNParametrization(NNTestCase):
     @skipIfNoLapack
     @swap([True, False])
     def test_register_and_remove_parametrization(self):
+        # [FUNCTION DOC] Walks through registering and removing parametrizations on a Linear
+        # module. Checks that an unsafe flag is needed for a shape change (ValueError
+        # otherwise), that removal with leave_parametrized false restores the original
+        # parameter object, id and class, that stacked parametrizations on weight and bias
+        # work with SGD updates and backward, partial removal keeps the other parameter
+        # parametrized, and removal with leave_parametrized true keeps object identity.
+        # Deletes temporaries when the swap_tensors path is active. Skipped without LAPACK.
         r"""Test that it is possible to add a few parametrizations
         on a parameter or a buffer and that removing them restores the initial state
         It also tests that backpropagating through them works as expected
@@ -46,12 +63,21 @@ class TestNNParametrization(NNTestCase):
 
         # Define a couple matrix parametrizations
         class Skew(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that maps a matrix to a skew-symmetric one.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Keeps the strictly lower triangle of the input and
+                # returns it minus its transpose.
                 X = X.tril(-1)
                 return X - X.T
 
         class Orthogonal(nn.Module):
+            # [CLASS DOC] HELPER: Cayley map parametrization that turns a skew-symmetric
+            # matrix into an orthogonal one.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Solves the linear system with identity plus X and
+                # identity minus X (identity on the input device) and returns the solution
+                # made contiguous, avoiding an autograd warning about Fortran-ordered strides
+                # when parametrizations are removed.
                 # Cayley map
                 # If X is skew-symmetric it returns an orthogonal matrix
                 Id = torch.eye(X.size(0), device=X.device)
@@ -62,20 +88,32 @@ class TestNNParametrization(NNTestCase):
                 return torch.linalg.solve(Id + X, Id - X).contiguous()
 
         class Resize(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that changes tensor shape (keeps only the
+            # first row), used for the unsafe flag tests.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns only the first row of the input as a one-row
+                # matrix, changing the shape.
                 return X[[0]]
 
         class NoResize(nn.Module):
+            # [CLASS DOC] HELPER: Shape-preserving identity parametrization.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return X
 
         # Define a couple vector parametrizations
         class FirstZero(nn.Module):
+            # [CLASS DOC] HELPER: Vector parametrization that forces the first entry to zero.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a new vector made of a zero followed by all
+                # entries of the input from the second on.
                 return torch.cat([x.new_zeros(1), x[1:]])
 
         class LastZero(nn.Module):
+            # [CLASS DOC] HELPER: Vector parametrization that forces the last entry to zero.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a new vector made of all entries but the last
+                # followed by a zero.
                 return torch.cat([x[:-1], x.new_zeros(1)])
 
         model = nn.Linear(8, 8)
@@ -291,12 +329,20 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_register_and_remove_nested_parametrization(self):
+        # [FUNCTION DOC] Registers a skew-symmetric parametrization on a weight, then
+        # registers another parametrization on the original tensor of the parametrization list
+        # module (nesting), checks both give skew-symmetric results, and removes them in
+        # reverse order, verifying the module class goes back to the list class and then to
+        # Linear.
         r"""Test that it is possible to nest the parametrizations
         meaning that the original param is parametrized again
         """
 
         class Skew(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that maps a matrix to a skew-symmetric one.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Keeps the strictly lower triangle and returns it
+                # minus its transpose.
                 X = X.tril(-1)
                 return X - X.T
 
@@ -345,15 +391,25 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_register_and_remove_buffer_parametrization(self):
+        # [FUNCTION DOC] Replaces the bias parameter of a Linear module by a buffer, registers
+        # two vector parametrizations on it, checks the zeroed ends and that only the weight
+        # remains a parameter, then removes the parametrizations with leave_parametrized true
+        # and checks the values stay.
         r"""Test that it is possible to add and remove parametrizations on buffers"""
 
         # Define a couple vector parametrizations
         class FirstZero(nn.Module):
+            # [CLASS DOC] HELPER: Vector parametrization that forces the first entry to zero.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a zero followed by the input entries from the
+                # second on.
                 return torch.cat([x.new_zeros(1), x[1:]])
 
         class LastZero(nn.Module):
+            # [CLASS DOC] HELPER: Vector parametrization that forces the last entry to zero.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input entries but the last followed by a
+                # zero.
                 return torch.cat([x[:-1], x.new_zeros(1)])
 
         model = nn.Linear(8, 8)
@@ -387,22 +443,38 @@ class TestNNParametrization(NNTestCase):
     )
     @swap([True, False])
     def test_serialization_parametrization(self):
+        # [FUNCTION DOC] Builds a Sequential model whose first layer weight has a stateful
+        # orthogonal parametrization, saves its state dict to a temporary file and loads it
+        # into a freshly built model, asserting the weight and the parametrization buffer are
+        # restored. Saving the whole parametrized model object must raise RuntimeError
+        # mentioning state_dict. Skipped without LAPACK and under TorchDynamo.
         r"""Test that it is possible to serialize a parametrized model via state_dict"""
 
         # A stateful parametrization
         class Orthogonal(nn.Module):
+            # [CLASS DOC] HELPER: Stateful Cayley-map parametrization of size n. Holds two
+            # buffers: an identity matrix and a random orthogonal matrix B initialized with
+            # orthogonal init.
             def __init__(self, n):
+                # [FUNCTION DOC] HELPER: Stores an identity buffer of size n and a buffer B
+                # filled with a random orthogonal matrix.
                 super().__init__()
                 self.id = Buffer(torch.eye(n))
                 self.B = Buffer(torch.empty(n, n))
                 init.orthogonal_(self.B)
 
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Takes the strict upper triangle of the input, makes
+                # it skew-symmetric, and returns B times the solution of the Cayley linear
+                # system.
                 A = X.triu(1)
                 A = A - A.T
                 return self.B @ torch.linalg.solve(self.id + A, self.id - A)
 
         def get_model():
+            # [FUNCTION DOC] HELPER: Builds a Sequential of Linear, ReLU and Linear layers and
+            # registers the stateful orthogonal parametrization on the weight of the first layer.
+            # Returns the model.
             model = torch.nn.Sequential(
                 torch.nn.Linear(5, 5),
                 torch.nn.ReLU(),
@@ -437,38 +509,63 @@ class TestNNParametrization(NNTestCase):
     @skipIfNoLapack
     @swap([True, False])
     def test_initialization_parametrization(self):
+        # [FUNCTION DOC] Checks assigning to a parametrized tensor, which calls right_inverse
+        # to initialize the original. A skew-symmetric parametrization must reject non-skew
+        # input with ValueError and accept skew input, storing its upper triangle. Stacking a
+        # Cayley orthogonal parametrization must reject non-orthogonal input, and accepting an
+        # orthogonal one stores zeros as original. Skipped without LAPACK.
         r"""Test that it is possible to initialize a parametrization when it
         implements a `right_inverse` method
         """
 
         class Skew(nn.Module):
+            # [CLASS DOC] HELPER: Skew-symmetric parametrization with a validating
+            # right_inverse.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns the strict upper triangle minus its
+                # transpose.
                 A = X.triu(1)
                 return A - A.T
 
             def is_skew(self, A):
+                # [FUNCTION DOC] HELPER: Returns whether the matrix is close to the negative
+                # of its transpose with absolute tolerance 1e-6.
                 return torch.allclose(A, -A.T, atol=1e-6)
 
             def right_inverse(self, X):
+                # [FUNCTION DOC] HELPER: Raises ValueError when the input is not
+                # skew-symmetric; otherwise returns its strict upper triangle.
                 if not self.is_skew(X):
                     raise ValueError("The matrix is not skew-symmetric.")
                 return X.triu(1)
 
         # Implements a Cayley map where right_inverse is not quite the inverse of forward
         class Orthogonal(nn.Module):
+            # [CLASS DOC] HELPER: Cayley-map parametrization of size n whose right_inverse is
+            # not an exact inverse of forward: it stores the target orthogonal matrix in the
+            # buffer B and returns zeros. State: buffer B (initially identity).
             def __init__(self, n):
+                # [FUNCTION DOC] HELPER: Registers a buffer B initialized to the n by n
+                # identity.
                 super().__init__()
                 self.B = Buffer(torch.eye(n))
 
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns B times the solution of the Cayley linear
+                # system built from the input.
                 Id = torch.eye(X.size(0))
                 return self.B @ torch.linalg.solve(Id + X, Id - X)
 
             def is_orthogonal(self, X):
+                # [FUNCTION DOC] HELPER: Returns whether the transpose of the matrix times the
+                # matrix is close to the identity with absolute tolerance 1e-4.
                 Id = torch.eye(X.size(0))
                 return torch.allclose(X.T @ X, Id, atol=1e-4)
 
             def right_inverse(self, X):
+                # [FUNCTION DOC] HELPER: Raises ValueError if the input is not orthogonal.
+                # Otherwise side effect: replaces the buffer B by the input; returns a zero
+                # tensor of the same shape.
                 if not self.is_orthogonal(X):
                     raise ValueError("The input is not orthogonal.")
                 # cayley(0) == Id, so B @ cayley(0) == B
@@ -507,12 +604,21 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_errors_unparametrized_tensor_parametrization(self):
+        # [FUNCTION DOC] Checks the errors raised when registering or removing
+        # parametrizations on a tensor that is not yet parametrized: missing parameter name,
+        # removing from an unparametrized tensor, removing a many-output parametrization with
+        # leave_parametrized false, wrong number of forward arguments (TypeError),
+        # right_inverse returning a non-tensor or a bad sequence, and dtype, device or shape
+        # changes. After each failure the module must not be parametrized. A length-one
+        # sequence from right_inverse is accepted. Finally checks the weight is unchanged.
         # Test errors when registering a parametrization on an unparametrized tensor
         module = nn.Linear(3, 4)
         weight_init = module.weight.clone()
 
         class Identity(nn.Module):
+            # [CLASS DOC] HELPER: Identity parametrization, also used as base class.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return x
 
         # Register a parametrization on a non-existing parameter throws
@@ -527,10 +633,15 @@ class TestNNParametrization(NNTestCase):
 
         # A correct parametrization with several outputs
         class Sum(nn.Module):
+            # [CLASS DOC] HELPER: Valid two-input parametrization (sum) whose right_inverse
+            # splits a tensor into itself and zeros.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of its two inputs.
                 return x + y
 
             def right_inverse(self, z):
+                # [FUNCTION DOC] HELPER: Returns a pair: the input and a zero tensor of the
+                # same shape.
                 return z, torch.zeros_like(z)
 
         parametrize.register_parametrization(module, "weight", Sum())
@@ -543,10 +654,15 @@ class TestNNParametrization(NNTestCase):
 
         # A parametrization with an incorrect number of outputs
         class WrongNumberParams(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization: forward takes three tensors while
+            # right_inverse returns only two.
             def forward(self, x, y, z):
+                # [FUNCTION DOC] HELPER: Returns the sum of three inputs.
                 return x + y + z
 
             def right_inverse(self, w):
+                # [FUNCTION DOC] HELPER: Returns a pair of the input and zeros, too few values
+                # for forward.
                 return w, torch.zeros_like(w)
 
         # Makes param(*param.right_inverse(X)) fail
@@ -556,7 +672,10 @@ class TestNNParametrization(NNTestCase):
 
         # A parametrization with a right_inverse that does not return a Tensor or Sequence[Tensor]
         class WrongRightInverse(Identity):
+            # [CLASS DOC] HELPER: Identity parametrization whose right_inverse returns None,
+            # which is invalid.
             def right_inverse(self, z):
+                # [FUNCTION DOC] HELPER: Returns None.
                 return None
 
         # right_inverse should return a Tensor or a Sequence[Tensor]
@@ -566,10 +685,14 @@ class TestNNParametrization(NNTestCase):
 
         # If it's a sequence, it must to be a sequence of tensors
         class WrongRightInverseSequence(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization whose right_inverse returns a
+            # sequence containing a non-tensor.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns its first input.
                 return x
 
             def right_inverse(self, z):
+                # [FUNCTION DOC] HELPER: Returns a pair of None and the input.
                 return None, z
 
         with self.assertRaisesRegex(ValueError, "of the sequence with type"):
@@ -580,10 +703,14 @@ class TestNNParametrization(NNTestCase):
 
         # A parametrization from one tensor to one tensor that changes the dtype
         class ChangeDtypeInverse(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization whose right_inverse changes the
+            # dtype to boolean.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Casts the input to float.
                 return x.float()
 
             def right_inverse(self, w):
+                # [FUNCTION DOC] HELPER: Casts the input to boolean.
                 return w.bool()
 
         # For parametrizations that return one tensor, right_inverse may not change the dtype
@@ -594,10 +721,14 @@ class TestNNParametrization(NNTestCase):
         self.assertFalse(parametrize.is_parametrized(module))
 
         class ChangeDeviceInverse(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization whose right_inverse moves the tensor
+            # to the meta device.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Casts the input to float.
                 return x.float()
 
             def right_inverse(self, w):
+                # [FUNCTION DOC] HELPER: Moves the input to the meta device.
                 return w.to(torch.device("meta"))
 
         # For parametrizations that return one tensor, right_inverse may not change the device
@@ -611,7 +742,10 @@ class TestNNParametrization(NNTestCase):
 
         # Doesn't return a tensor
         class NotTensor(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization whose forward does not return a
+            # tensor.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Ignores the input and returns the integer 2.
                 return 2
 
         # Forward must return a tensor
@@ -621,7 +755,10 @@ class TestNNParametrization(NNTestCase):
 
         # A parametrization from one tensor to one tensor that changes the dtype
         class ChangeDtype(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization whose forward changes the dtype to
+            # boolean.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input cast to boolean.
                 return x.bool()
 
         # forward should not change the initial dtype
@@ -631,7 +768,9 @@ class TestNNParametrization(NNTestCase):
 
         # Change shape
         class ChangeShape(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization whose forward changes the shape.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input without its last row.
                 return x[:-1]
 
         # forward should not change the original shape
@@ -641,10 +780,14 @@ class TestNNParametrization(NNTestCase):
 
         # Many to one that changes dtype
         class ChangeDtypeMulti(nn.Module):
+            # [CLASS DOC] HELPER: Invalid two-input parametrization whose forward changes the
+            # dtype to boolean.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the two inputs cast to boolean.
                 return (x + y).bool()
 
             def right_inverse(self, w):
+                # [FUNCTION DOC] HELPER: Returns a pair of the input and the input plus one.
                 return w, w + 1
 
         # forward should not change the original shape even for parametrizations with many inputs
@@ -654,10 +797,14 @@ class TestNNParametrization(NNTestCase):
 
         # Returning a sequence of size one, although weird, it's correct
         class SequenceLen1(nn.Module):
+            # [CLASS DOC] HELPER: Valid identity parametrization whose right_inverse returns a
+            # sequence of length one.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return x
 
             def right_inverse(self, w):
+                # [FUNCTION DOC] HELPER: Returns a one-element tuple containing the input.
                 return (w,)
 
         parametrize.register_parametrization(module, "weight", SequenceLen1())
@@ -673,10 +820,17 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_errors_parametrized_tensor_parametrization(self):
+        # [FUNCTION DOC] Registers an identity parametrization and then checks that adding
+        # further invalid parametrizations (forward returning two tensors, changing dtype or
+        # shape, or right_inverse returning two tensors, changing dtype or shape) raises
+        # ValueError with the expected message and leaves exactly the one identity
+        # parametrization registered.
         # Test errors when registering a parametrization on a parametrized tensor
 
         class Identity(nn.Module):
+            # [CLASS DOC] HELPER: Identity parametrization, also used as base class.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return x
 
         module = nn.Linear(3, 4)
@@ -684,7 +838,9 @@ class TestNNParametrization(NNTestCase):
 
         # Has to return a tensor
         class WrongReturn(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization whose forward returns two tensors.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a pair containing the input twice.
                 return x, x
 
         with self.assertRaisesRegex(ValueError, "must return a tensor"):
@@ -695,7 +851,10 @@ class TestNNParametrization(NNTestCase):
 
         # Cannot change dtype
         class ChangeDtype(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization whose forward changes the dtype to
+            # boolean.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input cast to boolean.
                 return x.bool()
 
         with self.assertRaisesRegex(ValueError, "may not change the dtype"):
@@ -706,7 +865,9 @@ class TestNNParametrization(NNTestCase):
 
         # Cannot change shape
         class ChangeShape(nn.Module):
+            # [CLASS DOC] HELPER: Invalid parametrization whose forward changes the shape.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input without its last row.
                 return x[:-1]
 
         with self.assertRaisesRegex(ValueError, "may not change the shape"):
@@ -719,7 +880,10 @@ class TestNNParametrization(NNTestCase):
 
         # right_inverse has to return a tensor
         class WrongReturnInverse(Identity):
+            # [CLASS DOC] HELPER: Identity parametrization whose right_inverse returns two
+            # tensors.
             def right_inverse(self, x):
+                # [FUNCTION DOC] HELPER: Returns a pair containing the input twice.
                 return x, x
 
         with self.assertRaisesRegex(ValueError, "right_inverse must return a tensor"):
@@ -730,7 +894,10 @@ class TestNNParametrization(NNTestCase):
 
         # Cannot change dtype
         class ChangeDtypeInverse(Identity):
+            # [CLASS DOC] HELPER: Identity parametrization whose right_inverse changes the
+            # dtype to boolean.
             def right_inverse(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input cast to boolean.
                 return x.bool()
 
         with self.assertRaisesRegex(ValueError, "must have the same dtype"):
@@ -741,7 +908,10 @@ class TestNNParametrization(NNTestCase):
 
         # Cannot change shape
         class ChangeShapeInverse(Identity):
+            # [CLASS DOC] HELPER: Identity parametrization whose right_inverse changes the
+            # shape.
             def right_inverse(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input without its last row.
                 return x[:-1]
 
         with self.assertRaisesRegex(ValueError, "must have the same shape"):
@@ -755,13 +925,25 @@ class TestNNParametrization(NNTestCase):
     @skipIfNoLapack
     @swap([True, False])
     def test_multiple_inputs_parametrization(self):
+        # [FUNCTION DOC] Registers a two-input rank-one parametrization on a 3 by 3 weight,
+        # checks the two original parameters exist and the weight has rank one, that removal
+        # with leave_parametrized false raises ValueError while true succeeds, then stacks a
+        # scaling parametrization on top, checks the values scale, that the model has three
+        # parameters, that SGD backward steps work, and removes again. Skipped without LAPACK.
         # A parametrization with several outputs
         class RankOne(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization building a rank-one matrix from two vectors,
+            # with right_inverse projecting a matrix onto rank one using its top singular
+            # triplet.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the outer product of the two input vectors.
                 # Form a rank-1 matrix from a pair of vectors
                 return x.unsqueeze(-1) @ y.unsqueeze(-2)
 
             def right_inverse(self, Y):
+                # [FUNCTION DOC] HELPER: Computes the reduced SVD of the matrix and returns
+                # two vectors: the first left and right singular vectors, each scaled by the
+                # square root of the largest singular value.
                 # We project the given matrix onto the rank 1 matrices
                 U, S, Vh = torch.linalg.svd(Y, full_matrices=False)
                 # S is ordered in a decreasing way.
@@ -770,10 +952,13 @@ class TestNNParametrization(NNTestCase):
 
         # Simple parametrisation
         class Double(nn.Module):
+            # [CLASS DOC] HELPER: Scaling parametrization with an exact inverse.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by two.
                 return 2.0 * x
 
             def right_inverse(self, w):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by one half.
                 return 0.5 * w
 
         model = nn.Linear(3, 3)
@@ -857,16 +1042,25 @@ class TestNNParametrization(NNTestCase):
     @skipIfNoLapack
     @swap([True, False])
     def test_caching_parametrization(self):
+        # [FUNCTION DOC] Registers two parametrizations on a weight and checks that inside the
+        # cached context manager two reads of the weight return the same object. Skipped
+        # without LAPACK.
         r"""Test the caching system of a parametrization"""
 
         # Define a couple matrix parametrizations
         class Skew(nn.Module):
+            # [CLASS DOC] HELPER: Skew-symmetric parametrization.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Keeps the strictly lower triangle and returns it
+                # minus its transpose.
                 X = X.tril(-1)
                 return X - X.T
 
         class Orthogonal(nn.Module):
+            # [CLASS DOC] HELPER: Cayley-map orthogonal parametrization.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns the solution of the linear system with
+                # identity plus X and identity minus X.
                 Id = torch.eye(X.size(0), device=X.device)
                 return torch.linalg.solve(Id + X, Id - X)
 
@@ -885,15 +1079,26 @@ class TestNNParametrization(NNTestCase):
     @skipIfNoLapack
     @swap([True, False])
     def test_caching_parametrization_with_transfer_parametrizations_and_params(self):
+        # [FUNCTION DOC] Registers two parametrizations on a Linear module, transfers them to
+        # another Linear module with transfer_parametrizations_and_params, and checks inside
+        # the cached context that each module caches its own weight (two reads give the same
+        # object) and that the two modules do not share cached objects. Skipped without
+        # LAPACK.
         r"""Test that transferring parametrizations doesn't cause issues with caching"""
 
         class Skew(nn.Module):
+            # [CLASS DOC] HELPER: Skew-symmetric parametrization.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Keeps the strictly lower triangle and returns it
+                # minus its transpose.
                 X = X.tril(-1)
                 return X - X.T
 
         class Orthogonal(nn.Module):
+            # [CLASS DOC] HELPER: Cayley-map orthogonal parametrization.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns the solution of the linear system with
+                # identity plus X and identity minus X.
                 Id = torch.eye(X.size(0), device=X.device)
                 return torch.linalg.solve(Id + X, Id - X)
 
@@ -918,10 +1123,16 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_parametrization_same_training_mode(self):
+        # [FUNCTION DOC] Checks that registering a parametrization copies the training mode of
+        # the host module onto it: an eval module gives a non-training parametrization, and
+        # after switching to train mode a newly registered eval parametrization becomes
+        # training, as does the earlier one.
         r"""Test training mode updated on parametrization registration"""
 
         class Identity(nn.Module):
+            # [CLASS DOC] HELPER: Identity parametrization.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return X
 
         module = nn.Linear(4, 4)
@@ -935,10 +1146,14 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_type_before_parametrizations(self):
+        # [FUNCTION DOC] Checks that type_before_parametrizations returns the original module
+        # class both before and after a parametrization is registered.
         r"""Test that type_before_parametrizations always retrieves original type"""
 
         class Identity(nn.Module):
+            # [CLASS DOC] HELPER: Identity parametrization.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return X
 
         model = nn.Linear(5, 5)
@@ -956,14 +1171,24 @@ class TestNNParametrization(NNTestCase):
     )
     @swap([True, False])
     def test_deepcopy_after_parametrization(self):
+        # [FUNCTION DOC] Checks deepcopy works on parametrized modules, for a plain module and
+        # a module with a custom deepcopy method: after registering on weight, then on bias,
+        # then again on weight, the copy must have equal but distinct original tensors and
+        # attribute list and the same set of attribute names. Skipped under TorchDynamo.
         r"""Test that we are able to create a deepcopy of the module when it's parametrized."""
 
         class AddOne(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that adds one.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus 1.0.
                 return x + 1.0
 
         class ModelWithoutDeepcopy(nn.Module):
+            # [CLASS DOC] HELPER: Plain module with weight and bias parameters (four ones and
+            # four zeros, both requiring grad) and a plain list attribute.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the weight and bias parameters and a list
+                # attribute holding four floats.
                 super().__init__()
                 self.weight = nn.Parameter(
                     torch.tensor([1.0, 1.0, 1.0, 1.0]), requires_grad=True
@@ -974,14 +1199,24 @@ class TestNNParametrization(NNTestCase):
                 self.attr = [1.0, 2.0, 3.0, 4.0]
 
         class ActualModel(ModelWithoutDeepcopy):
+            # [CLASS DOC] HELPER: Subclass emulating a user-defined deepcopy implementation.
             # Emulate custom implementation of the deepcopying.
             def __deepcopy__(self, memo):
+                # [FUNCTION DOC] HELPER: Creates a new instance without running the
+                # constructor, records it in the memo mapping under this object's id, assigns
+                # it a deep copy of this object's attribute dictionary using the memo, and
+                # returns it.
                 result = self.__new__(self.__class__)
                 memo[id(self)] = result
                 result.__dict__ = deepcopy(self.__dict__, memo)
                 return result
 
         def check_deepcopy(m1: nn.Module, m2: nn.Module):
+            # [FUNCTION DOC] HELPER: Compares two parametrized models: gets the original
+            # weight and bias (the parametrization original when the bias is parametrized,
+            # else the plain bias) and asserts equal values but distinct objects for weights,
+            # biases and the list attribute, distinct model objects and identical attribute
+            # names.
             w1 = m1.parametrizations.weight.original
             w2 = m2.parametrizations.weight.original
             b1 = (
@@ -1017,21 +1252,33 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_transfer_parametrizations_and_params(self):
+        # [FUNCTION DOC] Registers three parametrizations on a Linear weight, transfers them
+        # to a QAT Linear with transfer_parametrizations_and_params, and checks the target is
+        # parametrized with equal value and original, the source is unaffected, removing from
+        # the target leaves the source parametrized, and a parameter missing from the target
+        # is transferred when named explicitly.
         r"""Test that all parametrizations and their associated parameters are transferred."""
 
         class AddOne(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that adds one.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus 1.0.
                 return x + 1.0
 
         class Double(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that doubles, with an exact right_inverse.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by two.
                 return 2.0 * x
 
             def right_inverse(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by one half.
                 return 0.5 * x
 
         class MinusOne(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that subtracts one.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input minus 1.0.
                 return x - 1.0
 
         model = nn.Linear(5, 5)
@@ -1085,13 +1332,19 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_transfer_parametrizations_and_params_right_inverse(self):
+        # [FUNCTION DOC] Registers a doubling parametrization with a right_inverse on a Linear
+        # weight, transfers it to a QAT Linear and checks equal weight and original, and that
+        # the source weight is unchanged.
         r"""Test that all parametrizations and their associated parameters are transferred."""
 
         class Double(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that doubles, with an exact right_inverse.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by two.
                 return 2.0 * x
 
             def right_inverse(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by one half.
                 return 0.5 * x
 
         model = nn.Linear(5, 5)
@@ -1115,18 +1368,27 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_transfer_parametrizations_and_params_single_param(self):
+        # [FUNCTION DOC] Registers three parametrizations on both weight and bias, transfers
+        # only the weight to a QAT Linear by name, and checks the weight and its original
+        # match and the bias is not parametrized on the target.
         r"""Test that all parametrizations and their associated parameters are transferred."""
 
         class AddOne(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that adds one.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus 1.0.
                 return x + 1.0
 
         class Double(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that doubles.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by two.
                 return 2.0 * x
 
         class MinusOne(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that subtracts one.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input minus 1.0.
                 return x - 1.0
 
         model = nn.Linear(5, 5, bias=True)
@@ -1155,13 +1417,24 @@ class TestNNParametrization(NNTestCase):
     @skipIfNoLapack
     @swap([True, False])
     def test_transfer_parametrizations_and_params_many_to_one(self):
+        # [FUNCTION DOC] Transfers a parametrization with several originals (rank-one followed
+        # by doubling) from a Linear to a QAT Linear and checks the target has equal weight
+        # and both originals, the source value is unchanged, and an extra parameter registered
+        # on the source with the rank-one parametrization is transferred by name. Skipped
+        # without LAPACK.
         # A parametrization with several outputs
         class RankOne(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization building a rank-one matrix from two vectors,
+            # with right_inverse projecting onto rank one via SVD.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the outer product of the two input vectors.
                 # Form a rank-1 matrix from a pair of vectors
                 return x.unsqueeze(-1) @ y.unsqueeze(-2)
 
             def right_inverse(self, Y):
+                # [FUNCTION DOC] HELPER: Computes the reduced SVD and returns the first left
+                # and right singular vectors, each scaled by the square root of the largest
+                # singular value.
                 # We project the given matrix onto the rank 1 matrices
                 U, S, Vh = torch.linalg.svd(Y, full_matrices=False)
                 # S is ordered in a decreasing way.
@@ -1169,7 +1442,9 @@ class TestNNParametrization(NNTestCase):
                 return U[..., :, 0] * s0_sqrt, Vh[..., 0, :] * s0_sqrt
 
         class Double(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that doubles (no right_inverse).
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by two.
                 return 2.0 * x
 
         model = nn.Linear(3, 3)
@@ -1222,6 +1497,13 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_new_spectral_norm(self):
+        # [FUNCTION DOC] Exercises parametrizations.spectral_norm in double precision: buffers
+        # _u and _v, a trainable original, weight as a plain attribute, removal and repeated
+        # registration, then for both CPU and (when multi-GPU is available) DataParallel and
+        # both requires_grad settings it checks training power iteration updates u and v,
+        # backward and gradcheck through repeated forwards, removal outputs matching, eval
+        # mode freezing u and v and matching the last training output, and gradcheck in mixed
+        # train and eval modes (skipped for DataParallel, which is flaky).
         with set_default_dtype(torch.double):
             input = torch.randn(3, 5)
             m = nn.Linear(5, 7)
@@ -1284,17 +1566,24 @@ class TestNNParametrization(NNTestCase):
                     device = torch.device("cuda:0")
 
                     def maybe_wrap(m):
+                        # [FUNCTION DOC] HELPER: Wraps the module in DataParallel on devices 0
+                        # and 1.
                         return torch.nn.DataParallel(m, [0, 1])
 
                 else:
                     device = torch.device("cpu")
 
                     def maybe_wrap(m):
+                        # [FUNCTION DOC] HELPER: Returns the module unchanged.
                         return m
 
                 for requires_grad in (True, False):
 
                     def get_modules():
+                        # [FUNCTION DOC] HELPER: Builds a Linear module on the current device with
+                        # the weight requires_grad flag set, applies spectral_norm, and returns
+                        # the module, its possibly wrapped version, and the spectral norm
+                        # parametrization.
                         m = nn.Linear(3, 4).to(device)
                         m.weight.requires_grad_(requires_grad)
                         m = torch.nn.utils.parametrizations.spectral_norm(m)
@@ -1340,6 +1629,9 @@ class TestNNParametrization(NNTestCase):
                     saved_v = spectral_norm_m._v.clone()
 
                     def fn(input):
+                        # [FUNCTION DOC] HELPER: Restores saved u and v into the parametrization
+                        # (in place), runs the wrapped module twice on the input and returns the
+                        # sum of the outputs.
                         spectral_norm_m._u.data.copy_(saved_u)
                         spectral_norm_m._v.data.copy_(saved_v)
                         out0 = wrapped_m(input)
@@ -1413,6 +1705,9 @@ class TestNNParametrization(NNTestCase):
                     saved_v = spectral_norm_m._v.clone()
 
                     def fn(input):
+                        # [FUNCTION DOC] HELPER: Restores saved u and v, then runs the wrapped
+                        # module alternately in train, eval, train and eval mode on the input and
+                        # returns the sum of the four outputs. Leaves the module in eval mode.
                         spectral_norm_m._u.data.copy_(saved_u)
                         spectral_norm_m._v.data.copy_(saved_v)
                         wrapped_m.train()
@@ -1431,19 +1726,31 @@ class TestNNParametrization(NNTestCase):
                     if requires_grad:
 
                         def fn(weight):
+                            # [FUNCTION DOC] HELPER: Ignores its argument and returns the wrapped
+                            # module output on the enclosing input, so gradcheck differentiates
+                            # with respect to the original weight.
                             return wrapped_m(input)
 
                         gradcheck(fn, (m.parametrizations.weight.original,))
 
     def test_register_parametrization_no_grad(self):
+        # [FUNCTION DOC] Registers a parametrization that splits the weight into two pieces on
+        # a weight with requires_grad off, and asserts weight and both originals have
+        # requires_grad false.
         r"""Test that it is possible to register a parametrization without gradient"""
 
         class SplitAndCat(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that splits a tensor into two pieces and
+            # concatenates them back.
             def right_inverse(self, x):
+                # [FUNCTION DOC] HELPER: Splits the input into chunks whose size is half the
+                # number of columns and returns them.
                 # split the tensor in two halves
                 return torch.split(x, x.shape[1] // 2)
 
             def forward(self, x0, x1):
+                # [FUNCTION DOC] HELPER: Concatenates its two inputs along the first
+                # dimension.
                 return torch.cat([x0, x1])
 
         model = nn.Linear(8, 8)
@@ -1457,6 +1764,11 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_new_spectral_norm_load_state_dict(self):
+        # [FUNCTION DOC] For zero and three prior forward passes, checks the state dict keys
+        # of a spectral-normed Linear, that strict loading with an unexpected key raises
+        # RuntimeError, that non-strict loading tolerates progressively removed keys and
+        # metadata, and that after removing and re-applying spectral_norm, loading the saved
+        # state dict reproduces the saved eval and train outputs.
         for activate_times in (0, 3):
             inp = torch.randn(2, 3)
             m = nn.Linear(3, 5)
@@ -1537,6 +1849,9 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_new_spectral_norm_dim(self):
+        # [FUNCTION DOC] Applies spectral_norm to a ConvTranspose2d, runs a forward pass
+        # without shape errors and checks the u vector has the shape of the original weight
+        # along the output channel dimension (second dimension of the weight).
         inp = torch.randn(2, 3, 10, 12)
         m = nn.ConvTranspose2d(3, 4, (5, 6))
         m = torch.nn.utils.parametrizations.spectral_norm(m)
@@ -1550,6 +1865,8 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_new_spectral_norm_forward(self):
+        # [FUNCTION DOC] Compares the output of a spectral-normed Linear against a manual
+        # computation of one power iteration and weight rescaling.
         input = torch.randn(3, 5)
         m = nn.Linear(5, 7)
         m = torch.nn.utils.parametrizations.spectral_norm(m)
@@ -1570,6 +1887,9 @@ class TestNNParametrization(NNTestCase):
     @swap([True, False])
     @skipIfTorchDynamo("Test does not work with TorchDynamo")
     def test_new_spectral_norm_value(self):
+        # [FUNCTION DOC] For float and complex float, applies spectral_norm to a Linear with a
+        # diagonal weight under no_grad and checks the weight is divided by the largest
+        # absolute diagonal entry. Skipped under TorchDynamo.
         # a test that the spectral norm (= top singular value)
         # is in fact properly calculated, using example of a simple diagonal matrix.
         for dtype in (torch.float, torch.cfloat):
@@ -1586,9 +1906,21 @@ class TestNNParametrization(NNTestCase):
     @skipIfNoLapack
     @swap([True, False])
     def test_orthogonal_parametrization(self):
+        # [FUNCTION DOC] Tests parametrizations.orthogonal for matrix_exp, cayley and
+        # householder, with and without trivialization, for square, tall and wide shapes and
+        # float and complex dtypes. Checks householder rejects complex (ValueError), the
+        # weight is orthogonal, initialization from a matrix (through QR) works when
+        # right_inverse is implemented and raises NotImplementedError otherwise, and gradients
+        # of the original have a zero triangle and zero real diagonal before an SGD step keeps
+        # orthogonality. Skipped without LAPACK.
+        # KNOWN ISSUE: the loop skips every case where use_linear is false, so the Conv2d
+        # branches are dead code.
         # Orthogonal implements 6 algorithms (3x parametrizations times 2 options of use_trivialization)
 
         def assert_is_orthogonal(X):
+            # [FUNCTION DOC] HELPER: Asserts the matrix has orthonormal columns (rows if wide)
+            # by comparing the conjugate transpose product with the identity under a tolerance
+            # scaled by size and dtype epsilon. Raises AssertionError on failure.
             n, k = X.size(-2), X.size(-1)
             if n < k:
                 X = X.mT
@@ -1600,6 +1932,9 @@ class TestNNParametrization(NNTestCase):
             torch.testing.assert_close(X.mH @ X, Id, atol=eps, rtol=0.0)
 
         def assert_weight_allclose_Q(weight, W):
+            # [FUNCTION DOC] HELPER: Asserts the weight equals the Q factor of the QR
+            # decomposition of W (of its transpose if wide), with Q columns scaled by the
+            # signs of the diagonal of R. Raises AssertionError on mismatch.
             # Test that weight is equal to the Q part of the QR decomposition of W
             # (or of its transpose if the matrix is wide)
             wide_matrix = W.size(-2) < W.size(-1)
@@ -1721,6 +2056,9 @@ class TestNNParametrization(NNTestCase):
     @skipIfNoLapack
     @swap([True, False])
     def test_orthogonal_errors(self):
+        # [FUNCTION DOC] Checks orthogonal raises ValueError for an unknown parametrization
+        # name, for a non-matrix parameter, and that assigning a matrix of the wrong shape
+        # raises ValueError. Skipped without LAPACK.
         m = nn.Linear(3, 4)
         with self.assertRaisesRegex(ValueError, "has to be one of"):
             torch.nn.utils.parametrizations.orthogonal(m, "weight", "foo")
@@ -1735,6 +2073,8 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_weight_norm_state_dict_compat(self):
+        # [FUNCTION DOC] Checks a state dict from the old weight_norm hook loads into a module
+        # using the parametrization-based weight_norm and both produce the same output.
         m = nn.Linear(4, 5)
         m = torch.nn.utils.weight_norm(m)
         old_dict = m.state_dict()
@@ -1748,6 +2088,8 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_weight_norm_pickle(self):
+        # [FUNCTION DOC] Checks pickling a weight-normed module raises RuntimeError mentioning
+        # state_dict.
         m = nn.Linear(4, 5)
         m = torch.nn.utils.parametrizations.weight_norm(m)
         with self.assertRaisesRegex(RuntimeError, "state_dict"):
@@ -1755,6 +2097,8 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True, False])
     def test_weight_norm_deepcopy(self):
+        # [FUNCTION DOC] Checks a deepcopy of a weight-normed module gives the same output on
+        # a random input.
         m = nn.Linear(4, 5)
         m = torch.nn.utils.parametrizations.weight_norm(m)
         m2 = deepcopy(m)
@@ -1763,19 +2107,32 @@ class TestNNParametrization(NNTestCase):
 
     @swap([True])
     def test_wrapper_subclass_parametrization(self):
+        # [FUNCTION DOC] Checks parametrizations that produce or consume tensor subclass
+        # (TwoTensor) values, on both a parameter and a buffer. Runs only with swap_tensors
+        # enabled. Verifies types after registration, after removal with leave_parametrized
+        # true and false, and parameter identity.
         class Subclassify(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that wraps a tensor into a TwoTensor of
+            # itself.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns a TwoTensor built from the input twice.
                 return TwoTensor(X, X)
 
         class UnSubclassify(nn.Module):
+            # [CLASS DOC] HELPER: Parametrization that unwraps a TwoTensor.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns the first component of the input.
                 return X.a
 
         class IdentityWithRightInverse(nn.Module):
+            # [CLASS DOC] HELPER: Identity forward with a right_inverse that wraps the tensor
+            # into a TwoTensor.
             def forward(self, X):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return X
 
             def right_inverse(self, X):
+                # [FUNCTION DOC] HELPER: Returns a TwoTensor built from the input twice.
                 return TwoTensor(X, X)
 
         def _check_parametrization(
@@ -1785,6 +2142,11 @@ class TestNNParametrization(NNTestCase):
             leave_parametrized=False,
             type_after_right_inverse=None,
         ):
+            # [FUNCTION DOC] HELPER: Builds a Linear module with a buffer, optionally turning
+            # its tensors into TwoTensor, registers the given parametrization class on weight
+            # and buf, asserts expected types of originals and results, removes both with the
+            # given leave_parametrized flag, and asserts final types, module class, object
+            # identity and (when applicable) values. Raises AssertionError on mismatch.
             model = nn.Linear(2, 2)
             buf = torch.randn(2, 2)
             model.buf = torch.nn.Buffer(buf)
@@ -1884,10 +2246,16 @@ class TestNNParametrization(NNTestCase):
 
 
 class TestNNParametrizationDevice(NNTestCase):
+    # [CLASS DOC] Device-generic test case for weight_norm parametrization, with an
+    # accelerator hardware classification attribute. Instantiated per device.
     hw_classification = HardwareClassification.ACCELERATOR
 
     @swap([True, False])
     def test_weight_norm_parametrization(self, device):
+        # [FUNCTION DOC] For float and bfloat16, applies weight_norm to a Linear on the
+        # device, checking original0 and original1 shapes (norm column for dim zero, norm row
+        # for dim one), unchanged outputs, removal restoring the plain module, and dim None
+        # working.
         for dtype in [torch.float, torch.bfloat16]:
             input = torch.randn(3, 4, dtype=dtype, device=device)
             m = nn.Linear(4, 5, dtype=dtype, device=device)
