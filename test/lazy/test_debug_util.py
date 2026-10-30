@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Test for lazy tensor debug utilities. Import-time side effect: initializes the
+# TorchScript lazy backend. The test runs a linear layer on the lazy device with the environment
+# variable naming a tensors-save file set, then checks the saved graph dump contains a Python
+# stacktrace section with the expected frames. Skipped on Windows.
 
 import os
 import re
@@ -16,13 +20,22 @@ torch._lazy.ts_backend.init()
 
 @unittest.skipIf(IS_WINDOWS, "To be fixed")
 class DebugUtilTest(TestCase):
+    # [CLASS DOC] Test case for the lazy debug-dump feature; skipped on Windows by the decorator.
     def _run_linear(self):
+        # [FUNCTION DOC] HELPER: Moves a 5 by 5 linear layer to the lazy device, applies it to a
+        # random lazy input, and calls the lazy step marker so the pending graph is executed (and
+        # dumped if the save-tensors environment variable is set). The output is unused.
         device = "lazy"
         model = nn.Linear(5, 5).to(device)
         output = model(torch.randn(1, 5).to(device))  # noqa: F841
         torch._lazy.mark_step()
 
     def test_get_python_frames(self):
+        # [FUNCTION DOC] Creates a temporary file, points the lazy tensors-save environment
+        # variable (left set in the process afterwards) at it, runs the linear helper, reads the
+        # file, and checks with a dot-matches-newline regular expression that it contains a Python
+        # stacktrace section with frames for mark_step, the helper and this test in order. On
+        # mismatch it prints the file content and fails the test.
         # We only care about the first "Python Stacktrace" part of the saved
         # graph. However, we cannot save the whole stack for comparison given
         # it depends on a lot of things.

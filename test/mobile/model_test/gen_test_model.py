@@ -1,3 +1,10 @@
+# [MODULE DOC] Command-line generator of mobile test models. Import-time side effects: imports
+# sibling modules (math, nn, quantization, sampling, tensor, torchvision models and the android API
+# module, so it must be run from their directory) and instantiates one module per test name into a
+# table. Provides coverage reporting against the production operator list, scripting or tracing of
+# modules, a smoke run of each through the lite interpreter, and saving to the iOS and Android
+# asset folders (or to temporary names for on-the-fly runs). Run as a program with one argument
+# selecting what to generate.
 import io
 import sys
 
@@ -109,6 +116,12 @@ models_need_trace = [
 
 
 def calcOpsCoverage(ops):
+    # [FUNCTION DOC] Compares the operators of all generated models with production usage. Reads
+    # the production operator yaml (mapping each root operator to its occurrence count), computes
+    # the percentage of production operators covered and the percentage of occurrences covered,
+    # prints the uncovered operators and the summary plus the torch version, and writes a coverage
+    # yaml with counts, the uncovered and covered dictionaries and the sorted generated operator
+    # names. Raises if a yaml file is missing, and divides by zero if the production list is empty.
     with open(production_ops_path) as input_yaml_file:
         production_ops_dict = yaml.safe_load(input_yaml_file)
 
@@ -156,6 +169,11 @@ def calcOpsCoverage(ops):
 
 
 def getModuleFromName(model_name):
+    # [FUNCTION DOC] Looks up a test module by name. If the name is unknown it prints a message and
+    # returns None with an empty list. Otherwise it calls the module's getModule method if the
+    # entry is not a regular module, traces it with an empty input list when listed as needing a
+    # trace (otherwise scripts it), exports and prints the operator names, runs it once through the
+    # lite interpreter, and returns the pair of module and operator name list.
     if model_name not in all_modules:
         print("Cannot find test model for " + model_name)
         return None, []
@@ -179,6 +197,9 @@ def getModuleFromName(model_name):
 
 
 def runModule(module):
+    # [FUNCTION DOC] Serializes the module for the lite interpreter into memory, loads it back, and
+    # runs it: if it exposes a bundled-inputs method, calls forward with the first bundled input,
+    # otherwise calls it with no arguments. Raises whatever the interpreter raises.
     buffer = io.BytesIO(module._save_to_buffer_for_lite_interpreter())
     buffer.seek(0)
     lite_module = _load_for_lite_interpreter(buffer)
@@ -194,6 +215,10 @@ def runModule(module):
 # generate all models in the given folder.
 # If it's "on the fly" mode, add "_temp" suffix to the model file.
 def generateAllModels(folder, on_the_fly=False):
+    # [FUNCTION DOC] Generates every registered model: for each name, builds the module, collects
+    # its operators, saves it for the lite interpreter into the given folder (the folder string is
+    # simply prefixed to the file name) with a temp suffix in on-the-fly mode, prints the path, and
+    # finally reports operator coverage for all collected operators.
     all_ops = []
     for name in all_modules:
         module, ops = getModuleFromName(name)
@@ -206,6 +231,8 @@ def generateAllModels(folder, on_the_fly=False):
 
 # generate/update a given model for storage
 def generateModel(name):
+    # [FUNCTION DOC] Generates one named model and saves it for the lite interpreter into both the
+    # iOS and Android asset paths. Does nothing if the name is unknown.
     module, _ = getModuleFromName(name)
     if module is None:
         return
@@ -217,6 +244,13 @@ def generateModel(name):
 
 
 def main(argv):
+    # [FUNCTION DOC] Entry point taking the argument list (without program name). With an argument
+    # list that is missing or not of length one, prints usage text and returns. Otherwise the
+    # single argument selects: android or ios for all models in the matching folder, android-test
+    # or ios-test for all temporary on-the-fly models in the matching folder, anything else as a
+    # single model name.
+    # KNOWN ISSUE: the printed usage says the ios option generates on-the-fly models, but the code
+    #     writes the checked-in (non-temporary) models for ios.
     if argv is None or len(argv) != 1:
         print(
             """

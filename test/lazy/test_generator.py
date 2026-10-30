@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests for random number generators with lazy tensors on the TorchScript lazy
+# backend. Import-time side effect: initializes the TS lazy backend. Checks that generator state is
+# captured in the lazy graph and that different seeds cause recompilation.
 
 import torch
 import torch._lazy.metrics as metrics
@@ -10,7 +13,12 @@ torch._lazy.ts_backend.init()
 
 
 class LazyGeneratorTest(TestCase):
+    # [CLASS DOC] Test case for generator handling in the lazy backend.
     def test_generator(self):
+        # [FUNCTION DOC] Generates a pair of random tensors with seeded generators on CPU and on
+        # the lazy device (global seeds differ between runs), marks a step, and raises an assertion
+        # error unless both tensors from the lazy run match the CPU ones, showing seeds are part of
+        # the traced graph.
         """
         Test that generators are being inserted into the TorchScript
         graph by setting different seeds before each call to
@@ -18,6 +26,9 @@ class LazyGeneratorTest(TestCase):
         """
 
         def generate_tensor():
+            # [FUNCTION DOC] HELPER: Creates two generators seeded 2023 and 2024, fills one scalar
+            # tensor with a uniform draw from the first and another with a normal draw from the
+            # second, and returns both.
             g1 = torch.Generator()
             g1.manual_seed(2023)
             t1 = torch.tensor(1.0)
@@ -48,11 +59,19 @@ class LazyGeneratorTest(TestCase):
             raise AssertionError(f"Expected {cpu_t2}, got {lazy_t2.to('cpu')}")
 
     def test_generator_causes_multiple_compiles(self):
+        # [FUNCTION DOC] Resets metrics and runs the seeded generation on the lazy device three
+        # times (seeds 1, 2, 1), checking after each step the compile counters: one uncached
+        # compile after the first, two after the second, and after the third still two uncached
+        # plus one cached. Then resets metrics again and checks the latest computation graph
+        # text contains the generator with seed 1 and a uniform op. Raises assertion errors on
+        # any mismatch.
         """
         Test that inserting generators with different seed caused recompile
         """
 
         def generate_tensor(seed):
+            # [FUNCTION DOC] HELPER: Returns a scalar tensor filled with a uniform draw in the
+            # range from -1 to 1 using a generator seeded with the given seed.
             t = torch.tensor(1.0)
             g = torch.Generator()
             g.manual_seed(seed)

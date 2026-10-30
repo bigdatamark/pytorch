@@ -1,3 +1,7 @@
+# [MODULE DOC] Command-line helper that checks a serialized TorchScript model. Run as a program
+# with the model path as the first argument. It loads the scripted model from that path, loads a
+# pickled original module from the same path with an extra orig suffix, prints the scripted module,
+# runs the original on a random 2 by 784 input, and exits with status 0. No functions are defined.
 import sys
 
 import torch

@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests for IR node reuse in the lazy TorchScript backend. Import-time side effects:
+# initializes the TS lazy backend and turns on the global reuse-IR config flag for the whole
+# process. Each test runs the same arithmetic eagerly (CPU, or CUDA when the LTC_TS_CUDA
+# environment variable is set) and on the lazy device with a step marker per iteration, compares
+# results, and checks that a metrics counter shows enough reused IR nodes.
 
 import os
 import unittest
@@ -17,12 +22,19 @@ torch._lazy.config.set_reuse_ir(True)
 
 
 def get_test_device():
+    # [FUNCTION DOC] HELPER: Returns the string cuda if the LTC_TS_CUDA environment variable is
+    # present, otherwise cpu; this is the eager reference device.
     return "cuda" if "LTC_TS_CUDA" in os.environ else "cpu"
 
 
 @unittest.skipIf(IS_WINDOWS, "To be fixed")
 class TestLazyReuseIr(TestCase):
+    # [CLASS DOC] Test case for IR reuse; skipped on Windows by the decorator. Tests clear metrics
+    # and the IR cache when they finish so counters do not leak between tests.
     def testAdd(self):
+        # [FUNCTION DOC] Adds two random tensors into an accumulator ten times eagerly and on lazy
+        # (one step per iteration), asserts the results match, asserts the reused AddTensor node
+        # counter is at least 14, then resets metrics and the IR cache.
         device = get_test_device()
         x = torch.randn(2, 3, 4, device=device)
         y = torch.randn(2, 3, 4, device=device)
@@ -50,6 +62,9 @@ class TestLazyReuseIr(TestCase):
         torch._lazy.ir_cache.reset()
 
     def testAddSub(self):
+        # [FUNCTION DOC] Like the add test but the loop adds for the first five iterations and
+        # subtracts for the last five, both eagerly and lazily. Asserts matching results and at
+        # least 8 reused AddTensor nodes, then resets metrics and the IR cache.
         device = get_test_device()
         x = torch.randn(2, 3, 4, device=device)
         y = torch.randn(2, 3, 4, device=device)
@@ -83,6 +98,11 @@ class TestLazyReuseIr(TestCase):
         torch._lazy.ir_cache.reset()
 
     def testAddSubFallback(self):
+        # [FUNCTION DOC] Same as the add-then-subtract test but with the subtract op forced to fall
+        # back to eager via the lazy config. Asserts matching results and at least 8 reused
+        # AddTensor nodes, resets metrics and the IR cache, and finally clears the forced fallback.
+        # KNOWN ISSUE: the forced fallback is only cleared at the end, so a failing assertion
+        #     earlier leaves it set for later tests.
         torch._lazy.config.set_force_fallback("aten::sub")
         device = get_test_device()
         x = torch.randn(2, 3, 4, device=device)
@@ -118,6 +138,10 @@ class TestLazyReuseIr(TestCase):
         torch._lazy.config.set_force_fallback("")
 
     def testBatchNorm(self):
+        # [FUNCTION DOC] Runs two batch norm entry points (the native op and the legit variant) ten
+        # times on a random 16x3x224x224 input with weight and bias, eagerly and on lazy with a
+        # step per iteration, asserts both outputs match the eager ones and that the reused
+        # NativeBatchNorm node counter is at least 7, then resets metrics and the IR cache.
         device = get_test_device()
         x = torch.randn(16, 3, 224, 224, device=device)
         weight = torch.randn(3, device=device)

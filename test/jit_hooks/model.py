@@ -1,3 +1,7 @@
+# [MODULE DOC] Script that serializes TorchScript modules with forward hooks and pre-hooks to disk
+# for the C++ JIT hooks tests. It imports module factory functions from the sibling jit hooks test
+# module (adding the test directory to the import path at import time) and, when run as a program,
+# saves each scripted model under a path prefix given on the command line.
 import argparse
 import os
 import sys
@@ -29,6 +33,12 @@ from jit.test_hooks_modules import (
 
 # Create saved modules for JIT forward hooks and pre-hooks
 def main():
+    # [FUNCTION DOC] Entry point. Parses the required option naming the output path prefix, stores
+    # the prefix with a trailing underscore in a module-level global, builds a list of fifteen
+    # named hook-test modules (submodule and top-level variants with single or multiple inputs and
+    # hooks, hooks returning nothing, repeated hooks, no forward input, tuple input, and calling a
+    # submodule directly), scripts each, and saves it as a file named prefix, test name, then the
+    # pt suffix. Prints a completion message. Exits via argparse if the option is missing.
     parser = argparse.ArgumentParser(
         description="Serialize a script modules with hooks attached"
     )

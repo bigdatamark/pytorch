@@ -1,3 +1,7 @@
+# [MODULE DOC] Mobile model test source defining two modules that exercise TorchScript builtin
+# functions: scalar and tensor conversions, arithmetic and bitwise operators, comparisons, min and
+# max, string methods, length queries, list and dictionary operations. They are scripted and
+# exported by the test model generator to measure operator coverage. No import-time side effects.
 import torch
 
 
@@ -5,7 +9,17 @@ import torch
 
 
 class TSBuiltinOpsModule(torch.nn.Module):
+    # [CLASS DOC] Stateless module whose forward evaluates a wide set of builtin type, math,
+    # comparison and string operations on small constant tensors, numbers, a string list and
+    # two dictionaries.
     def forward(self):
+        # [FUNCTION DOC] Creates sample tensors, a float, a list of strings and two dictionaries,
+        # then passes the results of many builtin expressions (conversions, bit operations,
+        # arithmetic, comparisons, min and max, string methods, length queries) as arguments to a
+        # single length call and returns its result.
+        # KNOWN ISSUE: the length builtin takes a single argument, so this forward is only
+        #     meaningful when scripted (to collect operator names) and would raise a type error if
+        #     run in eager mode.
         x = torch.tensor(1)
         y = torch.tensor(0.5)
         b = float(1)
@@ -86,7 +100,16 @@ class TSBuiltinOpsModule(torch.nn.Module):
 
 
 class TSCollectionOpsModule(torch.nn.Module):
+    # [CLASS DOC] Stateless module whose forward exercises list and dictionary builtins.
     def forward(self):
+        # [FUNCTION DOC] Builds a string, a string list (reversed twice, element assigned,
+        # extended), a string-keyed dictionary (cleared, updated, key checked and reassigned) and
+        # an int-keyed dictionary (key checked, cleared, reassigned), then passes string indexing
+        # by tensor, dictionary lookups, keys, items, values and a list pop as arguments to a
+        # single length call and returns its result.
+        # KNOWN ISSUE: the length builtin takes a single argument, so this forward is only
+        #     meaningful when scripted (to collect operator names) and would raise a type error if
+        #     run in eager mode.
         s = "abcde"
         # list
         l = ["1", "2", "test"]

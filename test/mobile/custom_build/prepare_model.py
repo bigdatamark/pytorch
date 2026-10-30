@@ -1,3 +1,8 @@
+# [MODULE DOC] Script for the end-to-end mobile custom build test. Import-time side effects (it
+# runs as a script, no functions): downloads pretrained MobileNetV2 weights through torchvision,
+# traces the model with a random 1 by 3 by 224 by 224 input, saves the traced model to a file named
+# MobileNetV2.pt in the current directory, collects the operator names it uses, appends an extra
+# operator needed by the C++ driver, and writes the list as yaml to MobileNetV2.yaml.
 """
 This is a script for end-to-end mobile custom build test purpose. It prepares
 MobileNetV2 TorchScript model, and dumps root ops used by the model for custom

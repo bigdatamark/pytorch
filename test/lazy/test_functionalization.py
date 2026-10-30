@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests for functionalization behavior of lazy tensors on the TorchScript lazy
+# backend. Import-time side effects: initializes the TS lazy backend and compiles a regular
+# expression that strips node type suffixes from lazy IR text. Compares lazy results with CPU
+# results for a module created on the lazy device, and checks IR text after assigning to the
+# data attribute.
 
 import re
 
@@ -14,19 +19,35 @@ NODE_TYPE_PATTERN = re.compile(r", NodeType=[^\n]+")
 
 
 class LazyFuncionalizationTest(TestCase):
+    # [CLASS DOC] Test case for lazy tensors with functionalization (class name keeps the original
+    # misspelling). Contains a test for initializing a module under the lazy device context and a
+    # test for reassigning the data of a lazy tensor.
     def test_lazy_init_with_view(self):
+        # [FUNCTION DOC] Runs a helper that builds and applies a small bias-free linear layer on a
+        # device and compares the CPU output against two lazy runs, one with the functional storage
+        # left as is and one with it reset; outputs must be equal after moving to CPU.
         def f(device, reset_storage=False):
+            # [FUNCTION DOC] HELPER: Seeds the generator, resets lazy metrics when the device is
+            # lazy, creates the model under the device context, and on lazy marks a step and checks
+            # the synced-tensor counter: it must be 1 if the weight storage was reset, else 2 (an
+            # extra tensor is synced when the functional storage is kept); otherwise raises an
+            # assertion error. Then applies the model to a ones vector, marks a step on lazy, and
+            # returns the output.
             torch.manual_seed(2023)
 
             if device == "lazy":
                 metrics.reset()
 
             class Model(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module with one bias-free linear layer from 4 to 2 features.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the linear layer.
                     super().__init__()
                     self.fc1 = torch.nn.Linear(4, 2, bias=False)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Multiplies the input by the transposed weight of
+                    # the layer.
                     return x @ self.fc1.weight.transpose(0, 1)
 
             with torch.device(device):
@@ -68,7 +89,14 @@ class LazyFuncionalizationTest(TestCase):
         self.assertEqual(cpu_out, lazy_out_2.to("cpu"))
 
     def test_data_assign(self):
+        # [FUNCTION DOC] Creates a lazy float tensor and checks its IR text equals the expected
+        # single device-data node. Then converts it to bfloat16 and assigns that to its data
+        # attribute and checks the IR text now shows the original device data followed by a
+        # type-conversion copy node as root, i.e. assigning data updates the wrapper's inner tensor
+        # and IR node.
         def text(lazyt):
+            # [FUNCTION DOC] HELPER: Returns the lazy IR text of the given tensor with the node
+            # type suffixes removed by the pattern, so the comparison is stable.
             raw = torch._C._lazy._get_tensors_text([lazyt])
             return NODE_TYPE_PATTERN.sub("", raw)
 
