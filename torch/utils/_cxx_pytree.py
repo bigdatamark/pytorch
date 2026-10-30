@@ -1,5 +1,13 @@
 # Owner(s): ["module: pytree"]
 
+# [MODULE DOC] C++ (optree-backed) implementation of PyTorch's pytree API, mirroring the Python
+# module torch.utils._pytree. Every function delegates to the optree package using the 'torch'
+# namespace with None treated as a leaf. Importing raises ImportError if the static optree version
+# check in torch.utils._pytree fails. Import-time side effects: overwrites the optree version
+# recorded in the python pytree module, permanently enters an optree dict-insertion-ordered
+# session, marks the cxx pytree as imported and registers all node types queued in the python
+# pytree module before this import. Key-path APIs (flatten, map with path, keystr, key_get) are
+# stubs that raise NotImplementedError.
 """
 Contains utility functions for working with nested python data structures.
 
@@ -121,8 +129,13 @@ FlattenWithKeysFunc = FlattenWithKeysFn  # deprecated
 
 
 def _reverse_args(func: UnflattenFn) -> OpTreeUnflattenFn:
+    # [FUNCTION DOC] HELPER: Adapt a torch-style unflatten function to optree's argument order.
+    # Returns a wrapper (functools.wraps applied) that reverses the positional arguments before
+    # calling it; keyword arguments pass through unchanged.
     @functools.wraps(func)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Call the original unflatten function with positional args
+        # reversed.
         return func(*reversed(args), **kwargs)
 
     return wrapped
@@ -138,6 +151,11 @@ def register_pytree_node(
     from_dumpable_context: FromDumpableContextFn | None = None,
     flatten_with_keys_fn: FlattenWithKeysFn | None = None,
 ) -> None:
+    # [FUNCTION DOC] Register cls as a pytree node in both the C++ and the Python pytree
+    # registries. Args: cls, flatten_fn, unflatten_fn, and optional serialization name and
+    # dumpable-context converters. Raises NotImplementedError if flatten_with_keys_fn is given
+    # (key paths are not supported here). Side effect: mutates both global node registries;
+    # returns None.
     """Register a container-like type as pytree node.
 
     Args:
@@ -205,6 +223,8 @@ def _register_pytree_node(
     to_dumpable_context: ToDumpableContextFn | None = None,
     from_dumpable_context: FromDumpableContextFn | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Deprecated (emits FutureWarning) alias that registers cls only in the
+    # C++ pytree by forwarding all arguments to the private registration function. Returns None.
     """Register a container-like type as pytree node for the C++ pytree only.
 
     The ``namespace`` argument is used to avoid collisions that occur when different libraries
@@ -256,6 +276,9 @@ def _private_register_pytree_node(
     to_dumpable_context: ToDumpableContextFn | None = None,
     from_dumpable_context: FromDumpableContextFn | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Register cls with optree under the 'torch' namespace, wrapping
+    # unflatten_fn so its argument order matches optree. Does nothing for structseq classes, which
+    # optree already supports natively. Mutates the optree registry; returns None.
     """This is an internal function that is used to register a pytree node type
     for the C++ pytree only. End-users should use :func:`register_pytree_node`
     instead.
@@ -275,6 +298,8 @@ def _is_pytreespec_instance(
     obj: Any,
     /,
 ) -> TypeIs[TreeSpec | python_pytree.PyTreeSpec]:
+    # [FUNCTION DOC] HELPER: Return True if obj is a C++ treespec, a Python pytree treespec, or
+    # (only when the dynamo pytree polyfill module is already loaded) a dynamo polyfill treespec.
     if isinstance(obj, (TreeSpec, python_pytree.PyTreeSpec)):
         return True
     if "torch._dynamo.polyfills.pytree" in sys.modules:
@@ -288,11 +313,14 @@ def _is_pytreespec_instance(
 
 
 def treespec_leaf() -> TreeSpec:
+    # [FUNCTION DOC] Return a treespec for a single leaf (None counts as a leaf, namespace
+    # 'torch').
     """Make a treespec representing a leaf node."""
     return optree.treespec_leaf(none_is_leaf=True, namespace="torch")
 
 
 def treespec_tuple(iterable: Iterable[TreeSpec] = (), /) -> TreeSpec:
+    # [FUNCTION DOC] Return a tuple treespec built from an iterable of child treespecs.
     """Make a tuple treespec from an iterable of child treespecs."""
     return optree.treespec_tuple(iterable, none_is_leaf=True, namespace="torch")
 
@@ -302,6 +330,8 @@ def treespec_dict(
     /,
     **kwargs: TreeSpec,
 ) -> TreeSpec:
+    # [FUNCTION DOC] Return a dict treespec from a mapping, an iterable of key/treespec pairs,
+    # and/or keyword entries, whose values are child treespecs.
     """Make a dict treespec from a dict of child treespecs."""
     return optree.treespec_dict(
         mapping,
@@ -315,6 +345,8 @@ def tree_is_leaf(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Return True if tree is a leaf, i.e. not a registered container node (None is
+    # a leaf). is_leaf is an optional extra predicate; when it returns true the subtree is a leaf.
     """Check if a pytree is a leaf.
 
     >>> tree_is_leaf(1)
@@ -353,6 +385,8 @@ def tree_flatten(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> tuple[list[Any], TreeSpec]:
+    # [FUNCTION DOC] Flatten tree into a pair of (list of leaves, treespec). Leaves are in left-
+    # to-right depth-first order. is_leaf is an optional extra leaf predicate.
     """Flatten a pytree.
 
     See also :func:`tree_unflatten`.
@@ -393,6 +427,10 @@ def tree_flatten(
 
 
 def tree_unflatten(leaves: Iterable[Any], treespec: TreeSpec) -> PyTree:
+    # [FUNCTION DOC] Rebuild a pytree from leaves and a treespec. Raises TypeError if neither
+    # argument is a treespec; if the two arguments were passed swapped (treespec first), they are
+    # swapped back before unflattening. Argument count mismatches are reported by the treespec
+    # itself.
     """Reconstruct a pytree from the treespec and the leaves.
 
     The inverse of :func:`tree_flatten`.
@@ -427,6 +465,7 @@ def tree_iter(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> Iterable[Any]:
+    # [FUNCTION DOC] Return a lazy iterator over the leaves of tree in flattening order.
     """Get an iterator over the leaves of a pytree.
 
     See also :func:`tree_flatten`.
@@ -462,6 +501,7 @@ def tree_leaves(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> list[Any]:
+    # [FUNCTION DOC] Return the leaves of tree as a list in flattening order.
     """Get the leaves of a pytree.
 
     See also :func:`tree_flatten`.
@@ -497,6 +537,7 @@ def tree_structure(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> TreeSpec:
+    # [FUNCTION DOC] Return the treespec describing the structure of tree, without the leaves.
     """Get the treespec for a pytree.
 
     See also :func:`tree_flatten`.
@@ -534,6 +575,9 @@ def tree_map(
     *rests: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> PyTree:
+    # [FUNCTION DOC] Apply func to every leaf of tree (and the matching nodes of the extra trees
+    # in rests, which must have tree as a prefix) and return a new pytree of the results with the
+    # structure of tree. is_leaf is an optional extra leaf predicate.
     """Map a multi-input function over pytree args to produce a new pytree.
 
     See also :func:`tree_map_`.
@@ -583,6 +627,8 @@ def tree_map_(
     *rests: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> PyTree:
+    # [FUNCTION DOC] Apply func to every leaf of tree (and matching nodes of rests) for its side
+    # effects only; the return values of func are ignored and the original tree is returned.
     """Like :func:`tree_map`, but do an inplace call on each leaf and return the original tree.
 
     See also :func:`tree_map`.
@@ -657,6 +703,9 @@ def map_only(
 def map_only(
     type_or_types_or_pred: TypeAny | Callable[[Any], bool], /
 ) -> MapOnlyFn[FnAny[Any]]:
+    # [FUNCTION DOC] Build a decorator that applies a function only to values matching a type, a
+    # tuple or union of types, or a predicate, returning other values unchanged. Raises TypeError
+    # at construction if the argument is neither a type-like object nor callable.
     """
     Suppose you are writing a tree_map over tensors, leaving everything
     else unchanged.  Ordinarily you would have to write:
@@ -678,6 +727,7 @@ def map_only(
     if isinstance(type_or_types_or_pred, (type, tuple, types.UnionType)):
 
         def pred(x: Any) -> bool:
+            # [FUNCTION DOC] HELPER: Predicate returning whether x is an instance of the types.
             return isinstance(x, type_or_types_or_pred)  # type: ignore[arg-type]
 
     elif callable(type_or_types_or_pred):
@@ -686,8 +736,11 @@ def map_only(
         raise TypeError("Argument must be a type, a tuple of types, or a callable.")
 
     def wrapper(func: Callable[[T], Any]) -> Callable[[Any], Any]:
+        # [FUNCTION DOC] HELPER: Decorator that wraps func so it is applied only where pred holds.
         @functools.wraps(func)
         def wrapped(x: T) -> Any:
+            # [FUNCTION DOC] HELPER: Return func applied to x if the predicate accepts x,
+            # otherwise x itself.
             if pred(x):
                 return func(x)
             return x
@@ -754,6 +807,8 @@ def tree_map_only(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> PyTree:
+    # [FUNCTION DOC] Map func over only the leaves matching a type, types or predicate; all other
+    # leaves are kept as is. Returns a new pytree with the structure of tree.
     return tree_map(map_only(type_or_types_or_pred)(func), tree, is_leaf=is_leaf)
 
 
@@ -814,6 +869,8 @@ def tree_map_only_(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> PyTree:
+    # [FUNCTION DOC] In-place variant of tree_map_only: call func for its side effect on matching
+    # leaves only, and return the original tree.
     return tree_map_(map_only(type_or_types_or_pred)(func), tree, is_leaf=is_leaf)
 
 
@@ -822,6 +879,7 @@ def tree_all(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Return True if pred holds for every leaf of tree (True for no leaves).
     flat_args = tree_iter(tree, is_leaf=is_leaf)
     return all(map(pred, flat_args))
 
@@ -831,6 +889,8 @@ def tree_any(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Return True if pred holds for at least one leaf of tree (False for no
+    # leaves).
     flat_args = tree_iter(tree, is_leaf=is_leaf)
     return any(map(pred, flat_args))
 
@@ -872,6 +932,8 @@ def tree_all_only(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Return True if pred holds for every leaf that is an instance of
+    # type_or_types; leaves of other types are ignored.
     flat_args = tree_iter(tree, is_leaf=is_leaf)
     return all(pred(x) for x in flat_args if isinstance(x, type_or_types))
 
@@ -913,6 +975,8 @@ def tree_any_only(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Return True if pred holds for at least one leaf that is an instance of
+    # type_or_types; leaves of other types are ignored.
     flat_args = tree_iter(tree, is_leaf=is_leaf)
     return any(pred(x) for x in flat_args if isinstance(x, type_or_types))
 
@@ -922,6 +986,9 @@ def broadcast_prefix(
     full_tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> list[Any]:
+    # [FUNCTION DOC] Replicate each leaf of prefix_tree once per leaf of the matching subtree in
+    # full_tree and return the flat list. Raises ValueError (from the underlying map) if
+    # prefix_tree is not a structural prefix of full_tree, e.g. on a container arity mismatch.
     """Return a list of broadcasted leaves in ``prefix_tree`` to match the number of leaves in ``full_tree``.
 
     If a ``prefix_tree`` is a prefix of a ``full_tree``, this means the ``full_tree`` can be
@@ -959,6 +1026,7 @@ def broadcast_prefix(
     result: list[Any] = []
 
     def add_leaves(x: Any, subtree: PyTree) -> None:
+        # [FUNCTION DOC] HELPER: Append x to the enclosing result list once per leaf of subtree.
         subtreespec = tree_structure(subtree, is_leaf=is_leaf)
         result.extend([x] * subtreespec.num_leaves)
 
@@ -984,6 +1052,9 @@ def _broadcast_to_and_flatten(
     treespec: TreeSpec,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> list[Any] | None:
+    # [FUNCTION DOC] HELPER: Broadcast tree to the structure of treespec and return the flat list
+    # of leaves, or None when the broadcast fails with a ValueError. Raises TypeError if treespec
+    # is not a treespec instance.
     if not _is_pytreespec_instance(treespec):
         raise TypeError(
             f"Expected `treespec` to be an instance of "
@@ -997,6 +1068,9 @@ def _broadcast_to_and_flatten(
 
 
 def treespec_dumps(treespec: TreeSpec, protocol: int | None = None) -> str:
+    # [FUNCTION DOC] Serialize treespec to a JSON string by converting it to a Python-pytree spec
+    # and using its serializer (protocol is forwarded). Raises TypeError if treespec is not a
+    # treespec.
     """Serialize a treespec to a JSON string."""
     if not _is_pytreespec_instance(treespec):
         raise TypeError(
@@ -1011,6 +1085,8 @@ def treespec_dumps(treespec: TreeSpec, protocol: int | None = None) -> str:
 
 @functools.lru_cache
 def treespec_loads(serialized: str) -> TreeSpec:
+    # [FUNCTION DOC] Deserialize a treespec from a JSON string using the Python-pytree loader,
+    # then convert it to a C++ treespec. Results are cached per serialized string (lru_cache).
     """Deserialize a treespec from a JSON string."""
     orig_treespec = python_pytree.treespec_loads(serialized)
     dummy_tree = python_pytree.tree_unflatten(
@@ -1022,12 +1098,16 @@ def treespec_loads(serialized: str) -> TreeSpec:
 
 
 class _Asterisk(str):
+    # [CLASS DOC] HELPER: String subclass with no instance dict whose value and repr are both an
+    # asterisk without quotes; used to print leaves in treespec_pprint.
     __slots__ = ()
 
     def __new__(cls) -> Self:
+        # [FUNCTION DOC] HELPER: Create the single asterisk string instance.
         return super().__new__(cls, "*")
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Return the asterisk without quotes.
         return "*"  # no quotes
 
 
@@ -1036,12 +1116,18 @@ del _Asterisk
 
 
 def treespec_pprint(treespec: TreeSpec) -> str:
+    # [FUNCTION DOC] Return a readable string of the treespec structure, with each leaf shown as
+    # an unquoted asterisk (built by unflattening placeholder leaves and taking the repr).
     dummy_tree = tree_unflatten([_asterisk] * treespec.num_leaves, treespec)
     return repr(dummy_tree)
 
 
 class LeafSpecMeta(type(TreeSpec)):  # type: ignore[misc]
+    # [CLASS DOC] HELPER: Metaclass making isinstance checks against LeafSpec succeed for any
+    # treespec that is a leaf spec.
     def __instancecheck__(self, instance: object) -> bool:
+        # [FUNCTION DOC] HELPER: Return True if instance is a treespec object whose is_leaf check
+        # is true.
         return _is_pytreespec_instance(instance) and instance.is_leaf()
 
 
@@ -1051,7 +1137,10 @@ class LeafSpecMeta(type(TreeSpec)):  # type: ignore[misc]
     category=FutureWarning,
 )
 class LeafSpec(TreeSpec, metaclass=LeafSpecMeta):  # type: ignore[misc,final]
+    # [CLASS DOC] Deprecated compatibility class. Instantiating it returns a leaf treespec, and
+    # its metaclass makes isinstance checks true for any leaf treespec.
     def __new__(cls) -> Self:
+        # [FUNCTION DOC] Return a leaf treespec instead of a new LeafSpec instance.
         return treespec_leaf()  # type: ignore[return-value]
 
 
@@ -1059,6 +1148,7 @@ def tree_flatten_with_path(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> tuple[list[tuple[KeyPath, Any]], TreeSpec]:
+    # [FUNCTION DOC] Not supported in the C++ pytree: always raises NotImplementedError.
     """Flattens a pytree like :func:`tree_flatten`, but also returns each leaf's key path.
 
     Args:
@@ -1082,6 +1172,7 @@ def tree_leaves_with_path(
     tree: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> list[tuple[KeyPath, Any]]:
+    # [FUNCTION DOC] Not supported in the C++ pytree: always raises NotImplementedError.
     """Gets the leaves of a pytree like ``tree_leaves`` and returns each leaf's key path.
 
     Args:
@@ -1105,6 +1196,7 @@ def tree_map_with_path(
     *rests: PyTree,
     is_leaf: Callable[[PyTree], bool] | None = None,
 ) -> PyTree:
+    # [FUNCTION DOC] Not supported in the C++ pytree: always raises NotImplementedError.
     """Like :func:`tree_map`, but the provided callable takes an additional key path argument.
 
     Args:
@@ -1132,11 +1224,13 @@ def tree_map_with_path(
 
 
 def keystr(kp: KeyPath) -> str:
+    # [FUNCTION DOC] Not supported in the C++ pytree: always raises NotImplementedError.
     """Given a key path, return a pretty-printed representation."""
     raise NotImplementedError("KeyPaths are not yet supported in cxx_pytree.")
 
 
 def key_get(obj: Any, kp: KeyPath) -> Any:
+    # [FUNCTION DOC] Not supported in the C++ pytree: always raises NotImplementedError.
     """Given an object and a key path, return the value at the key path."""
     raise NotImplementedError("KeyPaths are not yet supported in cxx_pytree.")
 
