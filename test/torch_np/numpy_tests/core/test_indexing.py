@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests ported from NumPy test_indexing for the torch._numpy compatibility
+# layer (or real NumPy when TEST_WITH_TORCHDYNAMO is set). Covers basic, slice, boolean
+# and fancy indexing, broadcast assignment, float/bool rejection as indices and the
+# multi-index mimic harness. Several tests are skipped or expected-fail because torch
+# differs from NumPy. Import time: defines the module-level skip decorator (skipif with
+# a true condition) and picks the numpy backend; no other side effects.
 
 import functools
 import operator
@@ -47,7 +53,13 @@ skip = functools.partial(skipif, True)
 
 @instantiate_parametrized_tests
 class TestIndexing(TestCase):
+    # [CLASS DOC] Tests basic and advanced indexing behavior of arrays: error types for
+    # float indices, None, ellipsis, integer and boolean indices, strides and memory
+    # order, and index limits.
     def test_index_no_floats(self):
+        # [FUNCTION DOC] Checks that indexing with float components (alone, in tuples,
+        # with slices or ellipsis) raises IndexError, or either IndexError or TypeError
+        # when a float-bounded slice is involved because torch validates depth first.
         a = np.array([[[5]]])
 
         assert_raises(IndexError, lambda: a[0.0])
@@ -87,6 +99,9 @@ class TestIndexing(TestCase):
         assert_raises((IndexError, TypeError), lambda: a[0.0:, 0.0, :])
 
     def test_slicing_no_floats(self):
+        # [FUNCTION DOC] Checks that float start, stop or step values in slices (alone
+        # or mixed, in one or two dimensions, including a zero float step) raise
+        # TypeError.
         a = np.array([[5]])
 
         # start as float.
@@ -119,6 +134,8 @@ class TestIndexing(TestCase):
 
     @skip(reason="torch allows slicing with non-0d array components")
     def test_index_no_array_to_index(self):
+        # [FUNCTION DOC] Intended to check that using non-scalar arrays as slice bounds
+        # raises TypeError. Skipped because torch accepts them.
         # No non-scalar arrays.
         a = np.array([[[1]]])
 
@@ -131,6 +148,8 @@ class TestIndexing(TestCase):
         #
 
     def test_none_index(self):
+        # [FUNCTION DOC] Checks that indexing with None adds a new axis equal to
+        # indexing with newaxis and increases ndim by one.
         # `None` index adds newaxis
         a = np.array([1, 2, 3])
         assert_equal(a[None], a[np.newaxis])
@@ -138,6 +157,9 @@ class TestIndexing(TestCase):
 
     @skip
     def test_empty_tuple_index(self):
+        # [FUNCTION DOC] Intended to check that an empty tuple index returns a view
+        # sharing the base tensor, and that a zero-dim array yields a scalar. Skipped
+        # unconditionally.
         # Empty tuple index creates a view
         a = np.array([1, 2, 3])
         assert_equal(a[()], a)
@@ -146,6 +168,9 @@ class TestIndexing(TestCase):
         assert_(isinstance(a[()], np.int_))
 
     def test_same_kind_index_casting(self):
+        # [FUNCTION DOC] Checks that an unsigned 8-bit index array behaves like the
+        # default integer index for reads, assignment, 2-d row selection and paired
+        # indices.
         # Indexes should be cast with same-kind and not safe, even if that
         # is somewhat unsafe. So test various different code paths.
         index = np.arange(5)
@@ -166,6 +191,10 @@ class TestIndexing(TestCase):
         assert_array_equal(arr[u_index, u_index], arr[index, index])
 
     def test_empty_fancy_index(self):
+        # [FUNCTION DOC] Checks that an empty list index gives an empty result with the
+        # source dtype, and that an empty float array index raises IndexError.
+        # KNOWN ISSUE: the second block reassigns b but then indexes with the list
+        # again, so the empty integer array case is never actually tested.
         # Empty list index creates an empty array
         # with the same dtype (but with weird shape)
         a = np.array([1, 2, 3])
@@ -180,6 +209,9 @@ class TestIndexing(TestCase):
         assert_raises(IndexError, a.__getitem__, b)
 
     def test_ellipsis_index(self):
+        # [FUNCTION DOC] Checks ellipsis indexing: result is a new array equal to the
+        # source, it can skip dimensions, always returns an array, and assignment
+        # through a tuple holding only an ellipsis works on a zero-dim array.
         a = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
         assert_(a[...] is not a)
         assert_equal(a[...], a)
@@ -202,6 +234,9 @@ class TestIndexing(TestCase):
 
     @xpassIfTorchDynamo_np  # 'torch_.np.array() does not have base attribute.
     def test_ellipsis_index_2(self):
+        # [FUNCTION DOC] Checks that ellipsis indexing yields a new array that is a view
+        # of the original (base attribute is the source). Expected to pass only under
+        # dynamo with numpy.
         a = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
         assert_(a[...] is not a)
         assert_equal(a[...], a)
@@ -209,6 +244,9 @@ class TestIndexing(TestCase):
         assert_(a[...].base is a)
 
     def test_single_int_index(self):
+        # [FUNCTION DOC] Checks single integer indexing of positive and negative rows,
+        # IndexError for out-of-range values, and IndexError or ValueError for an
+        # integer too large for 64 bits.
         # Single integer index selects one row
         a = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
 
@@ -222,6 +260,8 @@ class TestIndexing(TestCase):
         assert_raises((IndexError, ValueError), a.__getitem__, 1 << 64)
 
     def test_single_bool_index(self):
+        # [FUNCTION DOC] Checks that zero-dim boolean array indices True and False
+        # behave like adding a leading axis of size one or an empty leading axis.
         # Single boolean index
         a = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
 
@@ -229,6 +269,9 @@ class TestIndexing(TestCase):
         assert_equal(a[np.array(False)], a[None][0:0])
 
     def test_boolean_shape_mismatch(self):
+        # [FUNCTION DOC] Checks that boolean index arrays whose shape does not match the
+        # leading dimensions of the indexed array raise IndexError, including inside a
+        # tuple after a full slice.
         arr = np.ones((5, 4, 3))
 
         index = np.array([True])
@@ -243,6 +286,8 @@ class TestIndexing(TestCase):
         assert_raises(IndexError, arr.__getitem__, (slice(None), index))
 
     def test_boolean_indexing_onedim(self):
+        # [FUNCTION DOC] Checks that a length-one boolean array indexes a one-row 2-d
+        # array for both reading and assignment.
         # Indexing a 2-dimensional array with
         # boolean array of length one
         a = np.array([[0.0, 0.0, 0.0]])
@@ -254,11 +299,15 @@ class TestIndexing(TestCase):
 
     @skip(reason="NP_VER: fails on CI")
     def test_boolean_assignment_value_mismatch(self):
+        # [FUNCTION DOC] Intended to check that a boolean mask assignment with values
+        # that cannot be broadcast raises an error. Skipped because it fails on CI.
         # A boolean assignment should fail when the shape of the values
         # cannot be broadcast to the subscription. (see also gh-3458)
         a = np.arange(4)
 
         def f(a, v):
+            # [FUNCTION DOC] HELPER: Assigns the value into every element of the array
+            # selected by an always-true mask; used to trigger the broadcast failure.
             a[a > -1] = v
 
         assert_raises((RuntimeError, ValueError, TypeError), f, a, [])
@@ -266,6 +315,8 @@ class TestIndexing(TestCase):
         assert_raises((RuntimeError, ValueError, TypeError), f, a[:1], [1, 2, 3])
 
     def test_boolean_indexing_twodim(self):
+        # [FUNCTION DOC] Checks 2-d boolean mask reads (flattened result), row boolean
+        # masks, and mask assignment of a scalar.
         # Indexing a 2-dimensional array with
         # 2-dimensional boolean array
         a = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
@@ -279,6 +330,8 @@ class TestIndexing(TestCase):
         assert_equal(a, [[0, 2, 0], [4, 0, 6], [0, 8, 0]])
 
     def test_boolean_indexing_list(self):
+        # [FUNCTION DOC] Regression check for indexing with a plain Python list of
+        # booleans, both directly and after a None axis.
         # Regression test for #13715. It's a use-after-free bug which the
         # test won't directly catch, but it will show up in valgrind.
         a = np.array([1, 2, 3])
@@ -288,6 +341,9 @@ class TestIndexing(TestCase):
         assert_equal(a[None, b], [[1, 3]])
 
     def test_reverse_strides_and_subspace_bufferinit(self):
+        # [FUNCTION DOC] Checks that assignment through a reversed-stride integer index
+        # and a reversed source keeps the last write ordering, for 1-d and for row-
+        # subspace assignment.
         # This tests that the strides are not reversed for simple and
         # subspace fancy indexing.
         a = np.ones(5)
@@ -305,6 +361,8 @@ class TestIndexing(TestCase):
         assert_equal(a[0], [0, 1])
 
     def test_reversed_strides_result_allocation(self):
+        # [FUNCTION DOC] Checks that fancy indexing with a reversed-stride index into a
+        # column array equals indexing with a contiguous copy of the index.
         # Test a bug when calculating the output strides for a result array
         # when the subspace size was 1 (and test other cases as well)
         a = np.arange(10)[:, None]
@@ -314,6 +372,8 @@ class TestIndexing(TestCase):
         a = np.arange(20).reshape(-1, 2)
 
     def test_uncontiguous_subspace_assignment(self):
+        # [FUNCTION DOC] Checks that assigning a transposed (non-contiguous) block
+        # through a list index gives the same result as assigning a contiguous copy.
         # During development there was a bug activating a skip logic
         # based on ndim instead of size.
         a = np.full((3, 4, 2), -1)
@@ -326,11 +386,15 @@ class TestIndexing(TestCase):
 
     @skip(reason="torch does not limit dims to 32")
     def test_too_many_fancy_indices_special_case(self):
+        # [FUNCTION DOC] Documents that NumPy limits dimensions to 32 so too many fancy
+        # indices raise IndexError. Skipped because torch has no such limit.
         # Just documents behaviour, this is a small limitation.
         a = np.ones((1,) * 32)  # 32 is NPY_MAXDIMS
         assert_raises(IndexError, a.__getitem__, (np.array([0]),) * 32)
 
     def test_scalar_array_bool(self):
+        # [FUNCTION DOC] Checks that a NumPy scalar boolean index matches a zero-dim
+        # boolean array index on a zero-dim array.
         # NumPy bools can be used as boolean index (python ones as of yet not)
         a = np.array(1)
         assert_equal(a[np.bool_(True)], a[np.array(True)])
@@ -344,6 +408,8 @@ class TestIndexing(TestCase):
         # assert_(not np.may_share_memory(a, a[True, :]))
 
     def test_everything_returns_views(self):
+        # [FUNCTION DOC] Checks that empty tuple, ellipsis and full slice indexing
+        # return a new object, not the original array.
         # Before `...` would return a itself.
         a = np.arange(5)
 
@@ -352,11 +418,16 @@ class TestIndexing(TestCase):
         assert_(a is not a[:])
 
     def test_broaderrors_indexing(self):
+        # [FUNCTION DOC] Checks that index lists of mismatched lengths raise IndexError
+        # for both getitem and setitem.
         a = np.zeros((5, 5))
         assert_raises(IndexError, a.__getitem__, ([0, 1], [0, 1, 2]))
         assert_raises(IndexError, a.__setitem__, ([0, 1], [0, 1, 2]), 0)
 
     def test_trivial_fancy_out_of_bounds(self):
+        # [FUNCTION DOC] Checks that a long index array containing one out-of-range
+        # entry, first or last, raises IndexError on read and IndexError or RuntimeError
+        # on write.
         a = np.zeros(5)
         ind = np.ones(20, dtype=np.intp)
         ind[-1] = 10
@@ -368,6 +439,9 @@ class TestIndexing(TestCase):
         assert_raises((IndexError, RuntimeError), a.__setitem__, ind, 0)
 
     def test_trivial_fancy_not_possible(self):
+        # [FUNCTION DOC] Checks that fancy read and assignment work with a non-
+        # contiguous, multi-dimensional index so the trivial fast path is not wrongly
+        # used.
         # Test that the fast path for trivial assignment is not incorrectly
         # used when the index is not contiguous or 1D, see also gh-11467.
         a = np.arange(6)
@@ -383,6 +457,9 @@ class TestIndexing(TestCase):
         assert_array_equal(a, res)
 
     def test_memory_order(self):
+        # [FUNCTION DOC] Checks that advanced indexing results with a transposed index
+        # are Fortran contiguous, for one index and for an index combined with an
+        # integer.
         # This is not necessary to preserve. Memory layouts for
         # more complex indices are not as simple.
         a = np.arange(10)
@@ -395,6 +472,10 @@ class TestIndexing(TestCase):
 
     @skipIfTorchDynamo()  # XXX: flaky, depends on implementation details
     def test_small_regressions(self):
+        # [FUNCTION DOC] Regression check on index validation in assignment: valid and
+        # out-of-range indices of two integer dtypes, and, when reference counts are
+        # available, that the dtype refcount is unchanged. Skipped under dynamo as
+        # flaky.
         # Reference count of intp for index checks
         a = np.array([0])
         if HAS_REFCOUNT:
@@ -409,10 +490,14 @@ class TestIndexing(TestCase):
             assert_equal(sys.getrefcount(np.dtype(np.intp)), refcount)
 
     def test_tuple_subclass(self):
+        # [FUNCTION DOC] Checks that a tuple subclass index is treated as a multi-
+        # dimensional index, unlike the same object wrapped in another tuple.
         arr = np.ones((5, 5))
 
         # A tuple subclass should also be an nd-index
         class TupleSubclass(tuple):
+            # [CLASS DOC] HELPER: Tuple subclass with empty slots used as an index
+            # object.
             __slots__ = ()
 
         index = ([1], [1])
@@ -423,19 +508,29 @@ class TestIndexing(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="XXX: low-prio behaviour to support")
     def test_broken_sequence_not_nd_index(self):
+        # [FUNCTION DOC] Checks that an object that has an index method and length but
+        # whose item access raises is not treated as a tuple index, on a plain and a
+        # structured array. Expected to pass only under dynamo.
         # See https://github.com/numpy/numpy/issues/5063
         # If we have an object which claims to be a sequence, but fails
         # on item getting, this should not be converted to an nd-index (tuple)
         # If this object happens to be a valid index otherwise, it should work
         # This object here is very dubious and probably bad though:
         class SequenceLike:
+            # [CLASS DOC] HELPER: Fake sequence that claims length one, converts to
+            # integer zero, and raises IndexError on any item access.
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Returns zero so the object acts as integer
+                # index zero.
                 return 0
 
             def __len__(self):
+                # [FUNCTION DOC] HELPER: Reports length one.
                 return 1
 
             def __getitem__(self, item):
+                # [FUNCTION DOC] HELPER: Always raises IndexError, whatever the item
+                # requested.
                 raise IndexError("Not possible")
 
         arr = np.arange(10)
@@ -447,6 +542,9 @@ class TestIndexing(TestCase):
         assert_array_equal(arr[SequenceLike()], arr[SequenceLike(),])
 
     def test_indexing_array_weird_strides(self):
+        # [FUNCTION DOC] Regression check (gh-6221) that advanced indexing with a
+        # broadcast, stride-zero index gives the same result as with a copied index, for
+        # one and for two index arrays.
         # See also gh-6221
         # the shapes used here come from the issue and create the correct
         # size for the iterator buffering size.
@@ -462,6 +560,8 @@ class TestIndexing(TestCase):
         assert_array_equal(x2[ind, zind], x2[ind.copy(), zind])
 
     def test_indexing_array_negative_strides(self):
+        # [FUNCTION DOC] Regression check (gh-8264) that assigning through a slice plus
+        # list index on a negatively strided view works and sets all elements.
         # From gh-8264,
         # core dumps if negative strides are used in iteration
         arro = np.zeros((4, 4))  # codespell:ignore
@@ -475,6 +575,10 @@ class TestIndexing(TestCase):
     @parametrize("num", [32, 40])
     @parametrize("original_ndim", [1, 32])
     def test_too_many_advanced_indices(self, index, num, original_ndim):
+        # [FUNCTION DOC] Parametrized over index kind, number of repeated indices and
+        # starting ndim. Skips unless the index is an integer array and the count
+        # exceeds ndim, since torch does not limit dims to 32. Otherwise checks that too
+        # many indices raise IndexError on read and write.
         # These are limitations based on the number of arguments we can process.
         # For `num=32` (and all boolean cases), the result is actually define;
         # but the use of NpyIter (NPY_MAXARGS) limits it for technical reasons.
@@ -489,6 +593,9 @@ class TestIndexing(TestCase):
             arr[(index,) * num] = 1.0
 
     def test_nontuple_ndindex(self):
+        # [FUNCTION DOC] Checks list indices used as nontuple indices for rows and
+        # pairs, then raises SkipTest because torch accepts sequences of slices.
+        # KNOWN ISSUE: the final assertion after the SkipTest is unreachable.
         a = np.arange(25).reshape((5, 5))
         assert_equal(a[[0, 1]], np.array([a[0], a[1]]))
         assert_equal(a[[0, 1], [0, 1]], np.array([0, 6]))
@@ -503,11 +610,17 @@ class TestIndexing(TestCase):
 
 @instantiate_parametrized_tests
 class TestBroadcastedAssignments(TestCase):
+    # [CLASS DOC] Tests broadcasting rules when assigning values through basic and fancy
+    # indices.
     def assign(self, a, ind, val):
+        # [FUNCTION DOC] HELPER: Assigns the value into the array at the given index and
+        # returns the array.
         a[ind] = val
         return a
 
     def test_prepending_ones(self):
+        # [FUNCTION DOC] Checks that values with extra leading dimensions of size one
+        # can be assigned via ellipsis and several fancy index forms.
         a = np.zeros((3, 2))
 
         a[...] = np.ones((1, 3, 2))
@@ -518,6 +631,9 @@ class TestBroadcastedAssignments(TestCase):
         a[[[0], [1], [2]], [0, 1]] = np.ones((1, 3, 2))
 
     def test_prepend_not_one(self):
+        # [FUNCTION DOC] Checks that values with extra leading dimensions that are not
+        # all ones raise ValueError or RuntimeError when assigned via ellipsis or fancy
+        # indices.
         assign = self.assign
         s_ = np.s_
         a = np.zeros(5)
@@ -535,6 +651,9 @@ class TestBroadcastedAssignments(TestCase):
         )
 
     def test_simple_broadcasting_errors(self):
+        # [FUNCTION DOC] Checks that assignments of values not broadcastable to the
+        # target (wrong or zero-size width or mismatched rows) raise ValueError or
+        # RuntimeError.
         assign = self.assign
         s_ = np.s_
         a = np.zeros((5, 1))
@@ -561,6 +680,9 @@ class TestBroadcastedAssignments(TestCase):
         "index", [(..., [1, 2], slice(None)), ([0, 1], ..., 0), (..., [1, 2], [1, 2])]
     )
     def test_broadcast_error_reports_correct_shape(self, index):
+        # [FUNCTION DOC] Parametrized over three mixed index tuples. Checks that failing
+        # broadcast assignment raises ValueError or RuntimeError whose message ends with
+        # the indexed shape (each dimension but the last followed by a placeholder).
         values = np.zeros((100, 100))  # will never broadcast below
 
         arr = np.zeros((3, 4, 5, 6, 7))
@@ -576,6 +698,8 @@ class TestBroadcastedAssignments(TestCase):
             )
 
     def test_index_is_larger(self):
+        # [FUNCTION DOC] Checks assigning a row to a fancy-indexed block where the index
+        # is larger than the values and the values broadcast.
         # Simple case of fancy index broadcasting of the index.
         a = np.zeros((5, 5))
         a[[[0], [1], [2]], [0, 1, 2]] = [2, 3, 4]
@@ -583,6 +707,8 @@ class TestBroadcastedAssignments(TestCase):
         assert_((a[:3, :3] == [2, 3, 4]).all())
 
     def test_broadcast_subspace(self):
+        # [FUNCTION DOC] Checks assigning a column of values through a reversed integer
+        # index onto a 2-d array reverses rows as expected.
         a = np.zeros((100, 100))
         v = np.arange(100)[:, None]
         b = np.arange(100)[::-1]
@@ -591,10 +717,15 @@ class TestBroadcastedAssignments(TestCase):
 
 
 class TestFancyIndexingCast(TestCase):
+    # [CLASS DOC] Tests casting rules during fancy-index assignment, specifically
+    # complex into float.
     @xpassIfTorchDynamo_np  # (
     #    reason="XXX: low-prio to support assigning complex values on floating arrays"
     # )
     def test_boolean_index_cast_assign(self):
+        # [FUNCTION DOC] Checks that assigning a complex value into a float array
+        # through a boolean mask or fancy index warns with ComplexWarning and stores
+        # only the real part. Expected to pass only under dynamo.
         # Setup the boolean index and float arrays.
         shape = (8, 63)
         bool_index = np.zeros(shape).astype(bool)
@@ -625,6 +756,9 @@ class TestFancyIndexingCast(TestCase):
 
 @xfail  # (reason="XXX: requires broadcast() and broadcast_to()")
 class TestMultiIndexingAutomated(TestCase):
+    # [CLASS DOC] Automated comparison of array indexing against a pure-Python mimic of
+    # multi-axis index semantics. The whole class is marked expected-failure because it
+    # needs broadcast support.
     """
     These tests use code to mimic the C-Code indexing for selection.
 
@@ -647,6 +781,11 @@ class TestMultiIndexingAutomated(TestCase):
     """
 
     def setupUp(self):
+        # [FUNCTION DOC] HELPER: Builds the fixtures: a 4-d arange array, an empty-axis
+        # array, lists of complex, simple and fill indices.
+        # KNOWN ISSUE: the name is a misspelling of the unittest setup hook, so it is
+        # never called automatically and the attributes it defines do not exist when
+        # tests run (the class is expected-fail anyway).
         self.a = np.arange(np.prod([3, 1, 5, 6])).reshape(3, 1, 5, 6)
         self.b = np.empty((3, 0, 5, 6))
         self.complex_indices = [
@@ -678,6 +817,10 @@ class TestMultiIndexingAutomated(TestCase):
         self.fill_indices = [slice(None, None), 0]
 
     def _get_multi_index(self, arr, indices):
+        # [FUNCTION DOC] HELPER: Mimics NumPy multi-dimensional indexing of an array by
+        # a tuple: expands ellipsis, converts slices, newaxis, boolean and integer
+        # arrays to take operations, and returns the result with a flag telling whether
+        # a copy was required. Raises IndexError for invalid indices.
         """Mimic multi dimensional indexing.
 
         Parameters
@@ -934,6 +1077,9 @@ class TestMultiIndexingAutomated(TestCase):
         return arr, no_copy
 
     def _check_multi_index(self, arr, index):
+        # [FUNCTION DOC] HELPER: For a tuple index, runs the mimic; if the mimic raises,
+        # checks that real getitem and setitem raise the same exception type and that
+        # the refcount of the array is unchanged; otherwise compares results.
         """Check a multi index item getting and simple setting.
 
         Parameters
@@ -958,6 +1104,8 @@ class TestMultiIndexingAutomated(TestCase):
         self._compare_index_result(arr, index, mimic_get, no_copy)
 
     def _check_single_index(self, arr, index):
+        # [FUNCTION DOC] HELPER: Same as the multi-index check but wraps one index into
+        # a one-element tuple for the mimic and passes the bare index to real indexing.
         """Check a single index item getting and simple setting.
 
         Parameters
@@ -982,6 +1130,10 @@ class TestMultiIndexingAutomated(TestCase):
         self._compare_index_result(arr, index, mimic_get, no_copy)
 
     def _compare_index_result(self, arr, index, mimic_get, no_copy):
+        # [FUNCTION DOC] HELPER: Compares real indexing with the mimic result, view-
+        # versus-copy behavior, refcounts and setitem behavior. Raises SkipTest
+        # immediately because torch does not support subclassing, so the rest is
+        # unreachable.
         """Compare mimicked result to indexing result."""
         raise SkipTest("torch does not support subclassing")
         arr = arr.copy()
@@ -1014,6 +1166,8 @@ class TestMultiIndexingAutomated(TestCase):
         assert_array_equal(arr, b)
 
     def test_boolean(self):
+        # [FUNCTION DOC] Checks zero-dim boolean array reading and assignment, then runs
+        # the multi-index check with full, reduced and extended-axis boolean masks.
         a = np.array(5)
         assert_equal(a[np.array(True)], 5)
         a[np.array(True)] = 1
@@ -1028,6 +1182,12 @@ class TestMultiIndexingAutomated(TestCase):
         self._check_multi_index(self.a, (np.zeros_like(self.a, dtype=bool)[None, ...],))
 
     def test_multidim(self):
+        # [FUNCTION DOC] Runs the multi-index check over products of complex and simple
+        # index lists on two arrays, turning deprecation warnings into errors, then
+        # checks simple full indexing and that too many indices raise IndexError.
+        # KNOWN ISSUE: the code filters with a visible-deprecation class looked up
+        # directly on the numpy module even though a compat lookup is computed just
+        # before it.
         # Automatically test combinations with complex indexes on 2nd (or 1st)
         # spot and the simple ones in one other spot.
         with warnings.catch_warnings():
@@ -1046,6 +1206,8 @@ class TestMultiIndexingAutomated(TestCase):
             warnings.filterwarnings("error", "", np.VisibleDeprecationWarning)
 
             def isskip(idx):
+                # [FUNCTION DOC] HELPER: Returns true if the index is the string marker
+                # used to drop an entry from a generated index tuple.
                 return isinstance(idx, str) and idx == "skip"
 
             for simple_pos in [0, 2, 3]:
@@ -1071,12 +1233,16 @@ class TestMultiIndexingAutomated(TestCase):
         assert_raises(IndexError, self.a.__setitem__, (0, 0, [1], 0, 0), 0)
 
     def test_1d(self):
+        # [FUNCTION DOC] Runs the single-index check on a 1-d arange for every complex
+        # index.
         a = np.arange(10)
         for index in self.complex_indices:
             self._check_single_index(a, index)
 
 
 class TestFloatNonIntegerArgument(TestCase):
+    # [CLASS DOC] Tests that non-integer arguments to indexing, slicing and reducing
+    # functions raise TypeError, while valid forms raise nothing.
     """
     These test that ``TypeError`` is raised when you try to use
     non-integers as arguments to for indexing and slicing e.g. ``a[0.0:5]``
@@ -1085,6 +1251,8 @@ class TestFloatNonIntegerArgument(TestCase):
     """
 
     def test_valid_indexing(self):
+        # [FUNCTION DOC] Checks that valid integer, list and array indexing forms
+        # execute without raising.
         # These should raise no errors.
         a = np.array([[[5]]])
 
@@ -1095,6 +1263,8 @@ class TestFloatNonIntegerArgument(TestCase):
         a[:, :, :]
 
     def test_valid_slicing(self):
+        # [FUNCTION DOC] Checks that valid slice forms with integer or omitted bounds
+        # execute without raising.
         # These should raise no errors.
         a = np.array([[[5]]])
 
@@ -1108,6 +1278,9 @@ class TestFloatNonIntegerArgument(TestCase):
         a[1:2:2]
 
     def test_non_integer_argument_errors(self):
+        # [FUNCTION DOC] Checks that float shape entries for reshape, float axes for
+        # take, and a NumPy float64 axis raise TypeError (or RuntimeError for the last
+        # case).
         a = np.array([[5]])
 
         assert_raises(TypeError, np.reshape, a, (1.0, 1.0, -1))
@@ -1119,8 +1292,12 @@ class TestFloatNonIntegerArgument(TestCase):
         reason=("torch doesn't have scalar types with distinct element-wise behaviours")
     )
     def test_non_integer_sequence_multiplication(self):
+        # [FUNCTION DOC] Intended to check that multiplying a list by a float scalar
+        # raises TypeError while an integer scalar works. Skipped because torch lacks
+        # distinct scalar types.
         # NumPy scalar sequence multiply should not work with non-integers
         def mult(a, b):
+            # [FUNCTION DOC] HELPER: Returns the product of the two operands.
             return a * b
 
         assert_raises(TypeError, mult, [1], np.float64(3))
@@ -1128,6 +1305,8 @@ class TestFloatNonIntegerArgument(TestCase):
         mult([1], np.int_(3))
 
     def test_reduce_axis_float_index(self):
+        # [FUNCTION DOC] Checks that float or tuple-with-float axis arguments to min
+        # over a 3-d array raise TypeError.
         d = np.zeros((3, 3, 3))
         assert_raises(TypeError, np.min, d, 0.5)
         assert_raises(TypeError, np.min, d, (0.5, 1))
@@ -1136,8 +1315,13 @@ class TestFloatNonIntegerArgument(TestCase):
 
 
 class TestBooleanIndexing(TestCase):
+    # [CLASS DOC] Tests that boolean values used as integer arguments or indices are
+    # handled as errors or as mask-style indices.
     # Using a boolean as integer argument/indexing is an error.
     def test_bool_as_int_argument_errors(self):
+        # [FUNCTION DOC] Checks that a boolean in a reshape shape and in take arguments
+        # raises TypeError, then raises SkipTest because torch accepts booleans as ints.
+        # KNOWN ISSUE: the assertions after the SkipTest are unreachable.
         a = np.array([[[1]]])
 
         assert_raises(TypeError, np.reshape, a, (True, -1))
@@ -1152,6 +1336,9 @@ class TestBooleanIndexing(TestCase):
         assert_raises(TypeError, operator.index, np.array(True))
 
     def test_boolean_indexing_weirdness(self):
+        # [FUNCTION DOC] Checks shapes from mixed boolean scalar, list and ellipsis
+        # indices and that a False scalar combined with a list index raises IndexError.
+        # Uses explicit AssertionError raises.
         # Weird boolean indexing things
         a = np.ones((2, 3, 4))
         if a[False, True, ...].shape != (0, 2, 3, 4):
@@ -1165,6 +1352,8 @@ class TestBooleanIndexing(TestCase):
         assert_raises(IndexError, lambda: a[False, [0, 1], ...])
 
     def test_boolean_indexing_fast_path(self):
+        # [FUNCTION DOC] Regression check that several mismatched boolean mask shapes
+        # (two 2-d masks and a 3-d mask) all raise IndexError.
         # These used to either give the wrong error, or incorrectly give no
         # error.
         a = np.ones((3, 3))
@@ -1192,9 +1381,14 @@ class TestBooleanIndexing(TestCase):
 
 
 class TestArrayToIndexDeprecation(TestCase):
+    # [CLASS DOC] Tests that arrays used as indices are rejected or skipped.
     """Creating an index from array not 0-D is an error."""
 
     def test_array_to_index_error(self):
+        # [FUNCTION DOC] Checks that using a 3-d array as the axis argument to take
+        # raises TypeError or RuntimeError, then raises SkipTest because torch accepts
+        # single-element tensors as ints.
+        # KNOWN ISSUE: the assertions after the SkipTest are unreachable.
         # so no exception is expected. The raising is effectively tested above.
         a = np.array([[[1]]])
 
@@ -1211,6 +1405,8 @@ class TestArrayToIndexDeprecation(TestCase):
 
 
 class TestNonIntegerArrayLike(TestCase):
+    # [CLASS DOC] Tests that array-likes with non-integer contents are rejected as
+    # indices (skipped for torch).
     """Tests that array_likes only valid if can safely cast to integer.
 
     For instance, lists give IndexError when they cannot be safely cast to
@@ -1225,6 +1421,9 @@ class TestNonIntegerArrayLike(TestCase):
         )
     )
     def test_basic(self):
+        # [FUNCTION DOC] Intended to check that float lists or string lists as indices
+        # raise IndexError and that an empty list is valid. Skipped because torch
+        # accepts floats.
         a = np.arange(10)
 
         assert_raises(IndexError, a.__getitem__, [0.5, 1.5])
@@ -1235,6 +1434,7 @@ class TestNonIntegerArrayLike(TestCase):
 
 
 class TestMultipleEllipsisError(TestCase):
+    # [CLASS DOC] Tests that an index may contain only one ellipsis.
     """An index can only have a single ellipsis."""
 
     @xfail  # (
@@ -1244,6 +1444,8 @@ class TestMultipleEllipsisError(TestCase):
     #    )
     # )
     def test_basic(self):
+        # [FUNCTION DOC] Checks that repeated ellipsis indices raise IndexError. Marked
+        # expected-failure because torch accepts multiple ellipses.
         a = np.arange(10)
         assert_raises(IndexError, lambda: a[..., ...])
         assert_raises(IndexError, a.__getitem__, ((Ellipsis,) * 2,))
