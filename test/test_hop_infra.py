@@ -1,4 +1,10 @@
 # Owner(s): ["module: higher order operators"]
+# [MODULE DOC] Infrastructure checks for higher order operators (HOPs). Verifies every registered
+# HOP has an OpInfo in hop_db (or is allowlisted), hop_db entries carry no decorators or skips,
+# HOPs are exported from the higher order ops package, and HOPs deepcopy to themselves. Also covers
+# the triton kernel wrapper HOPs under a fake tensor mode. Import-time side effect: the module
+# walks and imports every submodule of the higher order ops package so that all HOPs are
+# registered.
 import copy
 import importlib
 import pkgutil
@@ -12,6 +18,9 @@ from torch.testing._internal.hop_db import (
 
 
 def do_imports():
+    # [FUNCTION DOC] HELPER: Walks the submodules of the higher order ops package (using its path
+    # and the dotted package prefix) and imports each by name, so every HOP gets registered in the
+    # global registry. Returns nothing; called once at import time of this test module.
     for mod in pkgutil.walk_packages(
         torch._higher_order_ops.__path__, "torch._higher_order_ops."
     ):
@@ -24,7 +33,12 @@ do_imports()
 
 @skipIfTorchDynamo("not applicable")
 class TestHOPInfra(TestCase):
+    # [CLASS DOC] Test case (skipped under TorchDynamo) holding the HOP registry and export checks.
+    # Stateless; tests read the global HOP registry and hop_db.
     def test_all_hops_have_opinfo(self):
+        # [FUNCTION DOC] Collects the names of all registered HOPs and fails if any is neither the
+        # name of a hop_db OpInfo nor in the allowlist of known missing entries. The failure
+        # message lists the missing names and points to the hop_db file.
         """All HOPs should have an OpInfo in torch/testing/_internal/hop_db.py"""
         from torch._ops import _higher_order_ops
 
@@ -46,6 +60,9 @@ class TestHOPInfra(TestCase):
         )
 
     def test_hop_db_has_no_decorators_or_skips(self):
+        # [FUNCTION DOC] Builds the list of full names of hop_db OpInfos that have a non-empty
+        # decorators or skips collection and asserts it is empty, so skips live in the tests that
+        # need them.
         """hop_db entries should not decide how tests are skipped or decorated."""
         offending_op_infos = [
             op.full_name for op in hop_db if op.decorators or op.skips
@@ -61,6 +78,9 @@ class TestHOPInfra(TestCase):
         )
 
     def test_all_hops_are_imported(self):
+        # [FUNCTION DOC] Compares the registered HOP names against the package export list, after
+        # removing a hard-coded allowlist of HOPs that are known not to be exported. Asserts that
+        # the remaining set is empty, so new HOPs must be exported from the package.
         """All HOPs should be listed in torch._higher_order_ops.__all__
 
         Some constraints (see test_testing.py::TestImports)
@@ -100,12 +120,17 @@ class TestHOPInfra(TestCase):
         )
 
     def test_imports_from_all_work(self):
+        # [FUNCTION DOC] Iterates over each name in the higher order ops package export list and
+        # fetches the attribute from the package, failing with an error if any exported name cannot
+        # be resolved.
         """All APIs listed in torch._higher_order_ops.__all__ must be importable"""
         stuff = torch._higher_order_ops.__all__
         for attr in stuff:
             getattr(torch._higher_order_ops, attr)
 
     def test_hop_deepcopy_preserves_identity(self):
+        # [FUNCTION DOC] For every registered HOP, deep-copies it and asserts the copy is the very
+        # same object (identity check and equal object ids), verifying HOPs behave as singletons.
         """HigherOrderOperators should be singletons - deepcopy should return the same object"""
         from torch._ops import _higher_order_ops
 
@@ -119,6 +144,10 @@ class TestHOPInfra(TestCase):
             self.assertEqual(id(hop), id(copied_hop))
 
     def test_triton_kernel_wrapper_functional_fake_tensor_nested_kwargs(self):
+        # [FUNCTION DOC] Creates a fake tensor under a FakeTensorMode with a strided layout, then
+        # calls the functional triton kernel wrapper with that fake tensor inside the kwargs and
+        # one tensor to clone. Asserts the result mapping has only that key, holds a fake tensor
+        # from the same mode, and keeps the input size and stride.
         from torch._higher_order_ops.triton_kernel_wrap import (
             triton_kernel_wrapper_functional,
         )
@@ -146,6 +175,9 @@ class TestHOPInfra(TestCase):
         self.assertEqual(out["out_ptr"].stride(), fake_output.stride())
 
     def test_triton_kernel_wrapper_mutation_fake_tensor_nested_kwargs(self):
+        # [FUNCTION DOC] Creates a fake tensor under a FakeTensorMode, calls the mutation triton
+        # kernel wrapper with it in the kwargs, and asserts the call returns None (no real kernel
+        # is launched on fake inputs).
         from torch._higher_order_ops.triton_kernel_wrap import (
             triton_kernel_wrapper_mutation,
         )

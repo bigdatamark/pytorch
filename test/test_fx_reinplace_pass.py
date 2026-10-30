@@ -1,4 +1,9 @@
 # Owner(s): ["module: functionalization"]
+# [MODULE DOC] Tests for the FX reinplace pass, which rewrites out-of-place ops in a traced graph
+# into in-place variants when safe. Each test traces a function with make_fx (functionalized in
+# some cases), runs the pass, checks numerical equality with the eager function and compares the
+# printed generated code to an expected string. Some tests silently return when the functorch
+# functionalize import failed (recorded in a module flag set at import time).
 import torch
 from torch.testing._internal.common_utils import TestCase, run_tests
 from torch.fx.passes.reinplace import reinplace
@@ -14,11 +19,17 @@ except Exception:
     HAS_FUNCTIONALIZATION = False
 
 class TestReinplacePass(TestCase):
+    # [CLASS DOC] Test case holding the reinplace pass checks. Stateless; each test defines its own
+    # traced function.
 
     def test_reinplace_basic(self):
+        # [FUNCTION DOC] Clones the input and applies an out-of-place add; checks the pass turns
+        # the add into its in-place form on the clone, results equal eager, and the code matches
+        # the expected string.
         # Basic test: the out-of-place add() call should be converted
         # into add_()
         def f(x):
+            # [FUNCTION DOC] HELPER: Clones the input, adds one to the clone and returns the sum.
             a = x.clone()
             b = a.add(1)
             return b
@@ -40,7 +51,12 @@ def forward(self, x_1):
 
 
     def test_reinplace_with_view(self):
+        # [FUNCTION DOC] Checks that an add on a tensor whose view is used later is not made in-
+        # place, while the add on the view is. Compares outputs with eager and compares the
+        # generated code to the expected string.
         def f(x):
+            # [FUNCTION DOC] HELPER: Clones the input, takes a flattened view, computes an unused
+            # add on the base and an add on the view; returns the view add.
             a = x.clone()
             a_view = a.view(-1)
             # We shouldn't re-inplace the first add(), because an alias of a is reused later in the program
@@ -68,7 +84,11 @@ def forward(self, x_1):
     """)
 
     def test_reinplace_different_metadata(self):
+        # [FUNCTION DOC] Verifies a greater-or-equal comparison (output dtype differs from input)
+        # is not reinplaced, while results match eager and code matches the expected string.
         def f(a_):
+            # [FUNCTION DOC] HELPER: Clones the input, adds one, and returns the elementwise
+            # greater-or-equal comparison of the sum with the clone.
             a = a_.clone()
             b = a + 1
             # Naively, we shouldn't try to inplace the .ge() call,
@@ -93,7 +113,11 @@ def forward(self, a__1):
     """)
 
     def test_reinplace_overlapping_memory(self):
+        # [FUNCTION DOC] Verifies that an add on an expanded tensor with overlapping memory is not
+        # made in-place. Checks eager equality and the generated code.
         def f(a_):
+            # [FUNCTION DOC] HELPER: Clones a one element input, expands it to 4 by 4 and returns
+            # the expanded tensor plus one.
             a = a_.clone()
             b = a.expand(4, 4)
             # Can't reinplace because b has overlapping memory.
@@ -119,7 +143,12 @@ def forward(self, a__1):
     # I'm planning on testing more comprehensively with torchbench models,
     # but we can make this testing better once functorch moves into pytorch/pytorch.
     def test_reinplace_scatter_op(self):
+        # [FUNCTION DOC] Functionalizes a function doing an in-place add through nested views,
+        # traces it, runs the pass, and checks eager equality plus the expected code (which keeps
+        # redundant views). Returns early without checking if functionalize was unavailable.
         def f(a_):
+            # [FUNCTION DOC] HELPER: Clones the input, creates two flat views, selects an element,
+            # views it, adds one in place, and returns the clone plus the first view.
             # for now, don't test mutations to inputs
             a = a_.clone()
             e = a.view(-1)
@@ -166,7 +195,12 @@ def forward(self, a__1):
     """)
 
     def test_reinplace_scatter_twice(self):
+        # [FUNCTION DOC] Functionalizes a double-select in-place add, runs the pass, and checks
+        # eager equality and the expected code where the scatter becomes in-place. Returns early if
+        # functionalize is unavailable.
         def f(a_):
+            # [FUNCTION DOC] HELPER: Clones the input, selects a column then an element, adds one
+            # in place and returns the clone.
             # for now, don't test mutations to inputs
             a = a_.clone()
             b = a[:, 1]
@@ -198,7 +232,13 @@ def forward(self, a__1):
     """)
 
     def test_reinplace_scatter_twice_with_different_view_op_valid(self):
+        # [FUNCTION DOC] Checks that a select scatter into a differently constructed strided view
+        # that covers the same memory as the original view is reinplaced. Compares eager output and
+        # expected code.
         def f(a_):
+            # [FUNCTION DOC] HELPER: Clones the input, selects twice, adds one out of place, builds
+            # a strided mirror of the column and scatters the update at index one; returns the
+            # result.
             a = a_.clone()
             b = a[:, 1]
             c = b[1]
@@ -236,7 +276,12 @@ def forward(self, a__1):
     # has the same size/stride/storage offset (even though it is a different view),
     # making it valid to re-inplace
     def test_reinplace_scatter_twice_with_different_view_op_invalid(self):
+        # [FUNCTION DOC] Checks that a select scatter into an equivalent view but at a different
+        # slice than the source is not reinplaced and becomes a copy. Compares eager output and
+        # code.
         def f(a_):
+            # [FUNCTION DOC] HELPER: Same as the valid case but scatters the update at index zero
+            # of the strided mirror instead of one.
             a = a_.clone()
             b = a[:, 1]
             c = b[1]
@@ -270,7 +315,12 @@ def forward(self, a__1):
     """)
 
     def test_reinplace_scatter_twice_with_different_view_op_invalid2(self):
+        # [FUNCTION DOC] Checks that a select scatter whose base view points to a different place
+        # than the source is not reinplaced. The eager comparison is commented out; only the
+        # generated code is compared to the expected string.
         def f(a_):
+            # [FUNCTION DOC] HELPER: Same as the earlier cases but the mirror strided view uses
+            # offset zero, a different base from the source element.
             a = a_.clone()
             b = a[:, 1]
             c = b[1]
@@ -303,7 +353,12 @@ def forward(self, a__1):
 
 
     def test_out_node_updated(self):
+        # [FUNCTION DOC] Functionalizes a function that adds to a diagonal and scatters back, runs
+        # the pass without inputs, and checks the output refers to the original zeros tensor and
+        # the code matches. Returns early without functionalize.
         def f():
+            # [FUNCTION DOC] HELPER: Creates a 2 by 2 zero tensor, takes its diagonal, adds one,
+            # scatters it back and returns a one element list.
             x = torch.zeros(2, 2)
             y = x.diagonal()
             y_updated = y.add(1)
@@ -329,7 +384,12 @@ def forward(self):
     """)
 
     def test_reinplace_index_mutation(self):
+        # [FUNCTION DOC] Functionalizes an indexed slice assignment, runs the pass, and checks
+        # eager equality and the expected code with the slice copy performed in place. Returns
+        # early without functionalize.
         def f():
+            # [FUNCTION DOC] HELPER: Creates a 4 by 4 by 4 zero tensor, assigns ones into a slice
+            # along the middle dimension and returns the tensor.
             a = torch.zeros(4, 4, 4)
             a[:, 2:] = torch.ones(4, 2, 4)
             return a
@@ -354,9 +414,15 @@ def forward(self):
     """)
 
     def test_reinplace_sym_input(self):
+        # [FUNCTION DOC] Traces a function with a symbolic integer index input from a shape
+        # environment, runs the pass with the symbolic input, and checks the add after clone is
+        # made in-place and results equal eager with a real integer. Also prints the generated
+        # code.
         # Symbolic input test: the out-of-place add() call should be converted
         # into add_(), and symbolic input won't cause any error.
         def f(x, index):
+            # [FUNCTION DOC] HELPER: Selects a row by index, clones it, adds one and returns the
+            # sum.
             a = torch.select(x, 0, index)
             clone = a.clone()
             b = clone.add(1)

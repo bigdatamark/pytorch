@@ -1,5 +1,11 @@
 # Owner(s): ["module: fx.passes"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for FX graph passes: the capability based partitioner and its fusion step
+# (with a mock operator support that only allows add, getitem, view, permute, std_mean and a
+# wrapped tuple producer), the fuse-by-partitions utility, topological sort stability, and the
+# subgraph matcher. Defines sample functions and modules used as traced inputs, pattern/forward
+# model classes with expected match counts, and sets up root logging at warning level at import
+# time.
 
 from dataclasses import dataclass
 import operator
@@ -21,13 +27,20 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 class TestModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Small module with two linear layers and a parameter used as a traced
+    # input for fuser and topo sort tests. Its forward builds a chain of adds named add through
+    # add_6 plus two linear calls and a relu, and returns three values.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates two 4 by 4 linear layers and a random 4 by 4 parameter.
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
         self.linear2 = torch.nn.Linear(4, 4)
         self.param = torch.nn.Parameter(torch.rand(4, 4))
 
     def forward(self, a, b, c):
+        # [FUNCTION DOC] HELPER: Computes a sum of the first two inputs, applies the first linear
+        # layer, mixes in the third input, the parameter, and second linear layer through a series
+        # of adds, ends with a relu. Returns the fourth add, the sixth add, and the relu result.
         add = a + b
 
         linear_1 = self.linear(add)
@@ -46,11 +59,17 @@ class TestModule(torch.nn.Module):
         return add_4, add_6, relu
 
 class TestDeepModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module with one linear layer whose forward creates a very long chain of
+    # subtractions, to ensure passes do not use recursion that would overflow the interpreter
+    # stack.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates a single 4 by 4 linear layer (unused in forward).
         super().__init__()
         self.linear = torch.nn.Linear(4, 4)
 
     def forward(self, a, b, c):
+        # [FUNCTION DOC] HELPER: Adds the first two inputs, adds one, then subtracts the third
+        # input once more than the interpreter recursion limit in a loop. Returns the result.
         o = a + b
         o = o + 1.0
 
@@ -62,8 +81,13 @@ class TestDeepModule(torch.nn.Module):
 
 
 class TestPartitionFunctions:
+    # [CLASS DOC] HELPER: Namespace of static sample functions forward1 through forward21 used as
+    # partitioner inputs. Each is a small add/relu graph shaped to hit a specific partitioning
+    # case; the test parameter lists give expected node groupings.
     @staticmethod
     def forward1(a, b, c):
+        # [FUNCTION DOC] HELPER: Chain of adds with one relu in the middle; returns two of the add
+        # results. Used to check vertical grouping around an unsupported op.
         add = a + b
         add_1 = add + b
         add_2 = add_1 + c
@@ -77,6 +101,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward2(a, b, _):
+        # [FUNCTION DOC] HELPER: Adds on two inputs with a relu in the middle that blocks fusion;
+        # returns the last add and an earlier add. Third argument is unused.
         add = a + b
         add_1 = add + b
         relu_1 = add_1.relu()  # blocked by this
@@ -86,6 +112,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward3(a, b, c):
+        # [FUNCTION DOC] HELPER: Three independent adds over pairs of inputs, all returned; a
+        # horizontal fusion case with common producers.
         add = a + b
         add_1 = a + c
         add_2 = b + c
@@ -93,6 +121,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward4(a, b, c):
+        # [FUNCTION DOC] HELPER: Three independent adds feeding a where call on the first add,
+        # picking between the other two. Horizontal fusion case.
         add = a + b
         add_1 = a + c
         add_2 = b + c
@@ -100,6 +130,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward5(a, b, c):
+        # [FUNCTION DOC] HELPER: An add feeding a relu (unsupported) branch and an add branch; the
+        # add should join the supported right branch. Returns both branches.
         # add should be fused right branch, as left branch is not supported
         add = a + 1
         # left branch
@@ -110,6 +142,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward6(a, b, c):
+        # [FUNCTION DOC] HELPER: An add feeding two relu branches, neither supported, so the add
+        # stands in its own partition. Returns both relu results.
         # add should have its own partition, as neither branches are supported
         add = a + 1
         # left branch
@@ -120,6 +154,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward7(a, b, c):
+        # [FUNCTION DOC] HELPER: An add feeding two supported branches of different lengths;
+        # everything should fuse together. Returns the longer and shorter branch outputs.
         # both branches are supported, all adds should be fused together
         add = a + 1
         # left branch
@@ -131,6 +167,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward8(a, b, c):
+        # [FUNCTION DOC] HELPER: An add feeding two add branches that merge again by an add; all in
+        # one partition. Returns the merged value.
         # both branches are in the same partition, add should join the same partition
         add = a + 1
         # left branch
@@ -144,6 +182,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward9(a, b, c):
+        # [FUNCTION DOC] HELPER: One add feeding three independent add branches that are stacked
+        # into a single output tensor.
         add = a + 1
         # branch 1
         add_1 = add + 1
@@ -156,6 +196,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward10(a, b, c):
+        # [FUNCTION DOC] HELPER: Like the three branch case but the third branch also depends on
+        # the second branch; outputs are stacked.
         add = a + 1
         # branch 1
         add_1 = add + 1
@@ -168,6 +210,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward11(a, b, c):
+        # [FUNCTION DOC] HELPER: An add feeding a relu branch, a branch that depends on that relu,
+        # and another relu branch; outputs are stacked. Unsupported relus split partitions.
         add = a + 1
         # branch 1
         add_1 = add.relu()
@@ -180,6 +224,9 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward12(a, b, c):
+        # [FUNCTION DOC] HELPER: Builds two adds from the first input and relus of each, merged
+        # with cross dependencies so merging a group could introduce a cycle; checks the
+        # partitioner avoids cycles. Returns two values.
         b0 = a + 1.0
         c0 = a + 1.5
         x0 = b0.relu()
@@ -195,6 +242,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward13(a, b, c):
+        # [FUNCTION DOC] HELPER: Splits the first input into four pieces along dimension zero, adds
+        # two of them to the other inputs and returns their sum; exercises a getitem special case.
         a0, a1, a2, a3 = a.split(1, 0)
         b1 = a0 + b
         c1 = a1 + c
@@ -202,12 +251,16 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward14(a, b, c):
+        # [FUNCTION DOC] HELPER: Calls the aten std_mean operator on the first input, then adds one
+        # to the first result. Exercises tuple outputs with getitem.
         a0, a1 = torch.ops.aten.std_mean(a)
         out = a0 + 1.0
         return out
 
     @staticmethod
     def forward15(a, b, c):
+        # [FUNCTION DOC] HELPER: A view to 2 by 2 followed by alternating permutes and adds, ending
+        # with two permutes in a row; used with and without the bookend non-compute pass.
         a0 = torch.ops.aten.view(a, [2, 2])
         a1 = torch.ops.aten.permute(a0, [1, 0])
         a2 = a1 + 1.0
@@ -218,6 +271,9 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward16(a, b, c):
+        # [FUNCTION DOC] HELPER: Subtracts one, then view, permute, add, permute, add, two
+        # permutes, and a final subtract. The unsupported subtracts bound a supported middle
+        # section for the bookend pass.
         a0 = a - 1.0
         a1 = torch.ops.aten.view(a0, [2, 2])
         a2 = torch.ops.aten.permute(a1, [1, 0])
@@ -230,6 +286,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward17(a, b, c, d, e, f):
+        # [FUNCTION DOC] HELPER: Three independent adds over three input pairs, returned as a
+        # tuple; used for independent-output and horizontal fusion tests.
         a0 = a + b
         a1 = c + d
         a2 = e + f
@@ -237,11 +295,15 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward18(a, b, c):
+        # [FUNCTION DOC] HELPER: Calls the aten var_mean operator (not supported by the mock) and
+        # returns only the first result, giving an empty partition expectation.
         a0, a1 = torch.ops.aten.var_mean(a)
         return a0
 
     @staticmethod
     def forward19(a, b, c):
+        # [FUNCTION DOC] HELPER: A data dependent chain of adds ending with an add of a constant;
+        # returns the last result.
         add = a + b
         add_1 = add + c
         add_2 = add_1 + 1
@@ -249,6 +311,8 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward20(a, b, c):
+        # [FUNCTION DOC] HELPER: A relu (unsupported) of the first input feeding two adds with the
+        # other inputs; returns both.
         relu = a.relu()
         add = relu + b
         add_1 = relu + c
@@ -256,6 +320,9 @@ class TestPartitionFunctions:
 
     @staticmethod
     def forward21(a, b, c):
+        # [FUNCTION DOC] HELPER: Two adds, a relu of one, and combinations of the relu result and
+        # the adds; returns two values. Used to check that vertical partitions avoid cross-
+        # partition cycles.
         add = a + b
         add_1 = c + c
         relu = add_1.relu()
@@ -265,15 +332,24 @@ class TestPartitionFunctions:
 
 @torch.fx.wrap
 def _nested_tuple_producer(x):
+    # [FUNCTION DOC] HELPER: Opaque (wrapped for tracing) function returning a nested tuple of the
+    # input plus one and a pair with input plus two and three. Registered as a leaf call during
+    # symbolic tracing.
     """Returns a nested tuple structure: (x+1, (x+2, x+3))"""
     return (x + 1, (x + 2, x + 3))
 
 
 class TestNestedGetitemFunctions:
+    # [CLASS DOC] HELPER: Namespace holding the sample function for the nested getitem chain
+    # partitioner test.
     """Test functions for nested getitem chain handling in partitioner."""
 
     @staticmethod
     def forward_nested_getitem_cross_partition(a, b, c):
+        # [FUNCTION DOC] HELPER: Calls the wrapped nested tuple producer, takes the first element
+        # and an element of the inner tuple, applies relu (unsupported) to the first element and
+        # returns inner element plus relu result plus the second input. Used to check getitem
+        # chains stay with the producer.
         result = _nested_tuple_producer(a)
         outer_0 = result[0]
         inner_tuple = result[1]
@@ -287,7 +363,12 @@ class TestNestedGetitemFunctions:
 
 # A mock OperatorSupport class, where only operator.add is supported
 class MockOperatorSupport(OperatorSupport):
+    # [CLASS DOC] HELPER: Mock operator support. A node is supported only if it is a function call
+    # whose target is addition, getitem, aten view, permute, std_mean or the wrapped tuple
+    # producer.
     def is_node_supported(self, submodules, node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True when the node is a call_function node with a target
+        # in the supported set listed in the class; submodules are ignored.
         return (node.op == "call_function" and
                 node.target in {operator.add, operator.getitem,
                                 torch.ops.aten.view,
@@ -297,6 +378,8 @@ class MockOperatorSupport(OperatorSupport):
 
 @instantiate_parametrized_tests
 class TestFXGraphPasses(JitTestCase):
+    # [CLASS DOC] Parameterized tests for the capability based partitioner and the fuse-by-
+    # partitions utility. Stateless; each test traces a sample function or module symbolically.
 
     @parametrize("fn, expected_partition, bookend_non_compute_pass", [
         (TestPartitionFunctions.forward1, [["add_7", "add_6"], ["add_5", "add_4", "add_3"], ["add_2", "add_1", "add"]], False),
@@ -333,6 +416,11 @@ class TestFXGraphPasses(JitTestCase):
         (TestPartitionFunctions.forward18, [], False),
     ])
     def test_partitioner(self, fn, expected_partition, bookend_non_compute_pass):
+        # [FUNCTION DOC] Symbolically traces the function, optionally lists view and permute as
+        # non- compute ops, proposes partitions (single node allowed), applies the bookend removal
+        # when requested, and checks the number of partitions and per-partition node name sets (in
+        # order) equal the expectation, raising AssertionError otherwise. Fuses the partitions and
+        # asserts the fused graph gives the same output as the original on random inputs.
         traced = symbolic_trace(fn)
 
         non_compute_ops = []
@@ -367,6 +455,10 @@ class TestFXGraphPasses(JitTestCase):
         (TestPartitionFunctions.forward17, [['add', 'add_1', 'add_2']]),
     ])
     def test_partitioner_independent_output(self, fn, expected_partition):
+        # [FUNCTION DOC] Traces the function, proposes partitions with single node partitions
+        # allowed, and checks partition count and name sets against the expectation, raising
+        # AssertionError on mismatch. Then fuses and compares the fused graph output with the
+        # original on six random inputs.
         traced = symbolic_trace(fn)
 
         supported_ops = MockOperatorSupport()
@@ -407,6 +499,10 @@ class TestFXGraphPasses(JitTestCase):
         (TestPartitionFunctions.forward14, [["std_mean", "getitem", "getitem_1", "add"]]),
     ])
     def test_partitioner_skip_horizontal_fusion(self, fn, expected_partition):
+        # [FUNCTION DOC] Proposes partitions with horizontal fusion skipped and compares the set of
+        # node name sets to the expected sets (order agnostic). Fuses and compares output with the
+        # original on random inputs, with as many inputs as the function takes positional
+        # arguments.
         traced = symbolic_trace(fn)
 
         supported_ops = MockOperatorSupport()
@@ -446,6 +542,10 @@ class TestFXGraphPasses(JitTestCase):
         [["add", "linear", "add_1", "param", "add_2", "add_3", "add_4", "linear2", "add_5", "add_6", "relu"]],  # full graph
     ])
     def test_fuser_util(self, partition):
+        # [FUNCTION DOC] Traces the test module, builds the partition list from the named nodes
+        # (each partition an ordered mapping with keys only), fuses via the utility, and checks the
+        # fused module output equals the original on random inputs. Cases cover vertical,
+        # horizontal, arbitrary order and full graph fusion.
         m = TestModule()
         gm = symbolic_trace(m)
 
@@ -471,6 +571,9 @@ class TestFXGraphPasses(JitTestCase):
         [['relu', 'add_5']],    # invalid partition: circular dependency
     ])
     def test_fuser_util_xfail(self, partition):
+        # [FUNCTION DOC] Builds partitions from named nodes as in the success test, but with
+        # invalid inputs (duplicate node in two partitions or a partition that creates a cycle) and
+        # asserts that the fuse utility raises an exception.
         m = TestModule()
         gm = symbolic_trace(m)
 
@@ -484,6 +587,9 @@ class TestFXGraphPasses(JitTestCase):
             fuse_by_partitions(gm, partitions)
 
     def test_fuser_pass_deep_model(self):
+        # [FUNCTION DOC] Traces the deep module and proposes partitions with a single node
+        # partition allowed. Passes if no exception such as recursion error occurs; there are no
+        # other assertions.
         m = TestDeepModule()
         traced = symbolic_trace(m)
 
@@ -494,6 +600,9 @@ class TestFXGraphPasses(JitTestCase):
         partitions = partitioner.propose_partitions()
 
     def test_topo_sort_stability(self):
+        # [FUNCTION DOC] Calls the topological sort helper on node lists in two input orders for
+        # independent nodes, and asserts dependencies come first, independent nodes keep the order
+        # they were given, and the dependent node is last.
         """Test that topo_sort preserves relative order of independent nodes."""
         m = TestModule()
         gm = symbolic_trace(m)
@@ -539,8 +648,14 @@ class TestFXGraphPasses(JitTestCase):
         self.assertEqual(sorted_names_reversed[3], "add_3")
 
     def test_fuse_preserves_original_placeholder_input_order(self):
+        # [FUNCTION DOC] Fuses all non placeholder, non output nodes of a two input module into one
+        # partition and checks the fused submodule placeholders and the call node arguments keep
+        # the original input order. Also compares numeric output with the original module.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module adding one to the attention mask, doubling the input ids,
+            # and returning their sum.
             def forward(self, input_ids, attention_mask):
+                # [FUNCTION DOC] HELPER: Returns mask plus one summed with ids times two.
                 mask = attention_mask + 1
                 ids = input_ids * 2
                 return mask + ids
@@ -571,8 +686,14 @@ class TestFXGraphPasses(JitTestCase):
         )
 
     def test_fuse_preserves_original_placeholder_input_order_with_internal_deps(self):
+        # [FUNCTION DOC] Same as the placeholder order test but for a three input module where an
+        # internal value depends on two inputs; verifies the fused submodule inputs follow the
+        # original placeholder order and numerics match.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing the product of the second input and the sum of
+            # the first and third.
             def forward(self, x, y, z):
+                # [FUNCTION DOC] HELPER: Returns the sum of x and z multiplied by y.
                 a = x + z
                 return a * y
 
@@ -599,8 +720,15 @@ class TestFXGraphPasses(JitTestCase):
         torch.testing.assert_close(M()(x, y, z), fused_graph(x, y, z))
 
     def test_fuse_preserves_intermediate_input_encounter_order(self):
+        # [FUNCTION DOC] Fuses only a multiply and the add that follows it; the fused inputs are
+        # intermediate values and must appear in the order they are first encountered (add_1 then
+        # add). Checks call args and numerics.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module adding one to each input, multiplying the results and
+            # adding one.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the product of y plus one and x plus one, plus
+                # one.
                 a = x + 1
                 b = y + 1
                 c = b * a
@@ -629,8 +757,15 @@ class TestFXGraphPasses(JitTestCase):
         torch.testing.assert_close(M()(x, y), fused_graph(x, y))
 
     def test_fuse_preserves_mixed_input_encounter_order(self):
+        # [FUNCTION DOC] Fuses a second matrix multiply and an add. The fused inputs mix a computed
+        # value and graph inputs and must follow encounter order. Checks the submodule placeholder
+        # names, the call args, and numerical equality on 4 by 4 inputs.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two matrix multiplies, an add and a subtract reusing
+            # the input names.
             def forward(self, a, x, b):
+                # [FUNCTION DOC] HELPER: Computes mm of a and x, adds b, subtracts a, multiplies by
+                # x again and adds b. Returns the last add.
                 y = torch.mm(a, x)
                 z = y + b
                 a = z - a
@@ -660,6 +795,11 @@ class TestFXGraphPasses(JitTestCase):
         torch.testing.assert_close(M()(a, x, b), fused_graph(a, x, b))
 
     def test_partitioner_nested_getitem_chains(self):
+        # [FUNCTION DOC] Traces the nested getitem sample, proposes partitions, finds the producer
+        # node and all getitem nodes, asserts at least three getitems exist, and for getitems that
+        # trace back to the producer through getitem chains asserts they are in the same partition
+        # as the producer (when the producer is in a partition). Finally fuses and compares output
+        # numerically.
         """Test that nested getitem chains are properly reassigned to producer's partition.
 
         this tests the fix for handling patterns like:
@@ -732,19 +872,26 @@ class TestFXGraphPasses(JitTestCase):
 
 @dataclass
 class TestCase:
+    # [CLASS DOC] HELPER: Dataclass describing a matcher expectation: whether the output and
+    # placeholders are matched, the expected number of matches, and whether overlapping matches are
+    # removed (default true). Not a unittest case despite its name.
     match_output: bool
     match_placeholder: bool
     num_matches: int
     remove_overlapping_matches: bool = True
 
 class SingleNodePattern:
+    # [CLASS DOC] HELPER: Matcher model: forward negates and adds the result to itself, and the
+    # pattern is the negate; test_cases lists the expected match counts per flag combination.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Negates the input and returns the sum of the result with itself.
         val = torch.neg(x)
         return torch.add(val, val)
 
     @staticmethod
     def pattern(a):
+        # [FUNCTION DOC] HELPER: Pattern: negate of the input.
         return torch.neg(a)
 
     test_cases = [
@@ -755,8 +902,12 @@ class SingleNodePattern:
         TestCase(True, True, 0)
     ]
 class SimplePattern:
+    # [CLASS DOC] HELPER: Matcher model with three concatenate-and-sum operations; the pattern is
+    # concatenate then sum. Expected counts are in test_cases.
     @staticmethod
     def forward(x, w1, w2):
+        # [FUNCTION DOC] HELPER: Builds two concat sums, concat sum of those, and returns the input
+        # plus maxima of the first two plus the third.
         m1 = torch.cat([w1, w2]).sum()
         m2 = torch.cat([w2, w1]).sum()
         m3 = torch.cat([m1, m2]).sum()
@@ -764,6 +915,7 @@ class SimplePattern:
 
     @staticmethod
     def pattern(a, b):
+        # [FUNCTION DOC] HELPER: Pattern: concatenate two inputs then sum.
         return torch.cat([a, b]).sum()
 
     test_cases = [
@@ -775,13 +927,17 @@ class SimplePattern:
     ]
 
 class SimpleFullGraphMatching:
+    # [CLASS DOC] HELPER: Matcher model where the pattern equals the whole forward graph (negate
+    # then add to itself), so exactly one match is expected for every flag choice.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Negates the input and returns the sum of the result with itself.
         a = torch.neg(x)
         return torch.add(a, a)
 
     @staticmethod
     def pattern(x):
+        # [FUNCTION DOC] HELPER: Same computation as the model forward, used as the pattern.
         a = torch.neg(x)
         return torch.add(a, a)
 
@@ -794,8 +950,12 @@ class SimpleFullGraphMatching:
     ]
 
 class DiamondShapePatternTestCase:
+    # [CLASS DOC] HELPER: Matcher model with a diamond shaped subgraph (relu, then sigmoid and relu
+    # branches that are added), preceded by a negate.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Negates input, applies relu, then returns sigmoid plus relu of
+        # that value.
         a = torch.neg(x)
 
         a = a.relu()
@@ -807,6 +967,7 @@ class DiamondShapePatternTestCase:
 
     @staticmethod
     def pattern(a):
+        # [FUNCTION DOC] HELPER: Pattern: relu, then add of a sigmoid branch and a relu branch.
         a = a.relu()
         left = a.sigmoid()
         right = a.relu()
@@ -822,8 +983,13 @@ class DiamondShapePatternTestCase:
     ]
 
 class NonFullyContainedMatches:
+    # [CLASS DOC] HELPER: Matcher model where one occurrence of the pattern is fully contained and
+    # another leaks an intermediate value to outside users.
     @staticmethod
     def forward(x, w1, w2, b1, b2):
+        # [FUNCTION DOC] HELPER: Builds two concatenations and an addmm, summing the result (not
+        # leaking); repeats with the first concatenation also summed and thus leaking. Returns two
+        # sums.
         # fully contained matched subgraph
         m1 = torch.cat([w1, w2])
         m2 = torch.cat([x, b2])
@@ -840,6 +1006,7 @@ class NonFullyContainedMatches:
 
     @staticmethod
     def pattern(x, w1, w2, b1, b2):
+        # [FUNCTION DOC] HELPER: Pattern: two concatenations then addmm with the transposed second.
         m1 = torch.cat([w1, w2])
         m2 = torch.cat([x, b2])
         return torch.addmm(b1, m1, m2.t())
@@ -854,8 +1021,11 @@ class NonFullyContainedMatches:
     ]
 
 class ChainRepeatedPattern:
+    # [CLASS DOC] HELPER: Matcher model with four chained sigmoids; the pattern is two chained
+    # sigmoids, testing overlapping match handling.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Applies sigmoid four times in sequence and returns the result.
         x = torch.sigmoid(x)
         x = torch.sigmoid(x)
         x = torch.sigmoid(x)
@@ -863,6 +1033,7 @@ class ChainRepeatedPattern:
 
     @staticmethod
     def pattern(x):
+        # [FUNCTION DOC] HELPER: Pattern: two sigmoids in sequence.
         return torch.sigmoid(torch.sigmoid(x))
 
     test_cases = [
@@ -875,8 +1046,12 @@ class ChainRepeatedPattern:
     ]
 
 class QuantizationModel:
+    # [CLASS DOC] HELPER: Matcher model with an in-place add followed by dequantize, sigmoid and
+    # conversion to half precision; the pattern is the last three.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Adds three in place, dequantizes, applies sigmoid, converts to
+        # float16 and returns.
         x += 3
         x = x.dequantize()
         x = torch.sigmoid(x)
@@ -885,6 +1060,7 @@ class QuantizationModel:
 
     @staticmethod
     def pattern(x):
+        # [FUNCTION DOC] HELPER: Pattern: dequantize, sigmoid, convert to float16.
         x = x.dequantize()
         x = torch.sigmoid(x)
         x = x.to(torch.float16)
@@ -899,14 +1075,17 @@ class QuantizationModel:
     ]
 
 class MultipleOutputsWithDependency:
+    # [CLASS DOC] HELPER: Matcher model whose pattern has two outputs, one depending on the other.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Relu then sigmoid; returns the sigmoid result and the relu result.
         y = x.relu()
         z = y.sigmoid()
         return z, y
 
     @staticmethod
     def pattern(a):
+        # [FUNCTION DOC] HELPER: Pattern: relu then sigmoid, returning both with a data dependency.
         b = a.relu()
         c = b.sigmoid()
         return b, c     # outputs have data dependency
@@ -920,8 +1099,12 @@ class MultipleOutputsWithDependency:
     ]
 
 class MultipleOutputsWithoutDependency:
+    # [CLASS DOC] HELPER: Matcher model whose pattern has two outputs that do not depend on each
+    # other.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Adds one, then relu, sum and sigmoid of the relu; returns sigmoid
+        # of the sigmoid plus the sum of the sum.
         x = x + 1
 
         # target subgraph to match
@@ -934,6 +1117,8 @@ class MultipleOutputsWithoutDependency:
 
     @staticmethod
     def pattern(a):
+        # [FUNCTION DOC] HELPER: Pattern: relu, then sigmoid and sum; returns the sigmoid and the
+        # sum.
         a = a.relu()
         b = a.sigmoid()
         c = a.sum()
@@ -948,8 +1133,12 @@ class MultipleOutputsWithoutDependency:
     ]
 
 class MultipleOutputsMultipleOverlappingMatches:
+    # [CLASS DOC] HELPER: Matcher model with multiple overlapping matches for a three output
+    # pattern, tested with and without overlap removal.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Adds one, relu, two sums and two sigmoids of the relu, and returns
+        # their sum.
         x = x + 1
 
         # target subgraph to match
@@ -963,6 +1152,7 @@ class MultipleOutputsMultipleOverlappingMatches:
 
     @staticmethod
     def pattern(a):
+        # [FUNCTION DOC] HELPER: Pattern: relu, sigmoid, sum; returns the relu, sigmoid and sum.
         a = a.relu()
         b = a.sigmoid()
         c = a.sum()
@@ -975,8 +1165,11 @@ class MultipleOutputsMultipleOverlappingMatches:
     ]
 
 class MultipleOutputsMultipleNonOverlappingMatches:
+    # [CLASS DOC] HELPER: Matcher model with two disjoint occurrences of a two output pattern.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Adds one, then two successive relu, sum and sigmoid groups;
+        # returns the sum of all four results.
         x = x + 1
 
         # target subgraph to match
@@ -992,6 +1185,7 @@ class MultipleOutputsMultipleNonOverlappingMatches:
 
     @staticmethod
     def pattern(a):
+        # [FUNCTION DOC] HELPER: Pattern: relu, then sigmoid and sum; returns sigmoid and sum.
         a = a.relu()
         b = a.sigmoid()
         c = a.sum()
@@ -1003,8 +1197,11 @@ class MultipleOutputsMultipleNonOverlappingMatches:
     ]
 
 class MultipleOutputsIdenticalAnchor:
+    # [CLASS DOC] HELPER: Matcher model whose pattern has two identical sigmoid outputs (identical
+    # anchors). A commented-out case notes a known miscount.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Adds one, relu, two sigmoids of the relu; returns both.
         x = x + 1
 
         # target subgraph to match
@@ -1016,6 +1213,7 @@ class MultipleOutputsIdenticalAnchor:
 
     @staticmethod
     def pattern(a):
+        # [FUNCTION DOC] HELPER: Pattern: relu then two sigmoids; returns both.
         a = a.relu()
         b = a.sigmoid()
         b1 = a.sigmoid()
@@ -1030,8 +1228,11 @@ class MultipleOutputsIdenticalAnchor:
 
 
 class MultipleOutputsHorizontalPattern:
+    # [CLASS DOC] HELPER: Matcher model with a horizontal two output pattern of relu and sigmoid on
+    # the same input.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Adds one and returns relu and sigmoid of the result.
         x = x + 1
 
         # target subgraph to match
@@ -1042,6 +1243,7 @@ class MultipleOutputsHorizontalPattern:
 
     @staticmethod
     def pattern(a):
+        # [FUNCTION DOC] HELPER: Pattern: relu and sigmoid of the same input, both returned.
         b1 = a.relu()
         b2 = a.sigmoid()
 
@@ -1056,8 +1258,12 @@ class MultipleOutputsHorizontalPattern:
     ]
 
 class MultiOutputWithWithInvalidMatches:
+    # [CLASS DOC] HELPER: Matcher model where a multi output pattern finds only invalid matches,
+    # expecting zero.
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Linear with a random weight, sigmoid, multiply with the linear
+        # output, then sum along dimension one.
         res0 = torch.nn.functional.linear(x, torch.rand(3, 3))
         res1 = torch.sigmoid(res0)
         res2 = res0 * res1
@@ -1066,6 +1272,8 @@ class MultiOutputWithWithInvalidMatches:
 
     @staticmethod
     def pattern(a, b, c):
+        # [FUNCTION DOC] HELPER: Pattern: linear, then multiply the linear result by a third input;
+        # returns linear and product.
         lin_res = torch.nn.functional.linear(a, b)
         mul_res = lin_res * c
         return lin_res, mul_res
@@ -1078,18 +1286,28 @@ class MultiOutputWithWithInvalidMatches:
     ]
 
 class QuantizationFp8Pattern:
+    # [CLASS DOC] HELPER: Matcher model using custom fp8 quantize and dequantize ops registered in
+    # a temporary library. The setup and tearDown class methods create and destroy that library
+    # (kept in a class attribute).
     @classmethod
     def setup(cls):
+        # [FUNCTION DOC] HELPER: Defines a library for the fp8 quantization namespace with schemas
+        # for the quantize and dequantize per tensor ops, storing it on the class.
         cls.quantization = torch.library.Library("fp8_quantization", "DEF")  # noqa: SCOPED_LIBRARY
         cls.quantization.define("quantize_per_tensor_affine_fp8(Tensor self, int dtype, float scale) -> Tensor")
         cls.quantization.define("dequantize_per_tensor_affine_fp8(Tensor self, int dtype, float scale) -> Tensor")
 
     @classmethod
     def tearDown(cls):
+        # [FUNCTION DOC] HELPER: Destroys the library created in setup.
         cls.quantization._destroy()
 
     @staticmethod
     def forward(self, arg0_1, arg1_1):
+        # [FUNCTION DOC] HELPER: Despite being declared static, takes a first argument named self
+        # that tracing turns into a placeholder; builds three quantize/dequantize pairs around two
+        # adds with scale read from an attribute of that argument. Returns the last dequantized
+        # value.
         qt = torch.ops.fp8_quantization
         _scale_0 = self._scale_0
         quantize_per_tensor_affine_fp8 = qt.quantize_per_tensor_affine_fp8(arg0_1, 0, _scale_0)
@@ -1105,6 +1323,8 @@ class QuantizationFp8Pattern:
 
     @staticmethod
     def pattern(a, a_dtype, a_scale, b, b_dtype, b_scale, out_scale):
+        # [FUNCTION DOC] HELPER: Pattern: dequantize two inputs, add, then quantize the sum.
+        # Contains a stray statement that only references the dequantize op and has no effect.
         qt = torch.ops.fp8_quantization
         a = qt.dequantize_per_tensor_affine_fp8(a, a_dtype, a_scale)
         b = qt.dequantize_per_tensor_affine_fp8(b, b_dtype, b_scale)
@@ -1121,15 +1341,19 @@ class QuantizationFp8Pattern:
     ]
 
 class NoAnchorFound:
+    # [CLASS DOC] HELPER: Matcher model where the pattern has no anchor in the target, so no
+    # matches are expected.
     # This test case is for pattern where no matching anchor is found in the target graph
     # `anchor` is the starting point of the pattern matching, it's usually the boundary returning nodes
     @staticmethod
     def forward(x):
+        # [FUNCTION DOC] HELPER: Adds one to the input and returns it.
         x = x + 1
         return x
 
     @staticmethod
     def pattern(a):
+        # [FUNCTION DOC] HELPER: Pattern: relu of the input.
         b1 = a.relu()
         return b1
 
@@ -1143,6 +1367,8 @@ class NoAnchorFound:
 
 @instantiate_parametrized_tests
 class TestFXMatcherUtils(JitTestCase):
+    # [CLASS DOC] Parameterized tests for the subgraph matcher over the model classes defined
+    # above. Stateless.
 
     @parametrize("test_model", [
         SingleNodePattern,
@@ -1163,6 +1389,13 @@ class TestFXMatcherUtils(JitTestCase):
         NoAnchorFound,
     ])
     def test_subgraph_matcher(self, test_model):
+        # [FUNCTION DOC] Runs the optional class setup, traces the model forward and pattern, then
+        # for each expectation builds a matcher with the given flags, matches against the traced
+        # graph and raises AssertionError if the count differs or if any pattern node (skipping
+        # placeholders or outputs per flags) is missing from a match. Finally calls the class
+        # tearDown.
+        # KNOWN ISSUE: the tearDown step is guarded by a check on setup being callable rather than
+        # tearDown, so it would fail for a model with setup but no tearDown.
 
         setup = getattr(test_model, "setup", None)
         if callable(setup):
