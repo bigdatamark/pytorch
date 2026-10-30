@@ -1,5 +1,13 @@
 # Owner(s): ["module: linear algebra"]
 
+# [MODULE DOC] Tests and numerical reference helpers for scaled matrix multiplication on
+# accelerators: FP8 (tensorwise, rowwise, 1x128 and 128x128 blockwise scaling), MX formats
+# (mxfp8, mxfp4) and NVFP4, plus the scaled grouped GEMM variants. The module defines
+# scale computation, quantize/dequantize and emulated matmul helpers, thin wrappers over
+# the legacy and the v2 scaled matmul entry points, and one device generic test class that
+# is instantiated per device at import time (including XPU). Import-time side effects:
+# probes CUDA capability when CUDA is present and generates the device-specific test
+# classes. Running as a script enables the default dtype check.
 import contextlib
 import json
 import math
@@ -88,6 +96,12 @@ EPS = 1e-12
 def amax_to_scale(
     amax: torch.Tensor, float8_dtype: torch.dtype, orig_dtype: torch.dtype
 ):
+    # [FUNCTION DOC] Converts a tensor of absolute maxima into float8 quantization scales.
+    # Arguments: amax tensor, target float8 dtype (e4m3 or e5m2) and the original dtype.
+    # The scale is the largest positive value of the float8 dtype divided by the amax,
+    # where the amax is first clamped from below by EPS to avoid division by zero. For an
+    # original dtype of float16 the scale is also clamped to the float16 maximum. Returns
+    # a float32 tensor shaped like the amax. Raises ValueError for other dtypes.
     """ Converts the amax value of a tensor to the fp8 scale.
     Args:
         amax: The amax value of the tensor.
@@ -112,6 +126,10 @@ def amax_to_scale(
     return scale
 
 def tensor_to_scale(x: torch.Tensor, float8_dtype: torch.dtype, dim=None):
+    # [FUNCTION DOC] Computes float8 scales for a whole tensor or along a dimension. With
+    # no dim the amax of absolute values is a single scalar; otherwise the amax is reduced
+    # over the given dim keeping that dim with size one. The amax is passed to the amax
+    # conversion helper together with the tensor dtype; returns the float32 scale.
     if dim is None:
         amax = torch.max(torch.abs(x))
     else:
@@ -125,6 +143,13 @@ def tensor_to_scale_block(
     block_outer: int,
     block_inner: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Quantizes a 2D tensor to float8 using one scale per 2D block.
+    # Arguments: the matrix, the float8 dtype, block sizes along the outer (row) and inner
+    # (column) dimensions. The matrix is viewed as a grid of blocks, the per-block
+    # absolute max (as float32) gives a multiplicative scale equal to the float8 maximum
+    # over the amax; blocks that are all zero get scale zero while quantizing and then
+    # scale one so a later reciprocal stays finite. Returns the quantized matrix in the
+    # original 2D shape and the scale matrix with one entry per block.
     x = x.unflatten(1, (-1, block_inner)).unflatten(0, (-1, block_outer))
     amax = x.abs().amax(dim=[1, 3], keepdim=True).float()
     scale = torch.finfo(float8_dtype).max / amax
@@ -147,6 +172,10 @@ def tensor_to_scale_block(
     return x, scale
 
 def hp_from_128x128(x_lp, x_scale):
+    # [FUNCTION DOC] Dequantizes a float8 matrix that used 128x128 blocks. The matrix is
+    # viewed as a grid of 128 by 128 blocks, converted to float32 and divided by the per-
+    # block scale (given as a grid of rows of blocks by columns of blocks). Returns a
+    # bfloat16 tensor with the original shape. Assumes both dims are multiples of 128.
     orig_shape = x_lp.shape
     M, K = orig_shape
     x_lp = x_lp.view(M // 128, 128, K // 128, 128)
@@ -156,6 +185,10 @@ def hp_from_128x128(x_lp, x_scale):
     return x_hp.reshape(orig_shape).to(torch.bfloat16)
 
 def hp_to_128x128(x, x_scale):
+    # [FUNCTION DOC] Quantizes a matrix with 128x128 blocks by multiplying every block by
+    # its scale (scale grid given as rows of blocks by columns of blocks) and casting to
+    # float8 e4m3. Returns the result in the original shape. Both dims must be multiples
+    # of 128. Unlike the block quantizer it does not clamp, so values may saturate.
     orig_shape = x.shape
     M, K = orig_shape
     x = x.view(M // 128, 128, K // 128, 128)
@@ -165,6 +198,10 @@ def hp_to_128x128(x, x_scale):
     return x_lp.reshape(orig_shape).to(torch.float8_e4m3fn)
 
 def hp_from_1x128(x_lp, x_scale):
+    # [FUNCTION DOC] Dequantizes a float8 matrix that used one scale per row segment of
+    # 128 columns. The last dim is split into 128 element segments, converted to float32
+    # and divided by the matching scale, and the result is returned as bfloat16 with the
+    # original shape. Assumes a 2D input whose column count is a multiple of 128.
     orig_shape = x_lp.shape
     x_lp = x_lp.reshape(x_lp.shape[0], x_lp.shape[-1] // 128, 128)
     x_hp = x_lp.to(torch.float32)
@@ -172,6 +209,9 @@ def hp_from_1x128(x_lp, x_scale):
     return x_hp.reshape(orig_shape).to(torch.bfloat16)
 
 def hp_to_1x128(x, x_scale):
+    # [FUNCTION DOC] Quantizes a matrix with one scale per row segment of 128 columns by
+    # multiplying each segment by its scale and casting to float8 e4m3, returning the
+    # original shape. The column count must be a multiple of 128; no clamping is done.
     orig_shape = x.shape
     x = x.reshape(x.shape[0], x.shape[-1] // 128, 128)
     x_lp = x * x_scale.unsqueeze(-1)
@@ -189,6 +229,10 @@ def hp_to_1x128(x, x_scale):
 def _pad_128x128_scales(scale: torch.Tensor) -> (torch.Tensor, int):
     # scale is either [L4, ceil_div(M, 128)] or [L4, ceil_div(N, 128)], stride: [1, L4]
     # However, we get passed it as [ceil_div(M, 128), L] or [ceil_div(N, 128), L]
+    # [FUNCTION DOC] HELPER: Pads the inner dimension of a 128x128 scale matrix up to a
+    # multiple of four, as required by cuBLAS. Argument is the scale matrix; returns a
+    # tuple of the (possibly padded) scale and the number of zero columns appended. Zero
+    # padding is added on the right of the last dim only when it is not already aligned.
     # so check inner dim % 4, and pad if necessary
     pad_amount = scale.shape[-1] % 4
 
@@ -200,6 +244,8 @@ def _pad_128x128_scales(scale: torch.Tensor) -> (torch.Tensor, int):
 
 
 def round_up(x: int, y: int) -> int:
+    # [FUNCTION DOC] HELPER: Rounds the first integer up to the nearest multiple of the
+    # second integer and returns it.
     return ((x + y - 1) // y) * y
 
 
@@ -220,6 +266,14 @@ def scaled_mm_wrap(
     bias=None,
     wrap_v2=wrap,
 ):
+    # [FUNCTION DOC] Calls a scaled matmul through either the legacy or the v2 public API.
+    # Arguments are the two operands, their scales, optional scale recipes and swizzles,
+    # an optional result scale, output dtype (bfloat16 by default), a fast accumulation
+    # flag, an optional bias and the wrap_v2 switch (defaulting to the module level flag).
+    # When wrap_v2 is false the private scaled mm op is called and recipes and swizzles
+    # are ignored. Otherwise missing recipes (and swizzles) are inferred from each scale
+    # tensor and the functional scaled mm is used; result scale is not forwarded then.
+    # Returns the output tensor; errors come from the underlying op.
     if not wrap_v2:
         return torch._scaled_mm(
             a,
@@ -254,6 +308,9 @@ def scaled_mm_wrap(
         return out
 
 def _as_int_list(v):
+    # [FUNCTION DOC] HELPER: Converts an optional enum or list of enums to a plain list of
+    # their integer values, as the raw ATen op expects. None gives an empty list and a
+    # single enum is treated as a one element list.
     # Mirror functional._enum_list_as_int_list: flatten scalar-or-list of enums
     # into the int list the raw aten op expects.
     if v is None:
@@ -280,6 +337,14 @@ def scaled_grouped_mm_wrap(
     wrap_v2=True,
     out=None,
 ):
+    # [FUNCTION DOC] Calls a scaled grouped matmul through one of three code paths.
+    # Arguments are the operands, scales, scale recipes, swizzles, output dtype, fast
+    # accumulation flag, optional group end offsets, optional bias, a wrap_v2 switch and
+    # an optional preallocated out tensor. If wrap_v2 is false the legacy private op is
+    # used (recipes and swizzles ignored). If an out tensor is given with wrap_v2, the raw
+    # v2 ATen op with an out variant is called after normalizing scales to lists and
+    # recipes and swizzles to integer lists. Otherwise the public functional API is used.
+    # Returns the result tensor (the out tensor itself on the out path).
     if not wrap_v2:
         return torch._scaled_grouped_mm(
             a,
@@ -328,6 +393,9 @@ def scaled_grouped_mm_wrap(
 
 def mm_float8_emulated(x, x_scale, y, y_scale, out_dtype, bias: torch.Tensor | None = None) -> torch.Tensor:
     # naive implementation: dq -> op -> q
+    # [FUNCTION DOC] Reference float8 matmul done in float32. Both operands are converted
+    # to float32 and divided by their scales, multiplied with a plain matmul, an optional
+    # bias is added (in float32), and the result is cast to the requested output dtype.
     x_fp32 = x.to(torch.float) / x_scale
     y_fp32 = y.to(torch.float) / y_scale
     out_fp32 = torch.mm(x_fp32, y_fp32)
@@ -337,6 +405,11 @@ def mm_float8_emulated(x, x_scale, y, y_scale, out_dtype, bias: torch.Tensor | N
     return out_fp32.to(out_dtype)
 
 def mm_float8_emulated_block(x, x_scale, y, y_scale, out_dtype) -> torch.Tensor:
+    # [FUNCTION DOC] Reference blockwise float8 matmul in float32. Each operand is viewed
+    # as a grid of blocks whose shape is given by its scale matrix, divided by the
+    # matching block scale, flattened back to 2D and multiplied with a plain matmul.
+    # Returns the result cast to the output dtype. Block sizes are inferred from scale
+    # shapes.
     x = x.unflatten(1, (x_scale.shape[1], -1)).unflatten(0, (x_scale.shape[0], -1))
     y = y.unflatten(1, (y_scale.shape[1], -1)).unflatten(0, (y_scale.shape[0], -1))
     x_fp32 = x.to(torch.float) / x_scale[:, None, :, None]
@@ -356,6 +429,11 @@ def addmm_float8_unwrapped(
     output_scale: torch.Tensor | None,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Float8 addmm helper that takes quantization scales and passes their
+    # reciprocals as dequantization scales to the wrapped scaled matmul. Arguments are the
+    # quantized operands and scales, output dtype, optional output scale and optional
+    # bias. For float32 output with a bias the bias is added afterwards in place because
+    # the kernel does not support that combination; otherwise the bias goes to the kernel.
     a_inverse_scale = a_scale.reciprocal()
     b_inverse_scale = b_scale.reciprocal()
     if output_dtype == torch.float32 and bias is not None:
@@ -385,6 +463,9 @@ def to_fp8_saturated(
     x: torch.Tensor,
     fp8_dtype: torch.dtype
 ):
+    # [FUNCTION DOC] Casts a tensor to a float8 dtype with saturation: values are clamped
+    # to plus or minus the dtype maximum before the cast. Supports only e4m3 and e5m2 and
+    # raises ValueError for any other dtype.
     if fp8_dtype == e4m3_type:
         x = x.clamp(min=-1 * E4M3_MAX_POS, max=E4M3_MAX_POS)
     elif fp8_dtype == e5m2_type:
@@ -397,6 +478,10 @@ def to_fp8_saturated(
 
 
 def compute_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Returns the signal to noise ratio in decibels of a tensor y against a
+    # reference x, computed as twenty times the base ten log of the norm of x over the
+    # norm of the difference. Larger values mean closer agreement; identical inputs give
+    # infinity.
     """Computes the error between two tensors in dB.
 
     For more details see:
@@ -424,6 +509,13 @@ FP4_EBITS, FP4_MBITS = 2, 1
 FP4_MAX_VAL = 6.0
 
 def data_to_mx_scale(x, block_size, recipe):
+    # [FUNCTION DOC] Computes MX block scales (float8 e8m0) from data for the mxfp8 or
+    # mxfp4 recipe. The data is split into blocks of block_size along the last dim; for
+    # each block the largest power of two not above its absolute max is found, the
+    # recipe's largest representable power of two is subtracted, the exponent is clamped
+    # to the e8m0 range, biased, and stored as e8m0. Returns a matrix with one row per
+    # input row. Raises ValueError for another recipe. NaN and zero blocks are not handled
+    # specially.
     # simple implementation of https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
     # section 6.3, not all edge cases (such as NaN) are handled/tested
     if recipe == "mxfp8":
@@ -445,6 +537,10 @@ def data_to_mx_scale(x, block_size, recipe):
 
 
 def data_to_nvfp4_scale(x, block_size):
+    # [FUNCTION DOC] Computes NVFP4 per-block scales stored as float8 e4m3. The data is
+    # split into blocks of block_size along the last dim; each block's absolute max (plus
+    # a tiny epsilon) is divided by the largest FP4 value, clamped to the e4m3 maximum and
+    # cast to e4m3. Returns one row of scales per input row. No global scale is applied.
     orig_shape = x.shape
     x = x.reshape(-1, block_size)
     max_abs = torch.amax(torch.abs(x), 1) + 1e-12
@@ -465,6 +561,11 @@ def data_to_nvfp4_scale(x, block_size):
 
 
 def data_to_nvfp4_with_global_scale(x, block_size):
+    # [FUNCTION DOC] HELPER: Slow reference NVFP4 quantizer with two level scaling.
+    # Computes per-block maxima and a tensor level maximum, derives a global encode scale,
+    # stores per-block decode scales as float8 e4m3 relative to it, scales the data per
+    # block, and packs it into float4 e2m1 pairs. Returns the packed data, the per-block
+    # e4m3 scales shaped with one row per input row, and the float32 global decode scale.
     # Simple (slow) reference implementation of NVFP4 two-level-scaling
     orig_shape = x.shape
     x = x.reshape(-1, block_size)
@@ -501,6 +602,10 @@ def data_to_nvfp4_with_global_scale(x, block_size):
 
 
 def unpack_uint4(uint8_data) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Unpacks a tensor of bytes holding two 4 bit values each into
+    # a uint8 tensor whose last dim is twice as wide. The low nibble becomes the even
+    # position and the high nibble the odd position. Input is viewed as bytes; returns the
+    # new tensor.
     # Take a packed uint8 tensor (i.e. nvfp4) and unpack into
     # a tensor twice as wide. Useful for dequant operations.
     shape = list(uint8_data.shape)
@@ -520,6 +625,10 @@ def unpack_uint4(uint8_data) -> torch.Tensor:
     return out.view(shape)
 
 def _convert_to_nvfp4_with_hp_ref(t):
+    # [FUNCTION DOC] HELPER: Quantizes a tensor to NVFP4 (block size 16, two level scales)
+    # and also reconstructs a high precision version. Returns a tuple of the reconstructed
+    # tensor (unpacked, dequantized with block and global scales), the packed low
+    # precision data, the non-swizzled e4m3 block scales and the float32 global scale.
     # Convert a tensor to nvfp4, returning:
     #   t_hp : reconstructed bf16 version of t_lp
     #   t_lp : nvfp4 tensor (2x elements packed into uint8)
@@ -540,6 +649,9 @@ def _convert_to_nvfp4_with_hp_ref(t):
     return t_hp, t_lp, t_scale, t_global_scale
 
 def _convert_to_mxfp4_with_hp_ref(t):
+    # [FUNCTION DOC] HELPER: Quantizes a tensor to MXFP4 (block size 32) and reconstructs
+    # a high precision version. Returns the reconstructed tensor, the packed fp4 data and
+    # the non-swizzled e8m0 block scales.
     # Convert a tensor to mxfp8, returning:
     #   t_hp : reconstructed bf16 version of t_lp
     #   t_lp : fp8_e4m3 tensor
@@ -557,6 +669,9 @@ def _convert_to_mxfp4_with_hp_ref(t):
     return t_hp, t_lp, t_scale
 
 def _convert_to_mxfp8_with_hp_ref(t):
+    # [FUNCTION DOC] HELPER: Quantizes a tensor to MXFP8 (block size 32) and reconstructs
+    # a high precision version. Returns the reconstructed tensor, the float8 data and the
+    # non-swizzled e8m0 block scales.
     # Convert a tensor to mxfp8, returning:
     #   t_hp : reconstructed bf16 version of t_lp
     #   t_lp : fp8_e4m3 tensor
@@ -567,6 +682,16 @@ def _convert_to_mxfp8_with_hp_ref(t):
     return t_hp, t_lp, t_scale
 
 def _2d_grouped_tensor_to_blocked_scaled(t, MN, G, offs, format='mxfp8'):
+    # [FUNCTION DOC] HELPER: Quantizes a 2D tensor group by group along its columns, where
+    # group ends are given by an offsets tensor, and returns the combined result.
+    # Arguments: the tensor, its leading (row) size MN, the group count G, the offsets and
+    # the format (mxfp8, nvfp4 or mxfp4). Empty groups are skipped. Each group slice is
+    # quantized with the matching reference helper, its scales are swizzled to blocked
+    # layout, and the pieces are concatenated. Returns reconstructed data, quantized data,
+    # blocked scales reshaped to the row count rounded up to 128, and stacked global
+    # scales (only for nvfp4, otherwise None). Raises ValueError for an unknown format.
+    # KNOWN ISSUE: the blocked scale variable is only assigned when the CUDA version is set,
+    # so a non-CUDA build hits an unbound local error. The error text also omits mxfp4.
     # Convert scales to blocked format. either mxfp8 or nvfp4
     th_list = []
     t_list = []
@@ -574,6 +699,7 @@ def _2d_grouped_tensor_to_blocked_scaled(t, MN, G, offs, format='mxfp8'):
     t_global_scale_list = []
 
     def round_up(x: int, y: int) -> int:
+        # [FUNCTION DOC] HELPER: Rounds the first integer up to a multiple of the second.
         return ((x + y - 1) // y) * y
 
     for group_idx in range(G):
@@ -625,6 +751,12 @@ def _2d_grouped_tensor_to_blocked_scaled(t, MN, G, offs, format='mxfp8'):
     return th, tq, t_blocked_scales, t_global_scales
 
 def _build_scaled_grouped_mm_kwargs(scale_a, scale_b, offs, format):
+    # [FUNCTION DOC] HELPER: Builds the keyword arguments for the grouped scaled matmul
+    # for one format. Arguments are the two scales, the offsets and the format name. The
+    # swizzle is the 32_4_4 layout on CUDA and none otherwise. mxfp8 and mxfp4 use the
+    # 1x32 blockwise recipe for both operands; nvfp4 uses a 1x16 blockwise plus tensorwise
+    # recipe pair. All set bfloat16 output and the v2 wrapper. Returns the entry for
+    # format.
     # Build some standard args that are wordy
     swizzle = SwizzleType.NO_SWIZZLE
     if torch.version.cuda:
@@ -659,6 +791,10 @@ def _build_scaled_grouped_mm_kwargs(scale_a, scale_b, offs, format):
     return kwargs[format]
 
 class TestFP8Matmul(TestCase):
+    # [CLASS DOC] Device generic tests for scaled matrix multiplication (float8, MX and
+    # NVFP4 formats, grouped variants, error messages, compile). Holds no state; one test
+    # helper builds a tautological matmul. Most tests are skipped when the platform lacks
+    # FP8 or MX support. Instantiated for each device type at the end of the module.
 
     def _test_tautological_mm(self, device: str,
                               x_dtype: torch.dtype = e4m3_type,
@@ -667,6 +803,11 @@ class TestFP8Matmul(TestCase):
                               x_cm: bool = True,
                               y_cm: bool = False,
                               size: int = 16) -> None:
+        # [FUNCTION DOC] HELPER: Runs a scaled matmul of a random float8 matrix against an
+        # identity matrix with unit scales and checks it equals the float32 reference.
+        # Arguments: device, operand dtypes, optional output dtype, layout flags for each
+        # operand (column major or not, by transposing) and the matrix size. Raises
+        # SkipTest without FP8 support. Asserts the output dtype when one was requested.
         if not PLATFORM_SUPPORTS_FP8:
             raise unittest.SkipTest(f8_msg)
         x_fp8 = torch.rand(size, size, device=device).to(x_dtype)
@@ -702,6 +843,10 @@ class TestFP8Matmul(TestCase):
         name_fn=lambda test_case: test_case[0],
     )
     def test_float8_basics(self, device, test_case) -> None:
+        # [FUNCTION DOC] Parameterized basic float8 test over operand dtype pairs, output
+        # dtypes and sizes. It runs the tautological matmul helper. For e5m2 with e5m2
+        # operands on CUDA (non-ROCm) it expects a ValueError because the hardware does
+        # not support it.
         _, x_dtype, y_dtype, out_dtype, size = test_case
         expect_e5m2_cuda_error = x_dtype == e5m2_type and y_dtype == e5m2_type
         # According to https://docs.nvidia.com/cuda/cublas/#id99 8F_E5M2 MM is unsupported
@@ -722,6 +867,10 @@ class TestFP8Matmul(TestCase):
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     def test_float8_basics_layout_permutations(self, device) -> None:
+        # [FUNCTION DOC] Checks float8 matmul with all four layout combinations on CUDA.
+        # Depending on the compute capability and CUDA version, only some layouts are
+        # supported and the others must raise RuntimeError. On non-CUDA devices only the
+        # standard layout is run as a sanity check.
         if "cuda" in device:
             for (x_cm, y_cm) in itertools.product([True, False], repeat=2):
                 # SM 8.9 and 9 only support TN
@@ -744,6 +893,8 @@ class TestFP8Matmul(TestCase):
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     def test_float8_basics_invalid_out_dtype(self, device) -> None:
+        # [FUNCTION DOC] Checks that requesting an unsupported float8 output dtype fails:
+        # an AssertionError on ROCm, XPU and CPU, otherwise a RuntimeError.
         with self.assertRaises(
             AssertionError if (torch.version.hip or "xpu" in device or "cpu" in device)
             else RuntimeError
@@ -752,6 +903,9 @@ class TestFP8Matmul(TestCase):
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     def test_float8_scale(self, device) -> None:
+        # [FUNCTION DOC] Checks tensorwise scaling: with unit scales the product of
+        # constant half filled matrices is four; using scales of 1.5 and 0.66 (whose
+        # product is about one) gives the same result.
         size = (16, 16)
         x = torch.full(size, .5, device=device, dtype=e4m3_type)
         # hipblaslt does not yet support mixed e4m3_type input
@@ -769,6 +923,10 @@ class TestFP8Matmul(TestCase):
     @skipIfRocm
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     def test_float8_scale_result(self, device) -> None:
+        # [FUNCTION DOC] CUDA only test of the result scale argument of the legacy scaled
+        # mm. Small integer valued float8 operands are multiplied with a result scale of
+        # one half; the e4m3 output must equal the float32 reference times the scale. With
+        # bfloat16 output the result scale must be ignored, matching the unscaled call.
         torch.manual_seed(0)
         a = torch.randint(-1, 2, (32, 16), device=device).float().to(e4m3_type)
         b = torch.randint(-1, 2, (16, 32), device=device).float().t().contiguous().t().to(e4m3_type)
@@ -814,6 +972,14 @@ class TestFP8Matmul(TestCase):
     @parametrize("format", ["mxfp8"] + (["nvfp4", "mxfp4"] if torch.version.cuda else []))
     @parametrize("use_out", [False, True])
     def test_mxfp8_nvfp4_scaled_grouped_mm_2d_2d(self, G, M, N, K, format, use_out, device):
+        # [FUNCTION DOC] Compares grouped scaled matmul with groups along the shared K
+        # dimension (2D by 2D) against a bfloat16 grouped matmul on reconstructed data.
+        # Parameterized over group count, sizes, format (mxfp8, plus nvfp4 and mxfp4 on
+        # CUDA) and whether to pass a preallocated out tensor. Operands are quantized per
+        # group with random jagged offsets; for nvfp4 one global scale per group is
+        # checked. The output must be NaN free, close within tolerance, and share storage
+        # with the out tensor when one was given. mxfp4 is skipped on SM120 and later.
+        # Seeds the RNG for reproducibility.
         torch.manual_seed(42)
 
         if format == "mxfp4" and SM120OrLater:
@@ -896,6 +1062,12 @@ class TestFP8Matmul(TestCase):
     @parametrize("format", ["mxfp8"] + (["nvfp4", "mxfp4"] if torch.version.cuda else []))
     @parametrize("use_out", [False, True])
     def test_mxfp8_scaled_grouped_mm_2d_3d(self, G, M, N, K, format, use_out, device):
+        # [FUNCTION DOC] Compares grouped scaled matmul with a 2D input grouped along M
+        # and a 3D weight (one matrix per group) against a bfloat16 grouped matmul on
+        # reconstructed data. Parameterized over group count, format (mxfp8, nvfp4, mxfp4)
+        # and use of a preallocated out tensor, whose shape is the total rows by N. Checks
+        # storage sharing with out and closeness within tolerance. mxfp4 is skipped on
+        # SM120 and later.
         torch.manual_seed(42)
 
         if format == "mxfp4" and SM120OrLater:
@@ -914,6 +1086,11 @@ class TestFP8Matmul(TestCase):
         # For each constituent 2d subtensor in the 3d weights, quantize and convert scale to blocked format separately,
         # as they each used for independent gemm in the grouped gemm.
         def _3d_to_blocked_scaled(W, G, format):
+            # [FUNCTION DOC] HELPER: Quantizes each group matrix of the 3D weight
+            # separately to the given format, swizzles each scale on CUDA, and stacks the
+            # results. Returns stacked reconstructed data, quantized data, scales and
+            # (nvfp4 only) stacked global scales, otherwise None. Raises ValueError for an
+            # unknown format.
             wh_list = []
             wq_list = []
             w_scale_list = []
@@ -951,6 +1128,13 @@ class TestFP8Matmul(TestCase):
         # For each group along `total_M` in the 2D tensor, quantize and convert scale to blocked format separately,
         # as they each used for independent gemm in the grouped gemm.
         def _2d_to_blocked_scaled(X, K, G, offs, format):
+            # [FUNCTION DOC] HELPER: Quantizes each non-empty group of rows of the 2D
+            # input separately, swizzling scales on CUDA, and concatenates the pieces.
+            # Group boundaries come from the enclosing test's offsets rather than the offs
+            # argument. Returns reconstructed data, quantized data, scales reshaped to K
+            # over the block size columns, and stacked global scales for nvfp4 only
+            # (otherwise None).
+            # KNOWN ISSUE: the offs argument is ignored; enclosing offsets variable is used.
             xh_list = []
             xq_list = []
             x_scale_list = []
@@ -1050,6 +1234,13 @@ class TestFP8Matmul(TestCase):
     @parametrize("x_cm", [True, False])
     @parametrize("y_cm", [True, False])
     def test_scaled_mm_vs_emulated(self, base_dtype, x_cm, y_cm, device):
+        # [FUNCTION DOC] Compares the real float8 scaled matmul against the emulated
+        # version for several base dtypes and operand layouts. Skipped for non-standard
+        # layouts unless the GPU has major capability 10. Operands are scaled tensorwise
+        # to e4m3, saturated, and the two results compared with dtype dependent
+        # tolerances. Seeds the RNG.
+        # KNOWN ISSUE: output dtype always equals base dtype, so the normalization branch
+        # for differing dtypes is dead code.
         # Blackwell (SM_10) supports all possible layout permutations, while Hopper only TN
         if torch.cuda.is_available() and (x_cm, y_cm) != (True, False) and torch.cuda.get_device_properties(0).major != 10:
             raise unittest.SkipTest("Unsupported layout on the architecture")
@@ -1104,6 +1295,12 @@ class TestFP8Matmul(TestCase):
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     @parametrize("base_dtype", [torch.float16, torch.bfloat16, torch.float32])
     def test_scaled_mm_change_stride(self, base_dtype, device):
+        # [FUNCTION DOC] Same comparison as the layout test but with operands created via
+        # strided allocation so that the second operand has a non standard stride,
+        # checking that the scaled matmul handles changed strides. Compared with the
+        # emulated result using dtype dependent tolerances. Seeds the RNG.
+        # KNOWN ISSUE: output dtype always equals base dtype, so the normalization branch
+        # for differing dtypes is dead code.
         torch.manual_seed(42)
         input_dtype = e4m3_type
         output_dtype = base_dtype
@@ -1155,6 +1352,9 @@ class TestFP8Matmul(TestCase):
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     def test_float8_bias(self, device) -> None:
+        # [FUNCTION DOC] Checks the bias argument: with unit operand scales and a constant
+        # bias of four, the output with bias differs from the output without bias by
+        # exactly four.
         (k, l, m) = (16, 48, 32)
         x = torch.ones((k, l), device=device).to(e4m3_type)
         y = torch.full((m, l), .25, device=device, dtype=e4m3_type).t()
@@ -1172,6 +1372,9 @@ class TestFP8Matmul(TestCase):
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     @parametrize("bias", [True, False])
     def test_non_divisible_leading_dim(self, device, bias: bool) -> None:
+        # [FUNCTION DOC] Smoke test that a scaled matmul with a row count of 17 (not
+        # divisible by 16) runs, with and without a bias. Only checks that no error is
+        # raised.
         x = torch.rand((17, 16), device=device).to(e4m3_type)
         y = torch.rand((16, 16), device=device).to(e4m3_type).t()
         scale_a = torch.tensor(1.0, device=device)
@@ -1183,6 +1386,9 @@ class TestFP8Matmul(TestCase):
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     def test_float8_bias_relu_edgecase(self, device) -> None:
+        # [FUNCTION DOC] Checks bias handling when matmul output is zero: zero activations
+        # times ones plus a bias of minus three must give exactly minus three everywhere
+        # (no activation clipping of negative values).
         (k, l, m) = (16, 48, 32)
         x = torch.full((k, l), 0.0, device=device).to(e4m3_type)
         y = torch.full((m, l), 1.0, device=device, dtype=e4m3_type).t()
@@ -1195,6 +1401,10 @@ class TestFP8Matmul(TestCase):
 
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     def test_float32_output_errors_with_bias(self, device) -> None:
+        # [FUNCTION DOC] Checks that float32 output combined with a bias raises an error
+        # with the message that bias is unsupported for float32 output. A ValueError is
+        # expected on CUDA builds and RuntimeError otherwise. Skipped for the error check
+        # on XPU and CPU, which support the combination.
         (k, l, m) = (16, 48, 32)
         x = torch.rand((k, l), device=device).to(e4m3_type)
         y = torch.full((m, l), .25, device=device, dtype=e4m3_type).t()
@@ -1212,6 +1422,9 @@ class TestFP8Matmul(TestCase):
     @onlyCUDA
     @unittest.skipIf(PLATFORM_SUPPORTS_FP8 or not torch.cuda.is_available(), f8_msg)
     def test_error_message_fp8_pre_sm89(self, device) -> None:
+        # [FUNCTION DOC] On a CUDA device whose capability lacks FP8 support, checks that
+        # calling scaled mm raises RuntimeError with the message naming the required
+        # compute capability.
         (k, l, m) = (16, 48, 32)
         x = torch.rand((k, l), device=device).to(e4m3_type)
         y = torch.rand((m, l), device=device).to(e4m3_type).t()
@@ -1226,6 +1439,9 @@ class TestFP8Matmul(TestCase):
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     @skipCUDAIf(SM100OrLater, "fast_accum is SM90-only")
     def test_float8_scale_fast_accum(self, device) -> None:
+        # [FUNCTION DOC] Checks the fast accumulation flag with tensorwise scaling and
+        # e4m3 output: result must equal the constant four, and positional versus keyword
+        # scale arguments must give identical output. Skipped on SM100 and later.
         size = (16, 16)
         x = torch.full(size, .5, device=device, dtype=e4m3_type)
         # hipblaslt does not yet support mixed e4m3_type input
@@ -1242,6 +1458,9 @@ class TestFP8Matmul(TestCase):
     @skipCUDAIf(not SM89OrLater, "rowwise implementation is currently sm89-sm100 specific")
     @parametrize("use_fast_accum", [True, False])
     def test_float8_rowwise_scaling_sanity(self, device, use_fast_accum: bool) -> None:
+        # [FUNCTION DOC] Sanity test of rowwise scaling: all ones scales with constant 0.5
+        # operands must produce the constant K times 0.25 in a bfloat16 output.
+        # Parameterized over the fast accumulation flag.
 
         M, K, N = (1024, 512, 2048)
         fill_value = 0.5
@@ -1269,6 +1488,12 @@ class TestFP8Matmul(TestCase):
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8 or IS_WINDOWS, f8_msg)
     @skipIfTorchDynamo("error message checks rely on eager exception types")
     def test_float8_error_messages(self, device) -> None:
+        # [FUNCTION DOC] Checks error messages for invalid scale arguments: wrong
+        # tensorwise scale size, wrong rowwise scale length, a scale of missing dimension
+        # (IndexError), and a non unit scale stride (ValueError). Then runs a mixed e4m3
+        # and e5m2 product, which succeeds with value 128 on XPU, CPU and CUDA SM90 with
+        # CUDA 12.9 or newer, and on other backends must raise the expected dtype error
+        # (ValueError on ROCm, RuntimeError on CUDA). Skipped under TorchDynamo.
         M, K, N = (1024, 512, 2048)
         fill_value = 0.5
         x = torch.full((M, K), fill_value, device=device)
@@ -1329,6 +1554,8 @@ class TestFP8Matmul(TestCase):
             )
 
         def e5m2():
+            # [FUNCTION DOC] HELPER: Runs a rowwise scaled matmul where the second operand
+            # is cast to e5m2 while the first stays e4m3, and returns the output tensor.
             out = scaled_mm_wrap(
                 x_fp8,
                 y_fp8.to(e5m2_type),
@@ -1369,6 +1596,12 @@ class TestFP8Matmul(TestCase):
     ])
     @with_tf32_off
     def test_scaled_mm_vs_emulated_row_wise(self, base_dtype, shapes, device):
+        # [FUNCTION DOC] Compares rowwise scaled matmul against the emulated float32
+        # reference for bfloat16, float16 and float32, with a bias for the half precision
+        # types. Skips unsupported combinations on ROCm and pre-SM90 for float16. Scales
+        # are computed per row and per column, results are compared with dtype dependent
+        # tolerances and a cosine similarity floor of 0.999. TF32 is disabled and the RNG
+        # is seeded.
         M, K, N = shapes
         # Fp32 out_dtype works on the cuBLAS row-wise path when available; otherwise
         # the CUTLASS row-wise fallback now covers the no-bias case.
@@ -1399,6 +1632,10 @@ class TestFP8Matmul(TestCase):
         y_fp8 = to_fp8_saturated(y * y_scales, e4m3_type)
 
         def test():
+            # [FUNCTION DOC] HELPER: Runs the scaled matmul with reciprocal scales and
+            # optional bias, computes the emulated result, and asserts they agree within
+            # tolerance chosen by dtype and that cosine similarity of the flattened
+            # results is at least 0.999.
             # Calculate actual F8 mm
             out_scaled_mm = scaled_mm_wrap(
                 x_fp8,
@@ -1440,6 +1677,11 @@ class TestFP8Matmul(TestCase):
     @parametrize("wrap_v2", [True, False])
     @with_tf32_off
     def test_scaled_mm_row_wise_no_bias_output_dtypes(self, output_dtype, wrap_v2, device):
+        # [FUNCTION DOC] Checks that rowwise scaled matmul without bias returns the
+        # requested output dtype (bfloat16, float16 or float32) through the legacy and v2
+        # entry points. Half precision outputs are compared elementwise with the emulated
+        # result; float32 uses a cosine similarity floor of 0.999. Skipped on ROCm for non
+        # bfloat16 outputs.
         # No-bias row-wise binds the output dtype directly; this covers bf16/fp16/fp32
         # through both public entry points. Backend routing may still choose cuBLAS or
         # the CUTLASS fallback depending on CUDA version / arch.
@@ -1483,6 +1725,10 @@ class TestFP8Matmul(TestCase):
     @skipCUDAIf(not SM89OrLater, "rowwise implementation is currently sm89-sm100 specific")
     @parametrize("wrap_v2", [True, False])
     def test_scaled_mm_row_wise_fp32_out_with_bias_errors(self, wrap_v2, device):
+        # [FUNCTION DOC] CUDA only test that rowwise scaling with float32 output and a
+        # bias raises an error (ValueError or RuntimeError) whose message says bias is not
+        # supported for float32 output, via both the legacy and v2 entry points. Skipped
+        # on ROCm.
         # fp32 output combined with a bias is not supported on the row-wise path.
         if torch.version.hip:
             raise unittest.SkipTest("hipblaslt rowwise _scaled_mm only supports BFloat16")
@@ -1537,6 +1783,17 @@ class TestFP8Matmul(TestCase):
         "data_random_calc_scales",
     ])
     def test_scaled_mm_block_wise_numerics(self, output_dtype, lhs_block, rhs_block, M, N, K, test_case, device):
+        # [FUNCTION DOC] Numerics test of DeepSeek style blockwise scaling (1x128 and
+        # 128x128) on SM90 (CUDA 12.9 or newer) or XPU. Parameterized over output dtype,
+        # the block shape of each operand, matrix sizes and input cases: identity
+        # matrices, all ones with scales computed, set or modified, random data with unit
+        # scales, and random data with computed scales. For each case operands and scales
+        # are built, scales are laid out as the backend needs (padding to a multiple of
+        # four on CUDA), and the scaled matmul is compared with the emulated blockwise
+        # result and the full precision product using cosine similarity and tolerances.
+        # Raises ValueError for an unknown case.
+        # KNOWN ISSUE: for the identity case with a non square size the code returns a skip
+        # object instead of raising a skip, so the test passes silently without checking.
         """
         subsume test_scaled_mm_vs_emulated_block_wise for random inputs, random scales,
         do some other functional tests as well.
@@ -1566,6 +1823,12 @@ class TestFP8Matmul(TestCase):
         is_xpu = "xpu" in str(device)
 
         def _adjust_lhs_scale(x_fp8, x_scales, lhs_block):
+            # [FUNCTION DOC] HELPER: Prepares the left operand's scale for the chosen
+            # block shape. Returns the dequantized high precision operand, the scaling
+            # recipe, the scale in the layout the backend needs, and an unmodified copy of
+            # the original scale. One row blocks use a column major copy and have shape
+            # and stride checked; 128x128 blocks are padded to a multiple of four and
+            # transposed on CUDA, and only transposed on XPU.
             M, K = x_fp8.shape
             x_scales_original = x_scales.clone()
             # 1x128 blocks need scales to be outer-dim-major
@@ -1594,6 +1857,10 @@ class TestFP8Matmul(TestCase):
             return x_hp, lhs_recipe, x_scales, x_scales_original
 
         def _adjust_rhs_scale(y_fp8, y_scales, rhs_block):
+            # [FUNCTION DOC] HELPER: Same as the left operand helper but for the right
+            # operand. Returns the dequantized operand, scaling recipe, backend layout
+            # scale and a copy of the original scale. Checks shape and stride for 1x128
+            # blocks; for 128x128 blocks pads (CUDA) and transposes the scale.
             N, K = y_fp8.shape
             y_scales_original = y_scales.clone()
 
@@ -1624,6 +1891,9 @@ class TestFP8Matmul(TestCase):
             return y_hp, rhs_recipe, y_scales, y_scales_original
 
         def _build_lhs(x, lhs_block):
+            # [FUNCTION DOC] HELPER: Quantizes the left operand to e4m3 with blocks of the
+            # given row size by 128 columns and adjusts its scale. Returns the dequantized
+            # operand, recipe, quantized data, backend layout scale and original scale.
             M, K = x.shape
 
             x_fp8, x_scales = tensor_to_scale_block(x, e4m3_type, lhs_block, 128)
@@ -1634,6 +1904,10 @@ class TestFP8Matmul(TestCase):
             return x_hp, x_recipe, x_fp8, x_scales, x_scales_original
 
         def _build_rhs(y, rhs_block):
+            # [FUNCTION DOC] HELPER: Quantizes the right operand to e4m3 with blocks of
+            # the given row size by 128 columns and adjusts its scale. Returns the
+            # dequantized operand, recipe, quantized data, backend layout scale and
+            # original scale.
             N, K = y.shape
 
             y_fp8, y_scales = tensor_to_scale_block(y, e4m3_type, rhs_block, 128)
@@ -1643,6 +1917,13 @@ class TestFP8Matmul(TestCase):
 
         def _run_test(x_hp, x_recipe, x_fp8, x_scales, x_scales_original,
                       y_hp, y_recipe, y_fp8, y_scales, y_scales_original):
+            # [FUNCTION DOC] HELPER: Runs the scaled matmul on prepared operands (using
+            # reciprocal scales), builds the emulated blockwise result, and asserts: the
+            # emulated result matches the full precision product, the real result matches
+            # the emulated one, and the real result matches the full precision product,
+            # each by cosine similarity of at least 0.999, plus an elementwise comparison
+            # with tolerances depending on output dtype. Uses enclosing variables for the
+            # full precision inputs and output dtype.
 
             # Calculate actual F8 mm
             out_scaled_mm = scaled_mm_wrap(
@@ -1690,6 +1971,9 @@ class TestFP8Matmul(TestCase):
             self.assertGreaterEqual(float(cosine_sim), 0.999)
 
         def _build_constant_scale(t, block, val):
+            # [FUNCTION DOC] HELPER: Builds a scale tensor of constant value on the
+            # device. Shape is one entry per row and 128 column segment for one row
+            # blocks, otherwise one entry per 128 by 128 block.
             M, K = t.shape
 
             if block == 1:
@@ -1702,6 +1986,9 @@ class TestFP8Matmul(TestCase):
             return scale
 
         def hp_to_scaled(t, scale, block):
+            # [FUNCTION DOC] HELPER: Quantizes a high precision tensor to e4m3 using the
+            # given scale, dispatching to the 1x128 or 128x128 quantizer based on the
+            # block size.
             if block == 1:
                 return hp_to_1x128(t, scale)
             else:
@@ -1778,6 +2065,10 @@ class TestFP8Matmul(TestCase):
     def test_scaled_mm_vs_emulated_block_wise_verify_small_shapes(
         self, output_dtype, lhs_block, rhs_block, M, N, K, device
     ):
+        # [FUNCTION DOC] Smoke test that blockwise (1x128 or 128x128) scaled matmul runs
+        # without error on small shapes and that the emulated blockwise matmul also runs.
+        # Builds cubed random inputs, quantizes them blockwise, and lays out scales for
+        # CUDA (padding) or XPU. No numeric comparison is performed. Seeds the RNG.
         torch.manual_seed(42)
 
         x = torch.randn(M, K, device=device, dtype=output_dtype).pow(3)
@@ -1865,6 +2156,10 @@ class TestFP8Matmul(TestCase):
     def test_scaled_mm_deepseek_error_messages(
         self, output_dtype, lhs_block, rhs_block, M, N, K, device
     ):
+        # [FUNCTION DOC] Checks that DeepSeek style blockwise scaling on hardware that
+        # does not support it (non SM90 CUDA, or ROCm) raises NotImplementedError with a
+        # message saying so. Operands are quantized blockwise and scales laid out column
+        # major for 1x128 blocks. Seeds the RNG.
 
         torch.manual_seed(42)
 
@@ -1914,6 +2209,10 @@ class TestFP8Matmul(TestCase):
     @parametrize("which_dim_zero", [0, 1, 2])
     @parametrize("use_torch_compile", [False, True])
     def test_zero_dim_tensorwise(self, which_dim_zero, use_torch_compile, device) -> None:
+        # [FUNCTION DOC] Checks scaled matmul with a zero sized dimension (rows, inner or
+        # columns), optionally under compile, using minus infinity scales. The result must
+        # have the requested dtype and equal the float32 matmul reference of zero sized
+        # operands.
         x_dtype, y_dtype = e4m3_type, e4m3_type
         out_dtype = torch.bfloat16
         M, K, N = 32, 32, 32
@@ -1942,6 +2241,15 @@ class TestFP8Matmul(TestCase):
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     @unittest.skipIf(not SM90OrLater, "sm89 kernel isn't opted into carveout yet")
     def test_honor_sm_carveout(self, device) -> None:
+        # [FUNCTION DOC] Checks that the experimental SM carveout setting changes kernel
+        # launch behavior, using a profiler trace. Runs the rowwise scaled matmul four
+        # times: default, carveout zero, carveout 66, and reset to default, then reads the
+        # exported trace from a temporary file. On CUDA it compares kernel grid sizes
+        # (equal with no carveout, differ with 66 except on SM100 and later where carveout
+        # is expected to have no effect). On ROCm it compares kernel durations and stream
+        # ids. Modifies the global carveout setting.
+        # KNOWN ISSUE: the ROCm debug printing condition starts with a constant true, so
+        # debug information is always printed on ROCm.
         torch.manual_seed(42)
 
         x = torch.randn(8192, 2048, device=device, dtype=torch.float32)
@@ -2018,6 +2326,9 @@ class TestFP8Matmul(TestCase):
 
     @skipXPU
     def test_pack_uint4(self):
+        # [FUNCTION DOC] Checks the nibble order when packing two 4 bit values into one
+        # byte: the second value goes into the high bits. Packs two known values and
+        # compares with the expected byte exactly. Skipped on XPU.
         """
         Verify that given a tensor with high precision values [val0, val1],
         the x2 packed representation is val1:val0 (from MSB to LSB), and
@@ -2053,6 +2364,12 @@ class TestFP8Matmul(TestCase):
         (1025, 128, 96)
     ], name_fn=lambda mkn: f"{mkn[0]}_{mkn[1]}_{mkn[2]}")
     def test_blockwise_nvfp4_with_global_scale(self, mkn, device) -> None:
+        # [FUNCTION DOC] Checks NVFP4 matmul with two level (block and global) scaling for
+        # many shape combinations on CUDA or XPU (XPU needs Xe2 or later). Quantizes
+        # random large magnitude bfloat16 inputs with the reference quantizer, swizzles
+        # scales on CUDA, calls the functional scaled matmul with block and global scales,
+        # and asserts the signal to noise ratio against the full precision product exceeds
+        # 15.8 decibels.
         if "xpu" in device and not Xe2_Or_Later:
             raise unittest.SkipTest("NVFP4 numerics require Xe2+ on XPU")
         M, K, N = mkn
@@ -2131,6 +2448,14 @@ class TestFP8Matmul(TestCase):
     ], name_fn=lambda mkn: f"{mkn[0]}_{mkn[1]}_{mkn[2]}")
     @parametrize("recipe", ["mxfp8", "mxfp4", "nvfp4"])
     def test_blockwise_mxfp8_nvfp4_mxfp4_numerics(self, test_case_name, fast_accum, mkn, recipe, device) -> None:
+        # [FUNCTION DOC] Numerics test of MX and NVFP4 blockwise scaled matmul for many
+        # shapes, recipes (mxfp8, mxfp4, nvfp4) and fast accumulation. Several cases are
+        # skipped by platform or divisibility rules. Cases: identity, all ones, modified
+        # data or scale in one block, random exactly representable data with unit scales,
+        # and random data with scales derived from data. Scales are swizzled (except ROCm
+        # and XPU) and the scaled matmul is compared exactly with the reference for
+        # structured cases, or by signal to noise ratio (above 22, or 15 or 15.8 for
+        # derived scales on fp4 recipes) otherwise.
         if torch.version.hip and recipe == "nvfp4":
             raise unittest.SkipTest("nvfp4 not supported on ROCm, skipping")
         if (recipe == "nvfp4" or recipe == "mxfp4") and fast_accum:
@@ -2361,6 +2686,12 @@ class TestFP8Matmul(TestCase):
     @skipXPU
     @unittest.skipIf(not PLATFORM_SUPPORTS_MX_GEMM or IS_WINDOWS, mx_skip_msg)
     def test_passed_swizzle_arrays(self, device) -> None:
+        # [FUNCTION DOC] Checks validation of swizzle argument counts in the functional
+        # scaled matmul. Missing or wrong sized swizzle lists must raise ValueError (a
+        # specific message for the first or second operand), with different messages on
+        # ROCm, where non trivial swizzles are rejected and NVFP4 raises
+        # NotImplementedError. Covers mxfp8 with one value and NVFP4 two level scaling
+        # with two values. Skipped on XPU and Windows.
         # Ensure that incorrectly-sized swizzle arrays are caught
         M, N, K = 128, 128, 128
 
@@ -2483,6 +2814,10 @@ class TestFP8Matmul(TestCase):
     @unittest.skipIf(not PLATFORM_SUPPORTS_MX_GEMM or IS_WINDOWS, mx_skip_msg)
     @parametrize("recipe", ["mxfp8", "mxfp4" if torch.version.hip else "nvfp4"])
     def test_blockwise_mxfp8_nvfp4_error_messages(self, device, recipe) -> None:
+        # [FUNCTION DOC] Checks error messages for invalid blockwise scale tensors: a
+        # scale with too few elements for the first operand, too many for the second, and
+        # non contiguous scales. Each must raise ValueError with an informative message.
+        # Skipped on XPU. mxfp4 is skipped on SM120 and later.
         if "xpu" in device:
             raise unittest.SkipTest("Error messages test not supported on XPU, skipping")
         if recipe == "mxfp4" and SM120OrLater:
@@ -2578,6 +2913,10 @@ class TestFP8Matmul(TestCase):
             )
 
     def scaled_grouped_mm_helper(self, alist, blist, ascalelist, bscalelist, outlist, use_fast_accum):
+        # [FUNCTION DOC] HELPER: For each group, computes a reference result with the
+        # plain scaled matmul (scales reshaped to a column and a row, bfloat16 output,
+        # given fast accumulation flag) and asserts it is close to the corresponding
+        # grouped result entry.
         for a, b, ascale, bscale, out in zip(alist, blist, ascalelist, bscalelist, outlist):
             out_ref = scaled_mm_wrap(a, b.t(), ascale.view(-1, 1), bscale.view(1, -1),
                                      out_dtype=torch.bfloat16, use_fast_accum=use_fast_accum)
@@ -2595,6 +2934,10 @@ class TestFP8Matmul(TestCase):
     # AMD does not support NVFP4
     @parametrize("wrap_v2", [True, False])
     def test_scaled_grouped_gemm_2d_2d(self, fast_accum, strided, wrap_v2, device):
+        # [FUNCTION DOC] Tests scaled grouped matmul with rowwise scales where groups are
+        # split along the inner dimension (both operands 2D). Optionally uses strided
+        # inputs (CUDA only) and both wrapper paths. Compares each group's output slice
+        # against the per group reference helper.
 
         fp8_dtype = e4m3_type
         m, n, k, n_groups = 16, 32, 64, 4
@@ -2632,6 +2975,10 @@ class TestFP8Matmul(TestCase):
     @parametrize("strided", [False] + ([True] if torch.version.cuda else []))
     @parametrize("wrap_v2", [True, False])
     def test_scaled_grouped_gemm_2d_3d(self, fast_accum, strided, wrap_v2, device):
+        # [FUNCTION DOC] Tests rowwise scaled grouped matmul with a 2D first operand split
+        # into groups along rows and a 3D second operand, with and without a zero sized
+        # first group. Optionally strided inputs; checks contiguity expectations. Compares
+        # group results with the per group reference helper using cumulative lists.
 
         fp8_dtype = e4m3_type
         m, n, k, n_groups = 16, 32, 64, 4
@@ -2677,6 +3024,9 @@ class TestFP8Matmul(TestCase):
     # AMD does not support non-contiguous inputs yet
     @parametrize("strided", [False] + ([True] if torch.version.cuda else []))
     def test_scaled_grouped_gemm_3d_3d(self, fast_accum, strided, device):
+        # [FUNCTION DOC] Tests the legacy grouped scaled matmul with both operands 3D
+        # (batched, no offsets), optionally with strided inputs, comparing against the per
+        # group reference helper.
 
         fp8_dtype = e4m3_type
         m, n, k, n_groups = 16, 32, 64, 4
@@ -2701,6 +3051,10 @@ class TestFP8Matmul(TestCase):
     # AMD does not support non-contiguous inputs yet
     @parametrize("strided", [False] + ([True] if torch.version.cuda else []))
     def test_scaled_grouped_gemm_3d_2d(self, fast_accum, strided, device):
+        # [FUNCTION DOC] Tests the legacy grouped scaled matmul with a 3D first operand
+        # and a 2D second operand split into groups by offsets, with and without a zero
+        # sized first group, optionally strided. Compares group results with the per group
+        # reference helper.
 
         fp8_dtype = e4m3_type
         m, n, k, n_groups = 16, 32, 64, 4
@@ -2736,6 +3090,8 @@ class TestFP8Matmul(TestCase):
     @onlyAccelerator
     @unittest.skipIf(not PLATFORM_SUPPORTS_MX_GEMM, mx_skip_msg)
     def test_blockwise_mxfp8_compile(self, device) -> None:
+        # [FUNCTION DOC] Checks that an identity matmul in mxfp8 with unit scales, run
+        # through the inductor compiled wrapper, equals the reference exactly.
 
         M, K, N = 128, 128, 128
         BLOCK_SIZE = 32
@@ -2765,6 +3121,9 @@ class TestFP8Matmul(TestCase):
     @onlyAccelerator
     @unittest.skipIf(not PLATFORM_SUPPORTS_MX_GEMM, mx_skip_msg)
     def test_blockwise_nvfp4_compile(self, device) -> None:
+        # [FUNCTION DOC] Checks that an identity matmul in NVFP4 (MX style scaling dtype
+        # on ROCm) with unit scales, run through the inductor compiled wrapper, equals the
+        # reference exactly.
 
         M, K, N = 128, 128, 128
         BLOCK_SIZE = 32 if torch.version.hip else 16
@@ -2797,6 +3156,9 @@ class TestFP8Matmul(TestCase):
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8, f8_msg)
     @skipIfRocm
     def test_scaled_mm_v2_fullgraph(self, device) -> None:
+        # [FUNCTION DOC] Checks that the v2 functional scaled matmul with tensorwise
+        # scales can be compiled with a single graph and gives the same result as eager
+        # execution. Skipped on ROCm.
         m, n, k = 15, 32, 16
         a = torch.randn(m, k, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
         b = torch.randn(k, n, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn).t().contiguous().t()
@@ -2804,6 +3166,8 @@ class TestFP8Matmul(TestCase):
         scale_b = torch.ones(1, device=device)
 
         def fn(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Calls the v2 functional scaled matmul with tensorwise
+            # recipes and no swizzle, producing bfloat16 output.
             return scaled_mm(
                 a, b,
                 scale_a=scale_a,
@@ -2823,6 +3187,8 @@ class TestFP8Matmul(TestCase):
     @onlyAccelerator
     @unittest.skipIf(not PLATFORM_SUPPORTS_FP8_GROUPED_GEMM, f8_grouped_msg)
     def test_scaled_grouped_mm_v2_fullgraph(self, device) -> None:
+        # [FUNCTION DOC] Checks that the v2 functional scaled grouped matmul with rowwise
+        # scales and offsets compiles as a single graph and matches eager execution.
         fp8_dtype = e4m3_type
         m, n, k, n_groups = 16, 32, 64, 4
         a = torch.randn(m, k * n_groups, device=device).to(fp8_dtype)
@@ -2832,6 +3198,9 @@ class TestFP8Matmul(TestCase):
         offs = torch.arange(k, n_groups * k + 1, k, device=device, dtype=torch.int32)
 
         def fn(a, b, scale_a, scale_b, offs):
+            # [FUNCTION DOC] HELPER: Calls the v2 functional scaled grouped matmul with a
+            # transposed second operand, rowwise recipes and offsets, producing bfloat16
+            # output.
             return scaled_grouped_mm(
                 a, b.t(),
                 scale_a,
