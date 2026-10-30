@@ -1,5 +1,12 @@
 # Owner(s): ["oncall: quantization"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for the FX model report tooling (ModelReport, the detectors,
+# ModelReportObserver and ModelReportVisualizer) under the quantized backends fbgemm and qnnpack.
+# Defines example models and module level sample Sequential models, then test classes for the
+# per channel detector, the observer statistics, the dynamic vs static detector, the ModelReport
+# class, input-weight equalization, outlier detection and the visualizer. Import time side
+# effects: builds the module level example models only. When run directly the file raises an error
+# pointing to the main quantization test entry point.
 
 import torch
 import torch.nn as nn
@@ -85,28 +92,41 @@ FUSION_CONV_LINEAR_EXAMPLE = torch.nn.Sequential(
 # Test class
 # example model to use for tests
 class ThreeOps(nn.Module):
+    # [CLASS DOC] HELPER: Small test model with a linear layer, a 2d batch norm and a ReLU applied
+    # in sequence; used by the ModelReport tests as a simple model to prepare and calibrate.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the linear (3 to 3 features), batch norm (3 channels) and
+        # ReLU submodules.
         super().__init__()
         self.linear = nn.Linear(3, 3)
         self.bn = nn.BatchNorm2d(3)
         self.relu = nn.ReLU()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies linear, batch norm, then ReLU to the input and returns
+        # the result.
         x = self.linear(x)
         x = self.bn(x)
         x = self.relu(x)
         return x
 
     def get_example_inputs(self):
+        # [FUNCTION DOC] HELPER: Returns a one element tuple holding a random float tensor of
+        # shape 1x3x3x3, the example input for preparing the model.
         return (torch.randn(1, 3, 3, 3),)
 
 class TwoThreeOps(nn.Module):
+    # [CLASS DOC] HELPER: Test model made of two ThreeOps blocks; the second block consumes the
+    # first block output, the two outputs are added and passed through a functional ReLU.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the two ThreeOps submodules block1 and block2.
         super().__init__()
         self.block1 = ThreeOps()
         self.block2 = ThreeOps()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs block1, feeds its output to block2, adds both outputs,
+        # applies ReLU and returns the sum.
         x = self.block1(x)
         y = self.block2(x)
         z = x + y
@@ -114,13 +134,23 @@ class TwoThreeOps(nn.Module):
         return z
 
     def get_example_inputs(self):
+        # [FUNCTION DOC] HELPER: Returns a one element tuple holding a random float tensor of
+        # shape 1x3x3x3.
         return (torch.randn(1, 3, 3, 3),)
 
 class TestFxModelReportDetector(QuantizationTestCase):
+    # [CLASS DOC] Tests the PerChannelDetector on models prepared with fx quantization and
+    # calibrated with one input. Each test builds a QConfigMapping for a backend, runs the
+    # detector report and checks the suggestion text and the per module info (backend, per channel
+    # supported and used flags). Covers a single conv, multiple linears, mixed qconfigs, nested
+    # sequential, lazy conv subclasses, fused modules and a QAT model.
 
     """Prepares and calibrate the model"""
 
     def _prepare_model_and_run_input(self, model, q_config_mapping, input):
+        # [FUNCTION DOC] HELPER: Prepares the model with prepare_fx using the given qconfig
+        # mapping and example input, runs the input once through the prepared model to calibrate
+        # it, and returns the prepared model.
         model_prep = torch.ao.quantization.quantize_fx.prepare_fx(model, q_config_mapping, input)  # prep model
         model_prep(input).sum()  # calibrate the model
         return model_prep
@@ -136,6 +166,10 @@ class TestFxModelReportDetector(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_simple_conv(self):
+        # [FUNCTION DOC] With the fbgemm engine, prepares a single conv model using the default
+        # fbgemm qconfig and runs the detector. Expects the default no-optimizations message,
+        # exactly one entry named conv with backend fbgemm, and per channel quantization both
+        # supported and used.
 
         with override_quantized_engine('fbgemm'):
             torch.backends.quantized.engine = "fbgemm"
@@ -177,6 +211,10 @@ class TestFxModelReportDetector(QuantizationTestCase):
 
     @skipIfNoQNNPACK
     def test_multi_linear_model_without_per_channel(self):
+        # [FUNCTION DOC] With qnnpack, prepares a two layer linear model using the default qnnpack
+        # qconfig (no per channel weights). Expects a suggestion message different from the no-
+        # optimizations text, two entries with backend qnnpack, each supported but not used for
+        # per channel quantization.
 
         with override_quantized_engine('qnnpack'):
             torch.backends.quantized.engine = "qnnpack"
@@ -222,6 +260,10 @@ class TestFxModelReportDetector(QuantizationTestCase):
 
     @skipIfNoQNNPACK
     def test_multiple_q_config_options(self):
+        # [FUNCTION DOC] Uses qnnpack with a global default qconfig and a per channel qconfig set
+        # only for the conv type. Expects a suggestion message, four entries, with per channel
+        # supported everywhere, used for the conv layers and unused for the fc layers; any other
+        # key raises a ValueError.
 
         with override_quantized_engine('qnnpack'):
             torch.backends.quantized.engine = "qnnpack"
@@ -234,7 +276,10 @@ class TestFxModelReportDetector(QuantizationTestCase):
 
             # we need to design the model
             class ConvLinearModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local model with conv, linear, ReLU, linear, conv layers in a
+            # row, used to test mixed qconfigs.
                 def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates two convs, two linears and a ReLU as attributes.
                     super().__init__()
                     self.conv1 = torch.nn.Conv2d(3, 3, 2, 1)
                     self.fc1 = torch.nn.Linear(9, 27)
@@ -243,6 +288,8 @@ class TestFxModelReportDetector(QuantizationTestCase):
                     self.conv2 = torch.nn.Conv2d(3, 3, 2, 1)
 
                 def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv1, fc1, relu, fc2, conv2 in order and returns
+                # the result.
                     x = self.conv1(x)
                     x = self.fc1(x)
                     x = self.relu(x)
@@ -300,6 +347,9 @@ class TestFxModelReportDetector(QuantizationTestCase):
 
     @skipIfNoQNNPACK
     def test_sequential_model_format(self):
+        # [FUNCTION DOC] With qnnpack and the default qconfig, runs the detector on a nested
+        # sequential model of convs and linears. Expects a suggestion message and four entries
+        # (the nested layers are found), all supported for per channel but not used.
 
         with override_quantized_engine('qnnpack'):
             torch.backends.quantized.engine = "qnnpack"
@@ -344,6 +394,9 @@ class TestFxModelReportDetector(QuantizationTestCase):
 
     @skipIfNoQNNPACK
     def test_conv_sub_class_considered(self):
+        # [FUNCTION DOC] With qnnpack and the default qconfig, runs the detector on a sequential
+        # model using lazy conv layers. Expects a suggestion message and four entries, showing the
+        # lazy conv subclass is considered; all supported but not used for per channel.
 
         with override_quantized_engine('qnnpack'):
             torch.backends.quantized.engine = "qnnpack"
@@ -388,6 +441,9 @@ class TestFxModelReportDetector(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_fusion_layer_in_sequential(self):
+        # [FUNCTION DOC] With fbgemm and the default qconfig, runs the detector on a sequential
+        # model built from already fused conv/ReLU and linear/ReLU modules. Expects the no-
+        # optimizations message and four entries, all supported and used for per channel.
 
         with override_quantized_engine('fbgemm'):
             torch.backends.quantized.engine = "fbgemm"
@@ -431,10 +487,18 @@ class TestFxModelReportDetector(QuantizationTestCase):
 
     @skipIfNoQNNPACK
     def test_qat_aware_model_example(self):
+        # [FUNCTION DOC] Builds a QAT model (conv, bn, relu fused after quantization stubs) with
+        # the default qnnpack QAT qconfig, fuses in eval mode, prepares with prepare_qat in train
+        # mode and runs the detector. Expects a suggestion message and a single entry that is per
+        # channel supported but not used.
 
         # first we want a QAT model
         class QATConvLinearReluModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local float model with quant stub, conv, batch norm, ReLU and
+            # dequant stub used for the QAT test.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the quant and dequant stubs, a 1 channel conv,
+                # batch norm and ReLU.
                 super().__init__()
                 # QuantStub converts tensors from floating point to quantized
                 self.quant = torch.ao.quantization.QuantStub()
@@ -445,6 +509,8 @@ class TestFxModelReportDetector(QuantizationTestCase):
                 self.dequant = torch.ao.quantization.DeQuantStub()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Quantizes the input, applies conv, bn, relu and
+                # dequantizes the result.
                 x = self.quant(x)
                 x = self.conv(x)
                 x = self.bn(x)
@@ -505,8 +571,16 @@ Partition on Output
 
 
 class TestFxModelReportObserver(QuantizationTestCase):
+    # [CLASS DOC] Tests ModelReportObserver statistics. Holds a nested model class with an
+    # observer before and after a linear block, and a shared checker that feeds batches and
+    # verifies the running batch range average, the epoch min and max, and the batch to epoch
+    # ratio after a reset. Individual tests cover zero input, a single batch of ones, an observer
+    # after a ReLU and random shapes and models.
     class NestedModifiedSingleLayerLinear(torch.nn.Module):
+        # [CLASS DOC] HELPER: Model with an observer, a single layer linear model, a second
+        # observer, a linear and a ReLU; observer obs1 sees the model input.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates obs1, mod1, obs2, a 5 by 5 float linear and a ReLU.
             super().__init__()
             self.obs1 = ModelReportObserver()
             self.mod1 = SingleLayerLinearModel()
@@ -515,6 +589,8 @@ class TestFxModelReportObserver(QuantizationTestCase):
             self.relu = torch.nn.ReLU()
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Passes data through obs1, mod1, obs2, fc1 and relu and
+            # returns the output.
             x = self.obs1(x)
             x = self.mod1(x)
             x = self.obs2(x)
@@ -523,6 +599,14 @@ class TestFxModelReportObserver(QuantizationTestCase):
             return x
 
     def run_model_and_common_checks(self, model, ex_input, num_epochs, batch_size):
+        # [FUNCTION DOC] HELPER: Shared checker. Splits the example input into batches along the
+        # first dimension, and for each epoch resets every ModelReportObserver and checks the
+        # reset values (zero average range, infinite min, negative infinite max). For each batch
+        # it checks the tracked batch count, runs the model and verifies the running average range
+        # of obs1 and, when the epoch range was positive, the batch to epoch ratio.
+        # KNOWN ISSUE: the model is called with the whole example input rather than the current
+        # batch, while the expected values are computed from the current batch; the checks are
+        # only consistent when there is a single batch or the data is constant.
         # split up data into batches
         split_up_data = torch.split(ex_input, batch_size)
         for _epoch in range(num_epochs):
@@ -580,6 +664,9 @@ class TestFxModelReportObserver(QuantizationTestCase):
     """
 
     def test_zero_tensor_errors(self):
+        # [FUNCTION DOC] Feeds an all-zero input (10 batches of 1, one epoch) through the model.
+        # Expects epoch min, epoch max and average range all zero, and a ValueError when the batch
+        # to epoch ratio is requested because the epoch range is zero.
         # initialize the model
         model = self.NestedModifiedSingleLayerLinear()
 
@@ -607,6 +694,9 @@ class TestFxModelReportObserver(QuantizationTestCase):
     """
 
     def test_single_batch_of_ones(self):
+        # [FUNCTION DOC] Feeds a single batch of ones through the model for one epoch. Expects
+        # epoch min and max equal to one, average range zero, and a ValueError from the batch to
+        # epoch ratio since the epoch range is zero.
         # initialize the model
         model = self.NestedModifiedSingleLayerLinear()
 
@@ -634,10 +724,16 @@ class TestFxModelReportObserver(QuantizationTestCase):
     """
 
     def test_observer_after_relu(self):
+        # [FUNCTION DOC] Runs random data (15 samples as one batch, 10 epochs) through a model
+        # whose second observer sits after the ReLU, using the shared checker.
 
         # model specific to this test
         class NestedModifiedObserverAfterRelu(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local variant of the nested model where obs2 observes the output
+            # after the ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates obs1, mod1, obs2, a 5 by 5 float linear and a
+                # ReLU.
                 super().__init__()
                 self.obs1 = ModelReportObserver()
                 self.mod1 = SingleLayerLinearModel()
@@ -646,6 +742,8 @@ class TestFxModelReportObserver(QuantizationTestCase):
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies obs1, mod1, fc1, relu and obs2 in order and
+                # returns the result.
                 x = self.obs1(x)
                 x = self.mod1(x)
                 x = self.fc1(x)
@@ -671,10 +769,15 @@ class TestFxModelReportObserver(QuantizationTestCase):
     """
 
     def test_random_epochs_and_batches(self):
+        # [FUNCTION DOC] Builds four models of different structure and input shapes (nested
+        # observers, a batch norm 2d/3d block model, a high dimension network) and runs 10 epochs
+        # of 15 random samples through each with the shared checker.
 
         # set up a basic model
         class TinyNestModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Small model with obs1, a linear, a ReLU and obs2.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates obs1, a 5 by 5 linear, a ReLU and obs2.
                 super().__init__()
                 self.obs1 = ModelReportObserver()
                 self.fc1 = torch.nn.Linear(5, 5).to(dtype=torch.float)
@@ -682,6 +785,7 @@ class TestFxModelReportObserver(QuantizationTestCase):
                 self.obs2 = ModelReportObserver()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies obs1, fc1, relu and obs2 and returns the result.
                 x = self.obs1(x)
                 x = self.fc1(x)
                 x = self.relu(x)
@@ -689,7 +793,11 @@ class TestFxModelReportObserver(QuantizationTestCase):
                 return x
 
         class LargerIncludeNestModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model that wraps TinyNestModule between an observer and a single
+            # layer linear model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates obs1, the nested module, a single layer linear
+                # model and a ReLU.
                 super().__init__()
                 self.obs1 = ModelReportObserver()
                 self.nested = TinyNestModule()
@@ -697,6 +805,8 @@ class TestFxModelReportObserver(QuantizationTestCase):
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies obs1, the nested module, fc1 and relu in order
+                # and returns the result.
                 x = self.obs1(x)
                 x = self.nested(x)
                 x = self.fc1(x)
@@ -704,7 +814,12 @@ class TestFxModelReportObserver(QuantizationTestCase):
                 return x
 
         class ModifiedThreeOps(torch.nn.Module):
+            # [CLASS DOC] HELPER: Block with observers around a linear and a batch norm of 2d or
+            # 3d type.
             def __init__(self, batch_norm_dim):
+                # [FUNCTION DOC] HELPER: Creates two observers, a linear and a batch norm chosen
+                # by batch_norm_dim (2 gives 2d with 2 channels, 3 gives 3d with 4 channels); any
+                # other value raises a ValueError.
                 super().__init__()
                 self.obs1 = ModelReportObserver()
                 self.linear = torch.nn.Linear(7, 3, 2)
@@ -720,6 +835,8 @@ class TestFxModelReportObserver(QuantizationTestCase):
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies obs1, linear, obs2, bn and relu in order and
+                # returns the result.
                 x = self.obs1(x)
                 x = self.linear(x)
                 x = self.obs2(x)
@@ -728,7 +845,11 @@ class TestFxModelReportObserver(QuantizationTestCase):
                 return x
 
         class HighDimensionNet(torch.nn.Module):
+            # [CLASS DOC] HELPER: Network of linears and two ModifiedThreeOps blocks with an input
+            # observer, combining two branches by addition and a functional ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates obs1, three linears and two ModifiedThreeOps
+                # blocks (3d batch norm).
                 super().__init__()
                 self.obs1 = ModelReportObserver()
                 self.fc1 = torch.nn.Linear(3, 7)
@@ -738,6 +859,8 @@ class TestFxModelReportObserver(QuantizationTestCase):
                 self.fc3 = torch.nn.Linear(3, 7)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Observes the input, runs fc1, block1, fc2, then block2
+                # and fc3 on a second branch, adds both branches and applies ReLU.
                 x = self.obs1(x)
                 x = self.fc1(x)
                 x = self.block1(x)
@@ -784,24 +907,39 @@ This will be more thoroughly tested with the implementation of the full end to e
 
 
 class TestFxModelReportDetectDynamicStatic(QuantizationTestCase):
+    # [CLASS DOC] Tests the DynamicStaticDetector by manually inserting pre and post observers
+    # around a linear layer of a prepared model and calibrating with alternating data.
     @skipIfNoFBGEMM
     def test_nested_detection_case(self):
+        # [FUNCTION DOC] With fbgemm, prepares a two block network, inserts a ModelReportObserver
+        # as submodule and graph node before and after the target linear block2.linear,
+        # recompiles, and runs 10 inputs alternating between negative and non-negative integer
+        # valued data. The detector report must list one distribution as stationary and the other
+        # as non-stationary for that layer, and recommend dynamic quantization.
         class SingleLinear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local model with one linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a 3 by 3 linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and returns the result.
                 x = self.linear(x)
                 return x
 
         class TwoBlockNet(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local model with two SingleLinear blocks whose outputs are
+            # summed and passed through ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates block1 and block2.
                 super().__init__()
                 self.block1 = SingleLinear()
                 self.block2 = SingleLinear()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs block1, then block2 on that output, adds both and
+                # applies ReLU.
                 x = self.block1(x)
                 y = self.block2(x)
                 z = x + y
@@ -874,9 +1012,15 @@ class TestFxModelReportDetectDynamicStatic(QuantizationTestCase):
             self.assertTrue(dynam_vs_stat_dict[linear_fqn]["dynamic_recommended"])
 
 class TestFxModelReportClass(QuantizationTestCase):
+    # [CLASS DOC] Tests the ModelReport class API: construction, preparing for calibration,
+    # generating reports (with or without observer removal), the visualizer, and qconfig and
+    # equalization mapping generation. Uses the fbgemm engine.
 
     @skipIfNoFBGEMM
     def test_constructor(self):
+        # [FUNCTION DOC] Checks that ModelReport stores the desired detector names and starts with
+        # one empty observer entry per detector. Constructing with an empty detector set must
+        # raise a ValueError.
         """
         Tests the constructor of the ModelReport class.
         Specifically looks at:
@@ -917,6 +1061,11 @@ class TestFxModelReportClass(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_prepare_model_callibration(self):
+        # [FUNCTION DOC] Calls prepare_detailed_calibration on a two block model with dynamic
+        # static and per channel detectors. Expects four ModelReportObserver modules, graph
+        # observer nodes whose arguments match the neighboring linear node, two observer-of-
+        # interest entries (zero for per channel, four for dynamic static), and a ValueError on a
+        # second preparation.
         """
         Tests model_report.prepare_detailed_calibration that prepares the model for calibration
         Specifically looks at:
@@ -991,6 +1140,9 @@ class TestFxModelReportClass(QuantizationTestCase):
 
 
     def get_module_and_graph_cnts(self, callibrated_fx_module):
+        # [FUNCTION DOC] HELPER: Counts ModelReportObserver modules in the module tree and graph
+        # nodes whose string target contains model_report; returns the two counts as a tuple
+        # (module count, graph count).
         r"""
         Calculates number of ModelReportObserver modules in the model as well as the graph structure.
         Returns a tuple of two elements:
@@ -1017,6 +1169,14 @@ class TestFxModelReportClass(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_generate_report(self):
+        # [FUNCTION DOC] Prepares and calibrates two copies of a model, one with two detectors and
+        # one with one detector, and generates reports with and without observer removal. Expects
+        # report sizes to equal the detector counts, no observers left after removal, observers
+        # kept otherwise, and an exception for the second removal-run call and no error for a
+        # repeated report on the other.
+        # KNOWN ISSUE: the repeated report call for the full report passes the model as an extra
+        # argument although generate_model_report takes only the removal flag, so the expected
+        # exception is a wrong-arguments error and not the intended already-removed error.
         """
             Tests model_report.generate_model_report to ensure report generation
             Specifically looks at:
@@ -1092,6 +1252,10 @@ class TestFxModelReportClass(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_generate_visualizer(self):
+        # [FUNCTION DOC] Calibrates a model with outlier and input-weight equalization detectors.
+        # Expects an error when the visualizer is requested before a report was generated, then
+        # after generating the report expects six modules in the visualizer reports and 20
+        # features for each linear.
         """
         Tests that the ModelReport class can properly create the ModelReportVisualizer instance
         Checks that:
@@ -1147,6 +1311,10 @@ class TestFxModelReportClass(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_qconfig_mapping_generation(self):
+        # [FUNCTION DOC] Uses per channel and dynamic static detectors, calibrates, generates the
+        # qconfig mapping and then the report. Expects the mapping size to match the number of
+        # visualizer modules (two), per channel weight and default observer activation for each,
+        # and that the mapping can be used to prepare and convert a fresh model.
         """
         Tests for generation of qconfigs by ModelReport API
         - Tests that qconfigmapping is generated
@@ -1206,6 +1374,9 @@ class TestFxModelReportClass(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_equalization_mapping_generation(self):
+        # [FUNCTION DOC] Uses only the input-weight equalization detector, calibrates, and
+        # generates the qconfig and equalization mappings. Expects two module qconfigs and that
+        # both mappings can be used to prepare and convert a new model.
         """
         Tests for generation of qconfigs by ModelReport API
         - Tests that equalization config generated when input-weight equalization detector used
@@ -1254,20 +1425,31 @@ class TestFxModelReportClass(QuantizationTestCase):
             converted = quantize_fx.convert_fx(prepared)
 
 class TestFxDetectInputWeightEqualization(QuantizationTestCase):
+    # [CLASS DOC] Tests InputWeightEqualizationDetector: observer insertion points, the recorded
+    # per channel and global statistics for the first linear and the empty report case. Holds
+    # nested helper model classes.
 
     class SimpleConv(torch.nn.Module):
+        # [CLASS DOC] HELPER: Model of a conv (no bias, 3 by 3 kernel, stride 2) followed by ReLU.
         def __init__(self, con_dims):
+            # [FUNCTION DOC] HELPER: Creates a ReLU and a conv with input and output channels
+            # taken from the con_dims pair.
             super().__init__()
             self.relu = torch.nn.ReLU()
             self.conv = torch.nn.Conv2d(con_dims[0], con_dims[1], kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Applies conv and relu and returns the result.
             x = self.conv(x)
             x = self.relu(x)
             return x
 
     class TwoBlockComplexNet(torch.nn.Module):
+        # [CLASS DOC] HELPER: Network with two SimpleConv blocks, a conv, a linear and a ReLU used
+        # for the equalization tests.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates block1 (3 to 32 channels), block2 (3 to 3), a 1 by 1
+            # conv, a linear (768 to 10) and a ReLU.
             super().__init__()
             self.block1 = TestFxDetectInputWeightEqualization.SimpleConv((3, 32))
             self.block2 = TestFxDetectInputWeightEqualization.SimpleConv((3, 3))
@@ -1276,6 +1458,9 @@ class TestFxDetectInputWeightEqualization(QuantizationTestCase):
             self.relu = torch.nn.ReLU()
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Runs block1 and conv, then block2 and repeats its output
+            # spatially by two, adds it to the earlier result, flattens, then applies linear and
+            # ReLU.
             x = self.block1(x)
             x = self.conv(x)
             y = self.block2(x)
@@ -1287,24 +1472,36 @@ class TestFxDetectInputWeightEqualization(QuantizationTestCase):
             return z
 
         def get_fusion_modules(self):
+            # [FUNCTION DOC] HELPER: Returns the list of module name lists to fuse, a single group
+            # of conv and relu.
             return [['conv', 'relu']]
 
         def get_example_inputs(self):
+            # [FUNCTION DOC] HELPER: Returns a one element tuple holding a random 1x3x28x28 input.
             return (torch.randn((1, 3, 28, 28)),)
 
     class ReluOnly(torch.nn.Module):
+        # [CLASS DOC] HELPER: Model containing only a ReLU, so the detector has no layers to
+        # inspect.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates the ReLU.
             super().__init__()
             self.relu = torch.nn.ReLU()
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Applies the ReLU and returns the result.
             x = self.relu(x)
             return x
 
         def get_example_inputs(self):
+            # [FUNCTION DOC] HELPER: Returns a one element tuple holding an integer range tensor
+            # reshaped to 1x3x3x3.
             return (torch.arange(27).reshape((1, 3, 3, 3)),)
 
     def _get_prepped_for_calibration_model(self, model, detector_set, fused=False):
+        # [FUNCTION DOC] HELPER: Returns the pair (prepared model, ModelReport) for the model and
+        # detector set by delegating to the module level helper with the model first example
+        # input; the fused flag requests fusing first.
         r"""Returns a model that has been prepared for calibration and corresponding model_report"""
 
         # pass in necessary inputs to helper
@@ -1313,6 +1510,9 @@ class TestFxDetectInputWeightEqualization(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_input_weight_equalization_determine_points(self):
+        # [FUNCTION DOC] For both the plain and the fused network, counts graph nodes whose target
+        # contains the default pre observer name and expects four. Every linear and conv module
+        # must have the pre observer attribute and every other module must not.
         # use fbgemm and create our model instance
         # then create model report instance with detector
         with override_quantized_engine('fbgemm'):
@@ -1358,6 +1558,12 @@ class TestFxDetectInputWeightEqualization(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_input_weight_equalization_report_gen(self):
+        # [FUNCTION DOC] Calibrates with one input and generates the report. Expects one detector
+        # report with four layers. For the first linear in block1 compares the recorded per
+        # channel and global min and max of the activation, and the comparison metric, against
+        # values recomputed from the example input and weights (ratio of weight to input square
+        # root range ratios).
+        # KNOWN ISSUE: comments say five layers are looked at but the assertion expects four.
         # use fbgemm and create our model instance
         # then create model report instance with detector
         with override_quantized_engine('fbgemm'):
@@ -1467,6 +1673,8 @@ class TestFxDetectInputWeightEqualization(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_input_weight_equalization_report_gen_empty(self):
+        # [FUNCTION DOC] Generates the report for a ReLU-only model. Expects one detector report
+        # with zero layers and a summary string that contains exactly two newline characters.
         # tests report gen on a model that doesn't have any layers
         # use fbgemm and create our model instance
         # then create model report instance with detector
@@ -1500,9 +1708,16 @@ class TestFxDetectInputWeightEqualization(QuantizationTestCase):
 
 
 class TestFxDetectOutliers(QuantizationTestCase):
+    # [CLASS DOC] Tests OutlierDetector: observer insertion points, a report without outliers on
+    # normal data, a report where nearly every channel is an outlier, and detection of a
+    # consistently spiking channel over many runs.
 
     class LargeBatchModel(torch.nn.Module):
+        # [CLASS DOC] HELPER: Model of linear, ReLU, conv and ReLU whose sizes all use one
+        # param_size; provides normal and outlier example inputs.
         def __init__(self, param_size):
+            # [FUNCTION DOC] HELPER: Stores param_size and creates the linear, two ReLUs and a
+            # conv with param_size channels.
             super().__init__()
             self.param_size = param_size
             self.linear = torch.nn.Linear(param_size, param_size)
@@ -1511,6 +1726,8 @@ class TestFxDetectOutliers(QuantizationTestCase):
             self.relu_2 = torch.nn.ReLU()
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Applies linear, relu_1, conv and relu_2 in order and returns
+            # the result.
             x = self.linear(x)
             x = self.relu_1(x)
             x = self.conv(x)
@@ -1518,10 +1735,14 @@ class TestFxDetectOutliers(QuantizationTestCase):
             return x
 
         def get_example_inputs(self):
+            # [FUNCTION DOC] HELPER: Returns a one element tuple holding random normal data of
+            # shape 1 by param_size cubed.
             param_size = self.param_size
             return (torch.randn((1, param_size, param_size, param_size)),)
 
         def get_outlier_inputs(self):
+            # [FUNCTION DOC] HELPER: Returns a one element tuple of random normal data in which
+            # every second channel at one fixed position is set to the large value 3.28e8.
             param_size = self.param_size
             random_vals = torch.randn((1, param_size, param_size, param_size))
             # change one in some of them to be a massive value
@@ -1530,6 +1751,9 @@ class TestFxDetectOutliers(QuantizationTestCase):
 
 
     def _get_prepped_for_calibration_model(self, model, detector_set, use_outlier_data=False):
+        # [FUNCTION DOC] HELPER: Returns the pair (prepared model, ModelReport) from the module
+        # level helper; when use_outlier_data is true the example input comes from the outlier
+        # input method instead of the normal one.
         r"""Returns a model that has been prepared for calibration and corresponding model_report"""
         # call the general helper function to calibrate
         example_input = model.get_example_inputs()[0]
@@ -1542,6 +1766,9 @@ class TestFxDetectOutliers(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_outlier_detection_determine_points(self):
+        # [FUNCTION DOC] Prepares with an outlier detector on a 128 sized model and counts graph
+        # nodes with the pre observer name, expecting four. Linear, conv and ReLU modules must
+        # have the pre observer attribute and all other modules must not.
         # use fbgemm and create our model instance
         # then create model report instance with detector
         # similar to test for InputWeightEqualization but key differences that made refactoring not viable
@@ -1582,6 +1809,9 @@ class TestFxDetectOutliers(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_no_outlier_report_gen(self):
+        # [FUNCTION DOC] Uses an outlier detector and a dynamic static detector on a 4 sized model
+        # with normal data. Expects two reports, four layers in the outlier report, no outliers
+        # flagged, and comparison metric and batch count lists whose length equals param_size.
         # use fbgemm and create our model instance
         # then create model report instance with detector
         with override_quantized_engine('fbgemm'):
@@ -1633,6 +1863,10 @@ class TestFxDetectOutliers(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_all_outlier_report_gen(self):
+        # [FUNCTION DOC] Uses an outlier detector with ratio threshold 1 and percentile 0 on a 16
+        # sized model so nearly every channel qualifies. Expects four layers, at least half of the
+        # channels flagged as outliers (otherwise raises an AssertionError), and metric lists of
+        # length param_size.
         # make the percentile 0 and the ratio 1, and then see that everything is outlier according to it
         # use fbgemm and create our model instance
         # then create model report instance with detector
@@ -1686,6 +1920,11 @@ class TestFxDetectOutliers(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_multiple_run_consistent_spike_outlier_report_gen(self):
+        # [FUNCTION DOC] Calibrates an 8 sized model 30 times with outlier data, zeroing one
+        # channel on some runs. Expects four layers, at least half the channels with sufficient
+        # batches, exactly half flagged as outliers, and for the first linear at least two
+        # constant counts and half of the maximum values equal to the large value; failed checks
+        # raise an AssertionError.
         # specifically make a row really high consistently in the number of batches that you are testing and try that
         # generate report after just 1 run, and after many runs (30) and make sure above minimum threshold is there
         with override_quantized_engine('fbgemm'):
@@ -1769,8 +2008,13 @@ class TestFxDetectOutliers(QuantizationTestCase):
 
 
 class TestFxModelReportVisualizer(QuantizationTestCase):
+    # [CLASS DOC] Tests ModelReportVisualizer: the unique module and feature name queries and the
+    # table generation with module and feature filters.
 
     def _callibrate_and_generate_visualizer(self, model, prepared_for_callibrate_model, mod_report):
+        # [FUNCTION DOC] HELPER: Calibrates the prepared model with one example input, generates
+        # the model report keeping the observers, and returns the visualizer from the report
+        # object.
         r"""
         Calibrates the passed in model, generates report, and returns the visualizer
         """
@@ -1790,6 +2034,10 @@ class TestFxModelReportVisualizer(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_get_modules_and_features(self):
+        # [FUNCTION DOC] Builds a visualizer for a model with outlier and equalization detectors.
+        # Expects the unique module names to equal the keys of the generated reports, the
+        # unfiltered unique feature names to equal all features of block1.linear, and the default
+        # (plottable) feature names to equal only the tensor valued ones.
         """
         Tests the get_all_unique_module_fqns and get_all_unique_feature_names methods of
         ModelReportVisualizer
@@ -1840,6 +2088,9 @@ class TestFxModelReportVisualizer(QuantizationTestCase):
             self.assertEqual(returned_plottable_feats, plottable_set)
 
     def _prep_visualizer_helper(self):
+        # [FUNCTION DOC] HELPER: Sets the engine to fbgemm, builds a two block model with outlier
+        # and equalization detectors, prepares and calibrates it and returns the visualizer. Side
+        # effect: sets the global quantized engine.
         r"""
         Returns a mod rep visualizer that we test in various ways
         """
@@ -1866,6 +2117,9 @@ class TestFxModelReportVisualizer(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_generate_tables_match_with_report(self):
+        # [FUNCTION DOC] Generates the filtered tables without filters and expects the union of
+        # modules in the tensor table and channel table (second column of each row) to equal the
+        # keys of the generated reports.
         """
         Tests the generate_table_view()
         ModelReportVisualizer
@@ -1894,6 +2148,8 @@ class TestFxModelReportVisualizer(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_generate_tables_no_match(self):
+        # [FUNCTION DOC] Generates tables with a module filter matching nothing and expects no
+        # modules in either the tensor or the channel table.
         """
         Tests the generate_table_view()
         ModelReportVisualizer
@@ -1919,6 +2175,9 @@ class TestFxModelReportVisualizer(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_generate_tables_single_feat_match(self):
+        # [FUNCTION DOC] Generates tables with a feature filter for the maximum values key.
+        # Expects no tensor level feature columns and exactly one channel level feature column,
+        # after subtracting the non-feature headers.
         """
         Tests the generate_table_view()
         ModelReportVisualizer
@@ -1947,6 +2206,10 @@ class TestFxModelReportVisualizer(QuantizationTestCase):
             self.assertEqual(channel_info_features, 1)
 
 def _get_prepped_for_calibration_model_helper(model, detector_set, example_input, fused: bool = False):
+    # [FUNCTION DOC] HELPER: Sets the global quantized engine to fbgemm, converts the example
+    # input to float, uses the default qconfig mapping, optionally fuses the model using its
+    # fusion module list, prepares it with prepare_fx, builds a ModelReport with the detector set
+    # and calls prepare_detailed_calibration. Returns the tuple (calibration-ready model, report).
     r"""Returns a model that has been prepared for calibration and corresponding model_report"""
     # set the backend for this test
     torch.backends.quantized.engine = "fbgemm"
