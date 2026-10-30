@@ -1,5 +1,9 @@
 # Owner(s): ["module: unknown"]
 
+# [MODULE DOC] Tests that operators returning several tensors expose named tuple results.
+# Holds an allowlist of operator names permitted to have named returns in the native function
+# schema file, a skip list of attention operators, and one test class. The module reads the
+# schema yaml file located relative to this test file at import time only to compute its path.
 import os
 import re
 import yaml
@@ -35,13 +39,24 @@ all_operators_with_namedtuple_return_skip_list = {
 
 
 class TestNamedTupleAPI(TestCase):
+    # [CLASS DOC] Test case checking the named tuple return API: the torch.return_types module,
+    # the schema file's naming rules, and field access by name for each allowlisted operator.
+    # The class attribute hw_classification marks the test as generic (hardware independent).
     hw_classification = HardwareClassification.GENERIC
 
     def test_import_return_types(self):
+        # [FUNCTION DOC] Checks that the torch.return_types module can be imported and that a
+        # star import from it succeeds. Raises if either import fails; no other assertions.
         import torch.return_types  # noqa: F401
         exec('from torch.return_types import *')
 
     def test_native_functions_yaml(self):
+        # [FUNCTION DOC] Parses the native functions yaml schema file and checks that only
+        # allowlisted operators declare named return values. Entries whose names are in the
+        # allowlist are recorded and skipped; backward and forward-suffixed names, non-tuple or
+        # empty returns, and skip-listed operators are ignored; any other tuple return element
+        # with more than one token (type plus name) fails. Finally asserts the recorded set equals
+        # the allowlist, so a renamed or removed operator is reported.
         operators_found = set()
         regex = re.compile(r"^(\w*)(\(|\.)")
         with open(aten_native_yaml) as file:
@@ -73,6 +88,13 @@ class TestNamedTupleAPI(TestCase):
         """))
 
     def test_namedtuple_return(self):
+        # [FUNCTION DOC] For each entry in a table of operator names, expected field names, extra
+        # positional inputs and an out-variant flag, checks that results are named tuples.
+        # Three checks per operator when available: calling the torch (or torch.linalg or
+        # torch._VF) function, calling its out= variant, and calling the Tensor method; each
+        # result must expose fields matching tuple positions, and a matching class must exist in
+        # torch.return_types and be constructible. Finally asserts the covered operator names
+        # equal the allowlist, so a missing table entry is reported.
         a = torch.randn(5, 5)
         per_channel_scale = torch.randn(5)
         per_channel_zp = torch.zeros(5, dtype=torch.int64)
@@ -130,6 +152,9 @@ class TestNamedTupleAPI(TestCase):
         ]
 
         def get_func(f):
+            # [FUNCTION DOC] HELPER: Resolves an operator name string to a callable. Names with
+            # a linalg prefix map to the torch.linalg module with the prefix removed; names with a
+            # leading underscore map to torch._VF. Returns None if the attribute is absent.
             "Return either torch.f or torch.linalg.f, where 'f' is a string"
             mod = torch
             if f.startswith('linalg_'):
@@ -140,11 +165,16 @@ class TestNamedTupleAPI(TestCase):
             return getattr(mod, f, None)
 
         def check_namedtuple(tup, names):
+            # [FUNCTION DOC] HELPER: Asserts each named field of the given tuple is the same
+            # object as the element at the matching position.
             "Check that the namedtuple 'tup' has the given names"
             for i, name in enumerate(names):
                 self.assertIs(getattr(tup, name), tup[i])
 
         def check_torch_return_type(f, names):
+            # [FUNCTION DOC] HELPER: Looks up the return type class for the operator name in
+            # torch.return_types, builds it from a list of scalar tensors, one per field name, and
+            # asserts the constructed object has that class.
             """
             Check that the return_type exists in torch.return_types
             and they can constructed.

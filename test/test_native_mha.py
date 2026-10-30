@@ -1,4 +1,9 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Device-generic tests comparing native fused multi-head attention kernels with the
+# reference module torch.nn.MultiheadAttention: the bias, rescale and split of packed query, key
+# and value tensors (dense and nested), and full attention in self, encoder-decoder and generic
+# modes with optional padding. Tests are instantiated per device type at import, with XPU
+# allowed.
 import math
 import copy
 
@@ -16,10 +21,17 @@ from torch.testing._internal.common_utils import parametrize, run_tests, TestCas
 from torch.nn.attention import SDPBackend
 
 class TestMHADeviceType(TestCase):
+    # [CLASS DOC] Device-type test case holding the native multi-head attention checks; shared
+    # implementations are private methods called by the public dtype-parametrized tests.
     @torch.no_grad()
     def _test_transform_bias_rescale_qkv_impl(
         self, device, dtype, use_nt, use_padding=False
     ):
+        # [FUNCTION DOC] HELPER: For several (embed dim, heads, batch, length) configurations,
+        # builds a random packed input, optionally with a -inf padding row in the first batch item
+        # and optionally as a nested tensor, then runs the private transform op under inference
+        # mode and compares query, key and value against a dense reference. Runs without grad.
+        # Args: device, dtype, use_nt, use_padding.
         tests = [
             (64, 4, 16, 8),
             # dim_per_head = 12 does not divide evenly by CPU vectorization length of 8
@@ -56,10 +68,18 @@ class TestMHADeviceType(TestCase):
                     )
 
                     def simple_transform_bias_rescale_qkv(qkv, bias):
+                        # [FUNCTION DOC] HELPER: Reference implementation. Splits the packed
+                        # input and bias into query, key and value, adds biases, scales the
+                        # query by the inverse square root of head size, reshapes each to batch,
+                        # sequence, heads, head size and swaps the sequence and heads axes.
+                        # Returns a tuple of three tensors.
                         (q, k, v) = torch.split(qkv, embed_dim, dim=-1)
                         (q_bias, k_bias, v_bias) = torch.split(bias, embed_dim, dim=-1)
 
                         def embiggen(x):
+                            # [FUNCTION DOC] HELPER: Returns the input unchanged unless nested
+                            # mode is on; otherwise zero-pads the sequence axis up to the next
+                            # multiple of eight, matching the nested op's padded output.
                             if not use_nt:
                                 return x
                             b, t, d = x.size()
@@ -96,6 +116,8 @@ class TestMHADeviceType(TestCase):
     @dtypes(torch.float)
     @skipMeta
     def test_transform_bias_rescale_qkv(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared transform check on dense inputs, with and without padding
+        # rows. Registered for float on all device kinds; skipped for meta.
         for use_padding in (False, True):
             with self.subTest(use_padding=use_padding):
                 self._test_transform_bias_rescale_qkv_impl(
@@ -109,6 +131,8 @@ class TestMHADeviceType(TestCase):
     @onlyAccelerator
     @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/2182")
     def test_transform_bias_rescale_qkv_nested(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared transform check on nested tensor inputs, with and without
+        # padding rows. Accelerator only, skipped for meta and for a known XPU issue.
         for use_padding in (False, True):
             with self.subTest(use_padding=use_padding):
                 self._test_transform_bias_rescale_qkv_impl(
@@ -118,6 +142,13 @@ class TestMHADeviceType(TestCase):
     def _test_multihead_attention_impl(
         self, device, dtype, mode, use_nt, need_weights, average_attn_weights, use_padding=False, pad_all=False
     ):
+        # [FUNCTION DOC] HELPER: Core comparison of the native multi-head attention op against the
+        # reference module. Builds random float32 queries (plus key and value for the chosen mode
+        # of self, encdec or generic; any other mode fails the test), optional padding and key
+        # padding mask, shares weights between the reference and a native wrapper cast to the test
+        # dtype, optionally converts inputs to nested tensors, then compares outputs and
+        # attention weights (looser tolerance for half). Padding positions are zeroed in both
+        # results first, since the reference returns junk there.
         embed_dim = 64
         num_heads = 4
         bs = 16
@@ -163,7 +194,12 @@ class TestMHADeviceType(TestCase):
         pt.out_proj.bias = proj.bias
 
         class NativeMHA(torch.nn.Module):
+            # [CLASS DOC] HELPER: Minimal module that wraps the native attention op, holding the
+            # packed query/key/value linear layer, the output projection layer and the head
+            # settings.
             def __init__(self, embed_dim, num_heads, qkv, proj):
+                # [FUNCTION DOC] HELPER: Stores the two linear layers, embedding size and head
+                # count as attributes after base module initialization.
                 super().__init__()
                 self.qkv = qkv
                 self.proj = proj
@@ -171,6 +207,9 @@ class TestMHADeviceType(TestCase):
                 self.num_heads = num_heads
 
             def forward(self, q, k, v, key_padding_mask):
+                # [FUNCTION DOC] HELPER: Calls the native attention op with the stored weights and
+                # biases, the given key padding mask treated as a key-padding style mask, and the
+                # weights flags captured from the enclosing test. Returns its output and weights.
                 return torch._native_multi_head_attention(
                     q,
                     k,
@@ -234,6 +273,9 @@ class TestMHADeviceType(TestCase):
                 ynpt = ynpt_final
 
         def do_pad_all(tensors):
+            # [FUNCTION DOC] HELPER: For each tensor in the given sequence and each batch
+            # entry of it, overwrites the last position with zeros (in place) using the test
+            # device and dtype.
             for t in tensors:
                 for t_i in t:
                     t_i[-1] = torch.zeros_like(t_i[-1], device=device, dtype=dtype)
@@ -282,6 +324,10 @@ class TestMHADeviceType(TestCase):
     @torch.no_grad()
     def test_native_multihead_self_attention(self, device, dtype, use_nt,
                                              need_weights, average_attn_weights, use_padding, pad_all, fused):
+        # [FUNCTION DOC] Parametrized check of self-attention. For each of two need-weights
+        # settings (always off, and on when not all rows are padded) it selects allowed
+        # scaled-dot-product backends based on the fused flag and XPU device, enters the backend
+        # selection context, and runs the shared check in self mode.
         for need_weights in (False, not pad_all):
             with self.subTest(use_padding=use_padding, pad_all=pad_all,
                               use_nt=use_nt, need_weights=need_weights,
@@ -323,6 +369,8 @@ class TestMHADeviceType(TestCase):
     @skipMeta
     @torch.no_grad()
     def test_native_multihead_encoder_decoder_attention(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared check in encoder-decoder mode with no nested tensors and
+        # no weights.
         self._test_multihead_attention_impl(
             device,
             dtype,
@@ -338,6 +386,8 @@ class TestMHADeviceType(TestCase):
     @skipMeta
     @torch.no_grad()
     def test_native_multihead_attention(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared check in generic mode with separate key and value, no
+        # nested tensors and no weights.
         self._test_multihead_attention_impl(
             device,
             dtype,
