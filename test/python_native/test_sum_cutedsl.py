@@ -9,6 +9,12 @@
 # deterministic row sums. The hashes are the same ones the (now removed) ATen
 # CUDA inner-tree kernel produced -- the CuTeDSL kernel reproduces them
 # bit-for-bit, which is the contract for this op.
+# [MODULE DOC] CUDA tests for the CuTeDSL sum override in torch._native.ops.sum, enabled by the
+# PYTORCH_SUM_INNER_TREE environment flag. Covers the dispatch predicate (accept and reject
+# cases), agreement with aten, out variant, strided input, partial last block, fall-through for
+# integer and complex dtypes, and bitwise checks of row sums against stored truncated SHA-256
+# digests for float8, float16, float32 and float64 over many shapes. Skipped without CUDA or
+# CuTeDSL.
 
 import contextlib
 import os
@@ -31,6 +37,8 @@ from torch.testing._internal.common_utils import (
 
 
 def _cutedsl_impl():
+    # [FUNCTION DOC] HELPER: Lazily imports and returns the torch._native.ops.sum.cutedsl_impl
+    # module so importing this test file does not load it.
     from torch._native.ops.sum import cutedsl_impl
 
     return cutedsl_impl
@@ -39,6 +47,11 @@ def _cutedsl_impl():
 @unittest.skipUnless(TEST_CUDA, "CUDA required")
 @skipIfNoCuteDSL
 class TestSumCuteDSLOverride(TestCase):
+    # [CLASS DOC] Test case for the CuTeDSL inner-tree sum override. Class attributes: the
+    # accumulator dtype per input dtype, the list of (rows, columns) shapes, the table of
+    # expected 16-hex-character digests keyed by dtype name and shape, and the mapping from
+    # dtype names to dtypes. Tests turn the override on by setting an environment variable
+    # inside a context manager.
     """Tests for the CuTeDSL inner-tree reduction sum override."""
 
     _ACC_DTYPES = {
@@ -200,6 +213,9 @@ class TestSumCuteDSLOverride(TestCase):
 
     @contextlib.contextmanager
     def _inner_tree_flag(self):
+        # [FUNCTION DOC] HELPER: Context manager that sets the PYTORCH_SUM_INNER_TREE
+        # environment variable to the string 1 for its body and afterwards restores the previous
+        # value, or removes the variable if it was unset (done in finally).
         old_value = os.environ.get("PYTORCH_SUM_INNER_TREE")
         os.environ["PYTORCH_SUM_INNER_TREE"] = "1"
         try:
@@ -211,6 +227,10 @@ class TestSumCuteDSLOverride(TestCase):
                 os.environ["PYTORCH_SUM_INNER_TREE"] = old_value
 
     def _make_input(self, m, n, dtype):
+        # [FUNCTION DOC] HELPER: Builds a deterministic CUDA input of m rows and n columns in
+        # the given dtype. Columns alternate between -1 and 1; when m is above 1 each row adds
+        # an offset cycling through five values from -0.5 to 0.5. Computed in float64 for
+        # float64, otherwise float32, then cast to the dtype.
         compute_dtype = torch.float64 if dtype == torch.float64 else torch.float32
         cols = torch.arange(n, device="cuda", dtype=compute_dtype)
         values = ((cols % 2) * 2 - 1).reshape(1, n)
@@ -220,23 +240,34 @@ class TestSumCuteDSLOverride(TestCase):
         return values.to(dtype)
 
     def _eager_sum(self, x):
+        # [FUNCTION DOC] HELPER: Row sum over dim 1 after converting the input to the accumulator
+        # dtype from the class table (float32 for float8 and float16, same dtype otherwise);
+        # the float32 result is the one the bitwise test hashes. Returns the sum tensor.
         acc_dtype = self._ACC_DTYPES[x.dtype]
         if x.dtype == torch.float8_e4m3fn:
             return x.to(torch.float32).sum(dim=1).to(acc_dtype)
         return x.to(acc_dtype).sum(dim=1)
 
     def _sha(self, t):
+        # [FUNCTION DOC] HELPER: Returns the first 16 hex characters of the SHA-256 of the raw
+        # bytes of the given tensor, after moving it to CPU and making it contiguous.
         import hashlib
 
         return hashlib.sha256(t.cpu().contiguous().numpy().tobytes()).hexdigest()[:16]
 
     def _make_order_sensitive_input(self, m, n, dtype):
+        # [FUNCTION DOC] HELPER: Builds an m by n float64 CUDA tensor from the running element
+        # index using two mod-based patterns (period 29 and 7) so floating point summation order
+        # changes the result, then casts to the requested dtype.
         values = torch.arange(m * n, device="cuda", dtype=torch.float64).reshape(m, n)
         return (((values % 29) - 14) / 29 + ((values % 7) - 3) / 13).to(dtype)
 
     # --- predicate accept/reject ---
 
     def test_cond_accepts_covered_shapes(self):
+        # [FUNCTION DOC] With the flag set, checks the override predicate accepts a 128 by 8192
+        # input and a row-strided view of a 256 by 8192 input for both float32 and float64,
+        # reducing dim 1.
         impl = _cutedsl_impl()
         with self._inner_tree_flag():
             for dtype in (torch.float32, torch.float64):
@@ -247,6 +278,9 @@ class TestSumCuteDSLOverride(TestCase):
                 self.assertTrue(impl._cond(strided, [1]))
 
     def test_cond_rejects_unsupported(self):
+        # [FUNCTION DOC] Checks the predicate rejects: any input without the flag; multi-dim,
+        # full (no dim) and dtype-casting reductions; a non-contiguous reduced dim; int64 and
+        # complex64 inputs, all with the flag set.
         impl = _cutedsl_impl()
         x = torch.randn(128, 8192, device="cuda", dtype=torch.float32)
         # No flag -> reject.
@@ -273,6 +307,9 @@ class TestSumCuteDSLOverride(TestCase):
 
     @parametrize("dtype", [torch.float32, torch.float64])
     def test_override_matches_aten(self, dtype):
+        # [FUNCTION DOC] Parametrized over float32 and float64: an order-sensitive 128 by 8192
+        # sum with the override must equal the aten result computed with the cutedsl DSL
+        # disabled.
         x = self._make_order_sensitive_input(128, 8192, dtype)
         with torch.backends.python_native.cutedsl.disabled():
             ref = x.sum(dim=1)
@@ -281,6 +318,8 @@ class TestSumCuteDSLOverride(TestCase):
         self.assertEqual(got, ref)
 
     def test_override_out_variant(self):
+        # [FUNCTION DOC] Same comparison for float32 but the override writes into a preallocated
+        # out tensor; checks out equals the aten reference.
         x = self._make_order_sensitive_input(128, 8192, torch.float32)
         with torch.backends.python_native.cutedsl.disabled():
             ref = x.sum(dim=1)
@@ -290,6 +329,9 @@ class TestSumCuteDSLOverride(TestCase):
         self.assertEqual(out, ref)
 
     def test_strided_outer_input(self):
+        # [FUNCTION DOC] Sums every other row of an all-ones matrix with 32 columns (other rows
+        # hold fives, skipped by the stride) with the override; expects 128 results all equal to
+        # 32.
         base = torch.ones(256, 32, device="cuda", dtype=torch.float32)
         base[1::2, :] = 5
         x = base[::2, :]
@@ -298,6 +340,8 @@ class TestSumCuteDSLOverride(TestCase):
         self.assertEqual(result, torch.full((128,), 32, device="cuda", dtype=x.dtype))
 
     def test_looped_kernel_partial_last_block(self):
+        # [FUNCTION DOC] Sums a 129 by 256 matrix of ones with the override (row count not a
+        # multiple of the block); expects 129 results of 256.
         x = torch.ones(129, 256, device="cuda", dtype=torch.float32)
         with self._inner_tree_flag():
             result = x.sum(dim=1)
@@ -305,6 +349,8 @@ class TestSumCuteDSLOverride(TestCase):
 
     @parametrize("dtype", [torch.int64, torch.complex64])
     def test_integer_and_complex_fall_through(self, dtype):
+        # [FUNCTION DOC] Parametrized over int64 and complex64: sums a 17 by 8192 matrix of ones
+        # with the flag set; the override declines these dtypes and aten must give 8192 per row.
         # CuTeDSL declines integer/complex; the call must fall through to aten.
         x = torch.ones(17, 8192, device="cuda", dtype=dtype)
         with self._inner_tree_flag():
@@ -318,6 +364,9 @@ class TestSumCuteDSLOverride(TestCase):
         SM100OrLater, "SM100 hash is generated on GB200 with CUDA 12.8"
     )
     def test_cross_warp_order_sensitive_hash_sm100(self):
+        # [FUNCTION DOC] Skipped on ROCm and before SM100. Sums an order-sensitive 17 by 8192
+        # float32 input with the override and compares the truncated digest of the result with a
+        # hard-coded value generated on GB200.
         x = self._make_order_sensitive_input(17, 8192, torch.float32)
         with self._inner_tree_flag():
             result = x.sum(dim=1)
@@ -325,6 +374,10 @@ class TestSumCuteDSLOverride(TestCase):
 
     @skipIfRocm
     def test_bitwise(self):
+        # [FUNCTION DOC] Skipped on ROCm. For each dtype (float8 only when the platform supports
+        # it) and each shape in the class list, builds the deterministic input, sums over dim 1
+        # with the flag set, and compares the digest to the stored expected value in a subtest,
+        # with a message naming dtype and shape.
         for dtype_name, dtype in self._DTYPE_MAP.items():
             if dtype == torch.float8_e4m3fn and not PLATFORM_SUPPORTS_FP8:
                 continue

@@ -1,4 +1,10 @@
 # Owner(s): ["module: dsl-native-ops"]
+# [MODULE DOC] Tests for the user-facing torch.backends.python_native API: DSL discovery,
+# per-DSL controllers (name, available, enabled, version, enable, disable, disabled context
+# manager), operation and dispatch-key enable/disable calls, repr, dir, and registry state
+# checks. Defines a mixin that saves and restores the global filter state around each test. Uses
+# whatever DSLs the build exposes, so many loops may be empty. Runs via run_tests when executed
+# directly.
 
 import os
 from unittest.mock import patch
@@ -8,9 +14,16 @@ from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, T
 
 
 class RegistryTestMixin:
+    # [CLASS DOC] HELPER: Mixin for test cases that mutate the python_native filter state. It
+    # saves copies of the DSL-name, op-symbol and dispatch-key filter sets in setUp and restores
+    # them in tearDown. Must come before TestCase in the bases so its setUp/tearDown run first.
     """Mixin for tests that need to preserve registry state."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the parent setUp if one exists, stores copies of the
+        # three filter sets (DSL names, op symbols, dispatch keys) of the python_native filter
+        # state on the test instance, clears those sets, then tries to enable every DSL in the
+        # list of all DSLs. Any exception while enabling is swallowed.
         """Set up test state with registry preservation."""
         super().setUp() if hasattr(super(), "setUp") else None
 
@@ -36,6 +49,9 @@ class RegistryTestMixin:
             pass
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: If setUp saved a filter-state snapshot, clears the three filter
+        # sets and refills them from the snapshot; any exception during restore is swallowed.
+        # Then calls the parent tearDown if one exists.
         """Restore original filter state."""
         try:
             if hasattr(self, "_original_filter_state"):
@@ -56,9 +72,14 @@ class RegistryTestMixin:
 
 @skipIfTorchDynamo("Backend tests don't need dynamo compilation")
 class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
+    # [CLASS DOC] Main test case for the python_native backend module API, using the
+    # filter-state mixin. Skipped under torch dynamo. Tests iterate over all DSL names and
+    # restore each DSL's enabled state in finally blocks.
     """Tests for torch.backends.python_native user-facing API."""
 
     def test_module_import(self):
+        # [FUNCTION DOC] Smoke test that importing torch.backends.python_native again succeeds
+        # and yields a non-None module.
         """Test that torch.backends.python_native imports successfully."""
         # Should not raise any exceptions
         import torch.backends.python_native as pn_import
@@ -66,6 +87,8 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
         self.assertIsNotNone(pn_import)
 
     def test_dsl_discovery(self):
+        # [FUNCTION DOC] Checks the all_dsls and available_dsls attributes are lists and that
+        # the available DSLs are a subset of all DSLs.
         """Test DSL discovery functionality."""
         all_dsls = pn.all_dsls
         available_dsls = pn.available_dsls
@@ -78,6 +101,8 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
         self.assertTrue(set(available_dsls).issubset(set(all_dsls)))
 
     def test_dsl_access(self):
+        # [FUNCTION DOC] For every DSL name, checks the controller obtained via module attribute
+        # is not None, its name matches, and its available and enabled properties are booleans.
         """Test accessing DSL controllers."""
         all_dsls = pn.all_dsls
 
@@ -93,6 +118,9 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
                 self.assertIsInstance(dsl.enabled, bool)
 
     def test_dsl_properties(self):
+        # [FUNCTION DOC] For every DSL, reads name, available, version and enabled properties:
+        # name must match, available and enabled must be booleans, version must be None or have
+        # a major attribute.
         """Test DSL controller properties."""
         all_dsls = pn.all_dsls
 
@@ -117,6 +145,10 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
                 self.assertIsInstance(enabled, bool)
 
     def test_dsl_backend(self):
+        # [FUNCTION DOC] Checks the backend property: the helion controller reports triton when
+        # the HELION_BACKEND environment variable is unset and cutedsl when set to that value
+        # (environment patched for the check); the triton controller has no backend attribute
+        # and raises AttributeError.
         """Helion exposes a chosen lowering backend; other DSLs do not."""
         with patch.dict(os.environ):
             os.environ.pop("HELION_BACKEND", None)
@@ -127,6 +159,8 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
             pn.triton.backend
 
     def test_dsl_enable_disable(self):
+        # [FUNCTION DOC] For every DSL, calls disable and enable twice and asserts the enabled
+        # flag follows each call; the original enabled state is restored afterwards.
         """Test DSL enable/disable functionality."""
         all_dsls = pn.all_dsls
 
@@ -158,6 +192,9 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
                         dsl.disable()
 
     def test_dsl_context_managers(self):
+        # [FUNCTION DOC] For every DSL, enables it, checks the disabled context manager makes
+        # enabled false inside the block and true again after; original state is restored in
+        # finally.
         """Test DSL context manager functionality."""
         all_dsls = pn.all_dsls
 
@@ -185,6 +222,10 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
                         dsl.disable()
 
     def test_nested_context_managers(self):
+        # [FUNCTION DOC] When at least two DSLs exist, nests disabled context managers of the
+        # first two DSLs and checks each flag is toggled only for its own scope and restored on
+        # exit of each level. Does nothing with fewer than two DSLs; original states are
+        # restored.
         """Test nested DSL context managers."""
         all_dsls = pn.all_dsls
 
@@ -229,6 +270,8 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
                     dsl2.disable()
 
     def test_operation_discovery(self):
+        # [FUNCTION DOC] For every DSL, checks get_dsl_operations returns a list of non-empty
+        # strings.
         """Test operation discovery functionality."""
         all_dsls = pn.all_dsls
 
@@ -245,6 +288,9 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
                     self.assertTrue(len(op) > 0)
 
     def test_operation_control(self):
+        # [FUNCTION DOC] Finds the first operation of the first DSL that has any, then calls
+        # disable_operations and enable_operations on it, also with an extra unknown op name;
+        # only checks that no exception is raised. Does nothing if no operation exists.
         """Test operation-level control functionality."""
         # Get an operation to test with
         all_dsls = pn.all_dsls
@@ -266,6 +312,9 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
             pn.enable_operations(test_operation, "nonexistent_op")
 
     def test_operation_context_manager(self):
+        # [FUNCTION DOC] Finds a first available operation as in the control test and enters the
+        # operations_disabled context manager with it; only checks no exception occurs. Does
+        # nothing if no operation exists.
         """Test operation-level context manager."""
         # Get an operation to test with
         all_dsls = pn.all_dsls
@@ -284,17 +333,23 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
             # Operation should be re-enabled after context
 
     def test_dispatch_key_control(self):
+        # [FUNCTION DOC] Calls disable_dispatch_keys then enable_dispatch_keys with CUDA and
+        # CPU; only checks no exception is raised.
         """Test dispatch key control functionality."""
         # Test basic dispatch key control (should not raise)
         pn.disable_dispatch_keys("CUDA", "CPU")
         pn.enable_dispatch_keys("CUDA", "CPU")
 
     def test_invalid_dsl_access(self):
+        # [FUNCTION DOC] Checks that accessing an unknown module attribute for a DSL raises
+        # AttributeError.
         """Test accessing invalid DSL names."""
         with self.assertRaises(AttributeError):
             _ = pn.nonexistent_dsl
 
     def test_dsl_repr(self):
+        # [FUNCTION DOC] For every DSL, checks the repr string contains the DSL name, an
+        # availability word (available or unavailable) and a state word (enabled or disabled).
         """Test DSL controller string representation."""
         all_dsls = pn.all_dsls
 
@@ -314,6 +369,9 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
                 )
 
     def test_module_dir(self):
+        # [FUNCTION DOC] Checks the module directory listing contains the core API names (DSL
+        # lists, operation and dispatch-key control functions, operations_disabled) and every
+        # DSL name.
         """Test module __dir__ functionality."""
         attrs = dir(pn)
 
@@ -337,6 +395,9 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
             self.assertIn(dsl_name, attrs)
 
     def test_caching_functionality(self):
+        # [FUNCTION DOC] For the first DSL, if any: checks repeated get_dsl_operations calls
+        # give equal lists, repeated attribute access returns the identical controller object,
+        # and the controller still reports correct name and a boolean enabled.
         """Test caching integration and API contracts (not functools.lru_cache internals)."""
         all_dsls = pn.all_dsls
 
@@ -358,6 +419,9 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
             self.assertIsInstance(controller1.enabled, bool)
 
     def test_error_handling(self):
+        # [FUNCTION DOC] Checks that empty-string operation names and dispatch keys are accepted
+        # without error, an unknown DSL attribute raises AttributeError, and get_dsl_operations
+        # for an unknown DSL returns an empty list.
         """Test error handling with invalid inputs."""
         # Test with empty operation names - should not raise
         pn.disable_operations("")
@@ -377,6 +441,10 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
         self.assertEqual(len(invalid_ops), 0)
 
     def test_dispatch_behavior_verification(self):
+        # [FUNCTION DOC] For each available DSL with operations, checks enable and disable
+        # change the enabled flag and that is_dsl_disabled in the registry agrees, including
+        # after re-enable; original state is restored. Skips unavailable DSLs and ones without
+        # operations.
         """Test that DSL disable/enable actually affects operation dispatch."""
         all_dsls = pn.all_dsls
 
@@ -433,6 +501,9 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
                         dsl.disable()
 
     def test_context_manager_dispatch_behavior(self):
+        # [FUNCTION DOC] For each available DSL, checks that inside the disabled context manager
+        # the registry reports it disabled and after exit it reports it enabled; original state
+        # is restored.
         """Test that context managers actually affect dispatch, not just state tracking."""
         all_dsls = pn.all_dsls
 
@@ -472,6 +543,9 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
                         dsl.disable()
 
     def test_operation_dispatch_behavior(self):
+        # [FUNCTION DOC] Picks the first operation found; checks disable_operations makes
+        # is_operation_disabled true and enable_operations makes it false, then restores the
+        # initial disabled state. Does nothing if no operation exists.
         """Test that operation-level disable/enable affects registry state."""
         all_dsls = pn.all_dsls
         test_operation = None
@@ -512,9 +586,13 @@ class TestTorchBackendsPythonNative(RegistryTestMixin, TestCase):
 
 
 class TestTorchBackendsPythonNativeIntegration(TestCase):
+    # [CLASS DOC] Integration tests with the real DSL modules; does not use the filter-state
+    # mixin, so it relies on restoring each DSL's enabled state itself.
     """Integration tests for torch.backends.python_native with actual DSLs."""
 
     def test_real_dsl_integration(self):
+        # [FUNCTION DOC] For each available DSL, disables and then enables it (exercising the
+        # real deregister and re-enable paths) and restores the original state in finally.
         """Test integration with real DSL modules if available."""
         all_dsls = pn.all_dsls
 
@@ -541,6 +619,8 @@ class TestTorchBackendsPythonNativeIntegration(TestCase):
                             dsl.disable()
 
     def test_operations_with_real_registry(self):
+        # [FUNCTION DOC] For every DSL, checks that any operations returned by
+        # get_dsl_operations are non-empty strings.
         """Test operation discovery with real registry."""
         all_dsls = pn.all_dsls
 

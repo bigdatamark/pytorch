@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Migration tests checking that the legacy torch.quantization quantize_fx module
+# and its fx subpackage submodules expose the same objects as torch.ao.quantization. Two
+# submodules were renamed in the new location (quantization_patterns to quantize_handler,
+# fusion_patterns to fuse_handler) and are compared across the differing paths. Direct execution
+# is refused via raise_on_run_directly pointing to test/test_quantization.py.
 
 from torch.testing._internal.common_utils import raise_on_run_directly
 
@@ -6,7 +11,11 @@ from .common import AOMigrationTestCase
 
 
 class TestAOMigrationQuantizationFx(AOMigrationTestCase):
+    # [CLASS DOC] Stateless test case for the FX-related quantization modules; each test passes
+    # a hard-coded list of names to the base-class function-import helper.
     def test_function_import_quantize_fx(self):
+        # [FUNCTION DOC] Checks the listed names of quantize_fx are equal objects with equal
+        # hashes in the legacy and ao locations.
         function_list = [
             "_check_is_graph_module",
             "_swap_ff_with_fxff",
@@ -26,6 +35,7 @@ class TestAOMigrationQuantizationFx(AOMigrationTestCase):
         self._test_function_import("quantize_fx", function_list)
 
     def test_function_import_fx(self):
+        # [FUNCTION DOC] Same identity check for the names of the fx package.
         function_list = [
             "prepare",
             "convert",
@@ -34,6 +44,7 @@ class TestAOMigrationQuantizationFx(AOMigrationTestCase):
         self._test_function_import("fx", function_list)
 
     def test_function_import_fx_graph_module(self):
+        # [FUNCTION DOC] Same identity check for the names of fx.graph_module.
         function_list = [
             "FusedGraphModule",
             "ObservedGraphModule",
@@ -45,6 +56,7 @@ class TestAOMigrationQuantizationFx(AOMigrationTestCase):
         self._test_function_import("fx.graph_module", function_list)
 
     def test_function_import_fx_pattern_utils(self):
+        # [FUNCTION DOC] Same identity check for the names of fx.pattern_utils.
         function_list = [
             "QuantizeHandler",
             "_register_fusion_pattern",
@@ -56,6 +68,8 @@ class TestAOMigrationQuantizationFx(AOMigrationTestCase):
         self._test_function_import("fx.pattern_utils", function_list)
 
     def test_function_import_fx_equalize(self):
+        # [FUNCTION DOC] Same identity check for the names of the fx equalization module
+        # (private module name).
         function_list = [
             "reshape_scale",
             "_InputEqualizationObserver",
@@ -87,6 +101,9 @@ class TestAOMigrationQuantizationFx(AOMigrationTestCase):
         self._test_function_import("fx._equalize", function_list)
 
     def test_function_import_fx_quantization_patterns(self):
+        # [FUNCTION DOC] Compares names from the legacy fx.quantization_patterns module against
+        # the renamed ao module fx.quantize_handler, via the new-package-name argument of the
+        # helper.
         function_list = [
             "QuantizeHandler",
             "BinaryOpQuantizeHandler",
@@ -110,22 +127,29 @@ class TestAOMigrationQuantizationFx(AOMigrationTestCase):
         )
 
     def test_function_import_fx_match_utils(self):
+        # [FUNCTION DOC] Same identity check for four names of fx.match_utils: the match result
+        # type, the match-all node, and two private match helper functions.
         function_list = ["_MatchResult", "MatchAllNode", "_is_match", "_find_matches"]
         self._test_function_import("fx.match_utils", function_list)
 
     def test_function_import_fx_prepare(self):
+        # [FUNCTION DOC] Same identity check for the prepare entry point of fx.prepare.
         function_list = ["prepare"]
         self._test_function_import("fx.prepare", function_list)
 
     def test_function_import_fx_convert(self):
+        # [FUNCTION DOC] Same identity check for the convert entry point of fx.convert.
         function_list = ["convert"]
         self._test_function_import("fx.convert", function_list)
 
     def test_function_import_fx_fuse(self):
+        # [FUNCTION DOC] Same identity check for the fuse entry point of fx.fuse.
         function_list = ["fuse"]
         self._test_function_import("fx.fuse", function_list)
 
     def test_function_import_fx_fusion_patterns(self):
+        # [FUNCTION DOC] Compares FuseHandler and DefaultFuseHandler from the legacy
+        # fx.fusion_patterns against the renamed ao module fx.fuse_handler.
         function_list = ["FuseHandler", "DefaultFuseHandler"]
         self._test_function_import(
             "fx.fusion_patterns",
@@ -139,6 +163,7 @@ class TestAOMigrationQuantizationFx(AOMigrationTestCase):
     # both are valid, but we'll deprecate the old path in the future
 
     def test_function_import_fx_utils(self):
+        # [FUNCTION DOC] Same identity check for the names of fx.utils.
         function_list = [
             "get_custom_module_class_keys",
             "get_linear_prepack_op_for_dtype",

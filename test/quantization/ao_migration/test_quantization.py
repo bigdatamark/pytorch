@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Migration tests checking each legacy torch.quantization submodule exposes the
+# same objects as the matching torch.ao.quantization submodule: quantize, stubs, quantize_jit,
+# fake_quantize, fuse_modules, quant_type, observer, qconfig, quantization_mappings,
+# fuser_method_mappings and utils. Direct execution is refused via raise_on_run_directly
+# pointing to test/test_quantization.py.
 
 from torch.testing._internal.common_utils import raise_on_run_directly
 
@@ -6,11 +11,16 @@ from .common import AOMigrationTestCase
 
 
 class TestAOMigrationQuantization(AOMigrationTestCase):
+    # [CLASS DOC] Stateless test case with one test per migrated torch.quantization submodule;
+    # each passes a hard-coded list of public names to the base-class helpers (function-import
+    # for objects, dict-import for mapping dicts).
     r"""Modules and functions related to the
     `torch/quantization` migration to `torch/ao/quantization`.
     """
 
     def test_function_import_quantize(self):
+        # [FUNCTION DOC] Checks the listed names of the quantize submodule are identical (equal
+        # and same hash) between torch.quantization and torch.ao.quantization.
         function_list = [
             "_convert",
             "_observer_forward_hook",
@@ -35,6 +45,7 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_function_import("quantize", function_list)
 
     def test_function_import_stubs(self):
+        # [FUNCTION DOC] Same identity check for the names of the stubs submodule.
         function_list = [
             "QuantStub",
             "DeQuantStub",
@@ -43,6 +54,7 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_function_import("stubs", function_list)
 
     def test_function_import_quantize_jit(self):
+        # [FUNCTION DOC] Same identity check for the names of the quantize_jit submodule.
         function_list = [
             "_check_is_script_module",
             "_check_forward_method",
@@ -62,6 +74,7 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_function_import("quantize_jit", function_list)
 
     def test_function_import_fake_quantize(self):
+        # [FUNCTION DOC] Same identity check for the names of the fake_quantize submodule.
         function_list = [
             "_is_per_channel",
             "_is_per_tensor",
@@ -88,6 +101,7 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_function_import("fake_quantize", function_list)
 
     def test_function_import_fuse_modules(self):
+        # [FUNCTION DOC] Same identity check for the names of the fuse_modules submodule.
         function_list = [
             "_fuse_modules",
             "_get_module",
@@ -101,6 +115,7 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_function_import("fuse_modules", function_list)
 
     def test_function_import_quant_type(self):
+        # [FUNCTION DOC] Same identity check for the names of the quant_type submodule.
         function_list = [
             "QuantType",
             "_get_quant_type_to_str",
@@ -108,6 +123,7 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_function_import("quant_type", function_list)
 
     def test_function_import_observer(self):
+        # [FUNCTION DOC] Same identity check for the names of the observer submodule.
         function_list = [
             "_PartialWrapper",
             "_with_args",
@@ -139,6 +155,7 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_function_import("observer", function_list)
 
     def test_function_import_qconfig(self):
+        # [FUNCTION DOC] Same identity check for the names of the qconfig submodule.
         function_list = [
             "QConfig",
             "default_qconfig",
@@ -164,6 +181,10 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_function_import("qconfig", function_list)
 
     def test_function_import_quantization_mappings(self):
+        # [FUNCTION DOC] Same identity check for the function and class names of
+        # quantization_mappings, plus the dictionary helper on a separate list of mapping
+        # dictionary names (one candidate name is commented out in the list); dictionaries and
+        # their per-key values must be equal.
         function_list = [
             "no_observer_set",
             "get_default_static_quant_module_mappings",
@@ -191,6 +212,8 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_dict_import("quantization_mappings", dict_list)
 
     def test_function_import_fuser_method_mappings(self):
+        # [FUNCTION DOC] Same identity check for the function names of fuser_method_mappings,
+        # plus the dictionary check for the default op-list to fuser-method mapping.
         function_list = [
             "fuse_conv_bn",
             "fuse_conv_bn_relu",
@@ -202,6 +225,7 @@ class TestAOMigrationQuantization(AOMigrationTestCase):
         self._test_dict_import("fuser_method_mappings", dict_list)
 
     def test_function_import_utils(self):
+        # [FUNCTION DOC] Same identity check for the names of the quantization utils submodule.
         function_list = [
             "activation_dtype",
             "activation_is_int8_quantized",

@@ -1,4 +1,11 @@
 # Owner(s): ["module: dsl-native-ops"]
+# [MODULE DOC] Tests for torch._native.registry, the registry of python-native op overrides.
+# TestRegistry checks graph building without touching the dispatcher (node dataclass, register
+# and deregister of overrides, reordering by a user function, user ordering function lookup from
+# an environment variable, rejected arguments). TestRegistryRuntime installs real overrides on
+# aten mul and bmm in the dispatcher and checks routing, fall-through, copy-on-write (COW)
+# tensor handling under Dynamo and export, deregister and re-enable, and fake tensor shape
+# inference. Also defines a wrapper tensor subclass used to probe COW checks.
 
 from unittest.mock import MagicMock, patch
 
@@ -10,12 +17,19 @@ from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, T
 
 
 class _CowStateWrapperTensor(torch.Tensor):
+    # [CLASS DOC] HELPER: Minimal wrapper tensor subclass holding one inner tensor in a slot,
+    # built with the same size, dtype, layout, device, strides and storage offset as the inner
+    # one. It supports flatten and unflatten for the compiler and raises AssertionError if it is
+    # ever dispatched, so tests can prove no dispatch happens on it.
     elem: torch.Tensor
 
     __slots__ = ["elem"]
 
     @staticmethod
     def __new__(cls, elem):
+        # [FUNCTION DOC] HELPER: Creates the wrapper subclass instance mirroring the metadata of
+        # the given tensor (size, dtype, layout, device, requires_grad, strides, storage
+        # offset), stores that tensor as the inner element and returns the wrapper.
         out = torch.Tensor._make_wrapper_subclass(
             cls,
             elem.size(),
@@ -30,22 +44,35 @@ class _CowStateWrapperTensor(torch.Tensor):
         return out
 
     def __tensor_flatten__(self):
+        # [FUNCTION DOC] HELPER: Reports the single inner tensor attribute for flattening:
+        # returns a pair of a one-element name list and no metadata.
         return ["elem"], None
 
     @staticmethod
     def __tensor_unflatten__(inner_tensors, metadata, outer_size, outer_stride):
+        # [FUNCTION DOC] HELPER: Rebuilds a wrapper from a mapping of inner tensors by wrapping
+        # its elem entry; the metadata and size arguments are ignored.
         return _CowStateWrapperTensor(inner_tensors["elem"])
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] HELPER: Dispatch hook that always raises AssertionError with an
+        # unexpected-dispatch message, regardless of the operation.
         raise AssertionError("unexpected dispatch")
 
 
 @skipIfTorchDynamo("Registry tests don't need dynamo compilation")
 class TestRegistry(TestCase):
+    # [CLASS DOC] Graph-building tests for the registry module; skipped under Dynamo. setUp
+    # snapshots and clears the registry's global tables and filter state, tearDown restores
+    # them, so tests start from an empty registry and leave no trace.
     """Tests for the torch._native.registry module."""
 
     def setUp(self):
+        # [FUNCTION DOC] Saves copies of the registry's library and graph dictionaries, the
+        # three reverse lookup maps (copying their lists) and the filter-state sets (DSL names,
+        # op symbols, dispatch keys), then clears all of them so the test starts empty. Stores
+        # the registry module as an attribute.
         """Clean up registry state before each test."""
         super().setUp()
         self.registry = registry_module
@@ -83,6 +110,9 @@ class TestRegistry(TestCase):
         self.registry._filter_state._dispatch_keys.clear()
 
     def tearDown(self):
+        # [FUNCTION DOC] If setUp ran, restores the saved libs and graphs dictionaries, the
+        # three reverse maps (with fresh list copies) and the filter-state sets, replacing
+        # whatever the test left.
         """Restore original registry state after each test."""
         if hasattr(self, "registry"):
             # Restore original state
@@ -121,12 +151,17 @@ class TestRegistry(TestCase):
 
     # Keep essential existing tests
     def test_override_node_dataclass(self):
+        # [FUNCTION DOC] Builds an override node from DSL name, op symbol, dispatch key, two
+        # dummy functions and a node id; checks the fields are stored and that the unconditional
+        # flag defaults to false and active to true.
         """Test _OverrideNode dataclass creation and defaults."""
 
         def cond_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy condition that accepts any call and returns true.
             return True
 
         def impl_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy implementation that returns its argument.
             return x
 
         node = self.registry._OverrideNode(
@@ -142,12 +177,17 @@ class TestRegistry(TestCase):
 
     @patch("torch.library.Library")
     def test_register_op_override_basic(self, mock_library_cls):
+        # [FUNCTION DOC] With the library class patched out, registers one override for
+        # add.Tensor on CPU and checks the graph for that key holds exactly one node carrying
+        # the given DSL name, condition and implementation.
         """Test basic register_op_override functionality."""
 
         def cond_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy condition that accepts any call.
             return True
 
         def impl_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy implementation returning its argument.
             return x
 
         mock_lib = MagicMock()
@@ -166,12 +206,17 @@ class TestRegistry(TestCase):
 
     @patch("torch.library.Library")
     def test_deregister_op_overrides_basic(self, mock_library_cls):
+        # [FUNCTION DOC] With the library class patched, registers an override for mul.Tensor on
+        # CPU, checks the node is active, calls deregister with that DSL name disabled, and
+        # checks the node in the graph is now inactive.
         """Test basic deregister_op_overrides functionality."""
 
         def cond_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy condition that accepts any call.
             return True
 
         def impl_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy implementation returning its argument.
             return x
 
         mock_lib = MagicMock()
@@ -192,14 +237,19 @@ class TestRegistry(TestCase):
     # NEW FUNCTIONALITY TESTS - ONLY THE ESSENTIAL ONES
 
     def test_reorder_graphs_from_user_function_basic(self):
+        # [FUNCTION DOC] Places three nodes (DSL names c, a, b) directly in the graph for one
+        # key, runs reordering with an ordering function sorting nodes by DSL name and checks
+        # the stored order becomes a, b, c.
         """Test basic graph reordering functionality."""
         # Set up test data
         key = ("test_reorder.Tensor", "CPU")
 
         def cond_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy condition that accepts any call.
             return True
 
         def impl_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy implementation returning its argument.
             return x
 
         # Create nodes in specific order
@@ -218,6 +268,8 @@ class TestRegistry(TestCase):
 
         # Define alphabetical ordering function
         def alphabetical_order(op_symbol, dispatch_key, graph):
+            # [FUNCTION DOC] HELPER: User ordering function: ignores the op symbol and dispatch
+            # key and returns the graph nodes sorted by DSL name.
             return sorted(graph, key=lambda n: n.dsl_name)
 
         # Apply reordering
@@ -229,14 +281,20 @@ class TestRegistry(TestCase):
         self.assertEqual(actual_names, ["dsl_a", "dsl_b", "dsl_c"])
 
     def test_reorder_graphs_from_user_function_error_handling(self):
+        # [FUNCTION DOC] Places one node in the graph and runs reordering with a function that
+        # raises ValueError. Checks exactly one warning is logged by the registry logger
+        # containing the text about a failed graph transformation and that the stored graph is
+        # unchanged (no exception escapes).
         """Test error handling in graph reordering."""
         # Set up test data
         key = ("test_error.Tensor", "CPU")
 
         def cond_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy condition that accepts any call.
             return True
 
         def impl_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy implementation returning its argument.
             return x
 
         node = self.registry._OverrideNode(
@@ -247,6 +305,8 @@ class TestRegistry(TestCase):
 
         # Define failing ordering function
         def failing_order_fn(op_symbol, dispatch_key, graph):
+            # [FUNCTION DOC] HELPER: Ordering function that always raises ValueError with a test
+            # message.
             raise ValueError("Test exception")
 
         # Should handle the exception gracefully
@@ -259,6 +319,8 @@ class TestRegistry(TestCase):
         self.assertEqual(self.registry._graphs[key], original_graph)
 
     def test_get_user_ordering_fn_env_var_not_set(self):
+        # [FUNCTION DOC] With the environment emptied, clears the cache of the user ordering
+        # function lookup and checks it returns None.
         """Test behavior when environment variable is not set."""
         with patch.dict("os.environ", {}, clear=True):
             from torch._native import get_user_ordering_fn
@@ -268,6 +330,9 @@ class TestRegistry(TestCase):
             self.assertIsNone(result)
 
     def test_get_user_ordering_fn_invalid_path(self):
+        # [FUNCTION DOC] Sets the user graph-order environment variable to a path that cannot be
+        # imported, clears the lookup cache and checks the lookup raises ValueError whose
+        # message says it could not resolve the path.
         """Test handling of invalid environment variable paths."""
         with patch.dict(
             "os.environ",
@@ -282,15 +347,21 @@ class TestRegistry(TestCase):
             self.assertIn("Could not resolve", str(cm.exception))
 
     def test_integration_reorder_and_register(self):
+        # [FUNCTION DOC] Registers two overrides for one op and key from backends z then a,
+        # checks the graph order matches registration order, then reorders alphabetically by DSL
+        # name and checks the order becomes a then z.
         """Integration test: reorder then register functionality."""
 
         def cond_fn(x):
+            # [FUNCTION DOC] HELPER: Dummy condition that accepts any call.
             return True
 
         def impl_fn1(x):
+            # [FUNCTION DOC] HELPER: Dummy implementation that adds one to its argument.
             return x + 1
 
         def impl_fn2(x):
+            # [FUNCTION DOC] HELPER: Dummy implementation that adds two to its argument.
             return x + 2
 
         # Register multiple overrides
@@ -309,6 +380,8 @@ class TestRegistry(TestCase):
 
         # Reorder alphabetically
         def alphabetical_order(op_symbol, dispatch_key, graph):
+            # [FUNCTION DOC] HELPER: User ordering function returning the graph nodes sorted by
+            # DSL name.
             return sorted(graph, key=lambda n: n.dsl_name)
 
         self.registry.reorder_graphs_from_user_function(alphabetical_order)
@@ -318,14 +391,19 @@ class TestRegistry(TestCase):
         self.assertEqual(final_names, ["backend_a", "backend_z"])
 
     def test_disallowed_dispatch_key_rejected(self):
+        # [FUNCTION DOC] For each of the dispatch keys Meta, CompositeImplicitAutograd and
+        # CompositeExplicitAutograd, checks register_op_override raises ValueError whose message
+        # mentions the dispatch key argument.
         """Overrides installed at Meta / Composite* would loop through the
         fake kernel's redispatch — `register_op_override` must reject them.
         """
 
         def cond(*a, **k):
+            # [FUNCTION DOC] HELPER: Dummy condition accepting any arguments, returns true.
             return True
 
         def impl(*a, **k):
+            # [FUNCTION DOC] HELPER: Dummy implementation accepting any arguments, returns None.
             return None
 
         for bad_key in (
@@ -339,9 +417,12 @@ class TestRegistry(TestCase):
                 )
 
     def test_cond_none_without_unconditional_override_rejected(self):
+        # [FUNCTION DOC] Checks registering with no condition and without the unconditional flag
+        # raises ValueError saying the condition must be provided.
         """cond=None is only valid when unconditional_override=True."""
 
         def impl(*a, **k):
+            # [FUNCTION DOC] HELPER: Dummy implementation accepting any arguments, returns None.
             return None
 
         with self.assertRaisesRegex(ValueError, "cond must be provided"):
@@ -352,6 +433,11 @@ class TestRegistry(TestCase):
 
 @skipIfTorchDynamo("Runtime registry tests exercise the dispatcher directly")
 class TestRegistryRuntime(TestCase):
+    # [CLASS DOC] End-to-end tests that install overrides on real aten ops through the
+    # dispatcher; skipped under Dynamo. setUp saves registry tables and the node id counter and
+    # clears the graphs and reverse maps; tearDown destroys installed aten override libraries
+    # and restores the saved tables. The opaque native op definitions and fake kernels
+    # intentionally persist for the process.
     """End-to-end runtime tests that exercise the real dispatcher.
 
     These tests register overrides on real aten ops and therefore must fully
@@ -360,6 +446,10 @@ class TestRegistryRuntime(TestCase):
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Saves copies of the registry's graphs, libs, aten override libs, def
+        # libs, defined native ops, the three reverse maps and the node id counter into a
+        # dictionary, then clears the graphs and reverse maps so each test starts with no
+        # registered overrides.
         super().setUp()
         self.registry = registry_module
 
@@ -387,6 +477,10 @@ class TestRegistryRuntime(TestCase):
         self.registry._dispatch_key_to_lib_graph.clear()
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroys every aten override library the test installed, clears that
+        # table and restores the saved one, then restores the saved graphs, libs and reverse
+        # maps. Definitions of the native ops and fake kernels are deliberately left in place
+        # since they cannot be undefined.
         # Destroy any aten overrides the test installed so the dispatcher
         # returns to its pre-test state.
         for lib in list(self.registry._aten_override_libs.values()):
@@ -419,6 +513,9 @@ class TestRegistryRuntime(TestCase):
             self.registry._dispatch_key_to_lib_graph[k] = list(v)
 
     def _install(self, op_symbol, dispatch_key):
+        # [FUNCTION DOC] HELPER: Pushes the already registered graph for the given op symbol and
+        # dispatch key through the real registration path so the override becomes active in the
+        # dispatcher.
         """Build the graph then push it through the real registration path."""
         self.registry._register_overrides_from_graph(
             op_symbol,
@@ -427,13 +524,20 @@ class TestRegistryRuntime(TestCase):
         )
 
     def test_cond_false_falls_through_to_native(self):
+        # [FUNCTION DOC] Registers a mul.Tensor override on CPU whose condition returns false
+        # and whose implementation records a flag, installs it, calls the overload on two
+        # tensors and checks the native product is returned and the implementation was not
+        # called.
         """cond=False must transparently invoke the captured native kernel."""
         sentinel_called = [False]
 
         def cond(*a, **k):
+            # [FUNCTION DOC] HELPER: Condition that rejects every call.
             return False
 
         def impl(a, b):
+            # [FUNCTION DOC] HELPER: Implementation that records that it was called (in the
+            # shared flag list) and returns zeros like its first argument.
             sentinel_called[0] = True
             return torch.zeros_like(a)
 
@@ -451,14 +555,21 @@ class TestRegistryRuntime(TestCase):
         self.assertFalse(sentinel_called[0])
 
     def test_compile_session_flag_falls_through_without_recursion(self):
+        # [FUNCTION DOC] Installs a mul.Tensor override with a rejecting condition and an
+        # implementation that raises, then calls the op inside a compile-session context; checks
+        # the native product is returned, i.e. the router falls back without recursing into
+        # itself.
         """The eager router must not redispatch to its own aten override when
         compile-session state is set but Dynamo is not actively tracing it.
         """
 
         def cond(*a, **k):
+            # [FUNCTION DOC] HELPER: Condition that rejects every call.
             return False
 
         def impl(a, b):
+            # [FUNCTION DOC] HELPER: Implementation that raises AssertionError saying it must
+            # not be called.
             raise AssertionError("impl should not be called when cond=False")
 
         self.registry.register_op_override(
@@ -474,14 +585,22 @@ class TestRegistryRuntime(TestCase):
         self.assertTrue(torch.equal(out, torch.tensor([8.0, 15.0])))
 
     def test_dynamo_shortcut_preserves_cow_fallback(self):
+        # [FUNCTION DOC] Installs a rejecting mul.Tensor override whose condition records that
+        # it ran. Calls a function compiled with the eager backend on two lazily cloned (COW)
+        # tensors and checks the result is the native product, the condition was evaluated and
+        # both inputs are still COW afterwards.
         """COW inputs must keep using the eager fallback path under Dynamo."""
         sentinel_called = [False]
 
         def cond(*a, **k):
+            # [FUNCTION DOC] HELPER: Condition that records it was called (in the shared flag
+            # list) and rejects the call.
             sentinel_called[0] = True
             return False
 
         def impl(a, b):
+            # [FUNCTION DOC] HELPER: Implementation that raises AssertionError saying it must
+            # not be called.
             raise AssertionError("impl should not be called when cond=False")
 
         self.registry.register_op_override(
@@ -491,6 +610,8 @@ class TestRegistryRuntime(TestCase):
 
         @torch.compile(backend="eager")
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Compiled function that multiplies its two arguments with
+            # the CPU device context active.
             with torch.device("cpu"):
                 return torch.mul(a, b)
 
@@ -507,32 +628,50 @@ class TestRegistryRuntime(TestCase):
         self.assertTrue(torch._C._is_cow_tensor(b))
 
     def test_dynamo_guards_on_cow_state(self):
+        # [FUNCTION DOC] Compiles a function that returns the COW state of its argument and
+        # checks it reports false for a normal tensor and true for a lazily cloned one, i.e. the
+        # compiled code is guarded on COW state.
         @torch.compile(backend="eager")
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compiled function returning whether its argument is a COW
+            # tensor.
             return torch._C._is_cow_tensor(a)
 
         self.assertFalse(fn(torch.tensor([2.0, 3.0])))
         self.assertTrue(fn(torch._lazy_clone(torch.tensor([2.0, 3.0]))))
 
     def test_dynamo_graph_breaks_on_sourceless_cow_state(self):
+        # [FUNCTION DOC] Compiled function checks COW state of a view of its input (a value with
+        # no source); expects false for a normal tensor and true for a lazy clone.
         @torch.compile(backend="eager")
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compiled function returning whether a view of its argument
+            # is a COW tensor.
             return torch._C._is_cow_tensor(a.view_as(a))
 
         self.assertFalse(fn(torch.tensor([2.0, 3.0])))
         self.assertTrue(fn(torch._lazy_clone(torch.tensor([2.0, 3.0]))))
 
     def test_dynamo_graph_breaks_on_mutated_cow_state(self):
+        # [FUNCTION DOC] Compiled function mutates its COW input in place then reports its COW
+        # state; expects false after the in-place write.
         @torch.compile(backend="eager")
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compiled function that adds one in place to its argument
+            # and returns whether it is a COW tensor.
             a.add_(1)
             return torch._C._is_cow_tensor(a)
 
         self.assertFalse(fn(torch._lazy_clone(torch.tensor([2.0, 3.0]))))
 
     def test_dynamo_graph_breaks_after_lazy_clone_changes_cow_state(self):
+        # [FUNCTION DOC] With the inductor backend, a function that lazily clones its argument
+        # and reports the COW state of the argument and the clone must give true for both, even
+        # though the input was not COW before.
         @torch.compile(backend="inductor")
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compiled function that lazily clones its argument and
+            # returns the COW state of the argument and of the clone.
             clone = a._lazy_clone()
             return torch._C._is_cow_tensor(a), torch._C._is_cow_tensor(clone)
 
@@ -542,6 +681,11 @@ class TestRegistryRuntime(TestCase):
         )
 
     def test_dynamo_graph_breaks_after_lazy_clone_function_changes_cow_state(self):
+        # [FUNCTION DOC] Temporarily moves the lazy-clone function into the Dynamo
+        # allowed-callable set (removing it from the disallowed set) so it enters the FX graph,
+        # resets Dynamo, and checks a compiled function using it reports both tensors as COW. In
+        # finally restores membership of all three trace-rule id sets to their saved state and
+        # resets Dynamo again.
         fn_id = id(torch._lazy_clone)
         prior_trace_rule_state = (
             fn_id in trace_rules._allowed_callable_ids,
@@ -558,6 +702,8 @@ class TestRegistryRuntime(TestCase):
 
             @torch.compile(backend="eager")
             def fn(a):
+                # [FUNCTION DOC] HELPER: Compiled function that lazily clones its argument via
+                # the torch function and returns the COW state of the argument and the clone.
                 clone = torch._lazy_clone(a)
                 return torch._C._is_cow_tensor(a), torch._C._is_cow_tensor(clone)
 
@@ -581,8 +727,12 @@ class TestRegistryRuntime(TestCase):
             torch._dynamo.reset()
 
     def test_dynamo_graph_breaks_after_lazy_clone_view_changes_cow_state(self):
+        # [FUNCTION DOC] Compiled function takes a view of its argument and lazily clones the
+        # view; checks the argument, view and clone all report COW true.
         @torch.compile(backend="eager")
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compiled function that views its argument flat, lazily
+            # clones the view and returns the COW state of argument, view and clone.
             view = a.view(-1)
             clone = view._lazy_clone()
             return (
@@ -597,6 +747,9 @@ class TestRegistryRuntime(TestCase):
         )
 
     def test_cow_guard_misses_on_fake_tensor(self):
+        # [FUNCTION DOC] Imports the guard helper that compares COW state and checks it returns
+        # false for a fake tensor created under a fake tensor mode, whether the expected state
+        # is false or true.
         from torch._dynamo.guards import _cow_tensor_matches
 
         with FakeTensorMode():
@@ -606,6 +759,8 @@ class TestRegistryRuntime(TestCase):
         self.assertFalse(_cow_tensor_matches(fake, True))
 
     def test_is_cow_tensor_rejects_python_tensor_subclasses(self):
+        # [FUNCTION DOC] Wraps a tensor in the test wrapper subclass and checks the COW query
+        # raises RuntimeError saying it is not defined for Python tensor subclasses.
         x = _CowStateWrapperTensor(torch.tensor([2.0, 3.0]))
         with self.assertRaisesRegex(
             RuntimeError, "_is_cow_tensor is not defined for Python tensor subclasses"
@@ -613,8 +768,13 @@ class TestRegistryRuntime(TestCase):
             torch._C._is_cow_tensor(x)
 
     def test_dynamo_graph_breaks_on_subclass_cow_state(self):
+        # [FUNCTION DOC] With full-graph compilation, passing a Python tensor subclass instance
+        # to a function that queries COW state must raise an exception mentioning a COW check on
+        # a Python tensor subclass.
         @torch.compile(backend="eager", fullgraph=True)
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compiled function returning whether its argument is a COW
+            # tensor.
             return torch._C._is_cow_tensor(a)
 
         x = _CowStateWrapperTensor(torch.tensor([2.0, 3.0]))
@@ -624,8 +784,12 @@ class TestRegistryRuntime(TestCase):
             fn(x)
 
     def test_dynamo_allows_previously_mutated_cow_state(self):
+        # [FUNCTION DOC] With full-graph compilation, a tensor that was mutated in place earlier
+        # is not COW; the compiled COW query must work without a graph break and return false.
         @torch.compile(backend="eager", fullgraph=True)
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compiled function returning whether its argument is a COW
+            # tensor.
             return torch._C._is_cow_tensor(a)
 
         x = torch.tensor([2.0, 3.0])
@@ -633,8 +797,15 @@ class TestRegistryRuntime(TestCase):
         self.assertFalse(fn(x))
 
     def test_strict_export_rejects_cow_state(self):
+        # [FUNCTION DOC] Strict export of a module whose forward branches on the COW state of
+        # its input, given a lazily cloned input, must raise an exception mentioning a COW check
+        # during export.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module whose forward adds one to the input if it is a
+            # COW tensor and two otherwise.
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: Branches on the COW state of the argument: adds one if
+                # COW, else adds two; returns the sum tensor.
                 if torch._C._is_cow_tensor(a):
                     return a + 1
                 return a + 2
@@ -647,8 +818,15 @@ class TestRegistryRuntime(TestCase):
             )
 
     def test_non_strict_export_rejects_cow_state(self):
+        # [FUNCTION DOC] Non-strict export of the same COW-branching module with a lazily cloned
+        # input must raise an exception saying the COW query is not defined for Python tensor
+        # subclasses.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Local module whose forward adds one to the input if it is a
+            # COW tensor and two otherwise.
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: Branches on the COW state of the argument: adds one if
+                # COW, else adds two; returns the sum tensor.
                 if torch._C._is_cow_tensor(a):
                     return a + 1
                 return a + 2
@@ -663,12 +841,18 @@ class TestRegistryRuntime(TestCase):
             )
 
     def test_cond_true_routes_to_impl(self):
+        # [FUNCTION DOC] Installs a mul.Tensor override whose condition accepts and whose
+        # implementation returns a tensor of 42s; checks the dispatched call returns that
+        # implementation's result.
         """cond=True must route the call to the registered impl."""
 
         def cond(*a, **k):
+            # [FUNCTION DOC] HELPER: Condition that accepts every call.
             return True
 
         def impl(a, b):
+            # [FUNCTION DOC] HELPER: Implementation returning a tensor like the first argument
+            # filled with 42.
             return torch.full_like(a, 42.0)
 
         self.registry.register_op_override(
@@ -682,6 +866,10 @@ class TestRegistryRuntime(TestCase):
         self.assertTrue(torch.equal(out, torch.tensor([42.0, 42.0])))
 
     def test_no_recursion_in_aten_backward_formula(self):
+        # [FUNCTION DOC] Installs a bmm override with a rejecting condition, runs forward and
+        # backward on random tensors needing grad, and checks the forward result equals the
+        # plain product, gradients exist with the right shapes and are not all zero. This shows
+        # the native fallback does not re-enter the router in the backward formula.
         """Backward of bmm calls bmm again; the fallback must bypass the router.
 
         If the router weren't bypassed, aten's bmm backward formula would
@@ -690,12 +878,16 @@ class TestRegistryRuntime(TestCase):
         """
 
         def cond(*a, **k):
+            # [FUNCTION DOC] HELPER: Condition that rejects every call so each call takes the
+            # native fallback.
             # False so every call hits the fallback — this isolates the
             # "native kernel called via fallback must not re-enter the router"
             # property.
             return False
 
         def impl(a, b):
+            # [FUNCTION DOC] HELPER: Implementation that raises AssertionError saying it must
+            # not be called.
             raise AssertionError("impl should not be called when cond=False")
 
         self.registry.register_op_override("test_dsl", "aten", "bmm", "CPU", cond, impl)
@@ -714,12 +906,19 @@ class TestRegistryRuntime(TestCase):
         self.assertTrue((b.grad != 0).any())
 
     def test_deregister_reenable_roundtrip(self):
+        # [FUNCTION DOC] Installs a mul.Tensor override returning sevens and checks it is live
+        # and recorded in the aten override table. Deregisters the DSL and checks the native
+        # product returns and the table entry is gone; re-enables and checks sevens again and
+        # the entry is back.
         """deregister must tear down the aten router; reenable must reinstall."""
 
         def cond(*a, **k):
+            # [FUNCTION DOC] HELPER: Condition that accepts every call.
             return True
 
         def impl(a, b):
+            # [FUNCTION DOC] HELPER: Implementation returning a tensor like the first argument
+            # filled with 7.
             return torch.full_like(a, 7.0)
 
         self.registry.register_op_override(
@@ -746,6 +945,10 @@ class TestRegistryRuntime(TestCase):
         self.assertIn(("mul.Tensor", "CPU"), self.registry._aten_override_libs)
 
     def test_empty_graph_tears_down_router(self):
+        # [FUNCTION DOC] Regression test. Installs a mul.Tensor override returning 99s, then
+        # replaces the stored graph with an empty list and calls the cleanup-and-reregister
+        # routine; checks the aten override table entry is removed and the native product is
+        # returned again.
         """An empty graph passed to _cleanup_and_reregister_graph must still
         tear down the previously-installed aten router.
 
@@ -755,9 +958,12 @@ class TestRegistryRuntime(TestCase):
         """
 
         def cond(*a, **k):
+            # [FUNCTION DOC] HELPER: Condition that accepts every call.
             return True
 
         def impl(a, b):
+            # [FUNCTION DOC] HELPER: Implementation returning a tensor like the first argument
+            # filled with 99.
             return torch.full_like(a, 99.0)
 
         self.registry.register_op_override(
@@ -781,14 +987,20 @@ class TestRegistryRuntime(TestCase):
         self.assertTrue(torch.equal(mul(a, b), torch.tensor([8.0, 15.0])))
 
     def test_fake_tensor_shape_inference(self):
+        # [FUNCTION DOC] Installs a mul.Tensor override, then under a fake tensor mode
+        # multiplies two empty 3 by 4 float32 tensors through the op and checks the result has
+        # shape 3 by 4 and dtype float32, via the registered fake kernel.
         """FakeTensorMode must shape-infer through `_native::<id>` via the
         registered fake kernel (which redispatches to the aten meta).
         """
 
         def cond(*a, **k):
+            # [FUNCTION DOC] HELPER: Condition that accepts every call.
             return True
 
         def impl(a, b):
+            # [FUNCTION DOC] HELPER: Implementation returning a tensor like the first argument
+            # filled with 1.
             return torch.full_like(a, 1.0)
 
         self.registry.register_op_override(
@@ -805,12 +1017,17 @@ class TestRegistryRuntime(TestCase):
         self.assertEqual(out.dtype, torch.float32)
 
     def test_unconditional_override_cond_none(self):
+        # [FUNCTION DOC] Registers a mul.Tensor override with no condition but the unconditional
+        # flag, installs it, and checks two calls (including one on zeros) both return the
+        # implementation's fives and the implementation ran exactly twice.
         """`cond=None` + `unconditional_override=True` must substitute a
         trivially-true predicate so the impl fires on every call.
         """
         call_count = [0]
 
         def impl(a, b):
+            # [FUNCTION DOC] HELPER: Implementation that increments the shared call counter and
+            # returns a tensor like the first argument filled with 5.
             call_count[0] += 1
             return torch.full_like(a, 5.0)
 
