@@ -2,6 +2,14 @@
 # Based on the cute-dsl example:
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/dense_gemm_persistent.py
 
+# [MODULE DOC] Blackwell (SM100) persistent batched GEMM built on the CuTe DSL, adapted from the
+# NVIDIA dense GEMM example. Defines GemmSm100, a warp-specialized kernel family using TMA loads,
+# tcgen05 MMA with the accumulator in tensor memory, optional 2-CTA MMA, cluster multicast, CLC or
+# static persistent scheduling, optional gathered-A loads (cp.async or TMA gather), variable
+# length M or K batches, and optional block-scaled (scale factor) operands. Also holds static
+# validity checks for dtype, tile, cluster and alignment combinations. The long string literal
+# near the top is descriptive text only. No import-time side effects beyond imports and class
+# creation.
 from typing import Optional, Type, Tuple, Union, Callable, Literal
 from functools import partial
 import math
@@ -78,6 +86,16 @@ Constraints:
 
 
 class GemmSm100(GemmTmaBase):
+    # [CLASS DOC] Configurable SM100 GEMM kernel: output D = A times B plus epilogue, with
+    # optional C input, for batched, varlen and block-scaled problems. Constructor state:
+    # accumulator dtype, MMA tiler (K resolved later), cluster shape, 2-CTA flag (derived from
+    # cluster M and tiler M), CTA group, block-scaled flag, gather and CLC flags, and the fixed
+    # warp roles: four epilogue warps, one MMA warp, one or four A/B load warps, one epilogue-load
+    # warp, one scheduler warp and (gather only) one A-index prefetch warp. Attributes derived
+    # from the input tensors (dtypes, layouts, stage counts, smem layouts, tensor memory columns)
+    # are set when the object is called. Key methods: __call__ builds TMA atoms, shared storage
+    # and launches kernel; the static can_implement checks validate configurations. Inherits
+    # epilogue machinery from GemmTmaBase.
     """This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
 
@@ -143,6 +161,15 @@ class GemmSm100(GemmTmaBase):
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
     ):
+        # [FUNCTION DOC] Store the static kernel configuration and compute warp assignments.
+        # Decides 2-CTA mode when cluster M is even and tiler M is 128 or 256 (only 256 for block-
+        # scaled), pads a 2-element tiler with a zero K to be resolved later, forces persistence,
+        # and assigns warp ids: epilogue warps first, then MMA, A/B load, epilogue load and
+        # scheduler warps, plus a prefetch warp for gather. Builds the epilogue named barrier,
+        # sets default register budgets, and computes the CTA thread count. The a_dtype argument
+        # is ignored. Raises AssertionError for a tiler length other than 2 or 3, cluster K not 1,
+        # gather with cluster N above 1, TMA gather without gather_A, or a thread count not a
+        # multiple of 128.
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
         This configuration includes several key aspects:
@@ -231,6 +258,9 @@ class GemmSm100(GemmTmaBase):
         assert self.threads_per_cta % 128 == 0
 
     def epi_smem_warp_shape_mnk(self):
+        # [FUNCTION DOC] Return the (M warps, N warps, 1) arrangement of epilogue warps over the
+        # CTA tile: two by two when the per-CTA M tile is 64 and 2-CTA MMA is used, else four by
+        # one.
         # Mirrors cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape:
         # the epilogue tmem layout uses two M warps and two N warps when the
         # per-CTA M tile is 64 and the kernel uses 2-CTA instructions.
@@ -240,6 +270,17 @@ class GemmSm100(GemmTmaBase):
         return (warp_m, warp_n, 1)
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments, varlen_args: VarlenArguments):
+        # [FUNCTION DOC] Compute everything that depends on the actual tensor dtypes and layouts.
+        # Must run after dtype and layout attributes are set in __call__. Resolves epilogue
+        # M-major mode, builds the tiled MMA (plus a separate scale-factor-B MMA when block-
+        # scaled), resolves the K tile (default four MMA instructions, otherwise validates
+        # divisibility by instruction K), derives CTA tile shapes, cluster layouts and multicast
+        # counts, picks the epilogue tile (using the first tile-load tensor as a C stand-in, and
+        # shrinking the N extent when it does not divide the CTA N), computes accumulator, A/B and
+        # epilogue stage counts from shared memory capacity, builds all staged smem layouts, the
+        # tensor memory column count, and the early-release index used when accumulator and scale
+        # factors overlap in tensor memory. Raises AssertionError if MMA tiler K is not a multiple
+        # of instruction K, or if gather has A multicast. Writes many self attributes.
         """Set up configurations that are dependent on GEMM inputs
 
         This method configures various attributes based on the input tensor properties
@@ -527,6 +568,19 @@ class GemmSm100(GemmTmaBase):
         mSFB: Optional[cute.Tensor] = None,
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
+        # [FUNCTION DOC] Host entry: configure and launch the GEMM kernel. Applies the optional
+        # concat interleave to A, B, D and C, reads dtypes and layouts, runs _setup_attributes,
+        # rebuilds the scale factor layouts from actual strides when block-scaled, creates TMA
+        # atoms and tensors for A (not for cp.async gather), B, scale factors and the epilogue,
+        # computes expected TMA byte counts, builds scheduler arguments and grid, defines the
+        # shared storage struct, and launches the kernel with cluster and optional programmatic
+        # dependent launch. Returns nothing. Raises TypeError if A and B dtypes differ;
+        # AssertionError if block-scaled without scale tensors, or if the gather setting does not
+        # match presence of the A index tensor. Side effects: sets many self attributes including
+        # shared_storage.
+        # KNOWN ISSUE: the docstring lists a max_active_clusters parameter that does not exist; it
+        #   comes
+        # from the scheduler arguments.
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
         - Setup TMA load/store atoms and tensors
@@ -762,6 +816,13 @@ class GemmSm100(GemmTmaBase):
         # Define shared storage for kernel
         @cute.struct
         class SharedStorage:
+            # [CLASS DOC] HELPER: Shared memory layout struct for one CTA. Fields: mbarrier arrays
+            # for the A/B, epilogue-load, accumulator, scheduler and A-prefetch pipelines (two
+            # entries per stage), scheduler work-tile data (twelve integers per stage), tensor
+            # memory dealloc barrier and holding slot, an aligned A index buffer for gather, and
+            # 1024-byte aligned staged buffers for D, C, extra epilogue data, A, B and the two
+            # scale factors. Sizes depend on stage counts and dtypes captured from the enclosing
+            # call; unused buffers get size zero.
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             acc_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
@@ -885,6 +946,17 @@ class GemmSm100(GemmTmaBase):
         TileSchedulerCls: cutlass.Constexpr[Callable],
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
+        # [FUNCTION DOC] Device kernel: warp-specialized persistent GEMM. Every warp first helps
+        # set up pipelines, tensor memory allocator and smem tensors, then branches on its role.
+        # A/B load warps run TMA loads of A (or gathered A), B and scale factors per tile and K
+        # block, after waiting for the prior kernel when PDL is on; the scheduler warp drives the
+        # tile scheduler; the prefetch warp copies A row or K indices to smem; the epilogue-load
+        # warp loads C and tile-load inputs; the MMA warp issues tcgen05 MMAs into tensor memory
+        # (leader CTA only for 2-CTA) and signals accumulator readiness; the epilogue warps
+        # allocate tensor memory, read accumulator subtiles, run the epilogue and store D, then
+        # free tensor memory. Handles varlen M or K, optional C, and block-scaled operands. Raises
+        # AssertionError at trace time if both varlen modes are set or gather is used without
+        # varlen. Writes D to global memory.
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
@@ -1710,6 +1782,14 @@ class GemmSm100(GemmTmaBase):
         batch_idx: Int32,
         warp_idx: Int32,
     ):
+        # [FUNCTION DOC] HELPER: Build the per-tile A loader functions for the gather path.
+        # Returns a pair of callables: copy_A, and prefetch_A (None unless the K-gather variant
+        # needs it). With TMA gather it uses the TMA gather copy helpers for varlen M or varlen K;
+        # otherwise it builds a cp.async tiled copy over the load warps and uses the matching
+        # gather helpers with M and K limits taken from the batch lengths. For varlen M, A is used
+        # whole; otherwise it is tiled along M for the current tile. The index tensor must already
+        # be the current prefetch stage for varlen M. For TMA gather with neither varlen mode both
+        # results stay None.
         """Create copy_A and prefetch_A for gather_A (cp.async and TMA gather paths).
         sAIdx: sAIdx sliced to the current prefetch stage (for varlen_m paths).
         For varlen_k TMA gather, sAIdx (full) is used instead.
@@ -1788,6 +1868,13 @@ class GemmSm100(GemmTmaBase):
         k_tile_cnt: Int32,
         varlen_m: bool = True,
     ) -> Tuple[cutlass.pipeline.PipelineState, Optional[cutlass.pipeline.PipelineState]]:
+        # [FUNCTION DOC] Producer loop for the cp.async gathered-A path. Over all K tiles it
+        # prefetches A indices early when a prefetch function exists, waits for an empty A/B
+        # stage, has one rotating load warp issue the TMA load of B on the stage barrier, issues
+        # the gathered copy of A, and commits the cp.async arrivals to the stage barrier before
+        # advancing. The last tile is handled separately with predication so out-of-range K is
+        # bounds checked. Returns the advanced producer state and the advanced prefetch consumer
+        # state. With zero tiles nothing is issued.
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
         peek_ab_empty_status = Boolean(True)
@@ -1845,6 +1932,11 @@ class GemmSm100(GemmTmaBase):
         copy_B: Callable,
         k_tile_cnt: Int32,
     ) -> Tuple[cutlass.pipeline.PipelineState, Optional[cutlass.pipeline.PipelineState]]:
+        # [FUNCTION DOC] Producer loop for the TMA gather path, used for both varlen M (no
+        # prefetch function, the A copy gets the K tile) and varlen K (indices consumed per K tile
+        # from the prefetch pipeline). For each K tile it waits for an empty stage, lets one
+        # rotating warp load B, issues the A gather on the same barrier, commits the stage, and
+        # advances. Returns the producer state and the prefetch consumer state.
         """Unified TMA gather loading loop for both varlen_m and varlen_k.
 
         For varlen_m: a_prefetch_pipeline is None, copy_A receives k_tile as src_idx.
@@ -1893,6 +1985,15 @@ class GemmSm100(GemmTmaBase):
         copy_s2t_sfa: Optional[Callable] = None,
         copy_s2t_sfb: Optional[Callable] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState, cute.TiledMma]:
+        # [FUNCTION DOC] MMA warp mainloop for one output tile. Waits (leader CTA) for the
+        # accumulator buffer to be empty, clears the accumulate flag, then for each K tile waits
+        # for the full A/B stage, optionally copies scale factors from smem to tensor memory,
+        # issues one MMA per K block with accumulate turned on after the first, and releases the
+        # stage. In 2-CTA cp.async gather mode the non-leader CTA also waits for its own data and
+        # signals the leader CTA barrier. Finally the leader commits accumulator-full. Returns the
+        # updated A/B consumer state, accumulator producer state and tiled MMA (returned to avoid
+        # a compiler dominance error). Raises AssertionError at trace time if block-scaled inputs
+        # are missing.
         blockscaled = const_expr(copy_s2t_sfa is not None)
         if const_expr(blockscaled):
             assert all(x is not None for x in (tCtSFA, tCtSFB))
@@ -1968,6 +2069,12 @@ class GemmSm100(GemmTmaBase):
         acc_release_idx: int,
         clear_acc: Boolean = False,
     ):
+        # [FUNCTION DOC] Epilogue callback that loads one accumulator subtile into registers for
+        # D. Copies the subtile from tensor memory to registers and converts into the D register
+        # fragment, or fills the fragment with zero when clear_acc is set (empty varlen K batch).
+        # On the subtile whose column index equals acc_release_idx, it fences tensor memory loads
+        # and one elected thread releases the accumulator pipeline stage. Raises AssertionError if
+        # the subtile M coordinate is not zero (SM100 assumes epilogue tile M count of one).
         if not clear_acc:
             # Load accumulator from tensor memory buffer to register
             cute.copy(tiled_copy_t2r, tTR_tAcc[None, None, None, epi_coord], tTR_rAcc)
@@ -1988,6 +2095,11 @@ class GemmSm100(GemmTmaBase):
         epi_tile: cute.Tile,
         use_2cta_instrs: Union[Boolean, bool],
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Make the tensor-memory-to-register tiled copy for the epilogue and
+        # partition the accumulator with it. Takes the thread index, accumulator tensor across
+        # stages, epilogue tile and the 2-CTA flag. Returns the tiled copy, the partitioned tensor
+        # memory source, and a register tensor sized for one subtile in the accumulator dtype.
+        # Defaults to row-major and bfloat16 when D is absent.
         """
         Make tiledCopy for tensor memory load, then use it to partition tensor memory (source) and register array (destination).
 
@@ -2042,6 +2154,13 @@ class GemmSm100(GemmTmaBase):
         sD: cute.Tensor,
         tidx: Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Make the register-to-shared-memory store copy for D, built on the tensor
+        # memory copy so thread layouts match. Returns the tiled copy, the register tensor retiled
+        # for the store, and the smem destination partition (None when sD is None). Defaults to
+        # row-major and bfloat16 when layout or dtype is None.
+        # KNOWN ISSUE: the docstring mentions a parameter named sepi and describes tRS_rD as
+        #   tensor C;
+        # neither matches the code.
         """
         Make tiledCopy for shared memory store, then use it to partition register array (source) and shared memory (destination).
 
@@ -2085,6 +2204,11 @@ class GemmSm100(GemmTmaBase):
         tRS_rD_layout: cutlass.Layout,
         tidx: Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Make the shared-memory-to-register copy used to read C in the epilogue.
+        # Chooses the load op to mirror the store op for C: a matrix load for 16-bit stmatrix
+        # stores, a 16x16 8-bit matrix load for 2- or 4-matrix 8-bit stores, else a plain
+        # universal copy. Returns the tiled copy, the C register tensor (shaped like the D
+        # register layout), its retiled view, and the partitioned smem source.
         copy_atom_r2s = sm100_utils.get_smem_store_op(
             c_layout, dtype, self.acc_dtype, tiled_copy_t2r
         )
@@ -2116,6 +2240,12 @@ class GemmSm100(GemmTmaBase):
         ab_pipeline_mbar_ptr: cute.Pointer,
         is_leader_cta: Boolean,
     ) -> pipeline.PipelineAsync:
+        # [FUNCTION DOC] Create the A/B mainloop pipeline. Producer arrival count is one for TMA
+        # A, else the cp.async thread count plus one (or two with 2-CTA) for gathered A. Consumer
+        # count is the multicast fan-in. Picks a TMA-UMMA pipeline for plain and TMA gather, or a
+        # TMA plus cp.async UMMA pipeline for cp.async gather, in which the non-leader CTA drops
+        # two producer arrivals. Expected TMA bytes come from self.num_tma_load_bytes. Barriers
+        # live at the given storage.
         # If gather_A and use_2cta_instrs, the cp.async for the non-leader CTA will
         # arrive at an mbarrier on the non-leader CTA side, then the mma warp of the non-leader
         # CTA will wait for that then arrive at the mbarrier on the leader CTA.
@@ -2174,6 +2304,9 @@ class GemmSm100(GemmTmaBase):
     def make_acc_pipeline(
         self, cluster_layout_vmnk: cute.Layout, acc_pipeline_mbar_ptr: cute.Pointer
     ) -> pipeline.PipelineAsync:
+        # [FUNCTION DOC] Create the UMMA-to-epilogue accumulator pipeline with one producer
+        # arrival and a consumer count of epilogue warps (doubled for 2-CTA), over the accumulator
+        # stages.
         acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = self.num_epi_warps * (2 if self.use_2cta_instrs else 1)
         acc_pipeline_consumer_group = pipeline.CooperativeGroup(
@@ -2194,6 +2327,10 @@ class GemmSm100(GemmTmaBase):
         sched_pipeline_mbar_ptr: cute.Pointer,
         has_C: bool = False,
     ) -> pipeline.PipelineAsync:
+        # [FUNCTION DOC] Create the scheduler pipeline carrying work tile info. One producer
+        # arrival; consumers are every warp in the CTA that reads work tiles (load, MMA, epilogue,
+        # scheduler, prefetch, plus the epilogue load warp when C or tile loads exist) times the
+        # cluster size. With a cluster, consumers arrive on CTA zero.
         # Threads/warps participating in this pipeline
         sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(cluster_layout_mnk)
@@ -2222,6 +2359,9 @@ class GemmSm100(GemmTmaBase):
     def make_a_prefetch_pipeline(
         self, a_prefetch_pipeline_mbar_ptr: cute.Pointer
     ) -> pipeline.PipelineAsync:
+        # [FUNCTION DOC] Create the cp.async pipeline that passes prefetched A indices from the
+        # prefetch warp (32 producer threads) to the A load warps (one arrival per load warp),
+        # with the A-prefetch stage count.
         producer_cnt = 32
         a_prefetch_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         consumer_arrive_cnt = self.num_ab_load_warps
@@ -2257,6 +2397,15 @@ class GemmSm100(GemmTmaBase):
         occupancy: int,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
     ) -> Tuple[int, int, int]:
+        # [FUNCTION DOC] Heuristically pick stage counts under the shared memory budget.
+        # Accumulator stages: one for large N, else two. Epilogue stages: four for narrow epilogue
+        # tiles, else two; C stages zero when no C and no tile loads. Computes bytes per A/B stage
+        # (plus scale factors, plus index storage for varlen K prefetch), reserved barrier bytes
+        # (plus index storage for varlen M), and the epilogue bytes; A/B stages fill what remains,
+        # and leftover space is given to extra epilogue stages. Returns four values: accumulator,
+        # A/B, epilogue D and epilogue C stages.
+        # KNOWN ISSUE: the return annotation and docstring describe three values but four are
+        #   returned.
         """Computes the number of stages for A/B/C operands based on heuristics.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
@@ -2381,6 +2530,9 @@ class GemmSm100(GemmTmaBase):
         mma_tiler: Tuple[int, int, int],
         num_acc_stage: int,
     ) -> int:
+        # [FUNCTION DOC] Return how many tensor memory columns the accumulator needs, by building
+        # a placeholder accumulator fragment for the tiler across the given stage count and asking
+        # cutlass for its column count.
         """
         Compute the number of tensor memory allocation columns.
 
@@ -2408,6 +2560,14 @@ class GemmSm100(GemmTmaBase):
         a_major: str,
         b_major: str,
     ) -> bool:
+        # [FUNCTION DOC] Validity check for the A, B, accumulator and output dtype combination.
+        # Returns False if A and B differ, if the A/B dtype is outside fp16, bf16, tf32, 8-bit
+        # integer or fp8 types, if the accumulator dtype is not allowed for the operand dtype
+        # (half only for fp16 or fp8, int32 only for 8-bit integers), or if the output dtype is
+        # not allowed for the accumulator dtype. Pure function, no side effects.
+        # KNOWN ISSUE: the final fp4 requires-K-major branch is unreachable since fp4 is already
+        #   rejected
+        # by the operand dtype check.
         """
         Check if the dtypes are valid
 
@@ -2485,6 +2645,10 @@ class GemmSm100(GemmTmaBase):
         sf_vec_size: int,
         d_dtype: Type[cutlass.Numeric],
     ) -> bool:
+        # [FUNCTION DOC] Validity check for block-scaled dtype combinations. Operand type must be
+        # fp4 or fp8; vector size 16 or 32; scale dtype e8m0 or e4m3 (e4m3 not with size 32); fp8
+        # operands not with size 16; output dtype in fp32, fp16, bf16 or fp8. Returns a boolean
+        # without side effects.
         """
         Check if the dtypes and sf_vec_size are valid combinations
 
@@ -2538,6 +2702,11 @@ class GemmSm100(GemmTmaBase):
         cluster_shape_mn: Tuple[int, int],
         blockscaled: bool,
     ) -> bool:
+        # [FUNCTION DOC] Validity check for tiler and cluster. Tiler M must be 64, 128 or 256 (128
+        # or 256 when block-scaled); N must give an instruction N that is a multiple of 32 up to
+        # 256 (for block-scaled N must be 64, 128, 192 or 256); cluster M must be even for tiler M
+        # of 256; cluster dims must be positive powers of two with product at most 16, and at most
+        # 4 each when block-scaled. Returns a boolean.
         """
         Check if the mma tiler and cluster shape are valid
 
@@ -2596,6 +2765,12 @@ class GemmSm100(GemmTmaBase):
         b_major: str,
         d_major: str,
     ) -> bool:
+        # [FUNCTION DOC] Check 16-byte alignment of the contiguous dimension of A, B and D. For
+        # each, the extent along the major mode must be a multiple of the element count in 16
+        # bytes. Returns True only if all three pass; no side effects.
+        # KNOWN ISSUE: the batch size argument is never checked and its docstring wrongly calls it
+        #   the
+        # column count of C.
         """
         Check if the tensor alignment is valid
 
@@ -2624,6 +2799,9 @@ class GemmSm100(GemmTmaBase):
         is_valid = True
 
         def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
+            # [FUNCTION DOC] HELPER: True when the extent of the major dimension (first if mode
+            # zero is major, else second) of the given shape is a multiple of the number of
+            # elements in 16 bytes for the dtype width.
             major_mode_idx = 0 if is_mode0_major else 1
             num_major_elements = tensor_shape[major_mode_idx]
             num_contiguous_elements = 16 * 8 // dtype.width
@@ -2653,6 +2831,9 @@ class GemmSm100(GemmTmaBase):
         b_major: str,
         d_major: str,
     ) -> bool:
+        # [FUNCTION DOC] Combine the block-scaled checks: dtype and scale vector size validity,
+        # fp4 needing K-major A and B, tiler and cluster validity with block-scaled rules, and
+        # tensor alignment. Returns False if any fails.
         can_implement = True
         if not GemmSm100.is_valid_dtypes_and_scale_factor_vec_size(
             ab_dtype, sf_dtype, sf_vec_size, d_dtype
@@ -2685,6 +2866,9 @@ class GemmSm100(GemmTmaBase):
         b_major: str,
         d_major: str,
     ) -> bool:
+        # [FUNCTION DOC] Static check that a plain (non-block-scaled) GEMM problem is supported:
+        # validates dtypes, tiler and cluster shape, and tensor alignment for the given problem
+        # sizes and major modes. Returns True only if all pass; no side effects.
         """
         Check if the gemm can be implemented
 

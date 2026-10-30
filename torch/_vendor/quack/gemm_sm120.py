@@ -7,6 +7,10 @@
 
 # This is a work in progress and not very optimized.
 
+# [MODULE DOC] Warp-level (non-WGMMA) GEMM for SM120 GPUs, built on the SM90 GEMM class. Defines
+# GemmSm120, which keeps the SM90 host setup, scheduler, pipelines and epilogue but swaps the
+# tensor-core path for warp-level f16/bf16 MMA fed by explicit ldmatrix copies. Marked in the
+# header as a work in progress. No import-time side effects beyond imports.
 import math
 from typing import Tuple, Type, Callable, Optional
 from functools import partial
@@ -26,6 +30,13 @@ from . import sm80_utils
 
 
 class GemmSm120(GemmSm90):
+    # [CLASS DOC] GEMM kernel for SM120 using 32-thread warp MMA instead of SM90 warpgroup MMA.
+    # State: accumulator dtype, pingpong and persistence flags, gather_A flag, MMA atom shape
+    # (16x8x16), warp atom layout (4x2x1, or 2x2x1 per warp group when pingpong), warp counts,
+    # register budgets for load and MMA warps, TMA multicast counts and an epilogue barrier.
+    # Pipeline stage counts and staged smem layouts start as None and are filled by the inherited
+    # setup code. Overrides the kernel body, the mainloop (mma), the tiled MMA setup and the
+    # epilogue tile choice; everything else is inherited from GemmSm90.
     """SM120-style GEMM using warp-level MMA instead of WGMMA.
 
     Key differences from SM90:
@@ -50,6 +61,15 @@ class GemmSm120(GemmSm90):
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
     ):
+        # [FUNCTION DOC] Configure the kernel without calling the parent constructor. Stores
+        # dtypes and flags, fixes persistent CLC scheduling off and fp8 slow accumulation off,
+        # pads a 2-element tile shape with a zero K that _setup_tiled_mma resolves later, and
+        # derives warp counts: 8 MMA warps normally, 8 split over two warp groups when pingpong.
+        # Total threads are the MMA warp groups plus one load warp group. Register budgets are
+        # 40/232, or 56/224 with gather_A (which uses four load warps). Multicast counts come from
+        # the cluster shape. Raises AssertionError if pingpong is not persistent, if gather_A has
+        # a cluster N above 1, or if the tile shape length is not 2 or 3. Queries the SM120 shared
+        # memory capacity.
         # Don't call super().__init__ — we set up our own config
         self.acc_dtype = acc_dtype
         self.pingpong = pingpong
@@ -125,9 +145,17 @@ class GemmSm120(GemmSm90):
         self.buffer_align_bytes = 1024
 
     def epi_smem_warp_shape_mnk(self):
+        # [FUNCTION DOC] Return the warp layout (M, N, K atoms) the epilogue uses to split the
+        # tile across warps; this is simply the MMA atom layout chosen in the constructor.
         return self.atom_layout_mnk
 
     def _setup_tiled_mma(self):
+        # [FUNCTION DOC] Build the warp-level tiled MMA and finalize the CTA tile K size. Creates
+        # a warp MMA op for the A dtype and accumulator dtype, tiles it over the atom layout, and
+        # permutes the N mode so each warp owns 16 consecutive N elements (for stmatrix stores and
+        # gated epilogues). Stores the result in self.tiled_mma. K defaults to four MMA K steps
+        # when the tile K is zero. Raises AssertionError if K is not positive or not a multiple of
+        # the MMA instruction K. Replaces cta_tile_shape_mnk with the K-resolved shape.
         """Set up warp-level MMA (MmaF16BF16Op) and tile K dimension."""
         op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
         tC = cute.make_layout(self.atom_layout_mnk)
@@ -178,6 +206,17 @@ class GemmSm120(GemmSm90):
         TileSchedulerCls: cutlass.Constexpr[Callable],
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
+        # [FUNCTION DOC] Device kernel: TMA producer warp(s) plus warp-MMA consumer warps with an
+        # SM90-style epilogue. Sets up smem, the A/B pipeline, optional epilogue-load pipeline and
+        # scheduler pipeline, then runs a persistent tile loop. Load warps (index at or above the
+        # MMA warp count) issue TMA loads of A and B (or cp.async gather of A when gather_A) and
+        # release registers. MMA warps grow registers, copy A/B from smem to registers with
+        # ldmatrix inside self.mma, then run the inherited epilogue to write D (and read C). In
+        # pingpong mode two warp groups alternate tiles, synchronized by named barriers, and the
+        # second group first skips one tile's worth of pipeline state. Varlen M/K is supported
+        # through the varlen manager. Raises AssertionError at trace time if gather_A is used
+        # without varlen. Writes D to global memory; optionally records trace events via the trace
+        # context and flushes them at the end.
         from .trace import TraceContext
 
         tctx = TraceContext.create(trace_ptr)
@@ -589,6 +628,13 @@ class GemmSm120(GemmSm90):
         tCrA: cute.Tensor,
         tCrB: cute.Tensor,
     ) -> cutlass.pipeline.PipelineState:
+        # [FUNCTION DOC] Warp-level mainloop over K tiles for one output tile. Waits for each A/B
+        # smem stage, copies one K block ahead from smem into register fragments with ldmatrix,
+        # and accumulates with the warp MMA into acc. The last K block of each stage issues an
+        # async-shared fence and a warp sync before releasing the stage, since TMA writes through
+        # the async proxy while ldmatrix reads through the generic proxy. The final K tile is
+        # handled outside the loop so no prefetch past the end happens. With zero K tiles nothing
+        # is waited on or computed. Returns the advanced consumer pipeline state.
         """Warp-level MMA mainloop: ldmatrix SMEM→RMEM + warp MMA."""
         tCrA_copy_view = smem_tiled_copy_A.retile(tCrA)
         tCrB_copy_view = smem_tiled_copy_B.retile(tCrB)
@@ -654,6 +700,9 @@ class GemmSm120(GemmSm90):
         element_type: Optional[Type[cutlass.Numeric]] = None,
         epi_tile_override: Tuple[int, int] | None = None,
     ) -> Tuple[int, int]:
+        # [FUNCTION DOC] HELPER: Choose the epilogue tile (M, N). Returns the override unchanged
+        # when given. Otherwise M is the gcd of 64 and the CTA tile M, and N is the gcd of the CTA
+        # tile N with 64 for 8-bit elements or 32 otherwise. The atom layout argument is unused.
         """Compute the epilogue tile shape or use override if provided.
 
         :param cta_tile_shape_mnk: CTA tile shape (M,N,K)
