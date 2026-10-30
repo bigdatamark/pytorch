@@ -1,4 +1,12 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for user-annotated stream and event support in Inductor. Covers the stream
+# name utilities, the wrapper codegen line classes that enter and leave stream contexts,
+# compiled behavior of user streams and events (correctness, no fusion or buffer reuse across
+# streams, wait_stream ordering), expect-test checks of the dynamo graph and wrapper structure,
+# stress tests for races, generic stream API, PDL combined with multiple streams, AOTInductor
+# output, and cudagraph interaction. Most CUDA tests are skipped without CUDA. Import time side
+# effect: the parametrized test classes are instantiated at module level; run_tests is called
+# when executed as a script.
 """Tests for user-annotated stream support in Inductor.
 
 This module tests the infrastructure for supporting user-annotated CUDA stream
@@ -43,6 +51,12 @@ from torch.testing._internal.common_utils import (
 
 
 def _extract_wrapper_body(code):
+    # [FUNCTION DOC] HELPER: Extracts the body of the generated call function from wrapper
+    # source text and reduces it to structural lines. Finds the first line that defines call,
+    # collects following lines until one with indentation not deeper than the definition, drops
+    # blank lines, comment lines, size/stride assertions, delete statements, argument clearing
+    # and trailing inline comments, dedents the rest, and replaces every triton kernel name with
+    # a generic placeholder. Returns an empty string if call is not found or nothing is left.
     """Extract and normalize the call method body from generated wrapper code.
 
     Strips noise (comments, assert_size_stride, del statements, args.clear())
@@ -111,33 +125,47 @@ def _extract_wrapper_body(code):
 
 
 def _count_generated_stream_contexts(code):
+    # [FUNCTION DOC] HELPER: Returns the number of lines in the generated wrapper code that open
+    # a stream context, i.e. lines starting (after whitespace) with a with statement on
+    # default_stream or a numbered side stream name. Pure function.
     return len(re.findall(r"(?m)^\s*with (?:default_stream|stream\d+):", code))
 
 
 class TestStreamUtils(InductorTestCase):
+    # [CLASS DOC] Tests for the stream_utils helpers and the constants in stream_constants. No
+    # state; pure checks on stream naming.
     """Tests for stream_utils module."""
 
     def test_constants(self):
+        # [FUNCTION DOC] Checks that the default stream name, the default stream index (zero)
+        # and the side stream name template have their expected values.
         """Test stream utility constants are defined correctly."""
         self.assertEqual(DEFAULT_STREAM, "default_stream")
         self.assertEqual(DEFAULT_STREAM_IDX, 0)
         self.assertEqual(STREAM_NAME_TEMPLATE, "stream{stream_idx:d}")
 
     def test_get_stream_name_default(self):
+        # [FUNCTION DOC] Checks that stream index zero maps to the default stream name.
         """Test get_stream_name returns default stream for index 0."""
         self.assertEqual(get_stream_name(0), DEFAULT_STREAM)
 
     def test_get_stream_name_side_streams(self):
+        # [FUNCTION DOC] Checks that side stream indices map to names formed from the prefix
+        # stream and the index (one, two, ten).
         """Test get_stream_name returns formatted names for side streams."""
         self.assertEqual(get_stream_name(1), "stream1")
         self.assertEqual(get_stream_name(2), "stream2")
         self.assertEqual(get_stream_name(10), "stream10")
 
     def test_get_raw_stream_name(self):
+        # [FUNCTION DOC] Checks the raw stream name helper produces raw_stream followed by the
+        # index for indices zero and one.
         self.assertEqual(get_raw_stream_name(0), "raw_stream0")
         self.assertEqual(get_raw_stream_name(1), "raw_stream1")
 
     def test_get_stream_name_cached(self):
+        # [FUNCTION DOC] Calls the stream name helper twice with the same index and asserts the
+        # two results are the identical object, verifying caching.
         """Test that get_stream_name results are cached."""
         # Call twice and verify we get the same object (cached)
         name1 = get_stream_name(5)
@@ -146,9 +174,14 @@ class TestStreamUtils(InductorTestCase):
 
 
 class TestWrapperCodegenStreams(InductorTestCase):
+    # [CLASS DOC] Tests for the stream-related wrapper codegen line classes. Only constructs the
+    # objects and checks their stored attributes; nothing is generated or run.
     """Tests for stream-related wrapper codegen classes."""
 
     def test_enter_device_context_with_stream_info(self):
+        # [FUNCTION DOC] Builds the enter-device-context line with device index zero, no last
+        # seen guard index and four streams, and checks the num_streams and
+        # device_idx attributes.
         """Test EnterDeviceContextManagerWithStreamInfoLine has num_streams param."""
         line = EnterDeviceContextManagerWithStreamInfoLine(
             device_idx=0,
@@ -159,25 +192,37 @@ class TestWrapperCodegenStreams(InductorTestCase):
         self.assertEqual(line.device_idx, 0)
 
     def test_exit_device_context_with_stream_info(self):
+        # [FUNCTION DOC] Builds the exit-device-context line with four streams and checks its
+        # num_streams attribute.
         """Test ExitDeviceContextManagerWithStreamInfoLine has num_streams param."""
         line = ExitDeviceContextManagerWithStreamInfoLine(num_streams=4)
         self.assertEqual(line.num_streams, 4)
 
     def test_enter_cuda_stream_context(self):
+        # [FUNCTION DOC] Builds the enter-stream-context line for stream index one and checks
+        # its stream_idx attribute.
         """Test EnterCudaStreamContextLine creation."""
         line = EnterCudaStreamContextLine(stream_idx=1)
         self.assertEqual(line.stream_idx, 1)
 
     def test_exit_cuda_stream_context(self):
+        # [FUNCTION DOC] Builds the exit-stream-context line with no arguments and checks that
+        # construction yields a non-None object.
         """Test ExitCudaStreamContextLine creation."""
         line = ExitCudaStreamContextLine()
         self.assertIsNotNone(line)
 
 
 class TestStreamCodegen(InductorTestCase):
+    # [CLASS DOC] End-to-end tests that run the stream wrapper codegen lines against an indented
+    # code buffer (using fake graph objects for device ops), plus one compiled-code check.
+    # Mostly CPU-only; one test needs CUDA.
     """End-to-end tests for stream code generation."""
 
     def test_enter_cuda_stream_context_codegen(self):
+        # [FUNCTION DOC] Writes a function header and two indent levels into an indented buffer,
+        # runs the enter-stream-context line for stream one on it, and asserts the generated
+        # text contains a with statement on stream1.
         """Test code generation for entering a CUDA stream context."""
         code = IndentedBuffer()
         code.writeline("def call(args):")
@@ -192,6 +237,12 @@ class TestStreamCodegen(InductorTestCase):
         self.assertIn("with stream1", generated)
 
     def test_stream_codegen_uses_device_ops(self):
+        # [FUNCTION DOC] For CUDA and XPU device op overrides, sets a simple namespace as the
+        # graph handler (no cpp wrapper) and generates the enter-device-context line (device
+        # zero, two streams, stream one mapped to user object three) followed by the enter-
+        # stream-context line. Asserts the produced text equals the expected block using that
+        # device's guard, set_device, current_stream, stream-by-index lookup and a with
+        # statement. Runs each device as a subtest.
         cases = [
             (
                 "cuda",
@@ -238,6 +289,11 @@ with torch.xpu._DeviceGuard(0):
                 self.assertEqual(code.getvalue(), expected)
 
     def test_subgraph_raw_stream_uses_device_ops_stream_handle(self):
+        # [FUNCTION DOC] For CUDA and XPU device op overrides, calls the subgraph wrapper raw-
+        # stream writer as an unbound method with a fake wrapper whose writeline appends to a
+        # buffer and a fake graph whose scheduler current stream name is stream1. Asserts the
+        # returned name is stream1_raw and the emitted line takes the native handle of stream1.
+        # Runs each device as a subtest.
         cases = [
             ("cuda", CUDADeviceOpOverrides(), "stream1_raw = stream1.native_handle\n"),
             ("xpu", XPUDeviceOpOverrides(), "stream1_raw = stream1.native_handle\n"),
@@ -264,6 +320,8 @@ with torch.xpu._DeviceGuard(0):
                 self.assertEqual(code.getvalue(), expected)
 
     def test_exit_cuda_stream_context_codegen(self):
+        # [FUNCTION DOC] Indents a buffer once, runs the exit-stream-context line on it and
+        # asserts the buffer value is not None (the line only unindents).
         """Test code generation for exiting a CUDA stream context."""
         code = IndentedBuffer()
         code.do_indent()
@@ -275,6 +333,10 @@ with torch.xpu._DeviceGuard(0):
         self.assertIsNotNone(code.getvalue())
 
     def test_default_stream_setup_only_once_per_device(self):
+        # [FUNCTION DOC] Checks the setup_stream_cache flag of enter-device-context lines built
+        # through a local helper: it is true the first time a device index is seen, false when
+        # the same index repeats consecutively, and true again after the device changes
+        # (including returning to device zero).
         """default_stream capture should only run once per device entry."""
         from torch._inductor.codegen.wrapper import (
             EnterDeviceContextManagerWithStreamInfoLine,
@@ -284,6 +346,10 @@ with torch.xpu._DeviceGuard(0):
         stream_map = {1: 10}
 
         def make_line(device_idx):
+            # [FUNCTION DOC] HELPER: Closure over the last seen device and a fixed stream map.
+            # Computes whether the device differs from the previous call, records the device as
+            # last seen (mutating the enclosing variable), and returns an enter-device-context
+            # line with two streams and that setup flag.
             nonlocal last_device
             setup = last_device != device_idx
             last_device = device_idx
@@ -303,10 +369,15 @@ with torch.xpu._DeviceGuard(0):
     @unittest.skipIf(not TEST_CUDA, "requires CUDA")
     @xfailIfNoAcceleratorTriton
     def test_generated_code_uses_get_stream_by_index(self):
+        # [FUNCTION DOC] Needs CUDA and triton. Compiles a function that creates a generic
+        # stream and adds one inside the stream context, runs it and checks the generated code
+        # contains the stream-by-index lookup and that the result matches eager.
         """Generated inductor code should use _get_stream_by_index."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: creates a CUDA stream, enters it and
+            # returns the input plus one.
             s = torch.Stream(device="cuda")
             with s:
                 return x + 1
@@ -321,13 +392,24 @@ with torch.xpu._DeviceGuard(0):
 @unittest.skipIf(not TEST_CUDA, "requires CUDA")
 @xfailIfNoAcceleratorTriton
 class TestUserStreamCompile(InductorTestCase):
+    # [CLASS DOC] End-to-end torch.compile tests with user streams and events on CUDA (skipped
+    # without CUDA, xfail without triton). Each test runs eager as reference, compiles, runs
+    # generated-code retrieval, and checks results and expected wrapper content or kernel
+    # counts. Kernel counts are read from inductor metrics, which tests reset first.
     """End-to-end tests for torch.compile with user stream contexts."""
 
     def test_compile_with_user_stream_context(self):
+        # [FUNCTION DOC] Compiles a function with a side stream that waits on the current stream
+        # and then computes inside the stream, with a later synchronize. Checks output equals
+        # eager and the wrapper code has at least one stream context and a
+        # synchronize_stream operation.
         """Test that user code with stream context compiles and runs correctly."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Traced function: adds inputs on the default stream, makes a
+            # new stream wait on the current stream, doubles the sum inside that stream,
+            # synchronizes it and returns the result plus one.
             # Create a side stream
             s = torch.cuda.Stream()
             # Perform operation on default stream
@@ -363,6 +445,12 @@ class TestUserStreamCompile(InductorTestCase):
         "requires at least two CUDA devices",
     )
     def test_raw_stream_name_does_not_clobber_user_stream_on_cuda_1(self):
+        # [FUNCTION DOC] Needs at least two CUDA devices. Runs a function on cuda:1 using an
+        # auxiliary stream and two events recorded outside the function, compiled with
+        # fullgraph. Checks results match eager and that the generated code defines stream1 via
+        # stream-by-index and a separate raw_stream1 name from get_raw_stream, and that no line
+        # assigns stream1 directly from get_raw_stream (the raw name must not clobber the
+        # user stream).
         from torch._inductor.utils import run_and_get_code
 
         device = torch.device("cuda:1")
@@ -371,6 +459,11 @@ class TestUserStreamCompile(InductorTestCase):
         ev1 = torch.cuda.Event()
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Traced function using closure stream and events: records
+            # the first event, then on the auxiliary stream waits it, multiplies matrices and
+            # records the second event; waits the second event, applies sin, cos, add and relu
+            # pointwise, then on the auxiliary stream multiplies by the transposed weight.
+            # Returns the last product.
             ev0.record()
             with torch.cuda.stream(aux):
                 ev0.wait()
@@ -400,10 +493,15 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertNotRegex(code, r"(?m)^\s*stream1 = get_raw_stream\(1\)")
 
     def test_compile_preserves_stream_semantics(self):
+        # [FUNCTION DOC] Compiles a function that computes on the default stream and in a side
+        # stream context, then synchronizes the side stream. Checks the result matches eager and
+        # that stream contexts and synchronize_stream appear in the generated code.
         """Test that compiled code preserves stream execution semantics."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: doubles the input on the default stream,
+            # triples it inside a new side stream, synchronizes the stream and returns the sum.
             s = torch.cuda.Stream()
             # Work on default stream
             a = x * 2
@@ -426,10 +524,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("synchronize_stream", code)
 
     def test_multiple_stream_contexts(self):
+        # [FUNCTION DOC] Compiles a function using two side streams in sequence, synchronized
+        # afterwards. Checks eager parity and presence of stream contexts and synchronize_stream
+        # in the code.
         """Test compilation with multiple stream context switches."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: default-stream add, then separate stream
+            # contexts for multiply by two and by three, synchronizes both streams and returns
+            # the sum of three results.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
 
@@ -458,10 +562,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("synchronize_stream", code)
 
     def test_nested_stream_contexts(self):
+        # [FUNCTION DOC] Compiles a function with a stream context nested inside another and a
+        # computation back in the outer stream. Checks eager parity and presence of stream
+        # contexts and synchronize_stream.
         """Test compilation with nested stream contexts."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: outer stream computes a, inner stream
+            # computes b, outer stream computes c from a; synchronizes both streams and returns
+            # the sum of a, b and c.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
 
@@ -488,10 +598,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("synchronize_stream", code)
 
     def test_stream_context_with_data_dependency(self):
+        # [FUNCTION DOC] Compiles a function where a side stream waits for the current stream
+        # and then consumes a default-stream result. Checks eager parity and presence of stream
+        # contexts and synchronize_stream.
         """Test stream contexts with data flowing between streams."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: multiplies by two on the default stream,
+            # makes a side stream wait on the current stream, adds one inside the side stream,
+            # synchronizes and returns it.
             s = torch.cuda.Stream()
 
             # Compute on default stream
@@ -518,10 +634,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("synchronize_stream", code)
 
     def test_event_record_and_wait(self):
+        # [FUNCTION DOC] Compiles a function that records an event on the current stream and
+        # waits for it inside a side stream. Checks eager parity and that record_event and
+        # wait_event appear in the generated code.
         """Test compilation with explicit event record and wait."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: doubles input, records an event, then in a
+            # side stream waits the event and adds one; synchronizes the stream and returns
+            # the result.
             s = torch.cuda.Stream()
             event = torch.cuda.Event()
 
@@ -551,10 +673,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("wait_event", code)
 
     def test_event_record_on_stream(self):
+        # [FUNCTION DOC] Compiles a function that records an event on a named stream and waits
+        # on it with an explicit stream argument. Checks eager parity and presence of
+        # record_event and wait_event in the code.
         """Test event recording on a specific stream."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: stream one computes a and records an event
+            # on itself; stream two waits the event, adds one; both streams are synchronized;
+            # returns the result.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             event = torch.cuda.Event()
@@ -586,10 +714,17 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("wait_event", code)
 
     def test_multiple_events_multiple_streams(self):
+        # [FUNCTION DOC] Compiles a function chaining two events across two streams and the
+        # default stream. Checks eager parity and that the generated code has at least two
+        # record_event and two wait_event occurrences.
         """Test multiple events synchronizing multiple streams."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: stream one computes a and records event
+            # one; stream two waits event one, computes b and records event two; the default
+            # stream waits event two and adds the input; both streams synchronized; returns
+            # the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             event1 = torch.cuda.Event()
@@ -627,10 +762,19 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertGreaterEqual(code.count("wait_event"), 2)
 
     def test_event_wait_without_record(self):
+        # [FUNCTION DOC] Compiles a function that records an event, waits for it inside a side
+        # stream, and synchronizes. Checks eager parity and record_event and wait_event in
+        # the code.
+        # KNOWN ISSUE: the docstring says it waits on an unrecorded event, but the traced
+        # function records the event before waiting, so the unrecorded-wait case is
+        # not exercised.
         """Test that waiting on unrecorded event works (no-op)."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: records an event on the current stream,
+            # waits for it inside a side stream, doubles the input there, synchronizes and
+            # returns the result.
             s = torch.cuda.Stream()
             event = torch.cuda.Event()
 
@@ -658,10 +802,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("wait_event", code)
 
     def test_stream_wait_event(self):
+        # [FUNCTION DOC] Compiles a function using the stream-level wait for an event instead of
+        # the event-level wait. Checks eager parity and that wait_event appears in the
+        # generated code.
         """Test stream.wait_event() method."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: doubles input, records an event, makes a
+            # side stream wait for the event, adds one inside that stream, synchronizes and
+            # returns the result.
             s = torch.cuda.Stream()
             event = torch.cuda.Event()
 
@@ -688,10 +838,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("wait_event", code)
 
     def test_bidirectional_stream_sync(self):
+        # [FUNCTION DOC] Compiles a function that synchronizes two streams in both directions
+        # through two events. Checks eager parity and at least two record_event and two
+        # wait_event occurrences.
         """Test bidirectional synchronization between streams."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: stream one computes a and records; stream
+            # two waits, computes b and records; stream one waits again and computes c from b;
+            # both streams synchronized; returns c.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             event_s1 = torch.cuda.Event()
@@ -730,10 +886,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertGreaterEqual(code.count("wait_event"), 2)
 
     def test_three_streams_pipeline(self):
+        # [FUNCTION DOC] Compiles a three-stage pipeline over three streams linked by two
+        # events. Checks eager parity, at least three stream contexts and at least two
+        # record_event and wait_event occurrences.
         """Test pipeline pattern with three streams."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: three streams run multiply by two, add one
+            # and multiply by three in sequence, linked by two events; all three streams are
+            # synchronized; returns the last stage.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             s3 = torch.cuda.Stream()
@@ -775,10 +937,17 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertGreaterEqual(code.count("wait_event"), 2)
 
     def test_parallel_streams_join(self):
+        # [FUNCTION DOC] Compiles a function with three parallel streams each recording an
+        # event, joined on the default stream by waiting all events. Checks eager parity, at
+        # least three stream contexts and at least three record_event and
+        # wait_event occurrences.
         """Test parallel work on multiple streams joining at the end."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: three streams compute multiples of the
+            # input (two, three, four) and record events; the default stream waits all three
+            # events and sums the results; all streams synchronized; returns the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             s3 = torch.cuda.Stream()
@@ -824,10 +993,18 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertGreaterEqual(code.count("wait_event"), 3)
 
     def test_fan_out_fan_in(self):
+        # [FUNCTION DOC] Compiles a fan-out and fan-in pattern: the default stream records a
+        # start event, two streams wait it and compute, and the default stream waits both.
+        # Checks eager parity, at least three record_event and at least four
+        # wait_event occurrences.
         """Test fan-out from one stream to multiple, then fan-in."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: default-stream multiply, start event
+            # record, two side streams wait that event and add constants then record their own
+            # events, default stream waits both and adds the results; both streams synchronized;
+            # returns the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             e_start = torch.cuda.Event()
@@ -871,10 +1048,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertGreaterEqual(code.count("wait_event"), 4)
 
     def test_four_streams_diamond(self):
+        # [FUNCTION DOC] Compiles a diamond pattern with one start, two parallel streams and a
+        # third stream joining after waiting on both events. Checks eager parity, at least three
+        # stream contexts, at least three record_event and four wait_event occurrences.
         """Test diamond pattern: one start, two parallel, one end."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: default-stream add and start event; stream
+            # one and stream two wait it and compute b and c with their own events; stream three
+            # waits both and adds b and c; all three streams synchronized; returns the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             s3 = torch.cuda.Stream()
@@ -922,10 +1105,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertGreaterEqual(code.count("wait_event"), 4)
 
     def test_stream_reuse_across_iterations(self):
+        # [FUNCTION DOC] Compiles a function that reuses one stream and one event over three
+        # loop iterations. Checks eager parity, at least one stream context and presence of
+        # record_event and wait_event.
         """Test that streams can be reused across loop iterations."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: in a loop of three iterations, doubles the
+            # running value inside a side stream, records an event on that stream and waits it
+            # on the current stream; then synchronizes the stream and returns the value.
             s = torch.cuda.Stream()
             event = torch.cuda.Event()
             result = x
@@ -953,10 +1142,17 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("wait_event", code)
 
     def test_no_fusion_across_streams(self):
+        # [FUNCTION DOC] Verifies that pointwise chains on two different streams are not fused
+        # together. Resets inductor metrics, compiles and checks eager parity, and asserts
+        # exactly three generated kernels (one per stream and the final add on the
+        # default stream).
         """Test that operations on different streams are not fused together."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: stream one runs three chained pointwise
+            # ops and records an event; stream two runs another three-op chain and records an
+            # event; the default stream waits both and adds the two results.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             e1 = torch.cuda.Event()
@@ -996,10 +1192,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 3)
 
     def test_no_fusion_across_streams_with_dependency(self):
+        # [FUNCTION DOC] Verifies there is no fusion when a data dependency crosses streams
+        # through an event. Resets metrics, compiles, checks eager parity and asserts exactly
+        # two generated kernels.
         """Test no fusion when there's a data dependency across streams."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: default-stream multiply and add, event
+            # record; side stream waits and applies multiply and add on the result; synchronizes
+            # and returns it.
             s = torch.cuda.Stream()
             event = torch.cuda.Event()
 
@@ -1029,10 +1231,15 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 2)
 
     def test_fusion_within_same_stream(self):
+        # [FUNCTION DOC] Verifies that chained pointwise ops inside one side stream still fuse.
+        # Resets metrics, compiles, checks eager parity and asserts exactly one
+        # generated kernel.
         """Test that fusion still works for operations within the same stream."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: four chained pointwise ops inside one side
+            # stream, then stream synchronize; returns the final value.
             s = torch.cuda.Stream()
 
             with torch.cuda.stream(s):
@@ -1058,10 +1265,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 1)
 
     def test_no_fusion_simple_dependency_across_streams(self):
+        # [FUNCTION DOC] Regression test: a single pointwise result consumed on another stream
+        # across an event must not be fused with its consumer. Resets metrics, compiles, checks
+        # eager parity and asserts exactly two generated kernels.
         """Regression: a single pointwise consumed across a stream boundary must not fuse."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: stream one adds one, an event is recorded
+            # through the stream and stream two waits it, stream two multiplies by two; both
+            # streams synchronized; returns the result.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
 
@@ -1089,10 +1302,16 @@ class TestUserStreamCompile(InductorTestCase):
 
     @torch._inductor.config.patch(combo_kernels=True)
     def test_no_combo_kernel_fusion_across_streams(self):
+        # [FUNCTION DOC] With the combo kernels option enabled, verifies independent pointwise
+        # ops on different streams are not grouped into one kernel. Resets metrics, compiles,
+        # checks eager parity and asserts exactly two generated kernels.
         """Combo kernels must not group nodes on different streams."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, y, z, w):
+            # [FUNCTION DOC] HELPER: Traced function: adds the first two inputs on the default
+            # stream, records an event, then in a side stream waits and adds the other two
+            # inputs; synchronizes and returns both results as a tuple.
             s = torch.cuda.Stream()
             event = torch.cuda.Event()
 
@@ -1123,10 +1342,15 @@ class TestUserStreamCompile(InductorTestCase):
 
     @torch._inductor.config.patch(combo_kernels=True)
     def test_combo_kernel_fusion_within_same_stream(self):
+        # [FUNCTION DOC] With the combo kernels option enabled, verifies independent pointwise
+        # ops on the same stream may be combined. Resets metrics, compiles, checks eager parity
+        # and asserts at most two generated kernels.
         """Combo kernels should still group independent nodes on the same stream."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Traced function: inside one side stream multiplies the
+            # first input by two and the second by three, synchronizes and returns their sum.
             s = torch.cuda.Stream()
 
             with torch.cuda.stream(s):
@@ -1152,11 +1376,19 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertLessEqual(torch._inductor.metrics.generated_kernel_count, 2)
 
     def test_cross_stream_stride_copy(self):
+        # [FUNCTION DOC] Verifies that a contiguous copy forced by a strided slice of a result
+        # produced on one stream runs on the consuming stream. Checks eager parity and two
+        # kernels, then scans the extracted wrapper body tracking the current stream context and
+        # collecting lines that run kernels, asserting exactly one kernel line under stream one
+        # and one under stream two.
         """A contiguous copy forced by a non-contiguous slice across streams
         must run on the consumer's stream, not the producer's."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: stream one adds one and takes every other
+            # column (non-contiguous slice); an event links to stream two, which makes the slice
+            # contiguous and adds one; stream two is synchronized; returns the result.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
 
@@ -1213,10 +1445,17 @@ class TestUserStreamCompile(InductorTestCase):
         )
 
     def test_no_buffer_reuse_across_streams(self):
+        # [FUNCTION DOC] Verifies a buffer produced on one stream is not reused in place on
+        # another. Compiles, checks eager parity, and on the extracted wrapper body asserts
+        # record_event and wait_event appear while the reuse-and-delete pattern for the first
+        # buffer does not.
         """Buffer produced on one stream must not be reused in-place on another."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: stream one adds one, an event recorded
+            # through the stream is waited by stream two, which adds two; stream two is
+            # synchronized; returns the result.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             with torch.cuda.stream(s1):
@@ -1241,10 +1480,16 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertNotIn("buf0; del buf0", wrapper)
 
     def test_stream_record_wait_event_not_dropped(self):
+        # [FUNCTION DOC] Verifies stream-level record_event and wait_event survive compilation.
+        # Checks eager parity and that record_event, wait_event and synchronize_stream appear in
+        # the code.
         """stream.record_event() and stream.wait_event() must survive compilation."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: stream one adds one; stream two waits an
+            # event recorded on stream one and multiplies by two; stream two is synchronized;
+            # returns the result.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             with torch.cuda.stream(s1):
@@ -1266,10 +1511,15 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("synchronize_stream", code)
 
     def test_stream_synchronize_not_dropped(self):
+        # [FUNCTION DOC] Verifies a stream synchronize between two computations survives
+        # compilation. Checks eager parity and that synchronize_stream appears in the code.
         """stream.synchronize() must survive compilation and appear in wrapper code."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: adds one inside a side stream,
+            # synchronizes the stream, then multiplies by two on the default stream and
+            # returns it.
             s = torch.cuda.Stream()
             with torch.cuda.stream(s):
                 a = x + 1
@@ -1285,10 +1535,15 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("synchronize_stream", code)
 
     def test_stream_wait_stream_not_dropped(self):
+        # [FUNCTION DOC] Verifies stream-level wait_stream survives compilation. Checks eager
+        # parity and that wait_stream and synchronize_stream appear in the code.
         """stream.wait_stream() must survive compilation and appear in wrapper code."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: stream one adds one; stream two waits for
+            # stream one, then multiplies by two; stream two is synchronized; returns
+            # the result.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             with torch.cuda.stream(s1):
@@ -1308,12 +1563,20 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertIn("synchronize_stream", code)
 
     def test_wait_stream_ordering_preserved(self):
+        # [FUNCTION DOC] Verifies wait_stream is not moved before the work it synchronizes. Uses
+        # a module-level side stream; compiles, checks eager parity, then finds positions of the
+        # fused multiply kernel and of the two wait_stream calls in the generated text (side
+        # waits on default, then default waits on side) and asserts each is found and that the
+        # order is multiply, first wait, second wait.
         """wait_stream must not be reordered before the work it synchronizes."""
         from torch._inductor.utils import run_and_get_code
 
         side = torch.cuda.Stream()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function using a closure side stream: doubles input,
+            # side stream waits for the current stream, adds one inside the side stream, current
+            # stream waits for the side stream; returns the final side-stream result.
             a = x * 2
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
@@ -1344,12 +1607,19 @@ class TestUserStreamCompile(InductorTestCase):
         self.assertGreater(wait_0_1_pos, wait_1_0_pos)
 
     def test_wait_stream_ordering_independent_inputs(self):
+        # [FUNCTION DOC] Verifies wait_stream still orders side-stream work that uses an input
+        # independent of the default stream work. Compiles, checks closeness to eager, restricts
+        # search to the call function text, and asserts the first wait_stream appears before the
+        # fused add kernel and the second after it.
         """wait_stream must order subsequent waiting-stream work even with independent inputs."""
         from torch._inductor.utils import run_and_get_code
 
         side = torch.cuda.Stream()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Traced function using a closure side stream: doubles x on
+            # the default stream, side stream waits the current stream, adds one to y inside the
+            # side stream, current stream waits the side stream; returns the sum of both.
             a = x * 2
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
@@ -1394,6 +1664,12 @@ class TestUserStreamCompile(InductorTestCase):
         )
 
     def test_pattern_replacement_preserves_stream(self):
+        # [FUNCTION DOC] Regression test: a post-grad pattern replacement (online softmax) must
+        # keep the stream annotation on the intermediate nodes it creates, so the prepare-
+        # softmax kernel runs under the side stream context rather than the default one.
+        # Compiles, checks eager parity, then scans the call body tracking the enclosing with
+        # context and records the context of the kernel line, asserting it was found and starts
+        # with a numbered stream context.
         """A post-grad pattern replacement (online softmax) must preserve the
         stream annotation of the intermediate nodes it introduces. Regression
         test: the pattern matcher's percolate_tags dropped the "custom" (stream)
@@ -1405,6 +1681,9 @@ class TestUserStreamCompile(InductorTestCase):
         from torch._inductor.utils import run_and_get_code
 
         def fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Traced function: in a side stream waits an event, computes
+            # attention scores from queries and transposed keys, softmax over the last
+            # dimension, multiplies by values; synchronizes and returns the sum of the result.
             s = torch.cuda.Stream()
             e = torch.cuda.Event()
             with torch.cuda.stream(s):
@@ -1441,10 +1720,17 @@ class TestUserStreamCompile(InductorTestCase):
         )
 
     def test_codegen_structure_single_stream(self):
+        # [FUNCTION DOC] Expect test of the structure for pointwise ops with one side stream.
+        # Compiles with a counting inductor backend, checks eager parity, compares the
+        # normalized dynamo graph text to an expected inline string, and with FileCheck verifies
+        # the wrapper has default stream setup, a stream-by-index lookup, a stream one context,
+        # kernel runs, a synchronize and a return. Also asserts at least two kernel runs.
         """Verify wrapper structure for pointwise ops with one side stream."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: default-stream multiply by two, multiply
+            # by three inside a side stream, stream synchronize, returns the sum.
             s = torch.cuda.Stream()
             a = x * 2
             with torch.cuda.stream(s):
@@ -1493,10 +1779,18 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_codegen_structure_pipeline(self):
+        # [FUNCTION DOC] Expect test for a two-stage matmul pipeline: compares the normalized
+        # dynamo graph to an inline string (external object lookups, matmuls, record and wait
+        # event ops, synchronize) and FileCheck-matches the wrapper body for default stream,
+        # misalignment copies, mm calls, record_event, stream one, wait_event and
+        # final synchronize.
         """Verify wrapper structure for two-stage matmul pipeline."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, w1, w2):
+            # [FUNCTION DOC] HELPER: Traced function: matmul on default stream, event record, in
+            # a side stream waits and multiplies by a second weight; synchronizes and returns
+            # the result.
             s = torch.cuda.Stream()
             event = torch.cuda.Event()
             a = x @ w1
@@ -1560,10 +1854,17 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_codegen_structure_three_stream_pipeline(self):
+        # [FUNCTION DOC] Expect test for a three-stage matmul pipeline over three streams:
+        # compares the normalized dynamo graph to an inline string and FileCheck-matches the
+        # wrapper body for the ordered stream contexts, misalignment copies, mm calls, event
+        # records and waits, and three synchronizes on the default stream.
         """Verify wrapper structure for three-stage matmul pipeline."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, w1, w2, w3):
+            # [FUNCTION DOC] HELPER: Traced function: three streams run chained matmuls with
+            # weights one, two and three linked by two events; all three streams are
+            # synchronized; returns the last product.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             s3 = torch.cuda.Stream()
@@ -1661,10 +1962,17 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_codegen_structure_parallel_matmuls(self):
+        # [FUNCTION DOC] Expect test for parallel matmuls joined on the default stream: compares
+        # the normalized dynamo graph to an inline string and FileCheck-matches the wrapper body
+        # for two side stream mm calls with event records, then a default stream wait and kernel
+        # run, then two synchronizes.
         """Verify wrapper structure for parallel matmuls with join."""
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, w1, w2):
+            # [FUNCTION DOC] HELPER: Traced function: two streams each multiply the input by a
+            # different weight and record an event; the default stream waits both and adds; both
+            # streams are synchronized; returns the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             e1 = torch.cuda.Event()
@@ -1749,6 +2057,11 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_codegen_per_stream_alignment_copy_multi_stream(self):
+        # [FUNCTION DOC] Regression test for per-stream alignment fixups: an input read on two
+        # streams must be preserved once and cloned once inside each consuming stream context.
+        # Checks eager parity, then uses FileCheck counts on the wrapper body for exactly one
+        # preserved original and exactly two clones, that a stream context precedes the clone,
+        # and that the preserved original is deleted by a name pattern in the full code.
         """Regression test for per-stream alignment fixups read by many streams.
 
         When an input is read on more than one stream, its ``x =
@@ -1764,6 +2077,9 @@ class GraphModule(torch.nn.Module):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, w1, w2):
+            # [FUNCTION DOC] HELPER: Traced function: stream one multiplies the shared input by
+            # one weight, stream two by another, each recording an event; the default stream
+            # waits both and adds; both streams synchronized; returns the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             e1 = torch.cuda.Event()
@@ -1805,6 +2121,10 @@ class GraphModule(torch.nn.Module):
         FileCheck().check_regex(r"del arg\d+_1_orig").run(code)
 
     def test_codegen_per_stream_alignment_copy_one_per_stream(self):
+        # [FUNCTION DOC] Verifies the per-stream alignment copy is keyed by consuming stream,
+        # not by use: an input read once on one stream and twice on another is cloned twice
+        # (once per stream) from one preserved original. Checks eager parity and exact counts
+        # via FileCheck.
         """An input read multiple times on one stream gets a single copy there.
 
         The per-stream alignment copy should be keyed on the consuming stream,
@@ -1818,6 +2138,9 @@ class GraphModule(torch.nn.Module):
         from torch._inductor.utils import run_and_get_code
 
         def fn(x, w1, w2, w3):
+            # [FUNCTION DOC] HELPER: Traced function: stream one has one matmul with the shared
+            # input; stream two has two matmuls with it; both record events; the default stream
+            # waits and sums three results; both streams synchronized.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             e1 = torch.cuda.Event()
@@ -1854,10 +2177,17 @@ class GraphModule(torch.nn.Module):
         FileCheck().check_count("_orig)", 2, exactly=True).run(wrapper_body)
 
     def test_synchronize_threads_all_prior_sync_data(self):
+        # [FUNCTION DOC] Extracts the forward graph and verifies the synchronize_stream control
+        # dependency node feeds both intermediates: finds that node among the graph nodes and
+        # asserts each of the two sum nodes takes its input through a tuple-get of that node.
+        # Checks eager parity first.
         """Both intermediates must be threaded through synchronize_stream."""
         import operator
 
         def fn(x, w1, w2):
+            # [FUNCTION DOC] HELPER: Traced function: inside one stream computes two chained
+            # matmuls recording an event after each; synchronizes the stream; returns the sums
+            # of both intermediates as a tuple.
             s1 = torch.cuda.Stream()
             e1 = torch.cuda.Event()
             e2 = torch.cuda.Event()
@@ -1903,10 +2233,16 @@ class GraphModule(torch.nn.Module):
             )
 
     def test_synchronize_event_threads_all_prior_sync_data(self):
+        # [FUNCTION DOC] Same as the stream-synchronize variant but for event synchronize:
+        # extracts the forward graph, finds the synchronize_event control dependency node, and
+        # asserts each of the two sum nodes consumes its input through a tuple-get of that node.
         """Both intermediates must be threaded through synchronize_event."""
         import operator
 
         def fn(x, w1, w2):
+            # [FUNCTION DOC] HELPER: Traced function: inside one stream computes two chained
+            # matmuls recording a separate event after each; synchronizes the second event on
+            # the host; returns the sums of both intermediates.
             s = torch.cuda.Stream()
             e0 = torch.cuda.Event()
             e1 = torch.cuda.Event()
@@ -1955,6 +2291,10 @@ class GraphModule(torch.nn.Module):
 @unittest.skipUnless(TEST_CUDA, "requires CUDA")
 @xfailIfNoAcceleratorTriton
 class TestStreamOrderingStress(InductorTestCase):
+    # [CLASS DOC] Stress tests comparing compiled and eager results for event-ordered multi-
+    # stream code with large matrix sizes. Class attributes N (matrix size) and ITERS
+    # (repetitions per test) control the amount of GPU work; the heavy matmul chain widens the
+    # race window so missing synchronization would show up as wrong values.
     """Stress tests verifying that interleaved event record/wait ops
     produce correct ordering under compilation.  Each test uses large
     matmuls so there is real GPU work, and repeats many iterations so
@@ -1964,6 +2304,10 @@ class TestStreamOrderingStress(InductorTestCase):
     ITERS = 20  # repetitions per test
 
     def _check_compiled_matches_eager(self, fn, *args):
+        # [FUNCTION DOC] HELPER: Compiles the given function once and, for ITERS iterations,
+        # runs both eager and compiled versions with the same arguments, synchronizes the whole
+        # device, normalizes non-sequence results to lists and asserts each pair of outputs
+        # is equal.
         """Run fn eagerly and compiled, assert results match over ITERS runs."""
         compiled_fn = torch.compile(fn)
         for _ in range(self.ITERS):
@@ -1979,6 +2323,9 @@ class TestStreamOrderingStress(InductorTestCase):
 
     @staticmethod
     def _heavy_matmul_chain(x, w, depth=8):
+        # [FUNCTION DOC] HELPER: Static helper that applies the weight matrix to the input for a
+        # given depth (default eight) in a loop and returns the result, creating long GPU work
+        # to widen race windows.
         """Chain of matmuls to create substantial GPU work (~ms).
         Used to widen the race window between streams so that missing
         synchronization is observable."""
@@ -1993,9 +2340,15 @@ class TestStreamOrderingStress(InductorTestCase):
     #    and read stale memory because the producer chain hasn't finished.
     # ------------------------------------------------------------------
     def test_race_producer_consumer(self):
+        # [FUNCTION DOC] Race test where a slow producer chain on the default stream is consumed
+        # in a side stream after an event wait; compares compiled with eager using the stress
+        # helper on a large input and scaled identity weight.
         N = self.N
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Traced function: heavy matmul chain on the default stream,
+            # event record, in a side stream waits and adds one; synchronizes the stream and
+            # returns the result.
             s = torch.cuda.Stream()
             e = torch.cuda.Event()
 
@@ -2019,9 +2372,14 @@ class TestStreamOrderingStress(InductorTestCase):
     #    Both event.wait() calls are load-bearing.
     # ------------------------------------------------------------------
     def test_race_ping_pong(self):
+        # [FUNCTION DOC] Race test with ping-pong between two streams where both directions
+        # carry heavy work and both event waits are required; compares compiled and eager.
         N = self.N
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Traced function: stream one runs a heavy chain and records;
+            # stream two waits and runs a heavy chain on the result and records; stream one
+            # waits and adds the two results; both streams synchronized; returns the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             e1 = torch.cuda.Event()
@@ -2053,9 +2411,16 @@ class TestStreamOrderingStress(InductorTestCase):
     #    All three consumers depend on the producer finishing.
     # ------------------------------------------------------------------
     def test_race_fan_out(self):
+        # [FUNCTION DOC] Race test with fan-out of a slow producer to three consumer streams
+        # that each wait the same event, then fan-in by waiting each stream event; compares
+        # compiled and eager.
         N = self.N
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Traced function: heavy chain on default stream with an
+            # event; three streams wait it and scale the result by two, three and four, each
+            # recording an event; the default stream waits all and sums; all
+            # streams synchronized.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             s3 = torch.cuda.Stream()
@@ -2102,9 +2467,16 @@ class TestStreamOrderingStress(InductorTestCase):
     #    The join must wait for both branches.
     # ------------------------------------------------------------------
     def test_race_diamond(self):
+        # [FUNCTION DOC] Race test of a diamond pattern with heavy work on both branches; the
+        # join must wait for both branches. Compares compiled and eager with a half-scaled
+        # identity weight.
         N = self.N
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Traced function: matmul base on default stream with fork
+            # event; stream one runs a heavy chain on the relu of base, stream two on the
+            # sigmoid of base, each recording; the default stream waits both and adds; both
+            # streams synchronized.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             e_fork = torch.cuda.Event()
@@ -2145,9 +2517,15 @@ class TestStreamOrderingStress(InductorTestCase):
     #    Every event.wait() is load-bearing.
     # ------------------------------------------------------------------
     def test_race_pipeline(self):
+        # [FUNCTION DOC] Race test of a four-stage pipeline where each stage is heavy and every
+        # event wait is required; compares compiled and eager.
         N = self.N
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Traced function: builds four streams and three events in
+            # lists; the first three streams each run a short heavy chain linked by events; the
+            # fourth stream waits the last event and adds the original input; all streams are
+            # synchronized in a loop; returns the result.
             streams = [torch.cuda.Stream() for _ in range(4)]
             events = [torch.cuda.Event() for _ in range(3)]
 
@@ -2181,9 +2559,15 @@ class TestStreamOrderingStress(InductorTestCase):
     # 6. Race: back-to-back sync, both directions carry heavy work
     # ------------------------------------------------------------------
     def test_race_back_to_back(self):
+        # [FUNCTION DOC] Race test with back-to-back synchronization where both directions carry
+        # heavy work; compares compiled and eager.
         N = self.N
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Traced function: heavy chain on default stream with event;
+            # side stream waits and runs another heavy chain and records an event; the current
+            # stream waits that event and adds one; synchronizes the stream and returns
+            # the result.
             s = torch.cuda.Stream()
             e1 = torch.cuda.Event()
             e2 = torch.cuda.Event()
@@ -2212,9 +2596,15 @@ class TestStreamOrderingStress(InductorTestCase):
     #    stream and reads stale/in-progress data from the user stream.
     # ------------------------------------------------------------------
     def test_race_triton_on_user_stream(self):
+        # [FUNCTION DOC] Race test that a pointwise kernel generated for a user stream really
+        # launches on that stream (not the default one) after heavy matmul work on the stream;
+        # compares compiled and eager.
         N = self.N
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Traced function: inside a side stream runs a heavy matmul
+            # chain and relu and records an event; the current stream waits the event;
+            # synchronizes the stream; returns the relu result.
             s = torch.cuda.Stream()
             e = torch.cuda.Event()
 
@@ -2238,9 +2628,16 @@ class TestStreamOrderingStress(InductorTestCase):
 @unittest.skipUnless(TEST_CUDA, "requires CUDA")
 @xfailIfNoAcceleratorTriton
 class TestGenericStreamCompile(InductorTestCase):
+    # [CLASS DOC] Tests torch.compile with the device-agnostic torch.Stream and torch.Event API
+    # on CUDA (skipped without CUDA, xfail without triton). Streams and events are created
+    # outside the compiled functions, sometimes wrapped as CUDA streams by id, device index
+    # and type.
     """Tests for torch.compile with device-agnostic torch.Stream API."""
 
     def test_generic_stream_basic(self):
+        # [FUNCTION DOC] Compiles a function that uses a generic stream context and synchronize,
+        # created outside the function. Checks eager parity and that at least one stream context
+        # is generated.
         """Test compilation with torch.Stream (device-agnostic API)."""
         from torch._inductor.utils import run_and_get_code
 
@@ -2248,6 +2645,9 @@ class TestGenericStreamCompile(InductorTestCase):
         stream = torch.Stream("cuda")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: inside the closure generic stream context
+            # multiplies by two and adds one, then synchronizes the stream and returns
+            # the result.
             with stream:
                 a = x * 2
                 b = a + 1
@@ -2267,6 +2667,9 @@ class TestGenericStreamCompile(InductorTestCase):
         self.assertGreaterEqual(_count_generated_stream_contexts(code), 1)
 
     def test_generic_stream_with_event(self):
+        # [FUNCTION DOC] Compiles a function using a generic event recorded on the current
+        # stream and a CUDA stream wrapper built from the generic stream ids. Checks eager
+        # parity and that record_event appears in the generated code.
         """Test compilation with torch.Stream and torch.Event."""
         from torch._inductor.utils import run_and_get_code
 
@@ -2280,6 +2683,9 @@ class TestGenericStreamCompile(InductorTestCase):
         )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: doubles the input and records the closure
+            # event; in the wrapped stream context waits for the event and adds one;
+            # synchronizes that stream and returns the result.
             # Work on default stream
             a = x * 2
             event.record()
@@ -2303,6 +2709,9 @@ class TestGenericStreamCompile(InductorTestCase):
         self.assertIn("record_event", code)
 
     def test_generic_stream_multiple(self):
+        # [FUNCTION DOC] Compiles a function using two generic streams (wrapped as CUDA streams)
+        # and one generic event shared between them. Checks eager parity, at least two stream
+        # contexts and record_event and wait_event in the code.
         """Test compilation with multiple torch.Stream instances."""
         from torch._inductor.utils import run_and_get_code
 
@@ -2322,6 +2731,9 @@ class TestGenericStreamCompile(InductorTestCase):
         )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: first wrapped stream doubles the input and
+            # records the shared event; second wrapped stream waits the event and adds one; both
+            # streams synchronized; returns the result.
             with torch.cuda.stream(cuda_stream1):
                 a = x * 2
                 event.record()
@@ -2348,6 +2760,9 @@ class TestGenericStreamCompile(InductorTestCase):
         self.assertIn("wait_event", code)
 
     def test_generic_event_record_on_stream(self):
+        # [FUNCTION DOC] Compiles a function where a generic event is recorded with an explicit
+        # stream argument and then waited on the current stream. Checks eager parity and that
+        # record_event appears in the code.
         """Test torch.Event.record() with explicit stream argument."""
         from torch._inductor.utils import run_and_get_code
 
@@ -2361,6 +2776,9 @@ class TestGenericStreamCompile(InductorTestCase):
         )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: doubles the input inside the wrapped
+            # stream and records the event with that stream explicitly; waits the event on the
+            # current stream, adds one, synchronizes the stream and returns the result.
             with torch.cuda.stream(cuda_stream):
                 a = x * 2
                 # Record event with explicit stream (using cuda_stream)
@@ -2387,15 +2805,22 @@ class TestGenericStreamCompile(InductorTestCase):
 @unittest.skipUnless(TEST_CUDA, "requires CUDA")
 @xfailIfNoAcceleratorTriton
 class TestStreamIdentity(InductorTestCase):
+    # [CLASS DOC] Verifies compiled code retrieves the user's own stream objects by index rather
+    # than creating new streams (CUDA only).
     """Verify that compiled code uses the user's original stream objects."""
 
     def test_single_stream_identity(self):
+        # [FUNCTION DOC] Compiles a function that runs inside a stream created outside it.
+        # Checks eager parity, that the code contains a stream-by-index lookup and no
+        # construction of a new CUDA stream with a device argument.
         """Codegen should retrieve the user's stream via _get_stream_by_index."""
         from torch._inductor.utils import run_and_get_code
 
         user_stream = torch.cuda.Stream()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: enters the closure user stream and returns
+            # the input times two.
             with torch.cuda.stream(user_stream):
                 return x * 2
 
@@ -2407,6 +2832,9 @@ class TestStreamIdentity(InductorTestCase):
         self.assertNotIn("torch.cuda.Stream(device=", code)
 
     def test_multiple_stream_identity(self):
+        # [FUNCTION DOC] Compiles a function using two user streams linked by an event. Checks
+        # eager parity, that the code contains exactly two stream-by-index lookups with
+        # different indices, and no construction of a new stream.
         """Each stream context should retrieve a different user stream object."""
         from torch._inductor.utils import run_and_get_code
 
@@ -2414,6 +2842,9 @@ class TestStreamIdentity(InductorTestCase):
         stream_b = torch.cuda.Stream()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: creates an event; first user stream
+            # doubles and records; second user stream waits and adds one; second stream is
+            # synchronized; returns the result.
             event = torch.cuda.Event()
             with torch.cuda.stream(stream_a):
                 a = x * 2
@@ -2438,6 +2869,11 @@ class TestStreamIdentity(InductorTestCase):
 @xfailIfNoAcceleratorTriton
 @unittest.skipUnless(TEST_CUDA, "requires CUDA")
 class TestPDLWithMultiStream(InductorTestCase):
+    # [CLASS DOC] Tests that PDL (programmatic dependent launch) composes with multi-stream code
+    # under torch.compile on CUDA. Each test turns on the triton PDL option and requires an
+    # NVIDIA GPU of compute capability nine or newer (not ROCm). They check correctness, event
+    # preservation, no cross-stream fusion, and that kernels in each stream carry launch_pdl
+    # metadata and gdc wait and launch intrinsics.
     """Tests that PDL (Programmatic Dependent Launch) composes safely with
     user-annotated multi-stream code under torch.compile.
 
@@ -2453,10 +2889,15 @@ class TestPDLWithMultiStream(InductorTestCase):
     @unittest.skipIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
     @inductor_config.patch({"triton.enable_pdl": True})
     def test_pdl_single_side_stream(self):
+        # [FUNCTION DOC] Verifies a kernel on a side stream gets PDL metadata. Compiles, checks
+        # eager parity, at least one stream context and synchronize_stream in the wrapper, then
+        # FileCheck on the triton source for launch_pdl, gdc_wait and gdc_launch.
         """PDL metadata is emitted for a kernel on a side stream."""
         from torch._inductor.utils import run_and_get_code, run_and_get_triton_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: two chained pointwise ops in a side
+            # stream, then stream synchronize; returns the result.
             s = torch.cuda.Stream()
             with torch.cuda.stream(s):
                 a = x * 2
@@ -2485,10 +2926,15 @@ class TestPDLWithMultiStream(InductorTestCase):
     @unittest.skipIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
     @inductor_config.patch({"triton.enable_pdl": True})
     def test_pdl_correctness_with_multiple_streams(self):
+        # [FUNCTION DOC] Verifies PDL is applied for two independent side streams and the
+        # default stream add. Checks eager parity and that the triton source contains three
+        # successive occurrences of launch_pdl, gdc_wait and gdc_launch.
         """Enabling PDL with independent side streams produces correct results."""
         from torch._inductor.utils import run_and_get_triton_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: two side streams compute affine ops of the
+            # input and record events; the current stream waits both and returns the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             e1 = torch.cuda.Event()
@@ -2532,6 +2978,9 @@ class TestPDLWithMultiStream(InductorTestCase):
     @unittest.skipIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
     @inductor_config.patch({"triton.enable_pdl": True})
     def test_pdl_cross_stream_events_preserved(self):
+        # [FUNCTION DOC] Verifies event record and wait for cross-stream sync stay in generated
+        # code with PDL on, and that both the default stream and side stream kernels carry PDL
+        # intrinsics (two successive matches in the triton source).
         """Event record/wait for cross-stream sync must survive with PDL on.
 
         PDL is stream-local so it cannot replace event-based cross-stream
@@ -2539,6 +2988,8 @@ class TestPDLWithMultiStream(InductorTestCase):
         from torch._inductor.utils import run_and_get_code, run_and_get_triton_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: affine op on default stream, event record,
+            # side stream waits and adds three; synchronizes the stream and returns the result.
             s = torch.cuda.Stream()
             event = torch.cuda.Event()
 
@@ -2579,6 +3030,10 @@ class TestPDLWithMultiStream(InductorTestCase):
     @unittest.skipIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
     @inductor_config.patch({"triton.enable_pdl": True})
     def test_pdl_same_stream_consecutive_kernels(self):
+        # [FUNCTION DOC] Verifies consecutive kernels on the same side stream get PDL. Compiles
+        # a function that computes a polynomial and copies it in place into an argument,
+        # compares with eager using a clone, and checks the triton source for PDL metadata and
+        # gdc intrinsics.
         """Two consecutive kernels on the same side stream should both get PDL.
 
         This is the case where PDL is actually useful: the second kernel can
@@ -2586,6 +3041,9 @@ class TestPDLWithMultiStream(InductorTestCase):
         from torch._inductor.utils import run_and_get_triton_code
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Traced function: inside a side stream computes the square
+            # plus the input, copies it in place into the second argument, synchronizes the
+            # stream and returns that argument.
             s = torch.cuda.Stream()
             with torch.cuda.stream(s):
                 # Two separate fused groups on the same stream
@@ -2611,10 +3069,16 @@ class TestPDLWithMultiStream(InductorTestCase):
     @unittest.skipIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
     @inductor_config.patch({"triton.enable_pdl": True})
     def test_pdl_no_fusion_across_streams(self):
+        # [FUNCTION DOC] Verifies PDL does not cause fusion across streams: resets metrics,
+        # compiles and checks eager parity, asserts exactly three generated kernels, and that
+        # all three kernels in the triton source have PDL metadata and gdc intrinsics.
         """PDL must not cause cross-stream ops to be fused."""
         from torch._inductor.utils import run_and_get_triton_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: two side streams each run two chained
+            # pointwise ops and record events; the current stream waits both and returns
+            # the sum.
             s1 = torch.cuda.Stream()
             s2 = torch.cuda.Stream()
             e1 = torch.cuda.Event()
@@ -2666,6 +3130,10 @@ class TestPDLWithMultiStream(InductorTestCase):
     @unittest.skipIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
     @inductor_config.patch({"triton.enable_pdl": True})
     def test_pdl_stress_multistream_correctness(self):
+        # [FUNCTION DOC] Stress test combining PDL, heavy matmuls and a side stream over 20
+        # iterations. First compiles once and checks the wrapper has a stream context,
+        # wait_event and PDL metadata with gdc intrinsics, then loops comparing compiled with
+        # eager after full device synchronization.
         """Stress test: heavy work across streams with PDL must produce
         correct results over many iterations to surface any races.
 
@@ -2678,6 +3146,9 @@ class TestPDLWithMultiStream(InductorTestCase):
         ITERS = 20
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Traced function: four chained matmuls on the default
+            # stream, event record, side stream waits and computes relu plus one; synchronizes
+            # the stream and returns it.
             s = torch.cuda.Stream()
             e = torch.cuda.Event()
 
@@ -2719,6 +3190,9 @@ class TestPDLWithMultiStream(InductorTestCase):
     @unittest.skipIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
     @inductor_config.patch({"triton.enable_pdl": True})
     def test_pdl_mutation_across_streams(self):
+        # [FUNCTION DOC] Verifies an in-place add on a side stream of a locally created buffer,
+        # with an event wait before, works with PDL: compares with eager, checks record_event
+        # and wait_event in the wrapper, and that both kernels carry PDL intrinsics.
         """Buffer mutation on one stream, read on another, with PDL enabled.
 
         The mutation is on a locally-created buffer (not an input) to avoid
@@ -2726,6 +3200,9 @@ class TestPDLWithMultiStream(InductorTestCase):
         from torch._inductor.utils import run_and_get_code, run_and_get_triton_code
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: doubles the input into a new buffer,
+            # records an event, side stream waits then mutates the buffer in place by adding
+            # one; synchronizes and returns the buffer.
             s = torch.cuda.Stream()
             event = torch.cuda.Event()
 
@@ -2769,19 +3246,33 @@ class TestPDLWithMultiStream(InductorTestCase):
 @unittest.skipIf(not TEST_CUDA, "requires CUDA")
 @xfailIfNoAcceleratorTriton
 class TestAOTIUserStreams(InductorTestCase):
+    # [CLASS DOC] Tests exporting and AOT-compiling models that use user streams and events
+    # (CUDA only, xfail without triton). Compiles via export and the AOTInductor package API and
+    # inspects the generated C++ for runtime calls. Helpers: a runtime name mapper and a
+    # compile-and-run function.
     @staticmethod
     def _runtime_name(cuda_name):
+        # [FUNCTION DOC] HELPER: Static helper mapping a CUDA runtime API name to the HIP name
+        # on ROCm builds (replaces the first cuda with hip) and returning it
+        # unchanged otherwise.
         if TEST_WITH_ROCM:
             return cuda_name.replace("cuda", "hip", 1)
         return cuda_name
 
     def _compile_and_run(self, model, inputs):
+        # [FUNCTION DOC] HELPER: Exports the model strictly with the inputs, AOT-compiles and
+        # packages it under a fresh inductor cache, capturing the generated C++ code, then loads
+        # the package and runs it on the inputs. Returns the pair of result and generated
+        # C++ code.
         from torch._inductor.utils import fresh_cache, run_and_get_cpp_code
 
         with fresh_cache():
             ep = torch.export.export(model, inputs, strict=True)
 
             def _compile():
+                # [FUNCTION DOC] HELPER: Local callable that AOT-compiles and packages the
+                # exported program and returns the package path, used so the C++ code capture
+                # helper can wrap compilation.
                 return torch._inductor.aoti_compile_and_package(ep)
 
             package_path, code = run_and_get_cpp_code(_compile)
@@ -2790,8 +3281,15 @@ class TestAOTIUserStreams(InductorTestCase):
         return result, code
 
     def test_record_wait_event_basic(self):
+        # [FUNCTION DOC] Exports a model that computes on a side stream and then records and
+        # waits an event. Checks the loaded result equals eager and the C++ code contains the
+        # event record call, the stream wait event call and the per-thread stream cache.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Test model creating a side stream, computing in it, recording
+            # and waiting an event.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one to the input inside a new stream, records an
+                # event on the stream, waits it, and returns the result doubled.
                 s = torch.cuda.Stream()
                 with torch.cuda.stream(s):
                     y = x + 1
@@ -2811,8 +3309,15 @@ class TestAOTIUserStreams(InductorTestCase):
         self.assertIn("AOTIPerThreadStreamCache", code)
 
     def test_two_stream_dependency(self):
+        # [FUNCTION DOC] Exports a model with two streams linked by an event and a final event
+        # wait. Checks parity and that the C++ code has at least two event record calls, two
+        # stream wait calls and a lookup of an auxiliary stream with index two.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Test model with two streams linked by an event.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Stream one adds one; an event recorded on stream one is
+                # waited by stream two, which multiplies by two; an event recorded on stream two
+                # is waited; returns stream two result.
                 s1 = torch.cuda.Stream()
                 s2 = torch.cuda.Stream()
                 with torch.cuda.stream(s1):
@@ -2839,8 +3344,13 @@ class TestAOTIUserStreams(InductorTestCase):
         self.assertIn("_aoti_aux_stream_cache.get(2", code)
 
     def test_stream_synchronize_raises(self):
+        # [FUNCTION DOC] Verifies that a host stream synchronize in an exported model makes AOT
+        # compilation raise an error mentioning synchronize_stream.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Test model that synchronizes a stream on the host.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one inside a new stream, synchronizes the stream
+                # and returns the result doubled.
                 s = torch.cuda.Stream()
                 with torch.cuda.stream(s):
                     y = x + 1
@@ -2858,9 +3368,15 @@ class TestAOTIUserStreams(InductorTestCase):
 @torch._inductor.config.patch({"triton.cudagraphs": True})
 @xfailIfNoAcceleratorTriton
 class TestStreamCudagraphInteraction(InductorTestCase):
+    # [CLASS DOC] Tests user streams under cudagraph capture; the whole class has the triton
+    # cudagraphs option patched on (CUDA only, xfail without triton). Each test runs the
+    # compiled function three times (warmup, capture, replay) and compares with eager.
     """Tests for user streams under cudagraph capture (reduce-overhead mode)."""
 
     def test_implicit_current_stream_with_cudagraphs(self):
+        # [FUNCTION DOC] Verifies event record and wait with the implicit current stream work
+        # under cudagraph capture, since the current stream resolves to the capture stream
+        # at runtime.
         """Event record/wait with implicit current stream must work under cudagraph capture.
 
         The implicit current stream resolves at runtime via torch.cuda.current_stream(),
@@ -2871,6 +3387,9 @@ class TestStreamCudagraphInteraction(InductorTestCase):
         ev2 = torch.cuda.Event()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Traced function: records an event, side stream waits it,
+            # doubles x and records a second event, current stream waits it; returns the sum
+            # with y.
             ev.record()
             with torch.cuda.stream(s1):
                 ev.wait()
@@ -2890,6 +3409,8 @@ class TestStreamCudagraphInteraction(InductorTestCase):
         self.assertEqual(result, expected)
 
     def test_explicit_current_stream_with_cudagraphs(self):
+        # [FUNCTION DOC] Verifies passing the current stream explicitly to event record and wait
+        # behaves the same as the implicit form under cudagraph capture.
         """Passing torch.cuda.current_stream() explicitly must also work under capture.
 
         The user writes ev.record(torch.cuda.current_stream()) which is
@@ -2901,6 +3422,9 @@ class TestStreamCudagraphInteraction(InductorTestCase):
         ev2 = torch.cuda.Event()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Traced function: takes the current stream, records an event
+            # on it, side stream waits and doubles x and records a second event, then waits the
+            # second event on the saved stream; returns the sum with y.
             cur = torch.cuda.current_stream()
             ev.record(cur)
             with torch.cuda.stream(s1):
@@ -2920,6 +3444,9 @@ class TestStreamCudagraphInteraction(InductorTestCase):
         self.assertEqual(result, expected)
 
     def test_wait_stream_fork_join_with_cudagraphs(self):
+        # [FUNCTION DOC] Regression test for the wait_stream fork and join pattern under
+        # cudagraph capture: all forked streams must be rejoined before capture ends, so the
+        # join wait must not be reordered before the side work.
         """wait_stream fork-join pattern must work under cudagraph capture.
 
         Regression test for https://github.com/pytorch/pytorch/issues/185546.
@@ -2930,6 +3457,8 @@ class TestStreamCudagraphInteraction(InductorTestCase):
         side = torch.cuda.Stream()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: doubles x, side stream waits current, adds
+            # one in the side stream, current waits side; returns the side result.
             a = x * 2
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
@@ -2946,6 +3475,9 @@ class TestStreamCudagraphInteraction(InductorTestCase):
         self.assertEqual(result, expected)
 
     def test_wait_stream_independent_inputs_with_cudagraphs(self):
+        # [FUNCTION DOC] Verifies wait_stream ordering with independent inputs under cudagraph
+        # capture, compiling in reduce-overhead mode and checking closeness to eager after
+        # warmup, capture and replay.
         """wait_stream with independent inputs must work under cudagraph capture.
 
         When the waiting-stream computation uses an input independent of the
@@ -2954,6 +3486,8 @@ class TestStreamCudagraphInteraction(InductorTestCase):
         side = torch.cuda.Stream()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Traced function: doubles x, side stream waits current, adds
+            # one to y in the side stream, current waits side; returns the sum.
             a = x * 2
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
@@ -2985,12 +3519,20 @@ instantiate_parametrized_tests(TestStreamCudagraphInteraction)
 
 @unittest.skipIf(not TEST_CUDA, "requires CUDA")
 class TestStreamExternalObjectRestore(InductorTestCase):
+    # [CLASS DOC] Tests that external object state (user stream registry) is restored for
+    # backward (CUDA only).
     @xfailIfNoAcceleratorTriton
     def test_restore_external_objects_before_backward(self):
+        # [FUNCTION DOC] Compiles a function using a generic stream, runs forward on an input
+        # requiring gradients, then registers an unrelated new stream in the user object
+        # registry before calling backward, and checks the gradient is not None and equals a
+        # tensor of twos. Verifies backward restores the registry snapshot taken in forward.
         """Forward snapshots external object registry, backward restores it."""
         from torch._dynamo.graph_bytecode_inputs import store_user_object_weakrefs
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Traced function: creates a generic CUDA stream and returns
+            # the input times two plus one inside its context.
             s = torch.Stream(device="cuda")
             with s:
                 return x * 2 + 1
