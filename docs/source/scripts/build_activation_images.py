@@ -1,3 +1,8 @@
+# [MODULE DOC] Script that renders an input/output line plot of each listed activation
+# function over the range from -7 to 7 and saves it as a png in an activation_images
+# directory next to this file. Running it has side effects at import time: switches
+# matplotlib to the Agg backend, creates the output directory if missing, then plots
+# and prints a message per function. Plots whose png already exists are skipped.
 """
 This script will generate input-out plots for all of the activation
 functions. These are for use in the documentation, and potentially in
@@ -54,6 +59,10 @@ functions = [
 
 
 def plot_function(function, **args):
+    # [FUNCTION DOC] Evaluates the given activation module on a grid of inputs from -7 to
+    # 7 (step 0.01), detaches the result and draws it on the current matplotlib plot.
+    # Extra keyword arguments (color, alpha and so on) are passed to the plot call.
+    # Returns nothing.
     """
     Plot a function on the current plot. The additional arguments may
     be used to specify color, alpha, etc.

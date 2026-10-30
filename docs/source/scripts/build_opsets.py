@@ -1,3 +1,8 @@
+# [MODULE DOC] Script that generates two csv files, listing core ATen operators and
+# prim operators with their schemas, in the build/ir directory (relative to the
+# current directory) for inclusion in the IR documentation. Parses
+# native_functions.yaml and tags.yaml from the repo root. Importing has no side
+# effects beyond imports; running as main writes the files.
 import os
 from collections import OrderedDict
 from pathlib import Path
@@ -17,6 +22,10 @@ PRIMS_OPS_CSV_FILE = "prims_ops.csv"
 
 
 def get_aten():
+    # [FUNCTION DOC] Parses the native functions and tags yaml files and returns a list of
+    # pairs of operator name (prefixed with the aten namespace) and schema string, for
+    # functions tagged core, sorted by name. Asterisks in schemas are escaped for rst.
+    # Reads files from disk.
     parsed_yaml = parse_native_yaml(NATIVE_FUNCTION_YAML_PATH, TAGS_YAML_PATH)
     native_functions = parsed_yaml.native_functions
 
@@ -37,6 +46,10 @@ def get_aten():
 
 
 def get_prims():
+    # [FUNCTION DOC] Walks the exported names of the prims module and returns a list of
+    # pairs of operator name (default overload suffix stripped) and schema string, for
+    # those that are operator overloads. Asterisks in schemas are escaped for rst. Non-
+    # overload names are skipped.
     op_schema_pairs = []
     for op_name in prims.__all__:
         op_overload = getattr(prims, op_name, None)
@@ -55,6 +68,10 @@ def get_prims():
 
 
 def main():
+    # [FUNCTION DOC] Collects the ATen and prims operator lists, creates the build/ir
+    # directory if needed and writes one csv file for each (header line Operator,Schema
+    # followed by one quoted row per operator, with the operator name wrapped in rst
+    # literal markup). Overwrites existing files.
     aten_ops_list = get_aten()
     prims_ops_list = get_prims()
 

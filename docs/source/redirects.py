@@ -1,3 +1,8 @@
+# [MODULE DOC] Defines the redirects mapping from old documentation page names to the
+# new page paths, covering deprecated TorchScript pages, torch.compiler, export and
+# compile pages that moved under the user guide, and the removed distributed _dist2
+# page. Imported by conf.py (which re-exports it for the redirects extension). Pure
+# data; no import-time side effects.
 redirects = {
     # Redirects for deprecated TorchScript documentation
     "jit": "torch.compiler_api.html",

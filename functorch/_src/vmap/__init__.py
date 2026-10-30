@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Compatibility shim that re-exports private batching helpers and the
+# pytree flatten and unflatten functions and Tensor from torch._functorch.vmap. Not
+# public API.
 # This file has moved to under torch/_functorch. It is not public API.
 # If you are not a PyTorch developer and you are relying on the following
 # imports, please file an issue.

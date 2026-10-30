@@ -1,3 +1,9 @@
+# [MODULE DOC] Script that simulates 100 epochs for each learning rate scheduler
+# factory in a list (using a small linear model and an SGD optimizer with starting
+# rate 0.05) and saves a plot of the learning rate curve as a png named after the
+# scheduler class in a lr_scheduler_images directory next to this file. Runs at import
+# time: selects the Agg matplotlib backend, creates the output directory, and plots
+# every scheduler, skipping those whose png exists.
 from pathlib import Path
 
 import matplotlib
@@ -37,6 +43,9 @@ num_epochs = 100
 
 
 def constant_exponential_schedulers(opt):
+    # [FUNCTION DOC] HELPER: Given an optimizer, returns a list of two schedulers (a
+    # constant factor of 0.1 for the first fifth of the epochs, then exponential decay
+    # with gamma 0.9) used as the parts of the chained and sequential scheduler examples.
     return [
         ConstantLR(opt, factor=0.1, total_iters=num_epochs // 5),
         ExponentialLR(opt, gamma=0.9),
@@ -67,6 +76,12 @@ schedulers = [
 
 
 def plot_function(scheduler):
+    # [FUNCTION DOC] Given a factory taking an optimizer, builds a fresh SGD optimizer and
+    # scheduler, and returns early without plotting if the png for that scheduler class
+    # already exists. Otherwise steps for the configured number of epochs recording the
+    # first group learning rate (feeding a random validation loss for the plateau
+    # scheduler), plots the curve with title and axis labels, saves the png and prints a
+    # message. Side effects: clears the current plot, writes the file.
     plt.clf()
     plt.grid(color="k", alpha=0.2, linestyle="--")
     lrs = []

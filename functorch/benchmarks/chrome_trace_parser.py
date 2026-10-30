@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that computes GPU utilization and matmul/convolution
+# time utilization for PyTorch profiler chrome trace json files. Takes a runtimes csv
+# file (columns name and runtime, in seconds) and either trace file names or a folder
+# of json traces, and prints one line per model with the results. Import-time side
+# effect: creates a module logger.
 import argparse
 import logging
 import os
@@ -16,6 +21,9 @@ log = logging.getLogger(__name__)
 
 
 def get_model_name(filename):
+    # [FUNCTION DOC] Returns the model name: the part of the file base name before the
+    # chrome trace marker. If the marker is absent the search result is -1, so the last
+    # character is dropped.
     """
     Get model name from a file in format {model_name}_chrome_trace_*.json
     """
@@ -25,10 +33,22 @@ def get_model_name(filename):
 
 
 def get_total_length(run_times_df, modelname):
+    # [FUNCTION DOC] Looks up the runtime column of the data frame row whose name matches
+    # the model name and converts it to float. Fails if there is not exactly one matching
+    # row (the conversion of a series is deprecated or errors in recent pandas).
     return float(run_times_df[run_times_df["name"] == modelname]["runtime"])
 
 
 def main():
+    # [FUNCTION DOC] Parses arguments (required runtime csv, plus a mutually exclusive set
+    # of repeated trace file names or a folder scanned for json files), prints a header,
+    # reads the runtimes csv and for each trace prints model name, GPU utilization and
+    # matmul/convolution utilization; errors per file are logged and printed as an error
+    # line instead of aborting.
+    # KNOWN ISSUE: compute_utilization receives the whole list of file names rather than
+    # the current file name, although it expects a single file; so with several files it
+    # will fail and be reported as errors. Also the final else branch (no inputs) is
+    # unreachable since the group is required, and would leave the file list undefined.
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
     parser.add_argument(

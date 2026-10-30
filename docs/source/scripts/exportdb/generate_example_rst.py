@@ -1,3 +1,8 @@
+# [MODULE DOC] Script that generates the ExportDB rst documentation pages from the
+# registered export example cases: one page section per example (source code plus the
+# exported graph or the error text), one page per tag, and an index page, written
+# under the generated/exportdb directory of the source tree. Defines path constants at
+# import time; generation only runs when executed as main.
 import inspect
 import os
 import re
@@ -17,6 +22,13 @@ EXPORTDB_SOURCE = SOURCE / "generated" / "exportdb"
 
 
 def generate_example_rst(example_case: ExportCase):
+    # [FUNCTION DOC] Builds and returns the rst text for one export example case: title,
+    # tag and support level note, the original source file text (split at the rewrite
+    # decorator marker), the export call, and the result of strict export (graph text with
+    # file comment lines removed) or a one line message for unsupported, assertion or
+    # runtime errors. If a rewrite decorator is present, appends the rewritten source.
+    # Reads the source file of the model. Raises AssertionError if the source splits into
+    # more than two parts.
     """
     Generates the .rst files for all the examples in db/examples/
     """
@@ -107,6 +119,10 @@ You can rewrite the example above to something like the following:
 
 
 def generate_index_rst(example_cases, tag_to_modules, support_level_to_modules):
+    # [FUNCTION DOC] Writes index.rst into the exportdb output directory. Builds a section
+    # per support level (title-cased name) containing the example texts, a toctree listing
+    # the tags, and reads the intro blurb from blurb.txt next to this script. The
+    # example_cases argument is unused. Returns nothing; overwrites the file.
     """
     Generates the index.rst file
     """
@@ -149,6 +165,11 @@ ExportDB
 
 
 def generate_tag_rst(tag_to_modules):
+    # [FUNCTION DOC] For each tag in the mapping from tag to list of example rst texts,
+    # writes a file named after the tag in the exportdb output directory, with a title and
+    # the joined example texts in which heading underlines of three or more equals signs
+    # are turned into dashes (to demote them one level). Overwrites existing files.
+    # Returns nothing.
     """
     For each tag that shows up in each ExportCase.tag, generate an .rst file
     containing all the examples that have that tag.
@@ -167,6 +188,9 @@ def generate_tag_rst(tag_to_modules):
 
 
 def generate_rst():
+    # [FUNCTION DOC] Entry point. Creates the exportdb output directory if missing, loads
+    # all example cases, generates the rst for each, groups the texts by tag and by
+    # support level, then writes the per-tag pages and the index page. Returns nothing.
     if not os.path.exists(EXPORTDB_SOURCE):
         os.makedirs(EXPORTDB_SOURCE)
 

@@ -1,3 +1,8 @@
+# [MODULE DOC] Setup snippet run at the top of the compile user guide notebooks. At
+# import time it replaces torch.compile with a version defaulting to the eager backend
+# (shortens notebook execution), clears the torch logs format environment variable,
+# and reinitializes the torch logging formatter and log settings so output lacks the
+# usual prefix.
 import functools
 import os
 
