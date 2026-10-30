@@ -1,10 +1,17 @@
+# [MODULE DOC] SqueezeNet image classifier (versions 1.0 and 1.1) and its Fire block,
+# defined as ONNX test models. Only defines classes at import.
 import torch
 import torch.nn as nn
 import torch.nn.init as init
 
 
 class Fire(nn.Module):
+    # [CLASS DOC] SqueezeNet Fire block: a 1x1 squeeze convolution with ReLU, followed by
+    # parallel 1x1 and 3x3 (padding one) expand convolutions with ReLU whose outputs are
+    # concatenated along the channel dimension.
     def __init__(self, inplanes, squeeze_planes, expand1x1_planes, expand3x3_planes):
+        # [FUNCTION DOC] Stores inplanes and creates the squeeze convolution, the two expand
+        # convolutions and in-place ReLU activations for each.
         super().__init__()
         self.inplanes = inplanes
         self.squeeze = nn.Conv2d(inplanes, squeeze_planes, kernel_size=1)
@@ -17,6 +24,8 @@ class Fire(nn.Module):
         self.expand3x3_activation = nn.ReLU(inplace=True)
 
     def forward(self, x):
+        # [FUNCTION DOC] Applies squeeze then ReLU, then returns the channel-wise
+        # concatenation of the activated 1x1 and 3x3 expand outputs.
         x = self.squeeze_activation(self.squeeze(x))
         return torch.cat(
             [
@@ -28,7 +37,14 @@ class Fire(nn.Module):
 
 
 class SqueezeNet(nn.Module):
+    # [CLASS DOC] SqueezeNet classifier built from a convolutional feature extractor of Fire
+    # blocks and max pooling plus a classifier of dropout, a final 1x1 convolution to
+    # num_classes, ReLU and 13x13 average pooling. Max pooling honors ceil_mode.
     def __init__(self, version=1.0, num_classes=1000, ceil_mode=False):
+        # [FUNCTION DOC] Builds features for version 1.0 or 1.1 (different first convolution
+        # and Fire layout) and the classifier. Raises ValueError for any other version.
+        # Initializes convolutions in place: the final one with normal weights (std 0.01),
+        # all others with Kaiming uniform, and zeroes every bias.
         super().__init__()
         if version not in [1.0, 1.1]:
             raise ValueError(
@@ -83,6 +99,8 @@ class SqueezeNet(nn.Module):
                     m.bias.data.zero_()
 
     def forward(self, x):
+        # [FUNCTION DOC] Applies features and classifier and reshapes the result to batch
+        # size by num_classes.
         x = self.features(x)
         x = self.classifier(x)
         return x.view(x.size(0), self.num_classes)

@@ -1,9 +1,15 @@
+# [MODULE DOC] MNIST convolutional classifier definition used as an ONNX test model.
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class MNIST(nn.Module):
+    # [CLASS DOC] Two convolutions (1 to 10 and 10 to 20 channels, kernel 5), channel
+    # dropout, and two linear layers (320 to 50 to 10) producing log-probabilities
+    # over 10 classes.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates the layers conv1, conv2, conv2_drop (2D dropout),
+        # fc1 and fc2.
         super().__init__()
         self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
         self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
@@ -12,6 +18,9 @@ class MNIST(nn.Module):
         self.fc2 = nn.Linear(50, 10)
 
     def forward(self, x):
+        # [FUNCTION DOC] Applies conv, max pool by 2 and ReLU twice (dropout after the
+        # second conv), flattens to 320 features, applies fc1 with ReLU, dropout following
+        # the training flag, fc2, and returns log-softmax over dimension one.
         x = F.relu(F.max_pool2d(self.conv1(x), 2))
         x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
         x = x.view(-1, 320)

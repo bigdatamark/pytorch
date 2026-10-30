@@ -1,4 +1,11 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] Shared helpers for the ONNX export tests: type aliases, paths to the ONNX
+# backend test data, a base test case that exports a model and verifies it with ONNX
+# Runtime, a helper that runs a model in ONNX Runtime, the tested opset and dtype
+# ranges, and the DecorateMeta record with helpers (xfail, skip, skip_slow,
+# add_decorate_info) used to mark OpInfo based tests, plus reason-message formatters and
+# a context manager implementing skip/xfail behavior. Importing requires onnxruntime,
+# pytest, numpy and pytorch_test_common.
 
 from __future__ import annotations
 
@@ -45,6 +52,13 @@ pytorch_operator_dir = os.path.join(onnx_model_dir, "pytorch-operator")
 
 
 def run_model_test(test_suite: _TestONNXRuntime, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Runs verification for a test suite. Builds verification
+    # options from the suite attributes (check_shape and check_dtype when present, and a
+    # backend from ort_backend when it is not none), sets the opset version and
+    # initializer flag in the keyword arguments, and moves any keyword argument whose name
+    # is an options field into the options object (removing it from the keywords). Returns
+    # the result of the verification call using the remaining arguments. Mutates the
+    # passed keyword dictionary.
     options = verification.VerificationOptions()
 
     kwargs["opset_version"] = test_suite.opset_version
@@ -70,6 +84,9 @@ def run_model_test(test_suite: _TestONNXRuntime, *args, **kwargs):
 
 
 def parameterize_class_name(cls: type, idx: int, input_dicts: Mapping[Any, Any]):
+    # [FUNCTION DOC] HELPER: Builds a class name for parameterized test classes by joining
+    # the base class name and key_value pairs of the parameter mapping with underscores. The
+    # index argument is unused.
     """Combine class name with the parameterized arguments.
 
     This function is passed to `parameterized.parameterized_class` as the
@@ -80,6 +97,10 @@ def parameterize_class_name(cls: type, idx: int, input_dicts: Mapping[Any, Any])
 
 
 class _TestONNXRuntime(pytorch_test_common.ExportTestCase):
+    # [CLASS DOC] HELPER: Base test case for ONNX Runtime export tests. Class attributes
+    # configure the opset (default opset constant), whether initializers are graph inputs,
+    # scripting mode, shape and dtype checks, and an optional ORT backend name (none means
+    # the verification default). Subclasses call run_test to export and verify models.
     opset_version = _constants.ONNX_DEFAULT_OPSET
     keep_initializers_as_inputs = True  # For IR version 3 type export.
     is_script = False
@@ -90,6 +111,10 @@ class _TestONNXRuntime(pytorch_test_common.ExportTestCase):
     ort_backend: str | None = None
 
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setup, seeds ONNX Runtime with zero, seeds all
+        # devices of the current accelerator (if available) with zero, sets the
+        # environment variable that allows only released opsets to zero, and enables
+        # script tests on the instance.
         super().setUp()
         onnxruntime.set_seed(0)
         device_type = getattr(
@@ -121,7 +146,20 @@ class _TestONNXRuntime(pytorch_test_common.ExportTestCase):
         remained_onnx_input_idx=None,
         verbose=False,
     ):
+        # [FUNCTION DOC] Exports the model and verifies the ONNX result against PyTorch
+        # via the verification helper. The remained input index argument may be a mapping
+        # with scripting and tracing entries, or one value used for both. In scripting
+        # mode (is_script and script tests enabled) the model is scripted (unless already
+        # a script module or function) and verified without flattening and without
+        # ignoring none outputs. In tracing mode (not script and the model not already
+        # scripted) it is verified directly. Does nothing when neither applies. The
+        # remaining arguments are tolerances, export options and naming/dynamic axes
+        # settings passed through unchanged.
         def _run_test(m, remained_onnx_input_idx, flatten=True, ignore_none=True):
+            # [FUNCTION DOC] HELPER: Calls the module-level verification runner for the
+            # given model with all outer arguments (inputs, tolerances, constant folding,
+            # dynamic axes, names, batch size, training mode, verbose) plus the given
+            # remained input index and flatten and ignore-none flags. Returns its result.
             return run_model_test(
                 self,
                 m,
@@ -169,6 +207,11 @@ def run_ort(
     onnx_model: str | torch.onnx.ONNXProgram,
     pytorch_inputs: Sequence[_InputArgsType],
 ) -> _OutputsType:
+    # [FUNCTION DOC] Runs an ONNX model in ONNX Runtime on CPU. A program object is first
+    # saved to an in-memory buffer; a path or bytes value is used as is. Logging is limited
+    # to errors. Raises an assertion error if the number of PyTorch inputs differs from the
+    # number of model inputs. Inputs are converted to numpy arrays in order and matched to
+    # input names. Returns the list of output arrays.
     """Run ORT on the given ONNX model and inputs
 
     Used in test_fx_to_onnx_with_onnxruntime.py
@@ -257,6 +300,10 @@ TESTED_DTYPES = (
 
 @dataclasses.dataclass
 class DecorateMeta:
+    # [CLASS DOC] Data record describing one skip or xfail rule for an OpInfo test:
+    # operator name, variant name, decorator to apply, opset filters (integers or
+    # predicates), dtypes, reason, behavior name, optional input matcher, enable flag and
+    # optional torch model type.
     """Information about a test case to skip or xfail.
 
     Adapted from functorch: functorch/test/common_utils.py
@@ -286,6 +333,8 @@ class DecorateMeta:
     model_type: pytorch_test_common.TorchModelType | None = None
 
     def contains_opset(self, opset: int) -> bool:
+        # [FUNCTION DOC] Returns true when no opset filter is set, otherwise true if the
+        # given opset equals any integer filter or satisfies any predicate filter.
         if self.opsets is None:
             return True
         return any(
@@ -305,6 +354,9 @@ def xfail(
     enabled_if: bool = True,
     model_type: pytorch_test_common.TorchModelType | None = None,
 ):
+    # [FUNCTION DOC] Builds a rule that marks a matching test as an expected failure
+    # (unittest expected failure decorator, behavior name xfail), forwarding the given
+    # filters, reason, matcher, enable flag and model type.
     """Expects a OpInfo test to fail.
 
     Args:
@@ -343,6 +395,9 @@ def skip(
     enabled_if: bool = True,
     model_type: pytorch_test_common.TorchModelType | None = None,
 ):
+    # [FUNCTION DOC] Builds a rule that skips matching tests (unittest skip decorator with
+    # the reason prefixed by Skip, behavior name skip), forwarding the given filters,
+    # reason, matcher, enable flag and model type.
     """Skips a test case in OpInfo that we don't care about.
 
     Likely because ONNX does not support the use case or it is by design.
@@ -382,6 +437,9 @@ def skip_slow(
     matcher: Callable[[Any], Any] | None = None,
     model_type: pytorch_test_common.TorchModelType | None = None,
 ):
+    # [FUNCTION DOC] Builds a skip rule for tests that are too slow, using the slow test
+    # decorator and the behavior name skip; enabled only when slow tests are not being run.
+    # Forwards the filters, reason, matcher and model type.
     """Skips a test case in OpInfo that is too slow.
 
     It needs further investigation to understand why it is slow.
@@ -417,6 +475,11 @@ def add_decorate_info(
     opset: int,
     skip_or_xfails: Iterable[DecorateMeta],
 ):
+    # [FUNCTION DOC] Appends decorators from the rules to the matching OpInfo objects
+    # (mutating each opinfo decorators field in place). Rules whose opset filter excludes
+    # the given opset are ignored. Raises an assertion error when no OpInfo matches the rule
+    # operator and variant, or when a rule carries a model type (those belong in a different
+    # list). Returns an identity decorator that leaves the function unchanged.
     """Decorates OpInfo tests with decorators based on the skip_or_xfails list.
 
     Args:
@@ -455,24 +518,33 @@ def add_decorate_info(
 
     # This decorator doesn't modify fn in any way
     def wrapped(fn):
+        # [FUNCTION DOC] HELPER: Identity decorator that returns the function unchanged.
         return fn
 
     return wrapped
 
 
 def opsets_before(opset: int) -> Callable[[int], bool]:
+    # [FUNCTION DOC] Returns a predicate that is true for opsets strictly lower than
+    # the given opset.
     """Returns a comparison function that decides if the given opset is before the specified."""
 
     def compare(other_opset: int):
+        # [FUNCTION DOC] HELPER: True when the other opset is strictly lower than
+        # the captured opset.
         return other_opset < opset
 
     return compare
 
 
 def opsets_after(opset: int) -> Callable[[int], bool]:
+    # [FUNCTION DOC] Returns a predicate that is true for opsets strictly higher than
+    # the given opset.
     """Returns a comparison function that decides if the given opset is after the specified."""
 
     def compare(other_opset: int):
+        # [FUNCTION DOC] HELPER: True when the other opset is strictly higher than
+        # the captured opset.
         return other_opset > opset
 
     return compare
@@ -481,6 +553,8 @@ def opsets_after(opset: int) -> Callable[[int], bool]:
 def reason_onnx_script_does_not_support(
     operator: str, dtypes: Sequence[str] | None = None
 ) -> str:
+    # [FUNCTION DOC] HELPER: Formats a reason string saying the operator on the given dtypes
+    # (or a generic word when none) is not supported by ONNX script.
     """Formats the reason: ONNX script doesn't support the given dtypes."""
     return f"{operator} on {dtypes or 'dtypes'} not supported by ONNX script"
 
@@ -488,6 +562,8 @@ def reason_onnx_script_does_not_support(
 def reason_onnx_runtime_does_not_support(
     operator: str, dtypes: Sequence[str] | None = None
 ) -> str:
+    # [FUNCTION DOC] HELPER: Formats a reason string saying the operator on the given dtypes
+    # (or a generic word when none) is not supported by ONNX Runtime.
     """Formats the reason: ONNX Runtime doesn't support the given dtypes."""
     return f"{operator} on {dtypes or 'dtypes'} not supported by ONNX Runtime"
 
@@ -495,6 +571,8 @@ def reason_onnx_runtime_does_not_support(
 def reason_onnx_does_not_support(
     operator: str, dtypes: Sequence[str] | None = None
 ) -> str:
+    # [FUNCTION DOC] HELPER: Formats a reason string saying the operator on the given dtypes
+    # (or certain dtypes when none) is not supported by the ONNX spec.
     """Formats the reason: ONNX doesn't support the given dtypes."""
     return f"{operator} on {dtypes or 'certain dtypes'} not supported by the ONNX Spec"
 
@@ -502,6 +580,8 @@ def reason_onnx_does_not_support(
 def reason_dynamo_does_not_support(
     operator: str, dtypes: Sequence[str] | None = None
 ) -> str:
+    # [FUNCTION DOC] HELPER: Formats a reason string saying the operator on the given dtypes
+    # (or certain dtypes when none) is not supported by the Dynamo spec.
     """Formats the reason: Dynamo doesn't support the given dtypes."""
     return (
         f"{operator} on {dtypes or 'certain dtypes'} not supported by the Dynamo Spec"
@@ -509,11 +589,14 @@ def reason_dynamo_does_not_support(
 
 
 def reason_jit_tracer_error(info: str) -> str:
+    # [FUNCTION DOC] HELPER: Formats a reason string for a JIT tracer error on
+    # the given info.
     """Formats the reason: JIT tracer errors."""
     return f"JIT tracer error on {info}"
 
 
 def reason_flaky() -> str:
+    # [FUNCTION DOC] HELPER: Returns the fixed reason string for flaky tests.
     """Formats the reason: test is flaky."""
     return "flaky test"
 
@@ -522,6 +605,12 @@ def reason_flaky() -> str:
 def normal_xfail_skip_test_behaviors(
     test_behavior: str | None = None, reason: str | None = None
 ):
+    # [FUNCTION DOC] Context manager wrapping a test body. Behavior skip skips immediately
+    # via pytest. Otherwise the body runs: an exception is re-raised when the behavior is
+    # none, converts to a pytest expected failure when the behavior is xfail, and a clean
+    # pass under xfail is reported as a failure saying the test unexpectedly passed.
+    # KNOWN ISSUE: for any other behavior value an exception raised by the body is silently
+    # swallowed rather than re-raised.
     """This context manager is used to handle the different behaviors of xfail and skip.
 
     Args:
