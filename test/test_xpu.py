@@ -1,5 +1,12 @@
 # Owner(s): ["module: intel"]
 # ruff: noqa: F841
+# [MODULE DOC] Test suite for the Intel XPU backend. Covers device and stream management,
+# device properties and telemetry through pyzes, events, RNG, serialization, the caching and
+# pluggable allocators and memory snapshots, DLPack, XPU graphs with RNG and optimizers,
+# pinned host allocator under capture, native-math sanity, operator comparison against CPU,
+# autocast, GPU trace callbacks, API sanity and memory pools. Most test classes are skipped
+# when XPU is unavailable. Import time computes the multi-device flag and whether pyzes is
+# installed, builds the operator lists, and instantiates the device-type tests at the end.
 
 import collections
 import contextlib
@@ -97,15 +104,25 @@ _xpu_computation_ops = [
 
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 class TestXpu(TestCase):
+    # [CLASS DOC] Main XPU test case, skipped when no XPU device is available. Covers device
+    # selection, device properties and telemetry, streams and events, RNG, serialization, the
+    # caching allocator and memory snapshots, pluggable allocators, DLPack, XPU graphs, and
+    # graph-safe RNG. The class attribute expandable_segments is False here and lets
+    # subclasses switch tests that depend on allocator mode.
     expandable_segments = False
 
     def test_device_behavior(self):
+        # [FUNCTION DOC] Checks that setting the current XPU device to its own index leaves
+        # the current device unchanged.
         current_device = torch.xpu.current_device()
         torch.xpu.set_device(current_device)
         self.assertEqual(current_device, torch.xpu.current_device())
 
     @unittest.skipIf(not TEST_MULTIXPU, "only one GPU detected")
     def test_multi_device_behavior(self):
+        # [FUNCTION DOC] Multi-XPU only. Switches the current device with the device context
+        # manager and with the internal device guard and checks it is set inside the block and
+        # restored on exit.
         current_device = torch.xpu.current_device()
         target_device = (current_device + 1) % torch.xpu.device_count()
 
@@ -118,7 +135,12 @@ class TestXpu(TestCase):
         self.assertEqual(current_device, torch.xpu.current_device())
 
     def test_xpu_device(self):
+        # [FUNCTION DOC] Checks that a function using the XPU device context manager compiles
+        # with the eager backend in full-graph mode and gives the same result as running it
+        # uncompiled.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Takes a tensor, enters the XPU device context for that
+            # tensor's device index, and returns the sine of the tensor plus one.
             with torch.xpu.device(x.device.index):
                 x = torch.sin(x + 1)
             return x
@@ -130,6 +152,10 @@ class TestXpu(TestCase):
         self.assertEqual(ref, res)
 
     def test_get_device_properties(self):
+        # [FUNCTION DOC] Checks that device properties, name and capability queries with an
+        # explicit current index, with None and with no argument all agree. Also checks that
+        # capability fields are positive, that they match the matching fields on the
+        # properties object, and that the uuid has the canonical text length and 16 raw bytes.
         current_device = torch.xpu.current_device()
         device_properties = torch.xpu.get_device_properties(current_device)
         self.assertEqual(device_properties, torch.xpu.get_device_properties(None))
@@ -185,6 +211,9 @@ class TestXpu(TestCase):
         )
 
     def test_get_device_capability(self):
+        # [FUNCTION DOC] Checks that the accelerator capability supported dtypes always
+        # contain bool, int and float, and contain half, double and bfloat16 only as indicated
+        # by the device capability and bfloat16 support query (emulation included).
         device_capability = torch.xpu.get_device_capability()
         acc_capability = torch.accelerator.get_device_capability()
         supported_dtypes = acc_capability["supported_dtypes"]
@@ -200,6 +229,9 @@ class TestXpu(TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "not applicable to Windows (only fails with fork)")
     def test_wrong_xpu_fork(self):
+        # [FUNCTION DOC] Not on Windows. Runs a child script that touches an XPU device in the
+        # parent and then starts forked processes that set a device, and checks stderr reports
+        # that XPU cannot be re-initialized in a forked subprocess.
         stderr = TestCase.runWithPytorchAPIUsageStderr(
             """\
 import torch
@@ -225,9 +257,15 @@ if __name__ == "__main__":
         IS_WINDOWS, "Only for lazy initialization on Linux, not applicable on Windows."
     )
     def test_lazy_init(self):
+        # [FUNCTION DOC] Not on Windows. Runs child interpreters that import torch, run a
+        # model on XPU in forked subprocesses after CPU-only setup, and prints the device
+        # count. Checks the printed count equals the parent's device count, proving import did
+        # not initialize XPU.
         """Validate that no XPU calls are made during `import torch` call"""
 
         def check_output(script: str) -> str:
+            # [FUNCTION DOC] HELPER: Runs the given script text in a fresh Python interpreter
+            # and returns its decoded, stripped standard output; raises if the process fails.
             return (
                 subprocess.check_output([sys.executable, "-c", script])
                 .decode("ascii")
@@ -268,7 +306,14 @@ if __name__ == "__main__":
         self.assertEqual(rc, str(torch.xpu.device_count()))
 
     def test_parse_visible_devices(self):
+        # [FUNCTION DOC] Checks parsing of the Level Zero affinity mask environment variable
+        # into a list of device indices. Invalid tokens empty the result, negatives and
+        # duplicates are dropped, and signed numbers are accepted. In strict mode, composite
+        # or non-numeric masks raise ValueError.
         def _parse_visible_devices(val, strict=False):
+            # [FUNCTION DOC] HELPER: Sets the affinity mask environment variable to the given
+            # value with all other variables cleared, then returns the parsed device list,
+            # optionally in strict mode.
             with patch.dict(os.environ, {"ZE_AFFINITY_MASK": val}, clear=True):
                 return torch.xpu._parse_visible_devices(strict=strict)
 
@@ -292,6 +337,9 @@ if __name__ == "__main__":
             _parse_visible_devices("one, two", strict=True)
 
     def test_device_info_api_raises_import_error_without_pyzes(self):
+        # [FUNCTION DOC] Checks that every device telemetry API (temperature, clock rate,
+        # power, utilization, memory usage, device memory used, process listing) raises
+        # ImportError mentioning pyzes when that module is made unimportable.
         with unittest.mock.patch.dict("sys.modules", {"pyzes": None}):
             with self.assertRaisesRegex(ImportError, "pyzes is required"):
                 torch.xpu.temperature()
@@ -310,6 +358,8 @@ if __name__ == "__main__":
 
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_temperature_returns_float(self):
+        # [FUNCTION DOC] Needs pyzes. Reads GPU temperature, skipping the test if elevated
+        # privileges are required, and checks it is a float within a sanity range.
         try:
             temp = torch.xpu.temperature()
         except RuntimeError as e:
@@ -324,6 +374,8 @@ if __name__ == "__main__":
 
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_clock_rate_returns_float(self):
+        # [FUNCTION DOC] Needs pyzes. Checks the GPU clock rate is a float in a plausible
+        # megahertz range.
         rate = torch.xpu.clock_rate()
         self.assertIsInstance(rate, float)
         # Sanity check: GPU clock rate should be in a plausible range (0–5000 MHz)
@@ -332,6 +384,8 @@ if __name__ == "__main__":
 
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_power_draw_returns_float(self):
+        # [FUNCTION DOC] Needs pyzes. Reads power draw, skipping on a privilege error, and
+        # checks it is a float between zero and a sanity bound.
         try:
             power = torch.xpu.power_draw()
         except RuntimeError as e:
@@ -346,6 +400,8 @@ if __name__ == "__main__":
 
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_utilization_returns_float(self):
+        # [FUNCTION DOC] Needs pyzes. Reads utilization, skipping on a privilege error, and
+        # checks it is a float between 0 and 100.
         try:
             util = torch.xpu.utilization()
         except RuntimeError as e:
@@ -360,6 +416,8 @@ if __name__ == "__main__":
 
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_memory_usage_returns_float(self):
+        # [FUNCTION DOC] Needs pyzes. Reads memory bandwidth usage, skipping on a privilege
+        # error, and checks it is a float between 0 and 100.
         try:
             mem_usage = torch.xpu.memory_usage()
         except RuntimeError as e:
@@ -374,6 +432,8 @@ if __name__ == "__main__":
 
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_device_memory_used_returns_int(self):
+        # [FUNCTION DOC] Needs pyzes. Reads device memory used, skipping on a privilege error,
+        # and checks it is an int not above the device total memory.
         try:
             mem_used = torch.xpu.device_memory_used()
         except RuntimeError as e:
@@ -389,6 +449,9 @@ if __name__ == "__main__":
 
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_list_gpu_processes_returns_string(self):
+        # [FUNCTION DOC] Needs pyzes. For old pyzes versions checks listing processes raises
+        # RuntimeError mentioning the minimum version. Then checks the result is a string
+        # whose header names the current device.
         if torch.xpu._get_pyzes_version() < (0, 1, 2):
             with self.assertRaisesRegex(
                 RuntimeError, "requires pyzes version >= 0.1.2"
@@ -404,7 +467,13 @@ if __name__ == "__main__":
 
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_device_count_respects_affinity_mask(self):
+        # [FUNCTION DOC] Needs pyzes. For several affinity masks, runs child interpreters
+        # comparing the Level Zero based device count with the runtime device count. Out-of-
+        # range gives zero for both, composite masks give minus one for the Level Zero count,
+        # and valid masks give one for both.
         def _run(mask: str) -> str:
+            # [FUNCTION DOC] HELPER: Runs a child interpreter that sets the affinity mask to
+            # the given text and prints the two device counts; returns the last output line.
             script = f"""\
 import torch
 import os
@@ -433,6 +502,10 @@ print(f"{{r1}}, {{r2}}")
     @unittest.skipIf(not TEST_MULTIXPU, "requires multiple devices")
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_device_count_not_cached_pre_init(self):
+        # [FUNCTION DOC] Multi-XPU and pyzes only. In a child process, queries the device
+        # count, then sets the affinity mask to device 0 and queries again, then initializes
+        # XPU. Checks the first count equals the parent count and the second is one, so the
+        # pre-init count is not cached.
         test_script = """\
 import torch
 import os
@@ -456,6 +529,10 @@ print(f"{r1}, {r2}")
     @unittest.skipIf(not TEST_MULTIXPU, "requires multiple devices")
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_cached_zes_device_infos(self):
+        # [FUNCTION DOC] Multi-XPU and pyzes only. Runs a child script that enumerates Level
+        # Zero devices under different masks and checks the cached device info entries keep
+        # the same device handle and subdevice as the original entries. Expects the printed
+        # result to be that both comparisons are true.
         test_script = """\
 import torch
 import os
@@ -489,6 +566,10 @@ print(match1, match0)
         self.assertEqual("True True", r)
 
     def test_device_telemetry_api_without_ze_loader(self):
+        # [FUNCTION DOC] Fakes a missing Level Zero loader by making the pyzes import raise
+        # OSError. Checks the Level Zero device count returns minus one and that every
+        # telemetry API raises RuntimeError saying pyzes failed to import. Clears the cached
+        # device info list first and restores the import hook afterwards.
         # Simulate libze_loader.so.1 missing: pyzes raises OSError at import
         # time. Discovery must degrade gracefully; query APIs must surface a
         # RuntimeError (not leak OSError).
@@ -501,6 +582,8 @@ print(match1, match0)
         )
 
         def fake_import(name, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement import function that raises OSError when
+            # pyzes is requested and otherwise forwards to the real import function.
             if name == "pyzes":
                 raise OSError(oserror_msg)
             return real_import(name, *args, **kwargs)
@@ -525,9 +608,14 @@ print(match1, match0)
         IS_WINDOWS, "Only for lazy initialization on Linux, not applicable on Windows."
     )
     def test_no_xpu_device_query_on_inductor_import(self):
+        # [FUNCTION DOC] Not on Windows. Runs a child script that imports the inductor
+        # lowering module with the native device count query wrapped by a counter. Checks the
+        # count is zero and that XPU was not initialized.
         """Validate that importing torch._inductor.lowering does not trigger XPU device queries"""
 
         def check_output(script: str) -> str:
+            # [FUNCTION DOC] HELPER: Runs the given script text in a fresh Python interpreter
+            # and returns its decoded, stripped standard output; raises if the process fails.
             return (
                 subprocess.check_output([sys.executable, "-c", script])
                 .decode("ascii")
@@ -565,6 +653,8 @@ print(torch.xpu.is_initialized())
         )
 
     def test_streams(self):
+        # [FUNCTION DOC] Checks creating a stream, setting it as current, comparing streams,
+        # and the stream context manager restoring the previous current stream on exit.
         s0 = torch.xpu.Stream()
         torch.xpu.set_stream(s0)
         s1 = torch.xpu.current_stream()
@@ -577,6 +667,8 @@ print(torch.xpu.is_initialized())
         self.assertEqual(s2, torch.xpu.current_stream())
 
     def test_stream_priority(self):
+        # [FUNCTION DOC] Checks that streams made with the lowest and highest priority from
+        # the priority range report that priority and the device they were created on.
         low, high = torch.xpu.Stream.priority_range()
         s0 = torch.xpu.Stream(device=0, priority=low)
 
@@ -589,6 +681,8 @@ print(torch.xpu.is_initialized())
         self.assertEqual(torch.device("xpu:0"), s1.device)
 
     def test_stream_event_repr(self):
+        # [FUNCTION DOC] Checks the string forms of a stream, of a never-recorded event
+        # (marked uninitialized), and of an event after recording.
         s = torch.xpu.current_stream()
         self.assertTrue("torch.xpu.Stream" in str(s))
         e = torch.xpu.Event()
@@ -597,6 +691,9 @@ print(torch.xpu.is_initialized())
         self.assertTrue("torch.xpu.Event" in str(e))
 
     def test_events(self):
+        # [FUNCTION DOC] Checks event query, record and synchronize, positive elapsed time
+        # between two timing events across a short sleep, and that the sycl event handle and
+        # event id are zero until the event is recorded and then equal and nonzero.
         stream = torch.xpu.current_stream()
         event = torch.xpu.Event()
         self.assertTrue(event.query())
@@ -621,6 +718,10 @@ print(torch.xpu.is_initialized())
         self.assertEqual(event.sycl_event, event.event_id)
 
     def test_generic_stream_event(self):
+        # [FUNCTION DOC] Checks interoperability between the generic stream and event classes
+        # and the XPU ones: subclass relations, shared stream ids, recording and synchronizing
+        # events, copying tensors on a chosen stream, distinct event ids, and positive elapsed
+        # time between two generic events.
         stream = torch.Stream("xpu")
         self.assertEqual(stream.device_index, torch.xpu.current_device())
         xpu_stream = torch.xpu.Stream(
@@ -661,6 +762,10 @@ print(torch.xpu.is_initialized())
         self.assertTrue(torch.Event in type(xpu_event).mro())
 
     def test_stream_event_compatibility(self):
+        # [FUNCTION DOC] Checks accelerator stream APIs against XPU streams: current stream id
+        # and native handle match the queue, the out-of-range device index error, and elapsed
+        # time between XPU events. Also checks the errors raised when mixing event and stream
+        # types in elapsed time, record_event, record and wait.
         s1 = torch.xpu.Stream()
         s2 = torch.xpu.Stream()
         torch.accelerator.set_stream(s1)
@@ -719,6 +824,9 @@ print(torch.xpu.is_initialized())
             e2.wait(e2)
 
     def test_device_context_manager(self):
+        # [FUNCTION DOC] Checks the accelerator device index context manager: with no index
+        # nothing changes, with index zero the current device is zero, and the previous device
+        # is restored afterwards.
         prev_device = torch.xpu.current_device()
         with torch.accelerator.device_index(None):
             self.assertEqual(torch.xpu.current_device(), prev_device)
@@ -729,6 +837,8 @@ print(torch.xpu.is_initialized())
 
     @unittest.skipIf(not TEST_MULTIXPU, "only one GPU detected")
     def test_multi_device_context_manager(self):
+        # [FUNCTION DOC] Multi-XPU only. Checks the accelerator device index context manager
+        # switches to device one and restores device zero.
         src_device = 0
         dst_device = 1
         torch.xpu.set_device(src_device)
@@ -737,6 +847,8 @@ print(torch.xpu.is_initialized())
         self.assertEqual(torch.xpu.current_device(), src_device)
 
     def test_stream_context_manager(self):
+        # [FUNCTION DOC] Checks that using a new stream as a context manager makes it current
+        # inside the block and restores the previous stream after.
         prev_stream = torch.xpu.current_stream()
         with torch.xpu.Stream() as stream:
             self.assertEqual(stream, torch.xpu.current_stream())
@@ -744,6 +856,9 @@ print(torch.xpu.is_initialized())
 
     @unittest.skipIf(not TEST_MULTIXPU, "only one GPU detected")
     def test_multi_device_stream_context_manager(self):
+        # [FUNCTION DOC] Multi-XPU only. Checks that entering a stream on device one switches
+        # the current device and stream, leaves device zero's stream unchanged, and everything
+        # is restored on exit.
         src_device = 0
         dst_device = 1
         torch.xpu.set_device(src_device)
@@ -759,6 +874,10 @@ print(torch.xpu.is_initialized())
 
     @unittest.skipIf(not HAS_PYZES, "pyzes is required for this test")
     def test_sleep(self):
+        # [FUNCTION DOC] Needs pyzes. Computes a cycle count equal to about one second from
+        # the clock rate. On devices before Xe2, checks the sleep call raises
+        # NotImplementedError. Otherwise checks the sleep is queued asynchronously: the stream
+        # is busy right after the call and idle only after synchronization.
         # clock_rate() returns MHz; multiply by 1e6 to get ~1 second of device cycles.
         cycles = torch.xpu.clock_rate() * 1_000_000
         # Some Xe GPU's bundled IGC is too old to support it.
@@ -779,6 +898,9 @@ print(torch.xpu.is_initialized())
         self.assertTrue(torch.xpu.current_stream().query())
 
     def test_generator(self):
+        # [FUNCTION DOC] Checks seeding through the global and XPU seed functions, reading and
+        # restoring XPU RNG state, and that the initial seed reflects the seed set when state
+        # was restored.
         torch.manual_seed(2024)
         g_state0 = torch.xpu.get_rng_state()
         torch.manual_seed(1234)
@@ -797,6 +919,9 @@ print(torch.xpu.is_initialized())
         self.assertEqual(2024, torch.xpu.initial_seed())
 
     def test_accelerator_default_generator(self):
+        # [FUNCTION DOC] For each device, checks the XPU default generator and the accelerator
+        # default generator share device and state: manual seeding on one is visible through
+        # the other and reseeding keeps states equal.
         torch.xpu.init()
         for index in range(torch.accelerator.device_count()):
             xpu_default_generator = torch.xpu.default_generators[index]
@@ -815,6 +940,9 @@ print(torch.xpu.is_initialized())
             )
 
     def test_serialization_array_with_storage(self):
+        # [FUNCTION DOC] Saves and loads a list holding XPU tensors that share storage plus a
+        # typed storage via a temporary file. Checks values, dtypes, shared aliasing after
+        # load, and storage types and contents.
         x = torch.randn(5, 5).xpu()
         y = torch.zeros(2, 5, dtype=torch.int, device="xpu")
         q = [x, y, x, y.storage()]
@@ -835,6 +963,8 @@ print(torch.xpu.is_initialized())
         self.assertEqual(q_copy[3], y.storage())
 
     def test_serialization_array_with_empty(self):
+        # [FUNCTION DOC] Saves and loads a list with an XPU tensor and an empty XPU tensor,
+        # checking equality, type and device of each element.
         x = [
             torch.randn(4, 4).xpu(),
             torch.tensor([], dtype=torch.float, device=torch.device("xpu")),
@@ -849,16 +979,21 @@ print(torch.xpu.is_initialized())
             self.assertEqual(copy.get_device(), original.get_device())
 
     def test_is_shared(self):
+        # [FUNCTION DOC] Checks that a tensor on XPU reports itself as shared.
         t = torch.randn(5, 5, device="xpu")
         self.assertTrue(t.is_shared())
 
     def test_share_memory(self):
+        # [FUNCTION DOC] Checks that the in-place share memory call on an XPU tensor returns
+        # the same tensor and the tensor is shared.
         t = torch.randn(5, 5, device="xpu")
         result = t.share_memory_()
         self.assertIs(result, t)
         self.assertTrue(t.is_shared())
 
     def test_share_memory_nested(self):
+        # [FUNCTION DOC] Checks the in-place share memory call on a jagged layout nested
+        # tensor on XPU returns the same object and it is shared.
         a = torch.randn(3, 4, device="xpu")
         b = torch.randn(5, 4, device="xpu")
         nt = torch.nested.nested_tensor([a, b], layout=torch.jagged)
@@ -867,6 +1002,9 @@ print(torch.xpu.is_initialized())
         self.assertTrue(nt.is_shared())
 
     def test_out_of_memory(self):
+        # [FUNCTION DOC] Skipped with expandable segments. Checks that absurdly large
+        # allocations raise RuntimeError, with the message giving the size for one and the
+        # generic out of memory message for the larger one.
         if self.expandable_segments:
             self.skipTest("Skipping OOM test for expandable segments allocator.")
         tensor = torch.zeros(1024, device="xpu")
@@ -878,6 +1016,8 @@ print(torch.xpu.is_initialized())
             torch.empty(1024 * 1024 * 1024 * 8000000000, dtype=torch.int8, device="xpu")
 
     def test_raises_oom(self):
+        # [FUNCTION DOC] Skipped with expandable segments. Empties the cache and checks a huge
+        # allocation raises the dedicated OutOfMemoryError type.
         if self.expandable_segments:
             self.skipTest("Skipping OOM test for expandable segments allocator.")
         torch.xpu.memory.empty_cache()
@@ -886,6 +1026,9 @@ print(torch.xpu.is_initialized())
 
     @serialTest()
     def test_1mb_allocation_uses_small_block(self):
+        # [FUNCTION DOC] Serial test. Collects garbage and empties the cache, then allocates
+        # two one megabyte tensors. Checks allocated bytes rise by exactly two megabytes and
+        # reserved bytes rise by four megabytes, showing the small-block pool is used.
         gc.collect()
         torch.xpu.empty_cache()
         prev_allocated = torch.xpu.memory_allocated()
@@ -908,6 +1051,10 @@ print(torch.xpu.is_initialized())
 
     @serialTest()
     def test_set_per_process_memory_fraction(self):
+        # [FUNCTION DOC] Serial test. Checks invalid fractions raise ValueError, then limits
+        # the process to half the device memory. Checks an allocation just below the limit
+        # works, the fraction reads back, and one above the limit raises OutOfMemoryError.
+        # Restores the original fraction at the end.
         gc.collect()
         torch.xpu.empty_cache()
         total_memory = torch.xpu.get_device_properties().total_memory
@@ -936,6 +1083,9 @@ print(torch.xpu.is_initialized())
         torch.xpu.set_per_process_memory_fraction(orig_fraction)
 
     def test_memory_allocation(self):
+        # [FUNCTION DOC] Checks allocated and reserved counters change on allocation and free
+        # and after empty cache. Checks a 1 KiB tensor raises the active bytes statistic by
+        # 1024, that freed bytes read zero before and 1024 after deletion.
         torch.xpu.empty_cache()
         prev_allocated = torch.xpu.memory_allocated()
         prev_reserved = torch.xpu.memory_reserved()
@@ -966,6 +1116,8 @@ print(torch.xpu.is_initialized())
 
     @unittest.skipIf(not TEST_MULTIXPU, "only one GPU detected")
     def test_device_memory_allocated(self):
+        # [FUNCTION DOC] Multi-XPU only. Allocates on device zero and checks allocated memory
+        # rises only there while other devices stay unchanged.
         device_count = torch.xpu.device_count()
         current_alloc = [torch.xpu.memory_allocated(idx) for idx in range(device_count)]
         a = torch.ones(10, device="xpu:0")
@@ -979,6 +1131,9 @@ print(torch.xpu.is_initialized())
         del a
 
     def test_memory_stats(self):
+        # [FUNCTION DOC] Resets statistics, then checks via the accelerator memory APIs that
+        # peak equals current at start, active bytes statistics change by 1024 on allocate and
+        # free, and the peak values are restored by resetting the peak statistics.
         gc.collect()
         torch.xpu.empty_cache()
         torch.xpu.reset_peak_memory_stats()
@@ -1015,6 +1170,8 @@ print(torch.xpu.is_initialized())
         self.assertEqual(torch.accelerator.max_memory_reserved(), prev_max_reserved)
 
     def test_mem_get_info(self):
+        # [FUNCTION DOC] Allocates a one megabyte tensor and checks the free memory reported
+        # by the device query does not grow and total memory is unchanged.
         torch.xpu.synchronize()
         torch.xpu.empty_cache()
         before_free_bytes, before_total_bytes = torch.xpu.mem_get_info()
@@ -1027,6 +1184,8 @@ print(torch.xpu.is_initialized())
         self.assertEqual(before_total_bytes, after_total_bytes)
 
     def test_get_arch_list(self):
+        # [FUNCTION DOC] Checks that when the build has an architecture list, each
+        # architecture appears in the generated code-generation flags.
         arch_list = torch.xpu.get_arch_list()
         if not arch_list:
             return
@@ -1036,6 +1195,8 @@ print(torch.xpu.is_initialized())
 
     @unittest.skipIf(not TEST_MULTIXPU, "only one GPU detected")
     def test_can_device_access_peer(self):
+        # [FUNCTION DOC] Multi-XPU only. For every device pair checks peer access is
+        # symmetric.
         device_count = torch.xpu.device_count()
         for device in range(device_count):
             for peer in range(device_count):
@@ -1046,10 +1207,18 @@ print(torch.xpu.is_initialized())
 
     @serialTest()
     def test_memory_snapshot(self):
+        # [FUNCTION DOC] Serial test. Drives a generator that performs many allocations and
+        # frees of varied sizes, and after each step compares the memory snapshot with the
+        # memory statistics for consistency.
         def _test_memory_stats_generator(N=35):
+            # [FUNCTION DOC] HELPER: Generator that allocates, permutes and frees many
+            # tensors, yielding after each step so that the caller can inspect memory; asserts
+            # at the end that allocated memory returns to the starting values. Takes a size
+            # parameter N.
             m0 = torch.xpu.memory_allocated()
 
             def alloc(*size):
+                # [FUNCTION DOC] HELPER: Allocates an empty XPU tensor of the given shape.
                 return torch.empty(*size, device="xpu")
 
             yield
@@ -1101,6 +1270,10 @@ print(torch.xpu.is_initialized())
             self.assertEqual(torch.xpu.memory_allocated(), m0)
 
         def _check_memory_stat_consistency():
+            # [FUNCTION DOC] HELPER: Builds expected per-device statistics (segment counts,
+            # allocated, reserved, active and requested bytes, active and inactive-split
+            # blocks) from the memory snapshot and asserts they equal the reported memory
+            # statistics; also checks requested size sums per segment.
             snapshot = torch.xpu.memory_snapshot()
 
             expected_each_device = collections.defaultdict(
@@ -1166,6 +1339,8 @@ print(torch.xpu.is_initialized())
 
     @unittest.skipUnless(IS_X86 and IS_LINUX, "x86 linux only cpp unwinding")
     def test_direct_traceback(self):
+        # [FUNCTION DOC] Linux x86 only. Gathers a traceback with native frames, symbolizes
+        # it, and checks the text mentions this test file and the unwinder.
         from torch._C._profiler import gather_traceback, symbolize_tracebacks
 
         c = gather_traceback(True, True, True)
@@ -1175,6 +1350,11 @@ print(torch.xpu.is_initialized())
         self.assertTrue("unwind" in r)
 
     def test_memory_snapshot_with_python(self):
+        # [FUNCTION DOC] Records memory history with Python stacks, allocates tensors, and
+        # checks the memory snapshot has frames for each segment and that the block for a
+        # particular tensor has this test file as its first frame and the right address. After
+        # freeing, checks the last device trace is a segment free or unmap. History recording
+        # is always turned off at the end.
         try:
             gc.collect()
             torch.xpu.memory.empty_cache()
@@ -1218,6 +1398,9 @@ print(torch.xpu.is_initialized())
 
     @unittest.skipUnless(IS_X86 and IS_LINUX, "x86 linux only cpp unwinding")
     def test_memory_snapshot_with_cpp(self):
+        # [FUNCTION DOC] Linux x86 only. Records memory history with all stacks, allocates a
+        # random tensor, and checks the block's frames mention the native random function.
+        # Turns history recording off at the end.
         try:
             gc.collect()
             torch.xpu.memory.empty_cache()
@@ -1238,6 +1421,10 @@ print(torch.xpu.is_initialized())
 
     @unittest.skipUnless(IS_X86 and IS_LINUX, "x86 linux only cpp unwinding")
     def test_memory_plots_free_stack(self):
+        # [FUNCTION DOC] Linux x86 only. For each stack context mode, records history,
+        # allocates and frees a tensor in two nested helpers, and checks the snapshot text
+        # contains the free helper's name only in the all mode and the allocation helper's
+        # name unless the mode is state only.
         for context in ["alloc", "all", "state"]:
             try:
                 gc.collect()
@@ -1246,10 +1433,14 @@ print(torch.xpu.is_initialized())
                 x = None
 
                 def thealloc():
+                    # [FUNCTION DOC] HELPER: Allocates a random tensor and stores it in the
+                    # enclosing variable.
                     nonlocal x
                     x = torch.rand(3, 4, device="xpu")
 
                 def thefree():
+                    # [FUNCTION DOC] HELPER: Deletes the enclosing variable that holds the
+                    # tensor.
                     nonlocal x
                     del x
 
@@ -1262,12 +1453,18 @@ print(torch.xpu.is_initialized())
                 torch.xpu.memory._record_memory_history(None)
 
     def test_memory_snapshot_script(self):
+        # [FUNCTION DOC] Records memory history with Python stacks, runs a TorchScript
+        # function that allocates a random XPU tensor, and checks the matching block's first
+        # frame name is the scripted function's name. History recording is turned off at the
+        # end.
         try:
             gc.collect()
             torch.xpu.memory.empty_cache()
             torch.xpu.memory._record_memory_history("state", stacks="python")
 
             @torch.jit.script
+            # [FUNCTION DOC] HELPER: Scripted function that returns a random XPU tensor of a
+            # fixed size. The doc block is placed above the def line.
             def foo():
                 return torch.rand(311, 411, device="xpu")
 
@@ -1288,6 +1485,9 @@ print(torch.xpu.is_initialized())
     def collect_frames(
         self, augmented_snapshot, collect_device_traces=True, collect_segments=True
     ):
+        # [FUNCTION DOC] Helper used by the FX test. Walks a memory snapshot and returns the
+        # list of frames that carry FX node op or name fields, from device traces and/or from
+        # segment blocks depending on two flags, skipping entries that are not dictionaries.
         """Collects all frames that has node metadata from a memory snapshot."""
         # Collect all frames with FX metadata
         fx_frames = []
@@ -1317,10 +1517,20 @@ print(torch.xpu.is_initialized())
 
     @torch.fx.experimental._config.patch("enrich_profiler_metadata", True)
     def test_fx_memory_profiler_augmentation(self):
+        # [FUNCTION DOC] Runs two small modules through the compile with the ahead-of-time
+        # eager backend with profiler metadata enrichment enabled, takes a memory snapshot
+        # augmented with FX traces, and checks FX frames carry op, name, target and original
+        # trace fields, and that the original source line matches the expected node. The
+        # second module has identical graph structure but different source, and checks
+        # metadata is not shared. Skipped with expandable segments.
         """Test that memory snapshots are augmented with FX debug information."""
 
         class MLPModule(torch.nn.Module):
+            # [CLASS DOC] Small test module with two linear layers and a relu, built on the
+            # XPU device with a fixed seed.
             def __init__(self):
+                # [FUNCTION DOC] Seeds the RNG and creates two XPU linear layers and a relu
+                # activation.
                 super().__init__()
                 torch.manual_seed(5)
                 self.net1 = torch.nn.Linear(10, 16, bias=True, device="xpu")
@@ -1328,13 +1538,19 @@ print(torch.xpu.is_initialized())
                 self.net2 = torch.nn.Linear(16, 10, bias=True, device="xpu")
 
             def forward(self, x):
+                # [FUNCTION DOC] Applies the first linear layer, relu, and the second linear
+                # layer, in that order, and returns the result.
                 a = self.net1(x)
                 b = self.relu(a)
                 c = self.net2(b)
                 return c
 
         class MLPModule2(torch.nn.Module):
+            # [CLASS DOC] Same structure as the first module but different variable names in
+            # the forward method, used to check graphs with different source are not mixed up.
             def __init__(self):
+                # [FUNCTION DOC] Seeds the RNG and creates two XPU linear layers and a relu
+                # activation.
                 super().__init__()
                 torch.manual_seed(5)
                 self.net1 = torch.nn.Linear(10, 16, bias=True, device="xpu")
@@ -1342,6 +1558,8 @@ print(torch.xpu.is_initialized())
                 self.net2 = torch.nn.Linear(16, 10, bias=True, device="xpu")
 
             def forward(self, x):
+                # [FUNCTION DOC] Applies the first linear layer, relu, and the second linear
+                # layer, in that order, and returns the result.
                 d = self.net1(x)
                 e = self.relu(d)
                 f = self.net2(e)
@@ -1411,6 +1629,10 @@ print(torch.xpu.is_initialized())
                 self.assertIn("e = self.relu(d)", frame["fx_original_trace"])
 
     def get_dummy_allocator(self, check_vars):
+        # [FUNCTION DOC] Builds a pluggable allocator library from inline C++ source with an
+        # allocate and free function, compiled with SYCL support. If check_vars is true the
+        # source also records in exported global counters that the functions ran. Returns the
+        # allocator wrapper and the library path.
         dummy_allocator_source_vars = """
         #include <torch/extension.h>
         #include <c10/xpu/XPUFunctions.h>
@@ -1472,6 +1694,11 @@ print(torch.xpu.is_initialized())
         return allocator, dummy_allocator
 
     def test_xpu_pluggable_allocator(self):
+        # [FUNCTION DOC] Compiles a dummy allocator, checks its counters are zero and that
+        # changing the allocator after XPU is initialized raises RuntimeError. In a child
+        # process it installs the allocator, allocates and frees a tensor, and checks both
+        # counters were set. Also builds an extension that creates a custom allocator from C++
+        # and checks it is accepted as a Python allocator object.
         from torch.utils.cpp_extension import load_inline
 
         torch.xpu.init()
@@ -1486,6 +1713,8 @@ print(torch.xpu.is_initialized())
             torch.xpu.memory.change_current_allocator(allocator)
 
         def check_output(script: str) -> str:
+            # [FUNCTION DOC] HELPER: Runs the given script text in a fresh Python interpreter
+            # and returns its decoded, stripped standard output; raises if the process fails.
             return (
                 subprocess.check_output([sys.executable, "-c", script])
                 .decode("ascii")
@@ -1583,6 +1812,9 @@ if __name__ == "__main__":
         allocator = ext.get_xpu_allocator()
 
     def test_torch_version_xpu(self):
+        # [FUNCTION DOC] Checks the XPU compiler version string has eight characters and a
+        # plausible date-like value. On Linux, checks the XPU library links against exactly
+        # one SYCL runtime library.
         self.assertEqual(len(torch.version.xpu), 8)
         compiler_version = int(torch.version.xpu)
         self.assertGreater(compiler_version, 20230000)
@@ -1596,6 +1828,9 @@ if __name__ == "__main__":
                 self.assertTrue(b"libsycl.so" in result)
 
     def test_xpu_header_installed(self):
+        # [FUNCTION DOC] Checks that the installed torch include directory has the XPU
+        # function header and XPU dispatch and native headers, and that the native header
+        # content mentions the XPU kernel.
         include_dir = os.path.join(os.path.dirname(torch.__file__), "include")
         aten_dir = os.path.join(include_dir, "ATen")
         aten_ops_dir = os.path.join(aten_dir, "ops")
@@ -1608,6 +1843,9 @@ if __name__ == "__main__":
             self.assertIn("col2im_xpu", fr.read())
 
     def test_dlpack_conversion(self):
+        # [FUNCTION DOC] Skipped with expandable segments. Round-trips an XPU tensor through
+        # DLPack, checks writes are shared, and also imports a CPU tensor via DLPack onto XPU
+        # and compares values.
         if self.expandable_segments:
             self.skipTest("Skipping DLPack test for expandable segments allocator.")
         x = make_tensor((5,), dtype=torch.float32, device="xpu")
@@ -1620,6 +1858,10 @@ if __name__ == "__main__":
         self.assertEqual(z.cpu(), cpu)
 
     def test_dlpack_exchange_api_current_work_stream_xpu(self):
+        # [FUNCTION DOC] Compiles an inline C++ extension that uses the DLPack exchange API to
+        # read the tensor's device type and call the current work stream function. The C++
+        # side checks the device type is the oneAPI type and the returned stream handle is not
+        # null. Test body passes an XPU tensor and the API capsule.
         """Test DLPack Exchange API current_work_stream returns non-null for XPU."""
         from torch.utils import cpp_extension
 
@@ -1680,6 +1922,10 @@ if __name__ == "__main__":
         module.test_xpu_current_work_stream(tensor, api_capsule)
 
     def test_dlpack_exchange_api_stream_changes_with_xpu_stream(self):
+        # [FUNCTION DOC] Compiles an inline C++ extension returning the current work stream
+        # handle from the DLPack exchange API for an XPU tensor. Checks the handle is nonzero,
+        # differs inside a new XPU stream context, and is restored equal to the default after
+        # leaving it.
         """Test that current_work_stream reflects XPU stream context changes."""
         from torch.utils import cpp_extension
 
@@ -1739,6 +1985,9 @@ if __name__ == "__main__":
         self.assertEqual(default_handle, restored_handle)
 
     def test_storage_pin_memory(self):
+        # [FUNCTION DOC] Checks pinned memory tensors report pinned storage, that a storage
+        # can be pinned, and that copying an XPU storage to CPU without blocking yields a
+        # pinned storage.
         t = torch.empty(10, pin_memory=True)
         self.assertTrue(t.is_pinned())
         storage = t.untyped_storage()
@@ -1758,6 +2007,9 @@ if __name__ == "__main__":
         self.assertTrue(s_cpu.is_pinned())
 
     def test_graph_is_current_stream_capturing(self):
+        # [FUNCTION DOC] Checks current-stream capturing is false before capture, and during
+        # capture on a side stream becomes true both globally and on that stream, and is false
+        # before capture begins.
         self.assertFalse(torch.xpu.is_current_stream_capturing())
         s = torch.xpu.Stream()
         with torch.xpu.stream(s):
@@ -1770,6 +2022,8 @@ if __name__ == "__main__":
             g.capture_end()
 
     def test_graph_capture_simple(self):
+        # [FUNCTION DOC] Captures ten add operations on a side stream into an XPU graph,
+        # replays it, and checks the output sum equals 11000.
         s = torch.xpu.Stream()
 
         with torch.xpu.stream(s):
@@ -1788,6 +2042,9 @@ if __name__ == "__main__":
         self.assertEqual(b.sum().item(), 11000.0)
 
     def test_accelerator_graph_simple(self):
+        # [FUNCTION DOC] Captures ten add operations using the generic accelerator graph as a
+        # context manager together with a stream, replays it and checks the output sum equals
+        # 11000.
         s = torch.Stream()
         g = torch.accelerator.Graph()
 
@@ -1803,8 +2060,14 @@ if __name__ == "__main__":
         self.assertEqual(b.sum().item(), 11000.0)
 
     def test_graphsafe_set_get_rng_state(self):
+        # [FUNCTION DOC] Checks graph-safe get and set of generator state: random sequences
+        # generated eagerly with a fresh generator are compared to values generated inside a
+        # captured graph on the default generator, and final offsets are compared after
+        # repeated replays.
         # Define a function to create generator states, with optional graph registration
         def create_states(generator):
+            # [FUNCTION DOC] HELPER: Initializes the XPU generator, seeds it with zero, and
+            # returns the generator with its current state and a cloned state.
             """Initializes generator states and registers them with a XPU graph if provided."""
             # Ensure the XPU generator is initialized
             torch.rand(1, device="xpu")
@@ -1818,12 +2081,16 @@ if __name__ == "__main__":
             return generator, old_state, new_state
 
         def register_states_to_graph(generator_state, graph):
+            # [FUNCTION DOC] HELPER: Registers the old and new generator states with the given
+            # graph.
             _, old_state, new_state = generator_state
             graph.register_generator_state(old_state)
             graph.register_generator_state(new_state)
 
         # Define a function to perform specific RNG actions using the generator's states
         def perform_random_generation_steps(generator_state):
+            # [FUNCTION DOC] HELPER: Using the new state, generates one random tensor, then
+            # switches to the old state and generates two more; returns the list of tensors.
             generator, old_state, new_state = generator_state
             random_values = []
 
@@ -1841,6 +2108,8 @@ if __name__ == "__main__":
 
         # Define a function to retrieve the final offsets of the original and new generator states
         def get_final_offsets_of_states(generator_state):
+            # [FUNCTION DOC] HELPER: Returns the offsets of the old and new generator states
+            # as a tuple.
             _, old_state, new_state = generator_state
             old_state_offset = old_state.get_offset()
             new_state_offset = new_state.get_offset()
@@ -1879,6 +2148,9 @@ if __name__ == "__main__":
             self.assertEqual(random_values, graphed_random_values)
 
     def test_graph_capture_reset_recapture(self):
+        # [FUNCTION DOC] Captures and replays a graph, resets it, captures new work with
+        # different arithmetic on the same output tensor, replays, and checks the new sum;
+        # finally resets and deletes the graph.
         s = torch.xpu.Stream()
 
         with torch.xpu.stream(s):
@@ -1913,6 +2185,8 @@ if __name__ == "__main__":
         del g
 
     def test_graph_warn_if_has_zero_nodes(self):
+        # [FUNCTION DOC] Records warnings while capturing an empty XPU graph and checks one of
+        # them says the graph is empty.
         with warnings.catch_warnings(record=True) as caught:
             g = torch.xpu.XPUGraph()
             s = torch.xpu.Stream()
@@ -1922,12 +2196,17 @@ if __name__ == "__main__":
         self.assertTrue(any("The XPU Graph is empty" in str(w.message) for w in caught))
 
     def test_graph_capture_oom(self):
+        # [FUNCTION DOC] Checks that capturing an allocation of an enormous tensor inside the
+        # XPU graph context raises RuntimeError mentioning out of memory.
         oom_regex = "out of memory"
         with self.assertRaisesRegex(RuntimeError, oom_regex):
             with torch.xpu.graph(torch.xpu.XPUGraph()):
                 torch.zeros(2**40, device="xpu")
 
     def test_repeat_graph_capture_oneDNN_memory(self):
+        # [FUNCTION DOC] Skipped with expandable segments. Captures and replays a matrix
+        # multiply graph a hundred times and checks device memory in use did not grow by more
+        # than about a tenth of a gigabyte, to catch oneDNN memory leaks.
         if self.expandable_segments:
             self.skipTest("oneDNN does not support expandable_segments memory")
         (x, y, z) = 1024, 512, 64
@@ -1952,6 +2231,10 @@ if __name__ == "__main__":
         self.assertFalse(used_gb_before + 0.1 < used_gb_after)
 
     def test_graph_rng_functional(self):
+        # [FUNCTION DOC] For dropout and rrelu in training mode, builds an eager control run
+        # and a graph that runs the op twice, mixes replays with eager calls, and checks
+        # results match. Then repeats with several seeds to check the graph picks up the new
+        # seed. Errors are re-raised with the op named.
         ops_with_kwargs = (
             (torch.nn.functional.dropout, {"p": 0.1}),
             (torch.nn.functional.rrelu, {"training": True}),
@@ -1959,6 +2242,9 @@ if __name__ == "__main__":
         size = 10000
 
         def run(op, kwargs):
+            # [FUNCTION DOC] HELPER: Runs the comparison between eager and graphed random ops
+            # for one function and keyword arguments, as described by the enclosing test;
+            # synchronizes at the end.
             a = torch.randn((size,), device="xpu", dtype=torch.float)
 
             # Control
@@ -2037,6 +2323,10 @@ if __name__ == "__main__":
             run(op, kwargs)
 
     def test_graph_rng_distributions(self):
+        # [FUNCTION DOC] For random distribution functions and random tensor methods, compares
+        # eager control outputs with graph replays after seeding with several seeds, and
+        # checks that graphed results differ from controls before reseeding and equal them
+        # after.
         size = 10000
         input = torch.rand((size,), device="xpu", dtype=torch.float)
         alloc = torch.empty((size,), device="xpu", dtype=torch.float)
@@ -2064,6 +2354,9 @@ if __name__ == "__main__":
         )
 
         def run(module, op, args, kwargs):
+            # [FUNCTION DOC] HELPER: Runs the graph versus eager comparison for one random
+            # operation, given as a module kind (torch function or tensor method), a name,
+            # positional args and keyword args; errors name the operation.
             torch.xpu.manual_seed(5)
 
             # Each path runs a dummy op to increment the state a bit before creating controls.
@@ -2150,12 +2443,18 @@ if __name__ == "__main__":
             run("Tensor", *(meth_with_args + ({},)))
 
     def test_graph_two_successive(self):
+        # [FUNCTION DOC] Captures two graphs in sequence for each sharing mode (no sharing,
+        # sharing the first graph's pool, or a common graph pool handle), mixes replays with
+        # eager ops, checks the numerical results, and checks memory sharing saves exactly one
+        # small buffer of reserved bytes compared with no sharing.
         torch.xpu.empty_cache()
 
         size = 1000
         kSmallBuffer = 2097152
 
         def func_with_temps(t, val):
+            # [FUNCTION DOC] HELPER: Makes two clones of the tensor plus the value and returns
+            # their sum, creating temporaries inside graphs.
             x = t.clone() + val
             y = t.clone() + val
             return x + y
@@ -2219,6 +2518,9 @@ if __name__ == "__main__":
             torch.xpu.empty_cache()
 
     def test_graph_three_successive(self):
+        # [FUNCTION DOC] Captures three graphs for each pool sharing mode, replays them in
+        # capture order and checks results, then replays in a different order and checks that
+        # shared pools show overwritten data while separate pools do not.
         torch.xpu.empty_cache()
 
         size = 1000
@@ -2283,6 +2585,9 @@ if __name__ == "__main__":
 
     @serialTest()
     def test_graph_empty_cache_after_side_stream_free_during_capture(self):
+        # [FUNCTION DOC] Serial test. Frees a tensor used on a side stream forked into a
+        # capture, then ends capture and empties the cache. Checks the sequence completes
+        # without hanging; any exception is converted into a test failure.
         # Freeing a block during capture must be deferred until capture ends:
         # the block is used on a side stream that was forked into the capture,
         # so an allocator barrier submitted there would become a graph node
@@ -2316,6 +2621,11 @@ if __name__ == "__main__":
             ) from e
 
     def test_graph_memory_stats_and_use_result_after_destroy_graph(self):
+        # [FUNCTION DOC] For several allocation sizes in the small and large pools, captures a
+        # graph and checks changes in segment, reserved bytes and active block and bytes
+        # statistics against expected values, with adjustments for expandable segments.
+        # Replays before and after empty cache, then deletes the graph and checks only the
+        # result tensor remains in the pool and is still usable.
         kSmallSize = 1048576
         kSmallBuffer = 2097152
         kLargeBuffer = 20971520
@@ -2469,9 +2779,14 @@ if __name__ == "__main__":
 
     @serialTest()
     def test_graph_checkpoint_preserve_rng_state(self):
+        # [FUNCTION DOC] Serial test. Runs a checkpointed function with a random op eagerly
+        # and again inside a graph with preserved RNG state, and checks the gradients are
+        # exactly equal after reseeding and replay.
         torch.xpu.manual_seed(42)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by the sigmoid of a random XPU
+            # tensor of one element.
             return x * torch.sigmoid(torch.randn(1, device="xpu"))
 
         fn(torch.ones(1, device="xpu"))
@@ -2498,6 +2813,9 @@ if __name__ == "__main__":
 
     @serialTest()
     def test_graph_manual_seed_mismatch_raises(self):
+        # [FUNCTION DOC] Serial test. Checks that setting a different manual seed during graph
+        # capture raises RuntimeError saying the seed can only be set during capture if it
+        # equals the original seed.
         torch.xpu.manual_seed(0)
         g = torch.xpu.XPUGraph()
         with self.assertRaisesRegex(
@@ -2523,6 +2841,10 @@ if __name__ == "__main__":
     def test_graph_make_graphed_callables(
         self, with_amp, cache_enabled, allow_unused_input
     ):
+        # [FUNCTION DOC] Parametrized and serial. Builds two copies of a three-part model,
+        # makes graphed callables for the graphed copy with or without autocast, and compares
+        # forward outputs, gradients and optimizer updates against the control. Two parameter
+        # sets are marked as expected failures. Skipped with expandable segments.
         if self.expandable_segments:
             self.skipTest("oneDNN does not support expandable_segments memory")
         torch.manual_seed(5)
@@ -2531,7 +2853,11 @@ if __name__ == "__main__":
         N, D_in, H, D_out = 640, 4096, 2048, 1024
 
         class MLP1(torch.nn.Module):
+            # [CLASS DOC] Test module with two sequential parts of linear plus dropout on XPU,
+            # taking a dictionary input.
             def __init__(self, D_in: int, H: int, D_out: int):
+                # [FUNCTION DOC] Creates two sequential blocks of linear and dropout layers on
+                # the XPU device with the given sizes.
                 super().__init__()
                 self.net_1 = torch.nn.Sequential(
                     torch.nn.Linear(D_in, H), torch.nn.Dropout(p=0.1)
@@ -2541,11 +2867,17 @@ if __name__ == "__main__":
                 ).xpu()
 
             def forward(self, input_dict: dict):
+                # [FUNCTION DOC] Reads the tensor stored under the key x in the input
+                # dictionary and applies both blocks in order.
                 x = input_dict["x"]
                 return self.net_2(self.net_1(x))
 
         class MLP2(torch.nn.Module):
+            # [CLASS DOC] Same structure as the first test module but takes a plain tensor
+            # input.
             def __init__(self, D_in: int, H: int, D_out: int):
+                # [FUNCTION DOC] Creates two sequential blocks of linear and dropout layers on
+                # the XPU device with the given sizes.
                 super().__init__()
                 self.net_1 = torch.nn.Sequential(
                     torch.nn.Linear(D_in, H), torch.nn.Dropout(p=0.1)
@@ -2555,10 +2887,17 @@ if __name__ == "__main__":
                 ).xpu()
 
             def forward(self, x):
+                # [FUNCTION DOC] Applies both blocks in order to the input tensor and returns
+                # the result.
                 return self.net_2(self.net_1(x))
 
         class ParameterlessModule(torch.nn.Module):
+            # [CLASS DOC] Module without parameters that gathers rows of the input using a
+            # repeated row index.
             def forward(self, x):
+                # [FUNCTION DOC] Builds a row index from the input's first dimension, gathers
+                # along the first dimension, and returns a dictionary with the result under
+                # the key output.
                 idx = (
                     torch.arange(x.size(0), device=x.device)
                     .view(-1, 1)
@@ -2673,13 +3012,21 @@ if __name__ == "__main__":
     def test_graph_make_graphed_callables_parameterless_nograd_module(
         self, with_amp, cache_enabled, allow_unused_input
     ):
+        # [FUNCTION DOC] Parametrized and serial. Graphs a model that has no parameters and
+        # takes inputs that do not need gradients, with or without autocast, and compares
+        # graphed and ungraphed outputs in training and eval modes. One parameter set is an
+        # expected failure.
         torch.manual_seed(5)
         torch.xpu.manual_seed(5)
 
         N, D_in, H, _ = 640, 4096, 2048, 1024
 
         class ParameterlessModule(torch.nn.Module):
+            # [CLASS DOC] Parameterless module that gathers rows from a dictionary input.
             def forward(self, input_dict: dict):
+                # [FUNCTION DOC] Reads the tensor stored under the key x, gathers rows using a
+                # repeated row index, and returns a dictionary with the result under the key
+                # output.
                 x = input_dict["x"]
                 idx = (
                     torch.arange(x.size(0), device=x.device)
@@ -2734,6 +3081,9 @@ if __name__ == "__main__":
         )
 
     def test_graph_make_graphed_callables_same_pool(self):
+        # [FUNCTION DOC] Skipped with expandable segments. Makes graphed callables for several
+        # models sharing one memory pool and checks outputs, losses, parameters and gradients
+        # are equal to the originals, while storage addresses differ.
         if self.expandable_segments:
             self.skipTest("oneDNN does not support expandable_segments memory")
         torch.manual_seed(5)
@@ -2777,6 +3127,10 @@ if __name__ == "__main__":
                 self.assertNotEqual(p.grad.data_ptr(), pg.grad.data_ptr())
 
     def test_graph_optims_with_explicitly_capturable_param_groups(self):
+        # [FUNCTION DOC] For many optimizers, builds parameter groups where the first group is
+        # capturable and the second may not be. If the second is not capturable, checks
+        # capture raises RuntimeError. Otherwise captures a step, replays it, and checks
+        # parameters equal a non-capturable reference.
         n_warmup, n_replay = 3, 2
         for optimizer, second_param_group_capturable in product(
             (
@@ -2844,7 +3198,12 @@ if __name__ == "__main__":
                 self.assertEqual(ref_p2, param2)
 
     def test_xpu_graph_error_options(self):
+        # [FUNCTION DOC] Captures a graph where another thread tries a raw caching allocator
+        # allocation, and checks that this is not treated as an error; the nested helper
+        # reports whether capture raised.
         def fn():
+            # [FUNCTION DOC] HELPER: Allocates a zero tensor of two thousand elements and
+            # returns the sum of three copies of it.
             x = torch.zeros([2000], device="xpu")
             y = x + x + x
             return y
@@ -2852,6 +3211,9 @@ if __name__ == "__main__":
         mem = None
 
         def raw_malloc():
+            # [FUNCTION DOC] HELPER: Run in a thread. Allocates a kilobyte through the caching
+            # allocator on a new stream, storing the pointer in a module-level variable, then
+            # tries to free it; ignores errors.
             global mem
             mem = None
             stream = torch.xpu.Stream()
@@ -2869,6 +3231,9 @@ if __name__ == "__main__":
                 pass
 
         def throws_on_xpu_event():
+            # [FUNCTION DOC] HELPER: Runs the function once eagerly, then captures it in a
+            # graph while a thread tries a raw allocation. Returns true if the capture raised
+            # an exception (freeing any leftover allocation), else false.
             graph = torch.xpu.XPUGraph()
             torch.xpu.synchronize()
             stream = torch.xpu.Stream()
@@ -2894,6 +3259,9 @@ if __name__ == "__main__":
         self.assertFalse(throws_on_xpu_event())
 
     def test_xpu_graph_raw_graph_keep_graph_false(self):
+        # [FUNCTION DOC] Creates a graph with keep_graph disabled and captures an add. Checks
+        # that asking to instantiate it and asking for the raw graph handle each raise
+        # RuntimeError with messages about keep_graph.
         graph = torch.xpu.XPUGraph(keep_graph=False)
         x = torch.zeros([2000], device="xpu")
         y = torch.ones([2000], device="xpu")
@@ -2913,6 +3281,9 @@ if __name__ == "__main__":
             raw_pointer = graph.raw_xpu_graph()
 
     def test_xpu_graph_raw_graph_reset_and_recapture(self):
+        # [FUNCTION DOC] Creates a graph with keep_graph enabled, captures an in-place add,
+        # and checks repeated instantiate and replay accumulate results. Resets, recaptures a
+        # different add and checks the same behavior again.
         graph = torch.xpu.XPUGraph(keep_graph=True)
         x = torch.zeros([2000], device="xpu")
         with torch.xpu.graph(graph):
@@ -2945,6 +3316,9 @@ if __name__ == "__main__":
 
 @contextlib.contextmanager
 def caching_host_allocator_use_host_register(use_xpu_host_register: bool):
+    # [FUNCTION DOC] Context manager that, when requested, turns on the pinned host allocator
+    # mode of registering memory with the XPU host register and eight register threads, and
+    # restores the setting off afterwards in a finally block.
     if use_xpu_host_register:
         torch._C._accelerator_setAllocatorSettings(
             "pinned_use_xpu_host_register:True,pinned_num_register_threads:8"
@@ -2960,6 +3334,8 @@ def caching_host_allocator_use_host_register(use_xpu_host_register: bool):
 
 @contextlib.contextmanager
 def caching_host_allocator_use_background_threads(use_background_threads: bool):
+    # [FUNCTION DOC] Context manager that, when requested, turns on background threads for the
+    # pinned host allocator and turns that setting off in a finally block afterwards.
     if use_background_threads:
         torch._C._accelerator_setAllocatorSettings("pinned_use_background_threads:True")
     try:
@@ -2973,8 +3349,12 @@ def caching_host_allocator_use_background_threads(use_background_threads: bool):
 
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 class TestCachingHostAllocatorXpuGraph(TestCase):
+    # [CLASS DOC] Tests of the pinned host caching allocator during XPU graph capture,
+    # parametrized over host register mode. Checks when pinned blocks can or cannot be reused.
     @parametrize("use_xpu_host_register", [True, False])
     def test_pin_memory_no_use(self, use_xpu_host_register):
+        # [FUNCTION DOC] Within graph capture allocates two pinned tensors while the first is
+        # alive and checks they have different addresses.
         # A pinned host memory block cannot be reused if it is not deleted
         with caching_host_allocator_use_host_register(use_xpu_host_register):
             graph = torch.xpu.XPUGraph()
@@ -2986,6 +3366,8 @@ class TestCachingHostAllocatorXpuGraph(TestCase):
 
     @parametrize("use_xpu_host_register", [True, False])
     def test_pin_memory_no_use2(self, use_xpu_host_register):
+        # [FUNCTION DOC] Within graph capture allocates and deletes a pinned tensor never used
+        # in a copy and checks the next allocation reuses the same address.
         # A pinned host memory block can be reused if it is deleted
         # and has never been used by copy_
         with caching_host_allocator_use_host_register(use_xpu_host_register):
@@ -2999,6 +3381,8 @@ class TestCachingHostAllocatorXpuGraph(TestCase):
 
     @parametrize("use_xpu_host_register", [True, False])
     def test_pin_memory_use(self, use_xpu_host_register):
+        # [FUNCTION DOC] Within graph capture pins a tensor, copies it to the device without
+        # blocking, deletes it and checks a new pinned allocation does not reuse the address.
         # A pinned host memory block cannot be reused if it has been used by copy_
         with caching_host_allocator_use_host_register(use_xpu_host_register):
             graph = torch.xpu.XPUGraph()
@@ -3020,6 +3404,10 @@ class TestCachingHostAllocatorXpuGraph(TestCase):
     def test_two_graphs(
         self, use_background_threads, use_xpu_host_register, use_memory, delete_memory
     ):
+        # [FUNCTION DOC] Parametrized over background threads, host register, whether the
+        # memory is used in a copy and whether it is deleted. Captures two graphs sharing a
+        # pool, each allocating pinned memory, and checks the second reuses the first's
+        # address only when memory was deleted and never used.
         with (
             caching_host_allocator_use_background_threads(use_background_threads),
             caching_host_allocator_use_host_register(use_xpu_host_register),
@@ -3057,9 +3445,13 @@ class TestCachingHostAllocatorXpuGraph(TestCase):
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 @torch.testing._internal.common_utils.markDynamoStrictTest
 class TestXpuNativeMath(TestCase):
+    # [CLASS DOC] Sanity tests for random distribution generation on XPU that use native fast
+    # math functions; checks finiteness and statistics.
     """Test SYCL native fast math functions in NumericUtils.h on XPU."""
 
     def test_cauchy_sanity(self):
+        # [FUNCTION DOC] For float, half and bfloat16 fills a tensor from the Cauchy
+        # distribution and checks over 99 percent of values are finite.
         """cauchy_() exercises at::tan -> sycl::native::tan via TransformationHelper."""
         for dtype in [torch.float32, torch.float16, torch.bfloat16]:
             x = torch.empty(10000, device="xpu", dtype=dtype)
@@ -3072,6 +3464,8 @@ class TestXpuNativeMath(TestCase):
             )
 
     def test_log_normal_sanity(self):
+        # [FUNCTION DOC] For three float types fills a tensor with log-normal samples and
+        # checks all are positive and, for float32, finite.
         """log_normal_() exercises at::exp -> sycl::native::exp via TransformationHelper."""
         for dtype in [torch.float32, torch.float16, torch.bfloat16]:
             x = torch.empty(10000, device="xpu", dtype=dtype)
@@ -3087,6 +3481,8 @@ class TestXpuNativeMath(TestCase):
                 )
 
     def test_cauchy_accuracy(self):
+        # [FUNCTION DOC] Seeds and fills a float32 tensor from a Cauchy distribution with
+        # median 5 and checks the sample median is within 0.1 of 5.
         """Verify cauchy_() median is correct (exercises sycl::native::tan precision)."""
         torch.manual_seed(42)
         x = torch.empty(100000, device="xpu", dtype=torch.float32)
@@ -3095,6 +3491,8 @@ class TestXpuNativeMath(TestCase):
         self.assertTrue(abs(x.median().item() - 5.0) < 0.1)
 
     def test_log_normal_accuracy(self):
+        # [FUNCTION DOC] Seeds and fills a float32 tensor with log-normal samples and checks
+        # the median is near one and the mean near the analytic mean within 0.05.
         """Verify log_normal_() statistics (exercises sycl::native::exp precision)."""
         import math
 
@@ -3111,11 +3509,16 @@ class TestXpuNativeMath(TestCase):
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 @torch.testing._internal.common_utils.markDynamoStrictTest
 class TestXpuOptims(TestCase):
+    # [CLASS DOC] Tests of optimizers with XPU graph capture, instantiated for the XPU device
+    # type.
     @optims(
         [optim for optim in optim_db if optim.has_capturable_arg],
         dtypes=[torch.float32],
     )
     def test_graph_optims(self, dtype, optim_info):
+        # [FUNCTION DOC] For each optimizer that supports capturable mode, compares a non-
+        # capturable control with a capturable run that is either captured into a graph and
+        # replayed or run eagerly, after warmup steps. Checks final parameters are equal.
         device = "xpu"
         optim_cls = optim_info.optim_cls
         all_optim_inputs = _get_optim_inputs_including_global_cliquey_kwargs(
@@ -3189,6 +3592,9 @@ class TestXpuOptims(TestCase):
         dtypes=[torch.float32],
     )
     def test_graph_scaling_fused_optimizers(self, dtype, optim_info):
+        # [FUNCTION DOC] For fused-capable optimizers on XPU, compares a control with a
+        # graphed run combining the gradient scaler and fused optimizer, checking parameters
+        # match after training steps.
         device = "xpu"
         optim_cls = optim_info.optim_cls
 
@@ -3279,6 +3685,10 @@ class TestXpuOptims(TestCase):
         dtypes=[torch.float32],
     )
     def test_graph_grad_scaling(self, dtype, optim_info, foreach, fused):
+        # [FUNCTION DOC] Captures forward and backward with a gradient scaler into a graph,
+        # then replays with different inputs including ones that overflow in half precision,
+        # and checks gradients, scale and growth tracker after each scaler step and update
+        # match the expected values.
         torch.xpu.empty_cache()
 
         scaler = torch.amp.GradScaler(device="xpu", init_scale=4.0)
@@ -3324,10 +3734,16 @@ class TestXpuOptims(TestCase):
 
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 class TestXpuOps(TestCase):
+    # [CLASS DOC] Operator-level tests on XPU generated for the device type, comparing against
+    # CPU and checking raw boolean values.
     @suppress_warnings
     @ops(_xpu_computation_ops, dtypes=any_common_cpu_xpu_one)
     def test_compare_cpu(self, device, dtype, op):
+        # [FUNCTION DOC] For each sample input, runs the operator on XPU and CPU and checks
+        # results are equal within a small tolerance. Warnings are suppressed.
         def to_cpu(arg):
+            # [FUNCTION DOC] HELPER: Moves a tensor to CPU and returns any other value
+            # unchanged.
             if isinstance(arg, torch.Tensor):
                 return arg.to(device="cpu")
             return arg
@@ -3348,8 +3764,14 @@ class TestXpuOps(TestCase):
 
     @ops(_xpu_computation_ops, allowed_dtypes=(torch.bool,))
     def test_non_standard_bool_values(self, device, dtype, op):
+        # [FUNCTION DOC] For boolean samples, replaces true values with random bytes between 2
+        # and 255 through a byte view and checks the operator output equals the output on
+        # normal booleans.
         # Test boolean values other than 0x00 and 0x01 (gh-54789)
         def convert_boolean_tensors(x):
+            # [FUNCTION DOC] HELPER: For a boolean tensor, builds a byte tensor with zero for
+            # false and random values for true, views it as bool and asserts it equals the
+            # input; other values pass through unchanged.
             if not isinstance(x, torch.Tensor) or x.dtype != torch.bool:
                 return x
 
@@ -3374,6 +3796,9 @@ class TestXpuOps(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16, torch.float32)
     def test_fused_rms_norm(self, device, dtype):
+        # [FUNCTION DOC] Checks the fused RMS norm forward and backward XPU kernels are
+        # registered, then for many shapes compares forward output and input and weight
+        # gradients against the CPU result using a loose tolerance for half types.
         # Verify _fused_rms_norm is dispatched to XPU kernel (not fallback)
         has_xpu_kernel = torch._C._dispatch_has_kernel_for_dispatch_key(
             "aten::_fused_rms_norm",
@@ -3450,6 +3875,8 @@ instantiate_device_type_tests(TestXpuOps, globals(), only_for="xpu", allow_xpu=T
 
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 class TestXpuAutocast(TestAutocast):
+    # [CLASS DOC] Autocast tests on XPU, built on the shared autocast test base class. The
+    # skip_list class attribute names operators not implemented on XPU that are skipped.
     # These operators are not implemented on XPU backend and we can NOT fall back
     # them to CPU. So we have to skip them at this moment.
     # TODO: remove these operators from skip list when they are implemented on XPU backend.
@@ -3457,14 +3884,20 @@ class TestXpuAutocast(TestAutocast):
     skip_list = ["gru_cell", "lstm_cell"]
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the base setUp and creates the autocast operator lists for the
+        # XPU device.
         super().setUp()
         self.autocast_lists = AutocastTestLists(torch.device("xpu"))
 
     def tearDown(self):
+        # [FUNCTION DOC] Deletes the autocast lists and calls the base tearDown.
         del self.autocast_lists
         super().tearDown()
 
     def test_autocast_torch_fp16(self):
+        # [FUNCTION DOC] Runs each half precision autocast operator with float16 autocast,
+        # skipping unimplemented operators and entries with three fields, which are cudnn
+        # operators.
         for op_with_args in self.autocast_lists.torch_fp16:
             skip_test = False
             op, args = op_with_args[0], op_with_args[1]
@@ -3478,6 +3911,8 @@ class TestXpuAutocast(TestAutocast):
                 )
 
     def test_autocast_torch_bf16(self):
+        # [FUNCTION DOC] Same as the float16 test but runs with bfloat16 autocast dtype, using
+        # the same operator list as the float16 test and the same skipping rules.
         for op_with_args in self.autocast_lists.torch_fp16:
             skip_test = False
             op, args = op_with_args[0], op_with_args[1]
@@ -3489,12 +3924,16 @@ class TestXpuAutocast(TestAutocast):
                 self._run_autocast_outofplace(op, args, torch.bfloat16, device="xpu")
 
     def test_autocast_torch_need_autocast_promote(self):
+        # [FUNCTION DOC] Runs each operator that needs promotion under float16 autocast and
+        # expects float32 results.
         for op, args in self.autocast_lists.torch_need_autocast_promote:
             self._run_autocast_outofplace(
                 op, args, torch.float32, device="xpu", amp_dtype=torch.float16
             )
 
     def test_autocast_torch_expect_builtin_promote(self):
+        # [FUNCTION DOC] Runs each operator expected to use builtin promotion with float16
+        # autocast, passing the expected output type.
         for op, args, out_type in self.autocast_lists.torch_expect_builtin_promote:
             self._run_autocast_outofplace(
                 op,
@@ -3506,6 +3945,9 @@ class TestXpuAutocast(TestAutocast):
             )
 
     def test_autocast_checkpointing(self):
+        # [FUNCTION DOC] Runs a small linear model through checkpoint_sequential with both
+        # reentrant modes under autocast and checks the output requires grad, is float16, and
+        # backward works.
         model = torch.nn.Sequential(
             torch.nn.Linear(8, 8), torch.nn.Linear(8, 8), torch.nn.Linear(8, 8)
         ).xpu()
@@ -3520,6 +3962,8 @@ class TestXpuAutocast(TestAutocast):
             output.sum().backward()
 
     def test_xpu_autocast_dtype(self):
+        # [FUNCTION DOC] Checks the default XPU autocast dtype is float16 and a matrix
+        # multiply under autocast on XPU produces float16.
         dtype = torch.get_autocast_dtype("xpu")
         self.assertEqual(dtype, torch.float16)
         mat0_fp32 = torch.randn((10, 10), dtype=torch.float32, device="xpu")
@@ -3529,6 +3973,8 @@ class TestXpuAutocast(TestAutocast):
             self.assertEqual(result.dtype, torch.float16)
 
     def test_autocast_is_enabled(self):
+        # [FUNCTION DOC] Checks the XPU specific autocast enabled query matches the generic
+        # one, and toggling the generic setting changes both; restores the original value.
         is_enabled = torch.is_autocast_enabled("xpu")
         self.assertEqual(is_enabled, torch.is_autocast_enabled())
         torch.set_autocast_enabled(not is_enabled)
@@ -3539,6 +3985,9 @@ class TestXpuAutocast(TestAutocast):
         self.assertEqual(is_enabled, torch.is_autocast_enabled())
 
     def test_fft_fp16_promotion(self):
+        # [FUNCTION DOC] For tensors of one to five dimensions, checks real FFT on float16
+        # gives complex32 matching the float32 result and inverse FFT gives float16 matching
+        # the complex64 result, within tolerance.
         shapes = [tuple(range(5, 5 + ndim)) for ndim in range(1, 6)]
         for shape in shapes:
             # r2c: rfftn with float16 input should produce complex32
@@ -3558,12 +4007,18 @@ class TestXpuAutocast(TestAutocast):
 
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 class TestXpuTrace(TestCase):
+    # [CLASS DOC] Tests of the GPU trace callbacks for XPU events and synchronization. Holds a
+    # mock callback object created in setUp.
     def setUp(self):
+        # [FUNCTION DOC] Calls the base setUp, activates GPU tracing, and creates a mock
+        # object used as the callback.
         super().setUp()
         torch._C._activate_gpu_trace()
         self.mock = unittest.mock.MagicMock()
 
     def test_event_creation_callback(self):
+        # [FUNCTION DOC] Registers the mock as event creation callback and checks it is called
+        # once with the event handle after the first record.
         gpu_trace.register_callback_for_event_creation(self.mock)
 
         event = torch.xpu.Event()
@@ -3571,6 +4026,8 @@ class TestXpuTrace(TestCase):
         self.mock.assert_called_once_with(event._as_parameter_.value)
 
     def test_event_deletion_callback(self):
+        # [FUNCTION DOC] Registers the mock as the event deletion callback, deletes a recorded
+        # event and checks the mock is called once with its handle.
         gpu_trace.register_callback_for_event_deletion(self.mock)
 
         event = torch.xpu.Event()
@@ -3580,6 +4037,8 @@ class TestXpuTrace(TestCase):
         self.mock.assert_called_once_with(event_id)
 
     def test_event_record_callback(self):
+        # [FUNCTION DOC] Registers the mock as the event record callback and checks it is
+        # called once with the event handle and the current stream queue.
         gpu_trace.register_callback_for_event_record(self.mock)
 
         event = torch.xpu.Event()
@@ -3589,6 +4048,8 @@ class TestXpuTrace(TestCase):
         )
 
     def test_event_wait_callback(self):
+        # [FUNCTION DOC] Registers the mock as the event wait callback, records and waits on
+        # an event, and checks one call with the event handle and current queue.
         gpu_trace.register_callback_for_event_wait(self.mock)
 
         event = torch.xpu.Event()
@@ -3599,12 +4060,16 @@ class TestXpuTrace(TestCase):
         )
 
     def test_device_synchronization_callback(self):
+        # [FUNCTION DOC] Registers the mock as the device synchronization callback and checks
+        # it was called after synchronizing the device.
         gpu_trace.register_callback_for_device_synchronization(self.mock)
 
         torch.xpu.synchronize()
         self.mock.assert_called()
 
     def test_stream_synchronization_callback(self):
+        # [FUNCTION DOC] Registers the mock as the stream synchronization callback and checks
+        # one call with the stream queue after synchronizing a new stream.
         gpu_trace.register_callback_for_stream_synchronization(self.mock)
 
         stream = torch.xpu.Stream()
@@ -3612,6 +4077,8 @@ class TestXpuTrace(TestCase):
         self.mock.assert_called_once_with(stream.sycl_queue)
 
     def test_event_synchronization_callback(self):
+        # [FUNCTION DOC] Registers the mock as the event synchronization callback and checks
+        # one call with the event handle after synchronizing a recorded event.
         gpu_trace.register_callback_for_event_synchronization(self.mock)
 
         event = torch.xpu.Event()
@@ -3621,21 +4088,30 @@ class TestXpuTrace(TestCase):
 
 
 class TestXPUAPISanity(TestCase):
+    # [CLASS DOC] Basic API sanity checks of XPU that must hold whether or not an XPU device
+    # is present.
     def test_is_bf16_supported(self):
+        # [FUNCTION DOC] Checks bfloat16 support with emulation is reported exactly when XPU
+        # is available.
         self.assertEqual(
             torch.xpu.is_bf16_supported(including_emulation=True),
             torch.xpu.is_available(),
         )
 
     def test_is_tf32_supported(self):
+        # [FUNCTION DOC] If XPU is not available, checks TF32 is reported unsupported.
         if not torch.xpu.is_available():
             self.assertFalse(torch.xpu.is_tf32_supported())
 
     def test_get_arch_list(self):
+        # [FUNCTION DOC] If XPU is not compiled in, checks the architecture list is empty.
         if not torch.xpu._is_compiled():
             self.assertEqual(len(torch.xpu.get_arch_list()), 0)
 
     def test_torch_config_for_xpu(self):
+        # [FUNCTION DOC] Parses the build configuration text for the XPU, XCCL and SYCL
+        # compiler version entries and checks they are consistent with whether XPU is compiled
+        # and XCCL is available.
         config = torch.__config__.show()
         value = re.search(r"USE_XPU=([^,]+)", config)
         self.assertIsNotNone(value)
@@ -3658,7 +4134,12 @@ class TestXPUAPISanity(TestCase):
 
 @unittest.skipIf(not TEST_XPU, "XPU not available, skipping tests")
 class TestMemPool(TestCase):
+    # [CLASS DOC] Tests of XPU memory pools for pool ids, empty cache and out of memory
+    # recovery, and multi-stream block freeing.
     def _alloc_record_free_sync(self, pool_ctx, stream, nbytes):
+        # [FUNCTION DOC] HELPER: Allocates bytes inside the given pool context, records the
+        # tensor on another stream, frees it and synchronizes, then allocates the same size
+        # again. Returns the original and new data addresses.
         """Allocate a block, record it on a second stream, free, synchronize,
         then try to reallocate. Returns (original_ptr, new_ptr)."""
         with pool_ctx:
@@ -3678,6 +4159,8 @@ class TestMemPool(TestCase):
         return original_ptr, new_ptr
 
     def test_mempool_id(self):
+        # [FUNCTION DOC] Creates two memory pools and checks the pool id components: the first
+        # value matches and the second differs.
         pool1 = torch.xpu.MemPool().id
         pool2 = torch.xpu.MemPool().id
 
@@ -3689,9 +4172,12 @@ class TestMemPool(TestCase):
         self.assertTrue(abs(pool2[1] - pool1[1]) > 0)
 
     def test_mempool_multithread(self):
+        # [FUNCTION DOC] Creates memory pools from four threads and checks all ids are unique.
         pool_ids = []
 
         def create_mempool_and_make_active():
+            # [FUNCTION DOC] HELPER: Creates a memory pool and appends its id to the shared
+            # list.
             pool = torch.xpu.MemPool()
             pool_ids.extend([pool.id])
 
@@ -3710,6 +4196,8 @@ class TestMemPool(TestCase):
         self.assertEqual(len(set(pool_ids)), 4)
 
     def test_mempool_empty_cache(self):
+        # [FUNCTION DOC] Allocates inside and outside a memory pool, frees them, and checks
+        # that releasing the pool lowers but does not zero reserved memory.
         torch.xpu.empty_cache()
         pool = torch.xpu.MemPool()
         x = torch.empty(1024, 1024, device="xpu")
@@ -3728,10 +4216,15 @@ class TestMemPool(TestCase):
 
     @serialTest()
     def test_mempool_oom_recovery_releases_cached_blocks(self):
+        # [FUNCTION DOC] Serial test. For the default pool and a user pool, fills and frees
+        # half the free memory, then allocates most of the free memory and checks no out of
+        # memory error occurs because cached blocks are released. Skips when memory is too
+        # small.
         MB = 1024 * 1024
         device = torch.device("xpu:0")
 
         def align_down_2mb(n):
+            # [FUNCTION DOC] HELPER: Rounds a byte count down to a multiple of two megabytes.
             return n & ~(2 * MB - 1)
 
         for label, make_ctx in [
@@ -3770,6 +4263,9 @@ class TestMemPool(TestCase):
 
     @serialTest()
     def test_mempool_block_free_not_deferred(self):
+        # [FUNCTION DOC] Serial test. For the default pool and a user pool, checks a block
+        # freed after being used on another stream is reused at the same address after
+        # synchronization, i.e. its free was not deferred.
         torch.xpu.empty_cache()
         stream = torch.xpu.Stream()
         nbytes = 1024 * 1024
