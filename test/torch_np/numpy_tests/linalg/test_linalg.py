@@ -1,4 +1,12 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the linalg module of torch._numpy (or real numpy when
+#   TEST_WITH_TORCHDYNAMO is set), adapted from numpy's test suite. Defines a table of
+#   LinalgCase operand bundles (square, non-square, hermitian, and stacked "generalized"
+#   variants), mixin classes that run a per-routine check over the selected cases, and test
+#   classes for solve, inv, eigvals, eig, svd, cond, pinv, det, lstsq, matrix_power, eigvalsh,
+#   eigh, norm, matrix_rank, qr, cholesky, multi_dot, tensorinv and tensorsolve. Import-time
+#   side effects: seeds the random generator, builds the global CASES list (including random
+#   arrays), and rebinds assert_almost_equal to a dtype-aware wrapper.
 """Test functions for linalg module"""
 
 import functools
@@ -96,6 +104,9 @@ HAS_LAPACK64 = False
 
 
 def consistent_subclass(out, in_):
+    # [FUNCTION DOC] HELPER: Returns whether the output has exactly the type expected by
+    #   the numpy subclass rule: the input's own type when the input is an ndarray,
+    #   otherwise plain ndarray.
     # For ndarray subclass input, our output should have the same subclass
     # (non-ndarray input gets converted to ndarray).
     return type(out) is (type(in_) if isinstance(in_, np.ndarray) else np.ndarray)
@@ -105,6 +116,10 @@ old_assert_almost_equal = assert_almost_equal
 
 
 def assert_almost_equal(a, b, single_decimal=6, double_decimal=12, **kw):
+    # [FUNCTION DOC] HELPER: Dtype-aware wrapper over the original assert_almost_equal.
+    #   Chooses the decimal precision from the dtype of the first operand: single_decimal
+    #   (default 6) for float32 or complex64, otherwise double_decimal (default 12). Extra
+    #   keywords are forwarded.
     if asarray(a).dtype.type in (single, csingle):
         decimal = single_decimal
     else:
@@ -113,14 +128,22 @@ def assert_almost_equal(a, b, single_decimal=6, double_decimal=12, **kw):
 
 
 def get_real_dtype(dtype):
+    # [FUNCTION DOC] HELPER: Maps a float or complex dtype class (single, double, csingle,
+    #   cdouble) to the real dtype of the same precision. Raises KeyError for any other
+    #   key.
     return {single: single, double: double, csingle: single, cdouble: double}[dtype]
 
 
 def get_complex_dtype(dtype):
+    # [FUNCTION DOC] HELPER: Maps a float or complex dtype class (single, double, csingle,
+    #   cdouble) to the complex dtype of the same precision. Raises KeyError for any other
+    #   key.
     return {single: csingle, double: cdouble, csingle: csingle, cdouble: cdouble}[dtype]
 
 
 def get_rtol(dtype):
+    # [FUNCTION DOC] HELPER: Returns a relative tolerance for comparisons: 1e-5 for single
+    #   precision (float32, complex64) and 1e-11 for everything else.
     # Choose a safe rtol
     if dtype in (single, csingle):
         return 1e-5
@@ -140,7 +163,13 @@ all_tags = {
 
 
 class LinalgCase:
+    # [CLASS DOC] HELPER: Bundle of test inputs: an identifying name, operands a and b (b
+    #   may be None for hermitian cases) and a frozen set of tags used to select cases.
+    #   check applies a test callback to the operands.
     def __init__(self, name, a, b, tags=None):
+        # [FUNCTION DOC] HELPER: Stores the name, operands and tags. Tags default to
+        #   an empty set and are copied into a frozenset so instances do not share a
+        #   mutable set. Asserts the name is a string.
         """
         A bundle of arguments to be passed to a test case, with an identifying
         name, the operands a and b, and a set of tags to filter the tests
@@ -154,16 +183,24 @@ class LinalgCase:
         self.tags = frozenset(tags)  # prevent shared tags
 
     def check(self, do):
+        # [FUNCTION DOC] HELPER: Calls the given callback with operands a and b and
+        #   the case tags as the tags keyword; propagates whatever the callback
+        #   raises.
         """
         Run the function `do` on this test case, expanding arguments
         """
         do(self.a, self.b, tags=self.tags)
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns a short representation containing the case
+        #   name.
         return f"<LinalgCase: {self.name}>"
 
 
 def apply_tag(tag, cases):
+    # [FUNCTION DOC] HELPER: Adds the tag to every case in the list by replacing each
+    #   case's tag set with a union, and returns the same list. Raises AssertionError if
+    #   the tag is not in the global known tags.
     """
     Add the given tag (a string) to each of the cases (a list of LinalgCase
     objects)
@@ -338,6 +375,11 @@ CASES += apply_tag(
 # Gufunc test cases
 #
 def _make_generalized_cases():
+    # [FUNCTION DOC] HELPER: Builds stacked variants of all ndarray cases in the global
+    #   CASES list (non-array operands are skipped). For each, creates a case stacking the
+    #   operand three times scaled by 1, 2, 3 (b scaled 1, 7, 6) and another tiled into
+    #   shape 3x2 batches, both tagged generalized. Returns the new cases without
+    #   modifying CASES.
     new_cases = []
 
     for case in CASES:
@@ -374,9 +416,16 @@ CASES += _make_generalized_cases()
 # Test different routines against the above cases
 #
 class LinalgTestCase:
+    # [CLASS DOC] HELPER: Mixin that runs a subclass-provided callback over the global
+    #   CASES. Subclasses must define do(a, b, tags). TEST_CASES holds the shared case
+    #   list.
     TEST_CASES = CASES
 
     def check_cases(self, require=None, exclude=None):
+        # [FUNCTION DOC] HELPER: Runs do on every case whose tags include all of the
+        #   require set and none of the exclude set. Any exception is rethrown as
+        #   AssertionError whose message names the failing case and includes the
+        #   formatted traceback, chained to the original.
         """
         Run func on each of the cases with all of the tags in require, and none
         of the tags in exclude
@@ -401,62 +450,88 @@ class LinalgTestCase:
 
 
 class LinalgSquareTestCase(LinalgTestCase):
+    # [CLASS DOC] HELPER: Mixin adding tests for square, non-generalized cases.
     def test_sq_cases(self):
+        # [FUNCTION DOC] Runs the check over square, non-stacked, non-empty cases.
         self.check_cases(require={"square"}, exclude={"generalized", "size-0"})
 
     def test_empty_sq_cases(self):
+        # [FUNCTION DOC] Runs the check over square, empty (size-0), non-stacked
+        #   cases.
         self.check_cases(require={"square", "size-0"}, exclude={"generalized"})
 
 
 class LinalgNonsquareTestCase(LinalgTestCase):
+    # [CLASS DOC] HELPER: Mixin adding tests for non-square cases.
     def test_nonsq_cases(self):
+        # [FUNCTION DOC] Runs the check over non-square, non-stacked, non-empty cases.
         self.check_cases(require={"nonsquare"}, exclude={"generalized", "size-0"})
 
     def test_empty_nonsq_cases(self):
+        # [FUNCTION DOC] Runs the check over non-square, empty, non-stacked cases.
         self.check_cases(require={"nonsquare", "size-0"}, exclude={"generalized"})
 
 
 class HermitianTestCase(LinalgTestCase):
+    # [CLASS DOC] HELPER: Mixin adding tests for hermitian cases.
     def test_herm_cases(self):
+        # [FUNCTION DOC] Runs the check over hermitian, non-stacked, non-empty cases.
         self.check_cases(require={"hermitian"}, exclude={"generalized", "size-0"})
 
     def test_empty_herm_cases(self):
+        # [FUNCTION DOC] Runs the check over hermitian, empty, non-stacked cases.
         self.check_cases(require={"hermitian", "size-0"}, exclude={"generalized"})
 
 
 class LinalgGeneralizedSquareTestCase(LinalgTestCase):
+    # [CLASS DOC] HELPER: Mixin adding tests for stacked square cases; both tests are
+    #   marked slow.
     @slow
     def test_generalized_sq_cases(self):
+        # [FUNCTION DOC] Runs the check over stacked square non-empty cases.
         self.check_cases(require={"generalized", "square"}, exclude={"size-0"})
 
     @slow
     def test_generalized_empty_sq_cases(self):
+        # [FUNCTION DOC] Runs the check over stacked square empty cases.
         self.check_cases(require={"generalized", "square", "size-0"})
 
 
 class LinalgGeneralizedNonsquareTestCase(LinalgTestCase):
+    # [CLASS DOC] HELPER: Mixin adding slow tests for stacked non-square cases.
     @slow
     def test_generalized_nonsq_cases(self):
+        # [FUNCTION DOC] Runs the check over stacked non-square non-empty cases.
         self.check_cases(require={"generalized", "nonsquare"}, exclude={"size-0"})
 
     @slow
     def test_generalized_empty_nonsq_cases(self):
+        # [FUNCTION DOC] Runs the check over stacked non-square empty cases.
         self.check_cases(require={"generalized", "nonsquare", "size-0"})
 
 
 class HermitianGeneralizedTestCase(LinalgTestCase):
+    # [CLASS DOC] HELPER: Mixin adding slow tests for stacked hermitian cases.
     @slow
     def test_generalized_herm_cases(self):
+        # [FUNCTION DOC] Runs the check over stacked hermitian non-empty cases.
         self.check_cases(require={"generalized", "hermitian"}, exclude={"size-0"})
 
     @slow
     def test_generalized_empty_herm_cases(self):
+        # [FUNCTION DOC] Runs the check over stacked hermitian empty cases; the
+        #   exclude set contains a tag that no case has, so nothing else is filtered.
         self.check_cases(
             require={"generalized", "hermitian", "size-0"}, exclude={"none"}
         )
 
 
 def dot_generalized(a, b):
+    # [FUNCTION DOC] HELPER: Matrix product that also works on stacks. For inputs with
+    #   three or more dimensions, loops over the leading batch indices and multiplies each
+    #   pair of matrices into a preallocated result of the common type; supports matrix-
+    #   matrix (equal ndim) and matrix-vector (b has one fewer dim); otherwise raises
+    #   ValueError. Lower-rank input is passed to plain dot.
     a = asarray(a)
     if a.ndim >= 3:
         if a.ndim == b.ndim:
@@ -476,6 +551,10 @@ def dot_generalized(a, b):
 
 
 def identity_like_generalized(a):
+    # [FUNCTION DOC] HELPER: Returns an identity matrix matching the input: for stacked
+    #   input, an array of the input's shape and dtype with every batch entry set to the
+    #   identity of the matrix size; for a plain matrix, an identity of its first
+    #   dimension.
     a = asarray(a)
     if a.ndim >= 3:
         r = np.empty(a.shape, dtype=a.dtype)
@@ -486,8 +565,12 @@ def identity_like_generalized(a):
 
 
 class SolveCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
+    # [CLASS DOC] HELPER: Case checker for solve, run on square and stacked square cases.
     # kept apart from TestSolve for use for testing with matrices.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Solves a x = b, checks a times x reproduces b (5
+        #   decimals for single precision) and that the result type follows the
+        #   subclass rule relative to b.
         x = linalg.solve(a, b)
         assert_almost_equal(b, dot_generalized(a, x), single_decimal=5)
         assert_(consistent_subclass(x, b))
@@ -495,14 +578,22 @@ class SolveCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
 
 @instantiate_parametrized_tests
 class TestSolve(SolveCases, TestCase):
+    # [CLASS DOC] Tests for linalg.solve using the shared cases.
     @parametrize("dtype", [single, double, csingle, cdouble])
     def test_types(self, dtype):
+        # [FUNCTION DOC] For each of four dtypes, asserts solve of a 2x2 system
+        #   returns the same dtype.
         x = np.array([[1, 0.5], [0.5, 1]], dtype=dtype)
         assert_equal(linalg.solve(x, x).dtype, dtype)
 
     @skip(reason="subclass")
     def test_0_size(self):
+        # [FUNCTION DOC] Skipped (needs ndarray subclasses). Would check solve with
+        #   zero-sized stacked matrices, error cases for non-square or mismatched
+        #   shapes, and subclass preservation.
         class ArraySubclass(np.ndarray):
+            # [CLASS DOC] HELPER: Empty ndarray subclass used to test subclass
+            #   preservation.
             pass
 
         # Test system of 0x0 matrices
@@ -537,8 +628,13 @@ class TestSolve(SolveCases, TestCase):
 
     @skip(reason="subclass")
     def test_0_size_k(self):
+        # [FUNCTION DOC] Skipped (needs ndarray subclasses). Would check solve with
+        #   zero right-hand sides and with zero-sized matrices both preserve the
+        #   subclass.
         # test zero multiple equation (K=0) case.
         class ArraySubclass(np.ndarray):
+            # [CLASS DOC] HELPER: Empty ndarray subclass used to test subclass
+            #   preservation.
             pass
 
         a = np.arange(4).reshape(1, 2, 2)
@@ -557,7 +653,10 @@ class TestSolve(SolveCases, TestCase):
 
 
 class InvCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
+    # [CLASS DOC] HELPER: Case checker for inv on square and stacked square cases.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Inverts a, checks the product with the inverse is the
+        #   identity and that the result type follows the subclass rule relative to a.
         a_inv = linalg.inv(a)
         assert_almost_equal(dot_generalized(a, a_inv), identity_like_generalized(a))
         assert_(consistent_subclass(a_inv, a))
@@ -565,15 +664,23 @@ class InvCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
 
 @instantiate_parametrized_tests
 class TestInv(InvCases, TestCase):
+    # [CLASS DOC] Tests for linalg.inv using the shared cases.
     @parametrize("dtype", [single, double, csingle, cdouble])
     def test_types(self, dtype):
+        # [FUNCTION DOC] For each of four dtypes, asserts inv of a 2x2 matrix returns
+        #   the same dtype.
         x = np.array([[1, 0.5], [0.5, 1]], dtype=dtype)
         assert_equal(linalg.inv(x).dtype, dtype)
 
     @skip(reason="subclass")
     def test_0_size(self):
+        # [FUNCTION DOC] Skipped (needs ndarray subclasses). Would check inv on empty
+        #   stacked inputs keeps shape, promotes integer to float64 and keeps
+        #   complex64, and preserves the subclass.
         # Check that all kinds of 0-sized arrays work
         class ArraySubclass(np.ndarray):
+            # [CLASS DOC] HELPER: Empty ndarray subclass used to test subclass
+            #   preservation.
             pass
 
         a = np.zeros((0, 1, 1), dtype=np.int_).view(ArraySubclass)
@@ -590,7 +697,10 @@ class TestInv(InvCases, TestCase):
 
 
 class EigvalsCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
+    # [CLASS DOC] HELPER: Case checker comparing eigvals with the eigenvalues from eig.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Computes eigenvalues with eigvals and with eig and
+        #   asserts they match.
         ev = linalg.eigvals(a)
         evalues, evectors = linalg.eig(a)
         assert_almost_equal(ev, evalues)
@@ -598,8 +708,12 @@ class EigvalsCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
 
 @instantiate_parametrized_tests
 class TestEigvals(EigvalsCases, TestCase):
+    # [CLASS DOC] Tests for linalg.eigvals using the shared cases.
     @parametrize("dtype", [single, double, csingle, cdouble])
     def test_types(self, dtype):
+        # [FUNCTION DOC] For each dtype, a symmetric matrix keeps the input dtype
+        #   while a matrix with complex eigenvalues returns the matching complex
+        #   dtype.
         x = np.array([[1, 0.5], [0.5, 1]], dtype=dtype)
         assert_equal(linalg.eigvals(x).dtype, dtype)
         x = np.array([[1, 0.5], [-1, 1]], dtype=dtype)
@@ -607,8 +721,12 @@ class TestEigvals(EigvalsCases, TestCase):
 
     @skip(reason="subclass")
     def test_0_size(self):
+        # [FUNCTION DOC] Skipped (needs ndarray subclasses). Would check eigvals on
+        #   empty inputs for dtype and shape, and that the result is a plain ndarray.
         # Check that all kinds of 0-sized arrays work
         class ArraySubclass(np.ndarray):
+            # [CLASS DOC] HELPER: Empty ndarray subclass used to test subclass
+            #   preservation.
             pass
 
         a = np.zeros((0, 1, 1), dtype=np.int_).view(ArraySubclass)
@@ -627,7 +745,12 @@ class TestEigvals(EigvalsCases, TestCase):
 
 
 class EigCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
+    # [CLASS DOC] HELPER: Case checker verifying eig on square and stacked square cases.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Computes eigenvalues and eigenvectors and asserts
+        #   that a times the eigenvectors equals the eigenvectors scaled column-wise
+        #   by the eigenvalues, within a dtype-specific tolerance; also checks the
+        #   subclass rule for the eigenvectors.
         evalues, evectors = linalg.eig(a)
         assert_allclose(
             dot_generalized(a, evectors),
@@ -639,8 +762,12 @@ class EigCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
 
 @instantiate_parametrized_tests
 class TestEig(EigCases, TestCase):
+    # [CLASS DOC] Tests for linalg.eig using the shared cases.
     @parametrize("dtype", [single, double, csingle, cdouble])
     def test_types(self, dtype):
+        # [FUNCTION DOC] For each dtype, a symmetric matrix gives eigenvalues and
+        #   eigenvectors of the input dtype; a matrix with complex eigenvalues gives
+        #   the matching complex dtype for both.
         x = np.array([[1, 0.5], [0.5, 1]], dtype=dtype)
         w, v = np.linalg.eig(x)
         assert_equal(w.dtype, dtype)
@@ -653,8 +780,13 @@ class TestEig(EigCases, TestCase):
 
     @skip(reason="subclass")
     def test_0_size(self):
+        # [FUNCTION DOC] Skipped (needs ndarray subclasses). Would check eig of empty
+        #   inputs for dtype and shapes. KNOWN ISSUE: the trailing checks test the
+        #   input array, not the result, so they are vacuous.
         # Check that all kinds of 0-sized arrays work
         class ArraySubclass(np.ndarray):
+            # [CLASS DOC] HELPER: Empty ndarray subclass used to test subclass
+            #   preservation.
             pass
 
         a = np.zeros((0, 1, 1), dtype=np.int_).view(ArraySubclass)
@@ -678,10 +810,16 @@ class TestEig(EigCases, TestCase):
 
 @instantiate_parametrized_tests
 class SVDBaseTests:
+    # [CLASS DOC] HELPER: Mixin with SVD dtype tests; class attribute hermitian (default
+    #   False) selects the hermitian option for the values-only call.
     hermitian = False
 
     @parametrize("dtype", [single, double, csingle, cdouble])
     def test_types(self, dtype):
+        # [FUNCTION DOC] For each dtype, asserts the singular value decomposition
+        #   keeps dtype for u and vh, returns real dtype for singular values, and
+        #   likewise when only singular values are asked for (using the hermitian flag
+        #   from the class).
         x = np.array([[1, 0.5], [0.5, 1]], dtype=dtype)
         u, s, vh = linalg.svd(x)
         assert_equal(u.dtype, dtype)
@@ -692,7 +830,11 @@ class SVDBaseTests:
 
 
 class SVDCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
+    # [CLASS DOC] HELPER: Case checker for svd on square and stacked square cases.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Computes the reduced SVD, asserts u times scaled vt
+        #   reconstructs a within a dtype-specific tolerance and that u and vt follow
+        #   the subclass rule.
         u, s, vt = linalg.svd(a, False)
         assert_allclose(
             a,
@@ -706,7 +848,11 @@ class SVDCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
 
 
 class TestSVD(SVDCases, SVDBaseTests, TestCase):
+    # [CLASS DOC] Tests for linalg.svd using the shared cases.
     def test_empty_identity(self):
+        # [FUNCTION DOC] Asserts SVD of empty 4x0 and 0x4 matrices gives identity
+        #   matrices of the appropriate size for u (4x0 input) or vh (0x4 input) and
+        #   zero-sized other factors.
         """Empty input should put an identity matrix in u or vh"""
         x = np.empty((4, 0))
         u, s, vh = linalg.svd(x, compute_uv=True, hermitian=self.hermitian)
@@ -722,7 +868,13 @@ class TestSVD(SVDCases, SVDBaseTests, TestCase):
 
 
 class SVDHermitianCases(HermitianTestCase, HermitianGeneralizedTestCase):
+    # [CLASS DOC] HELPER: Case checker for svd with the hermitian option on hermitian
+    #   cases.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Computes the hermitian-mode SVD, asserts
+        #   reconstruction, that u and vt are unitary (product with conjugate
+        #   transpose is identity), that the singular values are in descending order
+        #   and that u and vt follow the subclass rule.
         u, s, vt = linalg.svd(a, False, hermitian=True)
         assert_allclose(
             a,
@@ -733,6 +885,8 @@ class SVDHermitianCases(HermitianTestCase, HermitianGeneralizedTestCase):
         )
 
         def hermitian(mat):
+            # [FUNCTION DOC] HELPER: Returns the conjugate transpose of the
+            #   matrix, swapping its last two axes.
             axes = list(range(mat.ndim))
             axes[-1], axes[-2] = axes[-2], axes[-1]
             return np.conj(np.transpose(mat, axes=axes))
@@ -750,13 +904,22 @@ class SVDHermitianCases(HermitianTestCase, HermitianGeneralizedTestCase):
 
 
 class TestSVDHermitian(SVDHermitianCases, SVDBaseTests, TestCase):
+    # [CLASS DOC] Tests for hermitian-mode SVD; sets the class attribute hermitian to
+    #   True.
     hermitian = True
 
 
 class CondCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
+    # [CLASS DOC] HELPER: Case checker for cond with norms None, 2, -2, 1, -1, inf, -inf
+    #   and fro.
     # cond(x, p) for p in (None, 2, -2)
 
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: For empty cases asserts cond raises LinAlgError.
+        #   Otherwise compares cond for each norm order with its definition: ratios of
+        #   extreme singular values for the 2-norms, and products of norms of the
+        #   matrix and its inverse for the others (1-norm, inf-norm, Frobenius, and
+        #   their negatives). Uses relaxed decimals for single precision.
         c = asarray(a)  # a might be a matrix
         if "size-0" in tags:
             assert_raises(LinAlgError, linalg.cond, c)
@@ -815,7 +978,10 @@ class CondCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
 
 
 class TestCond(CondCases, TestCase):
+    # [CLASS DOC] Tests for linalg.cond using the shared cases and extra edge cases.
     def test_basic_nonsvd(self):
+        # [FUNCTION DOC] Smoke tests cond of a fixed 3x3 matrix for inf, -inf, 1, -1
+        #   and fro norms against known values.
         # Smoketest the non-svd norms
         A = array([[1.0, 0, 1], [0, -2.0, 0], [0, 0, 3.0]])
         assert_almost_equal(linalg.cond(A, inf), 4)
@@ -825,6 +991,8 @@ class TestCond(CondCases, TestCase):
         assert_almost_equal(linalg.cond(A, "fro"), np.sqrt(265 / 12))
 
     def test_singular(self):
+        # [FUNCTION DOC] Asserts cond of zero and all-ones matrices is huge for
+        #   positive norms, and that negative norms do not raise.
         # Singular matrices have infinite condition number for
         # positive norms, and negative norms shouldn't raise
         # exceptions
@@ -842,6 +1010,10 @@ class TestCond(CondCases, TestCase):
     #    True, run=False, reason="Platform/LAPACK-dependent failure, see gh-18914"
     # )
     def test_nan(self):
+        # [FUNCTION DOC] Skipped (fails on CI). Would check NaN input gives NaN
+        #   condition number for every norm (a numpy float), and for stacked input
+        #   only the NaN entry is NaN while singular entries are huge for positive
+        #   norms.
         # nans should be passed through, not converted to infs
         ps = [None, 1, -1, 2, -2, "fro"]
         p_pos = [None, 1, 2, "fro"]
@@ -866,6 +1038,9 @@ class TestCond(CondCases, TestCase):
                 assert_(not np.isnan(c[2]))
 
     def test_stacked_singular(self):
+        # [FUNCTION DOC] Seeds the generator, builds stacked matrices with two zeroed
+        #   entries and asserts those entries have infinite condition number for
+        #   several norms while others are finite.
         # Check behavior when only some of the stacked matrices are
         # singular
         np.random.seed(1234)
@@ -887,7 +1062,11 @@ class PinvCases(
     LinalgGeneralizedSquareTestCase,
     LinalgGeneralizedNonsquareTestCase,
 ):
+    # [CLASS DOC] HELPER: Case checker for pinv on square, non-square and stacked cases.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Computes the pseudo-inverse and checks a times pinv
+        #   times a gives a back (single decimal 5, double 11) and the subclass rule;
+        #   local name dot shadows the global with the stack-aware product.
         a_ginv = linalg.pinv(a)
         # `a @ a_ginv == I` does not hold if a is singular
         dot = dot_generalized
@@ -898,11 +1077,15 @@ class PinvCases(
 
 
 class TestPinv(PinvCases, TestCase):
+    # [CLASS DOC] Tests for linalg.pinv using the shared cases.
     pass
 
 
 class PinvHermitianCases(HermitianTestCase, HermitianGeneralizedTestCase):
+    # [CLASS DOC] HELPER: Case checker for hermitian-mode pinv on hermitian cases.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Same check as the plain pinv checker but with the
+        #   hermitian option set.
         a_ginv = linalg.pinv(a, hermitian=True)
         # `a @ a_ginv == I` does not hold if a is singular
         dot = dot_generalized
@@ -913,11 +1096,17 @@ class PinvHermitianCases(HermitianTestCase, HermitianGeneralizedTestCase):
 
 
 class TestPinvHermitian(PinvHermitianCases, TestCase):
+    # [CLASS DOC] Tests for hermitian-mode linalg.pinv using the shared cases.
     pass
 
 
 class DetCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
+    # [CLASS DOC] HELPER: Case checker for det and slogdet on square and stacked cases.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Compares det and sign times exp of log-determinant
+        #   against the product of eigenvalues (computed in double or complex double).
+        #   Also checks nonzero signs have unit magnitude and zero-sign entries have
+        #   log-determinant minus infinity.
         d = linalg.det(a)
         (s, ld) = linalg.slogdet(a)
         if asarray(a).dtype.type in (single, double):
@@ -937,7 +1126,12 @@ class DetCases(LinalgSquareTestCase, LinalgGeneralizedSquareTestCase):
 
 @instantiate_parametrized_tests
 class TestDet(DetCases, TestCase):
+    # [CLASS DOC] Tests for linalg.det and slogdet using the shared cases.
     def test_zero(self):
+        # [FUNCTION DOC] Asserts det of a 1x1 zero matrix is zero and slogdet is zero
+        #   sign with minus infinity log-determinant, for real and complex input.
+        #   Scalar-type assertions are commented out because zero-dim arrays are
+        #   returned.
         # NB: comment out tests of type(det) is double : we return zero-dim arrays
         assert_equal(linalg.det([[0.0]]), 0.0)
         #    assert_equal(type(linalg.det([[0.0]])), double)
@@ -954,6 +1148,8 @@ class TestDet(DetCases, TestCase):
 
     @parametrize("dtype", [single, double, csingle, cdouble])
     def test_types(self, dtype):
+        # [FUNCTION DOC] For each dtype, asserts det keeps the dtype, slogdet's sign
+        #   has the input dtype and its log-determinant has the real dtype.
         x = np.array([[1, 0.5], [0.5, 1]], dtype=dtype)
         assert_equal(np.linalg.det(x).dtype, dtype)
         ph, s = np.linalg.slogdet(x)
@@ -961,6 +1157,9 @@ class TestDet(DetCases, TestCase):
         assert_equal(ph.dtype, dtype)
 
     def test_0_size(self):
+        # [FUNCTION DOC] Asserts det of a 0x0 matrix is 1 and slogdet is sign 1 and
+        #   log-determinant 0, with result dtypes matching the input precision
+        #   (complex64 and float64 checked).
         a = np.zeros((0, 0), dtype=np.complex64)
         res = linalg.det(a)
         assert_equal(res, 1.0)
@@ -981,7 +1180,13 @@ class TestDet(DetCases, TestCase):
 
 
 class LstsqCases(LinalgSquareTestCase, LinalgNonsquareTestCase):
+    # [CLASS DOC] HELPER: Case checker for lstsq on square and non-square cases.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Solves the least squares problem with rcond minus
+        #   one. Checks x is zero for empty systems, that a times x matches b when
+        #   underdetermined or square, the rank (m or n), residuals (squared residual
+        #   sums when full column rank and m exceeds n, else empty), residual dtype
+        #   floating, and the subclass rule.
         arr = np.asarray(a)
         m, n = arr.shape
         u, s, vt = linalg.svd(a, False)
@@ -1012,8 +1217,12 @@ class LstsqCases(LinalgSquareTestCase, LinalgNonsquareTestCase):
 
 @instantiate_parametrized_tests
 class TestLstsq(LstsqCases, TestCase):
+    # [CLASS DOC] Tests for linalg.lstsq using the shared cases and extra checks.
     @xpassIfTorchDynamo_np  # (reason="Lstsq: we use the future default =None")
     def test_future_rcond(self):
+        # [FUNCTION DOC] Marked to pass leniently under dynamo. Checks rank changes
+        #   with rcond: default and minus one give rank 4, None gives 3; a
+        #   FutureWarning about rcond is recorded once.
         a = np.array(
             [
                 [0.0, 1.0, 0.0, 1.0, 2.0, 0.0],
@@ -1048,6 +1257,11 @@ class TestLstsq(LstsqCases, TestCase):
         ],
     )
     def test_empty_a_b(self, m, n, n_rhs):
+        # [FUNCTION DOC] Parametrized over matrix sizes including empty ones. Solves
+        #   with rcond None and checks solution zero when m is zero, shapes of x,
+        #   residuals (one per right-hand side if m exceeds n else empty) and singular
+        #   values, rank equal to the smaller dimension, and that the residuals match
+        #   the explicit squared norms when m exceeds n.
         a = np.arange(m * n).reshape(m, n)
         b = np.ones((m, n_rhs))
         x, residuals, rank, s = linalg.lstsq(a, b, rcond=None)
@@ -1063,6 +1277,8 @@ class TestLstsq(LstsqCases, TestCase):
         assert_equal(s.shape, (min(m, n),))
 
     def test_incompatible_dims(self):
+        # [FUNCTION DOC] Asserts lstsq raises RuntimeError or LinAlgError when the
+        #   matrix and right-hand side have incompatible lengths.
         # use modified version of docstring example
         x = np.array([0, 1, 2, 3])
         y = np.array([-1, 0.2, 0.9, 2.1, 3.3])
@@ -1076,7 +1292,13 @@ class TestLstsq(LstsqCases, TestCase):
 @skip  # FIXME: otherwise fails in setUp calling np.block
 @instantiate_parametrized_tests
 class TestMatrixPower(TestCase):
+    # [CLASS DOC] Tests for matrix_power. KNOWN ISSUE: the whole class is skipped because
+    #   setUp calls a block function the wrapper lacks; the test bodies are unverified
+    #   here.
     def setUp(self):
+        # [FUNCTION DOC] Builds shared fixtures: identity and three cyclic permutation
+        #   matrices, a list of all four, a singular matrix, a stacked version made
+        #   with block, and a list of dtypes for which inversion is not tested.
         super().setUp()
         self.rshft_0 = np.eye(4)
         self.rshft_1 = self.rshft_0[[3, 0, 1, 2]]
@@ -1090,6 +1312,9 @@ class TestMatrixPower(TestCase):
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
     def test_large_power(self, dt):
+        # [FUNCTION DOC] Checks matrix_power with exponents of the form huge plus 0 to
+        #   3 cycles the permutation matrix back to the expected shifts, for the given
+        #   dtype.
         rshft = self.rshft_1.astype(dt)
         assert_equal(matrix_power(rshft, 2**100 + 2**10 + 2**5 + 0), self.rshft_0)
         assert_equal(matrix_power(rshft, 2**100 + 2**10 + 2**5 + 1), self.rshft_1)
@@ -1098,7 +1323,11 @@ class TestMatrixPower(TestCase):
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
     def test_power_is_zero(self, dt):
+        # [FUNCTION DOC] Checks power zero gives an identity of the same dtype for
+        #   each permutation matrix (and the stacked one unless dtype is object).
         def tz(M):
+            # [FUNCTION DOC] HELPER: Asserts matrix_power with exponent 0 equals
+            #   the identity-like matrix and keeps dtype.
             mz = matrix_power(M, 0)
             assert_equal(mz, identity_like_generalized(M))
             assert_equal(mz.dtype, M.dtype)
@@ -1110,7 +1339,11 @@ class TestMatrixPower(TestCase):
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
     def test_power_is_one(self, dt):
+        # [FUNCTION DOC] Checks power one returns the input unchanged with the same
+        #   dtype.
         def tz(mat):
+            # [FUNCTION DOC] HELPER: Asserts matrix_power with exponent 1 equals
+            #   the input and keeps dtype.
             mz = matrix_power(mat, 1)
             assert_equal(mz, mat)
             assert_equal(mz.dtype, mat.dtype)
@@ -1122,7 +1355,12 @@ class TestMatrixPower(TestCase):
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
     def test_power_is_two(self, dt):
+        # [FUNCTION DOC] Checks power two equals the matrix product of the matrix with
+        #   itself.
         def tz(mat):
+            # [FUNCTION DOC] HELPER: Asserts matrix_power with exponent 2 equals
+            #   the product (using dot for object dtype, matmul otherwise) and
+            #   keeps dtype.
             mz = matrix_power(mat, 2)
             mmul = matmul if mat.dtype != object else dot
             assert_equal(mz, mmul(mat, mat))
@@ -1135,7 +1373,11 @@ class TestMatrixPower(TestCase):
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
     def test_power_is_minus_one(self, dt):
+        # [FUNCTION DOC] Checks power minus one gives an inverse for dtypes that
+        #   support inversion.
         def tz(mat):
+            # [FUNCTION DOC] HELPER: Asserts the product of the matrix_power minus
+            #   one result with the input is the identity.
             invmat = matrix_power(mat, -1)
             mmul = matmul if mat.dtype != object else dot
             assert_almost_equal(mmul(invmat, mat), identity_like_generalized(mat))
@@ -1146,12 +1388,15 @@ class TestMatrixPower(TestCase):
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
     def test_exceptions_bad_power(self, dt):
+        # [FUNCTION DOC] Asserts a float or list exponent raises TypeError.
         mat = self.rshft_0.astype(dt)
         assert_raises(TypeError, matrix_power, mat, 1.5)
         assert_raises(TypeError, matrix_power, mat, [1])
 
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
     def test_exceptions_non_square(self, dt):
+        # [FUNCTION DOC] Asserts matrix_power raises LinAlgError for 1-d, non-square
+        #   2-d and non-square stacked input.
         assert_raises(LinAlgError, matrix_power, np.array([1], dt), 1)
         assert_raises(LinAlgError, matrix_power, np.array([[1], [2]], dt), 1)
         assert_raises(LinAlgError, matrix_power, np.ones((4, 3, 2), dt), 1)
@@ -1159,6 +1404,8 @@ class TestMatrixPower(TestCase):
     @skipif(IS_WASM, reason="fp errors don't work in wasm")
     @parametrize("dt", [np.dtype(c) for c in "?bBhilefdFD"])
     def test_exceptions_not_invertible(self, dt):
+        # [FUNCTION DOC] Asserts a negative power of a singular matrix raises
+        #   LinAlgError; returns early for dtypes where inversion is unsupported.
         if dt in self.dtnoinv:
             return
         mat = self.noninv.astype(dt)
@@ -1166,7 +1413,12 @@ class TestMatrixPower(TestCase):
 
 
 class TestEigvalshCases(HermitianTestCase, HermitianGeneralizedTestCase):
+    # [CLASS DOC] HELPER: Case checker for eigvalsh against eig. KNOWN ISSUE: do calls the
+    #   xfail helper first, so the comparison code after it never runs.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Marks the test as expected to fail (sort complex)
+        #   before running anything; the rest compares eigvalsh with lower and upper
+        #   triangle against sorted eig values.
         pytest.xfail(reason="sort complex")
         # note that eigenvalue arrays returned by eig must be sorted since
         # their order isn't guaranteed.
@@ -1181,19 +1433,27 @@ class TestEigvalshCases(HermitianTestCase, HermitianGeneralizedTestCase):
 
 @instantiate_parametrized_tests
 class TestEigvalsh(TestCase):
+    # [CLASS DOC] Tests for linalg.eigvalsh.
     @parametrize("dtype", [single, double, csingle, cdouble])
     def test_types(self, dtype):
+        # [FUNCTION DOC] For each dtype, asserts eigvalsh of a 2x2 symmetric matrix
+        #   returns the real dtype.
         x = np.array([[1, 0.5], [0.5, 1]], dtype=dtype)
         w = np.linalg.eigvalsh(x)
         assert_equal(w.dtype, get_real_dtype(dtype))
 
     def test_invalid(self):
+        # [FUNCTION DOC] Asserts invalid UPLO strings raise RuntimeError or
+        #   ValueError.
         x = np.array([[1, 0.5], [0.5, 1]], dtype=np.float32)
         assert_raises((RuntimeError, ValueError), np.linalg.eigvalsh, x, UPLO="lrong")
         assert_raises((RuntimeError, ValueError), np.linalg.eigvalsh, x, "lower")
         assert_raises((RuntimeError, ValueError), np.linalg.eigvalsh, x, "upper")
 
     def test_UPLO(self):
+        # [FUNCTION DOC] Asserts eigvalsh reads the lower triangle by default and for
+        #   L or l, and the upper triangle for U or u, giving eigenvalues minus one
+        #   and one.
         Klo = np.array([[0, 0], [1, 0]], dtype=np.double)
         Kup = np.array([[0, 1], [0, 0]], dtype=np.double)
         tgt = np.array([-1, 1], dtype=np.double)
@@ -1216,6 +1476,8 @@ class TestEigvalsh(TestCase):
         assert_allclose(w, tgt, rtol=rtol)
 
     def test_0_size(self):
+        # [FUNCTION DOC] Checks eigvalsh of empty stacks gives the right shape, real
+        #   dtype (float64 for integer, float32 for complex64) and a plain ndarray.
         # Check that all kinds of 0-sized arrays work
         #     class ArraySubclass(np.ndarray):
         #         pass
@@ -1235,7 +1497,12 @@ class TestEigvalsh(TestCase):
 
 
 class TestEighCases(HermitianTestCase, HermitianGeneralizedTestCase):
+    # [CLASS DOC] HELPER: Case checker for eigh against eig. KNOWN ISSUE: do calls the
+    #   xfail helper first, so the comparison code after it never runs.
     def do(self, a, b, tags):
+        # [FUNCTION DOC] HELPER: Marks the test as expected to fail (sort complex)
+        #   before running anything; the rest compares eigh eigenvalues and
+        #   eigenvectors for both triangles.
         pytest.xfail(reason="sort complex")
         # note that eigenvalue arrays returned by eig must be sorted since
         # their order isn't guaranteed.
@@ -1263,20 +1530,27 @@ class TestEighCases(HermitianTestCase, HermitianGeneralizedTestCase):
 
 @instantiate_parametrized_tests
 class TestEigh(TestCase):
+    # [CLASS DOC] Tests for linalg.eigh.
     @parametrize("dtype", [single, double, csingle, cdouble])
     def test_types(self, dtype):
+        # [FUNCTION DOC] For each dtype, asserts eigh returns real-dtype eigenvalues
+        #   and input-dtype eigenvectors.
         x = np.array([[1, 0.5], [0.5, 1]], dtype=dtype)
         w, v = np.linalg.eigh(x)
         assert_equal(w.dtype, get_real_dtype(dtype))
         assert_equal(v.dtype, dtype)
 
     def test_invalid(self):
+        # [FUNCTION DOC] Asserts invalid UPLO strings raise RuntimeError or
+        #   ValueError.
         x = np.array([[1, 0.5], [0.5, 1]], dtype=np.float32)
         assert_raises((RuntimeError, ValueError), np.linalg.eigh, x, UPLO="lrong")
         assert_raises((RuntimeError, ValueError), np.linalg.eigh, x, "lower")
         assert_raises((RuntimeError, ValueError), np.linalg.eigh, x, "upper")
 
     def test_UPLO(self):
+        # [FUNCTION DOC] Asserts eigh uses the lower triangle by default and for L or
+        #   l and the upper triangle for U or u, giving eigenvalues minus one and one.
         Klo = np.array([[0, 0], [1, 0]], dtype=np.double)
         Kup = np.array([[0, 1], [0, 0]], dtype=np.double)
         tgt = np.array([-1, 1], dtype=np.double)
@@ -1299,6 +1573,9 @@ class TestEigh(TestCase):
         assert_allclose(w, tgt, rtol=rtol)
 
     def test_0_size(self):
+        # [FUNCTION DOC] Checks eigh of empty inputs for dtypes and shapes. KNOWN
+        #   ISSUE: the last assertion in each section tests the input instead of the
+        #   result.
         # Check that all kinds of 0-sized arrays work
         #        class ArraySubclass(np.ndarray):
         #            pass
@@ -1322,11 +1599,16 @@ class TestEigh(TestCase):
 
 
 class _TestNormBase:
+    # [CLASS DOC] HELPER: Base for norm tests; dt and dec class attributes (dtype and
+    #   decimals) are set by subclasses.
     dt = None
     dec = None
 
     @staticmethod
     def check_dtype(x, res):
+        # [FUNCTION DOC] HELPER: Static check on a norm result: for inexact input the
+        #   result dtype must equal the real dtype of the input; for integer input it
+        #   only needs to be floating.
         if issubclass(x.dtype.type, np.inexact):
             assert_equal(res.dtype, x.real.dtype)
         else:
@@ -1335,12 +1617,19 @@ class _TestNormBase:
 
 
 class _TestNormGeneral(_TestNormBase):
+    # [CLASS DOC] HELPER: Norm tests that apply to vectors and arrays in general.
     def test_empty(self):
+        # [FUNCTION DOC] Asserts the norm of empty inputs (list, empty arrays) is
+        #   zero.
         assert_equal(norm([]), 0.0)
         assert_equal(norm(array([], dtype=self.dt)), 0.0)
         assert_equal(norm(atleast_2d(array([], dtype=self.dt))), 0.0)
 
     def test_vector_return_type(self):
+        # [FUNCTION DOC] For integer and float types, checks vector norms of orders
+        #   -inf, -1, 0, 1, 2, 4 and inf against known values and result dtypes.
+        #   Raises SkipTest when the float16 code is reached, which stops the test
+        #   there; the remaining types are not tested.
         a = np.array([1, 0, 1])
 
         exact_types = "Bbhil"  # np.typecodes["AllInteger"]
@@ -1387,11 +1676,17 @@ class _TestNormGeneral(_TestNormBase):
             assert_almost_equal(an, 1.0)
 
     def test_vector(self):
+        # [FUNCTION DOC] Checks vector norms of several orders against known values
+        #   for lists and arrays of the class dtype with positive, negative and mixed
+        #   sign entries.
         a = [1, 2, 3, 4]
         b = [-1, -2, -3, -4]
         c = [-1, 2, -3, 4]
 
         def _test(v):
+            # [FUNCTION DOC] HELPER: Asserts norm orders default, inf, -inf, 1,
+            #   -1, 2, -2 and 0 of a vector against known values at the class
+            #   decimals.
             np.testing.assert_almost_equal(norm(v), 30**0.5, decimal=self.dec)
             np.testing.assert_almost_equal(norm(v, inf), 4.0, decimal=self.dec)
             np.testing.assert_almost_equal(norm(v, -inf), 1.0, decimal=self.dec)
@@ -1418,6 +1713,10 @@ class _TestNormGeneral(_TestNormBase):
             _test(v)
 
     def test_axis(self):
+        # [FUNCTION DOC] Checks norm with the axis argument: vector norms along each
+        #   axis against per-row and per-column results, and matrix norms over each
+        #   pair of axes of a 3-d array against norms of slices; equal axes must raise
+        #   RuntimeError or ValueError.
         # Vector norms.
         # Compare the use of `axis` with computing the norm of each row
         # or column separately.
@@ -1461,6 +1760,9 @@ class _TestNormGeneral(_TestNormBase):
                     assert_almost_equal(n, expected)
 
     def test_keepdims(self):
+        # [FUNCTION DOC] Checks keepdims for default, vector and matrix norms of a 3-d
+        #   array: values equal the non-keepdims result and the shape has reduced axes
+        #   set to size one.
         A = np.arange(1, 25, dtype=self.dt).reshape(2, 3, 4)
 
         allclose_err = "order {0}, axis = {1}"
@@ -1513,13 +1815,19 @@ class _TestNormGeneral(_TestNormBase):
 
 
 class _TestNorm2D(_TestNormBase):
+    # [CLASS DOC] HELPER: Norm tests specific to 2-d arrays, separate so subclasses can
+    #   reuse them.
     # Define the part for 2d arrays separately, so we can subclass this
     # and run the tests using np.matrix in matrixlib.tests.test_matrix_linalg.
 
     def test_matrix_empty(self):
+        # [FUNCTION DOC] Asserts the norm of an empty 1x0 matrix is zero.
         assert_equal(norm(np.array([[]], dtype=self.dt)), 0.0)
 
     def test_matrix_return_type(self):
+        # [FUNCTION DOC] For integer and complex/float types, checks matrix norms
+        #   (-inf, -1, 1, 2, -2, inf, fro, nuc) of a fixed 2x3 matrix against known
+        #   values and result dtypes.
         a = np.array([[1, 0, 1], [0, 1, 1]])
 
         exact_types = "Bbhil"  # np.typecodes["AllInteger"]
@@ -1571,6 +1879,9 @@ class _TestNorm2D(_TestNormBase):
             np.testing.assert_almost_equal(an, 2.7320508075688772, decimal=6)
 
     def test_matrix_2x2(self):
+        # [FUNCTION DOC] Checks matrix norms of a 2x2 matrix against known values and
+        #   that an unknown string or the orders -3 and 0 raise RuntimeError or
+        #   ValueError.
         A = np.array([[1, 3], [5, 7]], dtype=self.dt)
         assert_almost_equal(norm(A), 84**0.5)
         assert_almost_equal(norm(A, "fro"), 84**0.5)
@@ -1587,6 +1898,8 @@ class _TestNorm2D(_TestNormBase):
         assert_raises((RuntimeError, ValueError), norm, A, 0)
 
     def test_matrix_3x3(self):
+        # [FUNCTION DOC] Checks matrix norms of a scaled 3x3 matrix against known
+        #   values.
         # This test has been added because the 2x2 example
         # happened to have equal nuclear norm and induced 1-norm.
         # The 1/10 scaling factor accommodates the absolute tolerance
@@ -1603,6 +1916,10 @@ class _TestNorm2D(_TestNormBase):
         assert_almost_equal(norm(A, -2), 0.19456584790481812)
 
     def test_bad_args(self):
+        # [FUNCTION DOC] Asserts invalid combinations raise: string orders with a
+        #   single axis or 1-d input, finite orders 0 or 3 for matrix norms, invalid
+        #   axis values (IndexError or axis error), and three axes (RuntimeError or
+        #   ValueError).
         # Check that bad arguments raise the appropriate exceptions.
 
         A = np.array([[1, 2, 3], [4, 5, 6]], dtype=self.dt)
@@ -1631,11 +1948,15 @@ class _TestNorm2D(_TestNormBase):
 
 
 class _TestNorm(_TestNorm2D, _TestNormGeneral):
+    # [CLASS DOC] HELPER: Combines the 2-d and general norm test mixins.
     pass
 
 
 class TestNorm_NonSystematic(TestCase):
+    # [CLASS DOC] Non-systematic norm regression tests.
     def test_intmin(self):
+        # [FUNCTION DOC] Regression test that the order 3 norm of the minimum int32
+        #   value is correct, i.e. absolute value is taken before the float cast.
         # Non-regression test: p-norm of signed integer would previously do
         # float cast and abs in the wrong order.
         x = np.array([-(2**31)], dtype=np.int32)
@@ -1644,34 +1965,43 @@ class TestNorm_NonSystematic(TestCase):
 
 # Separate definitions so we can use them for matrix tests.
 class _TestNormDoubleBase(_TestNormBase, TestCase):
+    # [CLASS DOC] HELPER: Norm test base with dt as float64 and dec 12.
     dt = np.double
     dec = 12
 
 
 class _TestNormSingleBase(_TestNormBase, TestCase):
+    # [CLASS DOC] HELPER: Norm test base with dt as float32 and dec 6.
     dt = np.float32
     dec = 6
 
 
 class _TestNormInt64Base(_TestNormBase, TestCase):
+    # [CLASS DOC] HELPER: Norm test base with dt as int64 and dec 12.
     dt = np.int64
     dec = 12
 
 
 class TestNormDouble(_TestNorm, _TestNormDoubleBase, TestCase):
+    # [CLASS DOC] Norm tests run with float64.
     pass
 
 
 class TestNormSingle(_TestNorm, _TestNormSingleBase, TestCase):
+    # [CLASS DOC] Norm tests run with float32.
     pass
 
 
 class TestNormInt64(_TestNorm, _TestNormInt64Base):
+    # [CLASS DOC] Norm tests run with int64.
     pass
 
 
 class TestMatrixRank(TestCase):
+    # [CLASS DOC] Tests for matrix_rank.
     def test_matrix_rank(self):
+        # [FUNCTION DOC] Checks rank of identity, rank-deficient, zero, 1-d, list,
+        #   stacked and scalar inputs against expected ranks.
         # Full rank matrix
         assert_equal(4, matrix_rank(np.eye(4)))
         # rank deficient matrix
@@ -1692,6 +2022,9 @@ class TestMatrixRank(TestCase):
         assert_equal(matrix_rank(1), 1)
 
     def test_symmetric_rank(self):
+        # [FUNCTION DOC] Checks rank with the hermitian option for identity, ones,
+        #   zero and rank-deficient matrices, and that a manual tolerance can include
+        #   or exclude a tiny eigenvalue.
         assert_equal(4, matrix_rank(np.eye(4), hermitian=True))
         assert_equal(1, matrix_rank(np.ones((4, 4)), hermitian=True))
         assert_equal(0, matrix_rank(np.zeros((4, 4)), hermitian=True))
@@ -1705,6 +2038,9 @@ class TestMatrixRank(TestCase):
         assert_equal(3, matrix_rank(I, hermitian=True, tol=1.01e-8))
 
     def test_reduced_rank(self):
+        # [FUNCTION DOC] Seeds the generator and, over 100 random 40x10 matrices with
+        #   one or two columns replaced by sums of others, asserts matrix_rank reports
+        #   9 and then 8.
         # Test matrices with reduced rank
         #  rng = np.random.RandomState(20120714)
         np.random.seed(20120714)
@@ -1720,7 +2056,11 @@ class TestMatrixRank(TestCase):
 
 @instantiate_parametrized_tests
 class TestQR(TestCase):
+    # [CLASS DOC] Tests for linalg.qr in all modes.
     def check_qr(self, a):
+        # [FUNCTION DOC] HELPER: For a 2-d inexact array checks complete and reduced
+        #   modes (dtype, type, shapes, reconstruction, orthonormal q, upper
+        #   triangular r) and that mode r matches reduced r.
         # This test expects the argument `a` to be an ndarray or
         # a subclass of an ndarray of inexact type.
         a_type = type(a)
@@ -1761,6 +2101,9 @@ class TestQR(TestCase):
     @xpassIfTorchDynamo_np  # (reason="torch does not allow qr(..., mode='raw'")
     @parametrize("m, n", [(3, 0), (0, 3), (0, 0)])
     def test_qr_empty(self, m, n):
+        # [FUNCTION DOC] Marked to pass leniently under dynamo (raw mode unsupported
+        #   by torch). For empty shapes runs the QR check and raw-mode checks of dtype
+        #   and shapes.
         k = min(m, n)
         a = np.empty((m, n))
 
@@ -1774,6 +2117,8 @@ class TestQR(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="torch does not allow qr(..., mode='raw'")
     def test_mode_raw(self):
+        # [FUNCTION DOC] Marked to pass leniently under dynamo. Checks raw mode QR
+        #   output dtype and shapes for a 3x2 matrix and its transpose.
         # The factorization is not unique and varies between libraries,
         # so it is not possible to check against known values. Functional
         # testing is a possibility, but awaits the exposure of more
@@ -1796,6 +2141,8 @@ class TestQR(TestCase):
         assert_(tau.shape == (2,))
 
     def test_mode_all_but_economic(self):
+        # [FUNCTION DOC] Runs the QR check on float and complex versions of square,
+        #   tall and wide matrices.
         a = np.array([[1, 2], [3, 4]])
         b = np.array([[1, 2], [3, 4], [5, 6]])
         for dt in "fd":
@@ -1813,6 +2160,8 @@ class TestQR(TestCase):
             self.check_qr(m2.T)
 
     def check_qr_stacked(self, a):
+        # [FUNCTION DOC] HELPER: Stacked-input version of the QR check using batched
+        #   matmul and identity broadcasting for complete, reduced and r modes.
         # This test expects the argument `a` to be an ndarray or
         # a subclass of an ndarray of inexact type.
         a_type = type(a)
@@ -1859,6 +2208,9 @@ class TestQR(TestCase):
     @parametrize("outer_size", [(2, 2), (2,), (2, 3, 4)])
     @parametrize("dt", [np.single, np.double, np.csingle, np.cdouble])
     def test_stacked_inputs(self, outer_size, size, dt):
+        # [FUNCTION DOC] Parametrized over outer shapes, matrix shapes and dtypes.
+        #   Builds random real and complex stacked input and runs the stacked QR
+        #   check. Skipped with numpy older than 1.22.
         A = np.random.normal(size=outer_size + size).astype(dt)
         B = np.random.normal(size=outer_size + size).astype(dt)
         self.check_qr_stacked(A)
@@ -1867,11 +2219,16 @@ class TestQR(TestCase):
 
 @instantiate_parametrized_tests
 class TestCholesky(TestCase):
+    # [CLASS DOC] Tests for linalg.cholesky.
     # TODO: are there no other tests for cholesky?
 
     @parametrize("shape", [(1, 1), (2, 2), (3, 3), (50, 50), (3, 10, 10)])
     @parametrize("dtype", (np.float32, np.float64, np.complex64, np.complex128))
     def test_basic_property(self, shape, dtype):
+        # [FUNCTION DOC] Builds a random hermitian positive matrix from a seeded
+        #   random array of the given shape and dtype, factors it and asserts the
+        #   factor times its conjugate transpose recovers the matrix within a size-
+        #   scaled tolerance.
         # Check A = L L^H
         np.random.seed(1)
         a = np.random.randn(*shape)
@@ -1891,6 +2248,8 @@ class TestCholesky(TestCase):
         assert_allclose(b, a, atol=atol, err_msg=f"{shape} {dtype}\n{a}\n{c}")
 
     def test_0_size(self):
+        # [FUNCTION DOC] Checks cholesky of empty stacks keeps the shape, promotes
+        #   integer to float64, keeps complex64, and returns a plain ndarray.
         #     class ArraySubclass(np.ndarray):
         #         pass
         a = np.zeros((0, 1, 1), dtype=np.int_)  # .view(ArraySubclass)
@@ -1908,8 +2267,12 @@ class TestCholesky(TestCase):
 
 
 class TestMisc(TestCase):
+    # [CLASS DOC] Miscellaneous linalg tests.
     @xpassIfTorchDynamo_np  # (reason="endianness")
     def test_byteorder_check(self):
+        # [FUNCTION DOC] Marked to pass leniently under dynamo. Checks inv, det and
+        #   pinv give equal results for native, explicitly native-ordered and byte-
+        #   swapped arrays.
         # Byte order check should pass for native order
         if sys.byteorder == "little":
             native = "<"
@@ -1931,6 +2294,8 @@ class TestMisc(TestCase):
 
     @pytest.mark.skipif(IS_WASM, reason="fp errors don't work in wasm")
     def test_generalized_raise_multiloop(self):
+        # [FUNCTION DOC] Builds stacked matrices with one singular entry in the middle
+        #   and asserts inv raises LinAlgError. Skipped on WASM.
         # It should raise an error even if the error doesn't occur in the
         # last iteration of the ufunc inner loop
 
@@ -1944,6 +2309,11 @@ class TestMisc(TestCase):
         assert_raises(np.linalg.LinAlgError, np.linalg.inv, x)
 
     def test_xerbla_override(self):
+        # [FUNCTION DOC] Forks a child process that calls the lapack_lite xerbla and
+        #   an invalid dorgqr call; the child exits with a marker code when the numpy
+        #   xerbla is linked. The parent skips the test (SkipTest) if the code differs
+        #   or fork is not available. Side effects: forks, closes the child's standard
+        #   descriptors and disables core dumps there.
         # Check that our xerbla has been successfully linked in. If it is not,
         # the default xerbla routine is called, which prints a message to stdout
         # and may, or may not, abort the process depending on the LAPACK package.
@@ -1994,6 +2364,11 @@ class TestMisc(TestCase):
     @pytest.mark.skipif(IS_WASM, reason="Cannot start subprocess")
     @slow
     def test_sdot_bug_8577(self):
+        # [FUNCTION DOC] Slow regression test: for each of two libraries that
+        #   triggered a bug, runs a subprocess importing numpy before or after the
+        #   library and checks that a float32 dot product is correct (exit code zero).
+        #   Skipped on WASM; if the library cannot be imported the subprocess exits
+        #   successfully.
         # Regression test that loading certain other libraries does not
         # result to wrong results in float32 linear algebra.
         #
@@ -2032,7 +2407,9 @@ class TestMisc(TestCase):
 
 
 class TestMultiDot(TestCase):
+    # [CLASS DOC] Tests for multi_dot.
     def test_basic_function_with_three_arguments(self):
+        # [FUNCTION DOC] Checks multi_dot of three matrices equals chained dot.
         # multi_dot with three arguments uses a fast hand coded algorithm to
         # determine the optimal order. Therefore test it separately.
         A = np.random.random((6, 2))
@@ -2043,6 +2420,7 @@ class TestMultiDot(TestCase):
         assert_almost_equal(multi_dot([A, B, C]), np.dot(A, np.dot(B, C)))
 
     def test_basic_function_with_two_arguments(self):
+        # [FUNCTION DOC] Checks multi_dot of two matrices equals dot.
         # separate code path with two arguments
         A = np.random.random((6, 2))
         B = np.random.random((2, 6))
@@ -2051,6 +2429,8 @@ class TestMultiDot(TestCase):
         assert_almost_equal(multi_dot([A, B]), np.dot(A, B))
 
     def test_basic_function_with_dynamic_programming_optimization(self):
+        # [FUNCTION DOC] Checks multi_dot of four matrices (dynamic programming path)
+        #   equals chained dot.
         # multi_dot with four or more arguments uses the dynamic programming
         # optimization and therefore deserve a separate
         A = np.random.random((6, 2))
@@ -2060,6 +2440,7 @@ class TestMultiDot(TestCase):
         assert_almost_equal(multi_dot([A, B, C, D]), A.dot(B).dot(C).dot(D))
 
     def test_vector_as_first_argument(self):
+        # [FUNCTION DOC] Asserts a 1-d first argument gives a 1-d result.
         # The first argument can be 1-D
         A1d = np.random.random(2)  # 1-D
         B = np.random.random((2, 6))
@@ -2070,6 +2451,7 @@ class TestMultiDot(TestCase):
         assert_equal(multi_dot([A1d, B, C, D]).shape, (2,))
 
     def test_vector_as_last_argument(self):
+        # [FUNCTION DOC] Asserts a 1-d last argument gives a 1-d result.
         # The last argument can be 1-D
         A = np.random.random((6, 2))
         B = np.random.random((2, 6))
@@ -2080,6 +2462,7 @@ class TestMultiDot(TestCase):
         assert_equal(multi_dot([A, B, C, D1d]).shape, (6,))
 
     def test_vector_as_first_and_last_argument(self):
+        # [FUNCTION DOC] Asserts 1-d first and last arguments give a zero-dim result.
         # The first and last arguments can be 1-D
         A1d = np.random.random(2)  # 1-D
         B = np.random.random((2, 6))
@@ -2090,6 +2473,8 @@ class TestMultiDot(TestCase):
         assert_equal(multi_dot([A1d, B, C, D1d]).shape, ())
 
     def test_three_arguments_and_out(self):
+        # [FUNCTION DOC] Asserts multi_dot of three matrices writes into and returns
+        #   the out array and matches the chained dot.
         # multi_dot with three arguments uses a fast hand coded algorithm to
         # determine the optimal order. Therefore test it separately.
         A = np.random.random((6, 2))
@@ -2104,6 +2489,8 @@ class TestMultiDot(TestCase):
         assert_almost_equal(out, np.dot(A, np.dot(B, C)))
 
     def test_two_arguments_and_out(self):
+        # [FUNCTION DOC] Asserts multi_dot of two matrices writes into and returns the
+        #   out array and matches dot.
         # separate code path with two arguments
         A = np.random.random((6, 2))
         B = np.random.random((2, 6))
@@ -2115,6 +2502,8 @@ class TestMultiDot(TestCase):
         assert_almost_equal(out, np.dot(A, B))
 
     def test_dynamic_programming_optimization_and_out(self):
+        # [FUNCTION DOC] Asserts multi_dot of four matrices writes into and returns
+        #   the out array and matches the chained dot.
         # multi_dot with four or more arguments uses the dynamic programming
         # optimization and therefore deserve a separate test
         A = np.random.random((6, 2))
@@ -2128,6 +2517,9 @@ class TestMultiDot(TestCase):
         assert_almost_equal(out, A.dot(B).dot(C).dot(D))
 
     def test_dynamic_programming_logic(self):
+        # [FUNCTION DOC] Checks the private matrix-chain ordering routine on the
+        #   textbook six-matrix example: cost and split tables (split table shifted to
+        #   zero-based) match in the upper triangle.
         # Test for the dynamic programming part
         # This test is directly taken from Cormen page 376.
         arrays = [
@@ -2168,12 +2560,15 @@ class TestMultiDot(TestCase):
         assert_almost_equal(np.triu(m), np.triu(m_expected))
 
     def test_too_few_input_arrays(self):
+        # [FUNCTION DOC] Asserts multi_dot raises RuntimeError or ValueError for an
+        #   empty list or a single-array list.
         assert_raises((RuntimeError, ValueError), multi_dot, [])
         assert_raises((RuntimeError, ValueError), multi_dot, [np.random.random((3, 3))])
 
 
 @instantiate_parametrized_tests
 class TestTensorinv(TestCase):
+    # [CLASS DOC] Tests for tensorinv.
     @parametrize(
         "arr, ind",
         [
@@ -2182,6 +2577,8 @@ class TestTensorinv(TestCase):
         ],
     )
     def test_non_square_handling(self, arr, ind):
+        # [FUNCTION DOC] Asserts tensorinv raises LinAlgError or RuntimeError for non-
+        #   square shapes.
         with assert_raises((LinAlgError, RuntimeError)):
             linalg.tensorinv(arr, ind=ind)
 
@@ -2194,6 +2591,8 @@ class TestTensorinv(TestCase):
         ],
     )
     def test_tensorinv_shape(self, shape, ind):
+        # [FUNCTION DOC] Checks the output shape of tensorinv equals the trailing dims
+        #   followed by the leading dims split at ind, for two docstring examples.
         a = np.eye(24).reshape(shape)
         ainv = linalg.tensorinv(a=a, ind=ind)
         expected = a.shape[ind:] + a.shape[:ind]
@@ -2208,11 +2607,15 @@ class TestTensorinv(TestCase):
         ],
     )
     def test_tensorinv_ind_limit(self, ind):
+        # [FUNCTION DOC] Asserts tensorinv with ind zero or negative raises ValueError
+        #   or RuntimeError.
         a = np.eye(24).reshape(4, 6, 8, 3)
         with assert_raises((ValueError, RuntimeError)):
             linalg.tensorinv(a=a, ind=ind)
 
     def test_tensorinv_result(self):
+        # [FUNCTION DOC] Checks the tensor inverse contracted with a vector equals the
+        #   solution from tensorsolve.
         # mimic a docstring example
         a = np.eye(24).reshape(24, 8, 3)
         ainv = linalg.tensorinv(a, ind=1)
@@ -2222,6 +2625,7 @@ class TestTensorinv(TestCase):
 
 @instantiate_parametrized_tests
 class TestTensorsolve(TestCase):
+    # [CLASS DOC] Tests for tensorsolve.
     @parametrize(
         "a, axes",
         [
@@ -2230,6 +2634,8 @@ class TestTensorsolve(TestCase):
         ],
     )
     def test_non_square_handling(self, a, axes):
+        # [FUNCTION DOC] Asserts tensorsolve raises LinAlgError or RuntimeError for
+        #   non-square shapes.
         with assert_raises((LinAlgError, RuntimeError)):
             b = np.ones(a.shape[:2])
             linalg.tensorsolve(a, b, axes=axes)
@@ -2240,6 +2646,9 @@ class TestTensorsolve(TestCase):
         [(2, 3, 6), (3, 4, 4, 3), (0, 3, 3, 0)],
     )
     def test_tensorsolve_result(self, shape):
+        # [FUNCTION DOC] For random arrays (including empty dims) solves with a ones
+        #   right-hand side and asserts contracting a with the solution gives b.
+        #   Skipped with numpy older than 1.22.
         a = np.random.randn(*shape)
         b = np.ones(a.shape[:2])
         x = np.linalg.tensorsolve(a, b)
@@ -2247,8 +2656,11 @@ class TestTensorsolve(TestCase):
 
 
 class TestMisc2(TestCase):
+    # [CLASS DOC] More miscellaneous linalg tests.
     @xpassIfTorchDynamo_np  # (reason="TODO")
     def test_unsupported_commontype(self):
+        # [FUNCTION DOC] Marked to pass leniently under dynamo. Asserts cholesky of
+        #   float16 input raises TypeError.
         # linalg gracefully handles unsupported type
         arr = np.array([[1, -2], [2, 5]], dtype="float16")
         # with assert_raises_regex(TypeError, "unsupported in linalg"):
@@ -2261,6 +2673,8 @@ class TestMisc2(TestCase):
     # @requires_memory(free_bytes=16e9)
     @skip(reason="Bad memory reports lead to OOM in ci testing")
     def test_blas64_dot(self):
+        # [FUNCTION DOC] Skipped (memory use). Would check a dot product with a 2**32
+        #   length vector returns the expected last element.
         n = 2**32
         a = np.zeros([1, n], dtype=np.float32)
         b = np.ones([1, 1], dtype=np.float32)
@@ -2273,6 +2687,9 @@ class TestMisc2(TestCase):
     #    not HAS_LAPACK64, reason="Numpy not compiled with 64-bit BLAS/LAPACK"
     # )
     def test_blas64_geqrf_lwork_smoketest(self):
+        # [FUNCTION DOC] Skipped and expected to fail (lapack-lite specific). Would
+        #   query a LAPACK QR workspace size with 64-bit sizes and check the returned
+        #   info and sizes.
         # Smoke test LAPACK geqrf lwork call with 64-bit integers
         dtype = np.float64
         lapack_routine = np.linalg.lapack_lite.dgeqrf
