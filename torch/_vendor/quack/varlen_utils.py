@@ -1,4 +1,9 @@
 # Copyright (c) 2025, Tri Dao.
+# [MODULE DOC] Variable-length (ragged batch) support for the quack GEMM kernels. Defines the
+# argument bundle holding optional cumulative sequence-length tensors and a gather index, and a
+# manager class that, per batch index, computes the per-group M or K length and slices the A, B,
+# epilogue and block-scale-factor tensors accordingly. Import-time side effects: none beyond
+# imports (the named tuple is registered through the mlir_namedtuple decorator).
 
 from typing import Optional, NamedTuple
 from dataclasses import dataclass
@@ -14,14 +19,25 @@ from .cute_dsl_utils import mlir_namedtuple
 # Grouping arguments together that should be passed to __call__
 @mlir_namedtuple
 class VarlenArguments(NamedTuple):
+    # [CLASS DOC] Named tuple grouping the optional varlen inputs passed to a GEMM call: cumulative
+    # sequence lengths along M, cumulative sequence lengths along K, and a row-gather index for A.
+    # All fields default to None (meaning the feature is disabled).
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
     mAIdx: Optional[cute.Tensor] = None
 
 
 class VarlenManager:
+    # [CLASS DOC] Compile-time-specialized helper that handles ragged (variable length) batches in
+    # a GEMM. Holds a Params object plus static M and K lengths, and the previous batch index and
+    # group-changed flag. The flags varlen_m, varlen_k and gather_A are derived from which Params
+    # fields are not None. Methods return per-batch lengths and per-batch views of tensors. It can
+    # be flattened to and rebuilt from MLIR values so it can cross jit boundaries.
     @dataclass
     class Params:
+        # [CLASS DOC] Dataclass holding the optional device tensors used by VarlenManager:
+        # cumulative sequence lengths for M and K and the gather index for A (all default None).
+        # Built from a VarlenArguments via the create static method.
         cu_seqlens_m: Optional[cute.Tensor] = None
         cu_seqlens_k: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
@@ -29,6 +45,10 @@ class VarlenManager:
         @staticmethod
         @cute.jit
         def create(args: VarlenArguments, *, loc=None, ip=None) -> "VarlenManager.Params":
+            # [FUNCTION DOC] Jit-compiled factory that copies the three tensors of a
+            # VarlenArguments (M cumulative lengths, K cumulative lengths, A gather index)
+            # into a new Params object and returns it. No validation here. The loc and ip
+            # arguments are unused.
             return VarlenManager.Params(
                 cu_seqlens_m=args.mCuSeqlensM,
                 cu_seqlens_k=args.mCuSeqlensK,
@@ -46,6 +66,11 @@ class VarlenManager:
         loc=None,
         ip=None,
     ):
+        # [FUNCTION DOC] Stores the params, static M and K lengths, last batch index and group-
+        # changed flag (defaults: minus one and true), plus loc and ip. Derives three compile-time
+        # constant flags: varlen_m if the M cumulative lengths exist, varlen_k if the K ones
+        # exist, gather_A if the A gather index exists. Does not check that varlen_m and varlen_k
+        # are not both set.
         self.params = params
         self._len_m_static = len_m_static
         self._len_k_static = len_k_static
@@ -59,6 +84,9 @@ class VarlenManager:
 
     @staticmethod
     def to_underlying_arguments(args: VarlenArguments, *, loc=None, ip=None) -> Params:
+        # [FUNCTION DOC] Converts VarlenArguments to a Params object. Raises AssertionError if both
+        # the M and K cumulative-length tensors are provided (only one varlen mode is supported).
+        # Returns the Params built by Params.create.
         assert not (args.mCuSeqlensM is not None and args.mCuSeqlensK is not None), (
             "Only support either varlen_m or varlen_k"
         )
@@ -74,21 +102,32 @@ class VarlenManager:
         loc=None,
         ip=None,
     ) -> "VarlenManager":
+        # [FUNCTION DOC] Jit-compiled factory returning a new VarlenManager from params and the
+        # static M and K lengths. The loc and ip arguments are accepted but not forwarded.
         return VarlenManager(params, len_m_static=len_m_static, len_k_static=len_k_static)
 
     def len_m(self, batch_idx: Int32) -> Int32:
+        # [FUNCTION DOC] Returns the M extent for a batch: the difference of adjacent entries of
+        # the M cumulative-length tensor when varlen_m is enabled, otherwise the static M length.
         if const_expr(self.varlen_m):
             return self.params.cu_seqlens_m[batch_idx + 1] - self.params.cu_seqlens_m[batch_idx]
         else:
             return self._len_m_static
 
     def len_k(self, batch_idx: Int32) -> Int32:
+        # [FUNCTION DOC] Returns the K extent for a batch: the difference of adjacent entries of
+        # the K cumulative-length tensor when varlen_k is enabled, otherwise the static K length.
         if const_expr(self.varlen_k):
             return self.params.cu_seqlens_k[batch_idx + 1] - self.params.cu_seqlens_k[batch_idx]
         else:
             return self._len_k_static
 
     def offset_batch_A(self, mA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
+        # [FUNCTION DOC] Returns the 2D (M, K) view of tensor A for one batch. With varlen_m,
+        # shifts the M origin by the batch's cumulative M offset. With varlen_k, shifts the K
+        # origin by the K offset when the tensor has rank 2; for higher rank it builds a ragged
+        # tensor through copy_utils.offset_ragged_tensor on dimension 1 (pointer shifted only when
+        # rank is 3). Without varlen, selects the batch index along the last mode.
         params = self.params
         if const_expr(self.varlen_m):
             mA_mk = cute.domain_offset((params.cu_seqlens_m[batch_idx], None), mA_mkl)
@@ -113,6 +152,9 @@ class VarlenManager:
         return mA_mk
 
     def offset_batch_AIdx(self, batch_idx: Int32) -> cute.Tensor:
+        # [FUNCTION DOC] Returns the per-batch slice of the A gather-index tensor: offset by the
+        # batch's cumulative M offset (varlen_m) or K offset (varlen_k), otherwise the column
+        # selected by the batch index in the 2D index tensor.
         params = self.params
         if const_expr(self.varlen_m):
             mAIdx_mk = cute.domain_offset((params.cu_seqlens_m[batch_idx],), params.mAIdx)
@@ -123,6 +165,10 @@ class VarlenManager:
         return mAIdx_mk
 
     def offset_batch_SFA(self, mSFA_mkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
+        # [FUNCTION DOC] Returns the batch view of the block scale-factor tensor for A. For
+        # varlen_m or varlen_k the offset is the cumulative length divided by 128 (integer
+        # division) plus the batch index, applied as a tile-unit shift on the M (resp. K) mode via
+        # a compound coordinate; otherwise selects the batch index along the last mode.
         """Offset SFA by padded per-expert offset (dQaccum-style).
 
         The padded offset, in tile units (128 source-M or source-K per tile),
@@ -144,6 +190,10 @@ class VarlenManager:
             return mSFA_mkl[None, None, batch_idx]
 
     def offset_batch_SFB(self, mSFB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
+        # [FUNCTION DOC] Returns the batch view of the block scale-factor tensor for B. Only
+        # varlen_k shifts it (tile-unit offset of cumulative K length divided by 128 plus
+        # batch index on the K mode); in all other cases it simply selects the batch index
+        # along the last mode.
         """Offset SFB by padded per-expert K offset (varlen_k only)."""
         params = self.params
         tile = 128
@@ -154,6 +204,10 @@ class VarlenManager:
             return mSFB_nkl[None, None, batch_idx]
 
     def offset_batch_B(self, mB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
+        # [FUNCTION DOC] Returns the 2D (N, K) view of tensor B for one batch. Only varlen_k
+        # changes behavior: rank-2 tensors get a K-origin shift, higher-rank ones go through
+        # copy_utils.offset_ragged_tensor on dimension 1 (pointer shift only for rank 3). Otherwise
+        # selects the batch index along the last mode.
         params = self.params
         if const_expr(self.varlen_k):
             offset = params.cu_seqlens_k[batch_idx]
@@ -175,6 +229,10 @@ class VarlenManager:
         return mB_nk
 
     def offset_batch_epi(self, mD_mnl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
+        # [FUNCTION DOC] Returns the 2D (M, N) view of an epilogue tensor (such as the output) for
+        # one batch. Only varlen_m changes behavior: rank-2 tensors get an M-origin shift, higher-
+        # rank ones go through copy_utils.offset_ragged_tensor on dimension 0 (pointer shift only
+        # for rank 3). Otherwise selects the batch index along the last mode.
         params = self.params
         if const_expr(self.varlen_m):
             offset = params.cu_seqlens_m[batch_idx]
@@ -196,6 +254,9 @@ class VarlenManager:
         return mD_mn
 
     def __extract_mlir_values__(self):
+        # [FUNCTION DOC] Flattens params and the four scalar fields into one list of MLIR values
+        # and returns it. Side effect: records on the instance how many values each member
+        # contributed (stored in _values_pos) so they can be split again later.
         values, self._values_pos = [], []
         for obj in [
             self.params,
@@ -210,6 +271,9 @@ class VarlenManager:
         return values
 
     def __new_from_mlir_values__(self, values):
+        # [FUNCTION DOC] Rebuilds a VarlenManager from a flat list of MLIR values, splitting it
+        # using the per-member counts saved by the extract method (so that must have been called
+        # first on this instance). Returns a new instance of the same class, passing the saved loc.
         obj_list = []
         for obj, n_items in zip(
             [

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Internal implementation of the legacy vmap API on top of batched tensors. Holds
+# helpers to validate in_dims and outputs, wrap inputs as batched tensors at a nesting level,
+# and unwrap the results into the requested output dims, plus the deprecated public vmap and
+# the internal _vmap wrapper. Import-time side effects: defines type aliases only.
 import functools
 from collections.abc import Callable
 from typing import Any
@@ -18,6 +22,9 @@ def _validate_and_get_batch_size(
     flat_in_dims: list[int | None],
     flat_args: list,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Returns the common size of the mapped dimension over all arguments
+    # whose in_dim is not None. Raises ValueError if the sizes differ. Note: if every in_dim is
+    # None the list is empty and an IndexError results rather than a clear error.
     batch_sizes = [
         arg.size(in_dim)
         for in_dim, arg in zip(flat_in_dims, flat_args)
@@ -32,6 +39,7 @@ def _validate_and_get_batch_size(
 
 
 def _num_outputs(batched_outputs: Tensor | tuple[Tensor, ...]) -> int:
+    # [FUNCTION DOC] HELPER: Returns the number of outputs: tuple length if a tuple, otherwise one.
     if isinstance(batched_outputs, tuple):
         return len(batched_outputs)
     return 1
@@ -44,6 +52,9 @@ def _as_tuple(
     num_elements: int,
     error_message_lambda: Callable[[], str],
 ) -> tuple:
+    # [FUNCTION DOC] HELPER: If value is not a tuple, returns a tuple repeating it num_elements
+    # times. If it is a tuple of the wrong length, raises ValueError with the message produced by
+    # the supplied callable. Otherwise returns it unchanged.
     if not isinstance(value, tuple):
         return (value,) * num_elements
     if len(value) != num_elements:
@@ -59,6 +70,11 @@ def _create_batched_inputs(
     vmap_level: int,
     func: Callable,
 ) -> tuple[tuple, int]:
+    # [FUNCTION DOC] HELPER: Validates in_dims against the flattened inputs and wraps each mapped
+    # tensor with a batch dimension at the given vmap level. Raises ValueError for: in_dims not an
+    # int or tuple, no inputs, structure mismatch between in_dims and inputs, a non-int non-None
+    # entry, an int entry for a non-Tensor input, or an out-of-range dimension. Returns the
+    # re-nested inputs and the batch size.
     if not isinstance(in_dims, int) and not isinstance(in_dims, tuple):
         raise ValueError(
             f"vmap({_get_name(func)}, in_dims={in_dims}, ...)(<inputs>): "
@@ -122,6 +138,10 @@ def _unwrap_batched(
     func: Callable,
     allow_none_pass_through: bool = False,
 ) -> tuple:
+    # [FUNCTION DOC] HELPER: Removes the batch dimension of the given level from each output
+    # tensor, placing it at the requested out dim (out_dims is broadcast to a per-output tuple,
+    # raising ValueError on length mismatch). A single tensor output returns a tensor; otherwise
+    # returns a tuple. When allow_none_pass_through is true, None entries are kept as None.
     num_outputs = _num_outputs(batched_outputs)
     out_dims_as_tuple = _as_tuple(
         out_dims,
@@ -157,6 +177,8 @@ def _unwrap_batched(
 # so we are effectively checking that `outputs` is a single Tensor or a tuple of
 # Tensors.
 def _validate_outputs(outputs: Any, func: Callable) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError unless outputs is a Tensor or a tuple made only of
+    # Tensors; the message names the function and the offending type or index.
     if isinstance(outputs, Tensor):
         return
     if not isinstance(outputs, tuple):
@@ -174,6 +196,7 @@ def _validate_outputs(outputs: Any, func: Callable) -> None:
 
 
 def _check_out_dims_is_int_or_int_tuple(out_dims: out_dims_t, func: Callable) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError unless out_dims is an int or a tuple of ints.
     if isinstance(out_dims, int):
         return
     if not isinstance(out_dims, tuple) or not all(
@@ -187,6 +210,8 @@ def _check_out_dims_is_int_or_int_tuple(out_dims: out_dims_t, func: Callable) ->
 
 
 def _get_name(func: Callable):
+    # [FUNCTION DOC] HELPER: Returns the callable's name attribute if present, else its repr
+    # (partials and modules lack a name).
     if hasattr(func, "__name__"):
         return func.__name__
 
@@ -204,6 +229,8 @@ def _get_name(func: Callable):
     category=FutureWarning,
 )
 def vmap(func: Callable, in_dims: in_dims_t = 0, out_dims: out_dims_t = 0) -> Callable:
+    # [FUNCTION DOC] Deprecated public entry point (emits a FutureWarning through the decorator).
+    # Simply forwards to _vmap with the same func, in_dims and out_dims and returns the wrapper.
     """
     Please use torch.vmap instead of this API.
     """
@@ -217,12 +244,21 @@ def _vmap(
     out_dims: out_dims_t = 0,
     allow_none_pass_through: bool = False,
 ) -> Callable:
+    # [FUNCTION DOC] Returns a wrapper of func that runs it on batched inputs. The wrapper
+    # validates out_dims, increments the vmap nesting level, batches the inputs, calls func,
+    # validates outputs (skipped if allow_none_pass_through), and returns the unwrapped
+    # outputs. The nesting level is always decremented in a finally clause. When
+    # allow_none_pass_through is set, None outputs are let through (used for autograd grad
+    # calls with unused inputs).
     # The `allow_none_pass_through` argument is a temporary workaround may be removed.
     # Currently it enables us to wrap the call in `autograd.grad` to the autograd engine,
     # which may return None if any of the inputs are unused. See the issue discussing this:
     # https://github.com/pytorch/functorch/issues/159.
     @functools.wraps(func)
     def wrapped(*args):
+        # [FUNCTION DOC] HELPER: The wrapper returned by _vmap; takes positional args only. See the
+        # enclosing function for the sequence of steps. Propagates ValueError from validation and
+        # any error from func; metadata is copied from func by functools.wraps.
         _check_out_dims_is_int_or_int_tuple(out_dims, func)
         vmap_level = torch._C._vmapmode_increment_nesting()
         try:

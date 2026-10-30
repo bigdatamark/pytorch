@@ -21,6 +21,13 @@
 # data = urllib.request.urlopen('https://download.pytorch.org/models/resnet50-0676ba61.pth').read()
 # buf = io.BytesIO(data)
 # weights = torch.load(buf, weights_only = True)
+# [MODULE DOC] Restricted pickle reader used by torch.load when only weights are wanted. It
+# implements a subset of the pickle virtual machine and refuses anything not on an allowlist:
+# global lookups come from a built-in table (tensor rebuild helpers, dtypes, storage types,
+# ordered dict, counter and similar) or from a user-extensible set of safe globals. Also offers a
+# scanner listing the globals referenced by a pickle, and helpers to add, remove, clear and read
+# the user allowlist (including a context manager). Import-time side effects: creates the
+# module-level allowlist set (empty) and the blocked module name list.
 
 import functools as _functools
 import warnings
@@ -88,16 +95,20 @@ _marked_safe_globals_set: set[Callable | tuple[Callable, str]] = set()
 
 
 def _add_safe_globals(safe_globals: list[Callable | tuple[Callable, str]]):
+    # [FUNCTION DOC] Adds the given callables (or pairs of callable and full path string) to the
+    # module-level user allowlist by replacing it with the union. Mutates global state.
     global _marked_safe_globals_set
     _marked_safe_globals_set = _marked_safe_globals_set.union(set(safe_globals))
 
 
 def _get_safe_globals() -> list[Callable | tuple[Callable, str]]:
+    # [FUNCTION DOC] Returns the current user allowlist as a new list (order unspecified).
     global _marked_safe_globals_set
     return list(_marked_safe_globals_set)
 
 
 def _clear_safe_globals():
+    # [FUNCTION DOC] Empties the module-level user allowlist (rebinds it to a new empty set).
     global _marked_safe_globals_set
     _marked_safe_globals_set = set()
 
@@ -105,18 +116,28 @@ def _clear_safe_globals():
 def _remove_safe_globals(
     globals_to_remove: list[Callable | tuple[Callable, str]],
 ):
+    # [FUNCTION DOC] Removes the given entries from the module-level user allowlist (entries not
+    # present are ignored). Mutates global state.
     global _marked_safe_globals_set
     _marked_safe_globals_set = _marked_safe_globals_set - set(globals_to_remove)
 
 
 class _safe_globals:
+    # [CLASS DOC] Context manager that temporarily allowlists the given globals: on entry adds them
+    # to the user allowlist, on exit removes them. Note exit removes every entry given, including
+    # ones that were already allowlisted before entry. Does not suppress exceptions.
     def __init__(self, safe_globals: list[Callable | tuple[Callable, str]]):
+        # [FUNCTION DOC] Stores the list of globals (callables or callable-and-path
+        # pairs) to allowlist.
         self.safe_globals = safe_globals
 
     def __enter__(self):
+        # [FUNCTION DOC] Adds the stored globals to the user allowlist. Returns None.
         _add_safe_globals(self.safe_globals)
 
     def __exit__(self, type, value, tb):
+        # [FUNCTION DOC] Removes the stored globals from the user allowlist; the exception
+        # arguments are ignored.
         _remove_safe_globals(self.safe_globals)
 
 
@@ -128,6 +149,11 @@ class _safe_globals:
 # the dynamic additions to safe_globals would not be picked up by
 # _get_allowed_globals due to the lru_cache
 def _get_user_allowed_globals():
+    # [FUNCTION DOC] Builds a mapping from full dotted name to object for the user allowlist
+    # entries. A pair entry must have exactly two items (raises ValueError otherwise) and its
+    # second item must be a string (raises TypeError otherwise); the name is that string. A plain
+    # entry is keyed by module name plus qualified name. Recomputed on every call so later
+    # additions are seen (unlike the cached built-in table).
     rc: dict[str, Any] = {}
     for f in _marked_safe_globals_set:
         if isinstance(f, tuple):
@@ -148,6 +174,9 @@ def _get_user_allowed_globals():
 
 
 def _tensor_rebuild_functions():
+    # [FUNCTION DOC] Returns the set of tensor rebuild functions from torch._utils (parameter,
+    # quantized, regular, sparse, meta, nested, wrapper subclass and device-from-numpy or
+    # device-from-cpu-tensor variants) that are considered safe to call during unpickling.
     return {
         torch._utils._rebuild_parameter,
         torch._utils._rebuild_parameter_with_state,
@@ -172,6 +201,12 @@ def _tensor_rebuild_functions():
 # Unpickling machinery
 @_functools.lru_cache(maxsize=1)
 def _get_allowed_globals():
+    # [FUNCTION DOC] Builds (once, cached with a single-entry cache) the mapping from dotted name
+    # to object that unpickling may reference by default: ordered dict, counter, parameter, layout
+    # helper, size, tensor, device, byte-encoding helper, a few builtin types, all dtypes by their
+    # string form (including extra small int and uint types), tensor classes, storage classes
+    # (legacy ones wrapped in a placeholder storage type), quantization schemes, rebuild functions
+    # and the tensor-subclass rebuild function. Returns the mapping.
     rc: dict[str, Any] = {
         "collections.OrderedDict": OrderedDict,
         "collections.Counter": Counter,
@@ -228,6 +263,10 @@ def _get_allowed_globals():
 
 
 def _read_global_instruction(readline: Callable) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Reads the two text lines that follow a global opcode (module then
+    # name), dropping the trailing newline character of each and decoding as utf-8. Maps old
+    # Python 2 names to Python 3 ones using the name mapping first, else the module mapping.
+    # Returns the pair.
     module = readline()[:-1].decode("utf-8")
     name = readline()[:-1].decode("utf-8")
     # Patch since torch.save default protocol is 2
@@ -240,6 +279,11 @@ def _read_global_instruction(readline: Callable) -> tuple[str, str]:
 
 
 def get_globals_in_pkl(file) -> set[str]:
+    # [FUNCTION DOC] Scans a pickle stream without executing it and returns the set of dotted names
+    # of all global opcodes found. Uses a table of opcodes with fixed argument sizes to skip data,
+    # handles variable-length unicode and string opcodes, accepts the protocol marker, and stops at
+    # the stop opcode. Raises EOFError at end of data, UnpicklingError for strings too long or for
+    # any opcode outside the supported set (for example stack-based global lookup).
     globals_in_checkpoint = set()
     read = file.read
     readline = file.readline
@@ -305,7 +349,14 @@ def get_globals_in_pkl(file) -> set[str]:
 
 
 class Unpickler:
+    # [CLASS DOC] Restricted pickle interpreter. State: encoding used for short byte strings,
+    # bound read and readline functions of the input file, a memo mapping index to object, the
+    # protocol number seen (initially minus one), and during loading a value stack and a stack of
+    # saved stacks (used for mark handling). Only an allowlisted opcode subset is run; unsupported
+    # globals, object creation, reduce or build targets raise UnpicklingError. Main entry is load.
     def __init__(self, file, *, encoding: str = "bytes"):
+        # [FUNCTION DOC] Stores the file's read and readline methods, the encoding (default bytes),
+        # an empty memo and protocol number minus one. The value stacks are created later by load.
         self.encoding = encoding
         self.readline = file.readline
         self.read = file.read
@@ -313,6 +364,15 @@ class Unpickler:
         self.proto: int = -1
 
     def load(self):
+        # [FUNCTION DOC] Runs the opcode loop and returns the unpickled object when the stop opcode
+        # is reached. Resets the value stack and mark stack on each call. Raises EOFError at end of
+        # data and UnpicklingError for: globals in blocked modules or not allowlisted (with hints
+        # for nested tensors and distributed tensors), object creation or reduce on non-allowlisted
+        # callables, build on non-allowlisted types, set-item or append on disallowed containers,
+        # bad persistent ids, too long strings, or unknown opcodes. Appends are limited to lists,
+        # item assignment to dict-like types, and persistent ids to storage ones (delegated to
+        # persistent_load). Warns if the pickle protocol is not 2. Side effect: sparse tensors
+        # created are queued for later validation.
         """Read a pickled object representation from the open file.
 
         Return the reconstituted object hierarchy specified in the file.
@@ -564,12 +624,17 @@ class Unpickler:
 
     # Return a list of items pushed in the stack after last MARK instruction.
     def pop_mark(self):
+        # [FUNCTION DOC] Pops the current stack (items since the last mark) and restores the saved
+        # outer stack, rebinding the append shortcut. Returns the popped items. Raises IndexError
+        # if no mark was pushed.
         items = self.stack
         self.stack = self.metastack.pop()
         self.append = self.stack.append
         return items
 
     def _check_set_item_target(self, opcode: str):
+        # [FUNCTION DOC] HELPER: Raises UnpicklingError unless the object on top of the stack is
+        # exactly a dict, ordered dict or counter; the opcode name is used in the message.
         if type(self.stack[-1]) not in [dict, OrderedDict, Counter]:
             raise UnpicklingError(
                 f"Can only {opcode} for dict, collections.OrderedDict, "
@@ -577,6 +642,8 @@ class Unpickler:
             )
 
     def _check_append_target(self, list_obj):
+        # [FUNCTION DOC] HELPER: Raises UnpicklingError unless the object is exactly a list, or an
+        # instance of a list subclass that was allowlisted by the user.
         # list subclasses allowlisted via add_safe_globals can be appended to
         # (e.g. traceback.StackSummary); plain list is always allowed
         if type(list_obj) is not list and not (
@@ -586,8 +653,12 @@ class Unpickler:
             raise UnpicklingError(f"Can only append to lists, but got {type(list_obj)}")
 
     def persistent_load(self, pid):
+        # [FUNCTION DOC] Always raises UnpicklingError; subclasses are expected to override it to
+        # resolve persistent ids (loading storages). The base class refuses persistent loading.
         raise UnpicklingError("unsupported persistent id encountered")
 
 
 def load(file, *, encoding: str = "ASCII"):
+    # [FUNCTION DOC] Convenience function: builds a restricted Unpickler on the open file with the
+    # given encoding (default ASCII, unlike the class default) and returns the loaded object.
     return Unpickler(file, encoding=encoding).load()
