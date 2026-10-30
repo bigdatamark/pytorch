@@ -1,4 +1,9 @@
 # Owner(s): ["module: tests"]
+# [MODULE DOC] Regression repros for bugs found by the torch fuzzer.
+# Each test builds a random-looking function, runs it eagerly with backward, then compiles
+# it with full graph and dynamic shapes and runs forward and backward again. All tests are
+# marked expected-failure with the GitHub issue number; a test that starts passing means the
+# bug was fixed. Most need a CUDA device (tensors are created there).
 """
 Fuzzer-discovered eager/compile divergence test cases.
 
@@ -16,9 +21,15 @@ from torch.testing._internal.common_utils import run_tests, skipIfRocm, TestCase
 
 
 class TestFuzzerCompileIssues(TestCase):
+    # [CLASS DOC] Collection of expected-failure compile repros from the fuzzer.
+    # setUp enables global dynamo and inductor flags shared by all cases; each test method
+    # seeds the RNG, defines a function foo, and compares eager versus compiled execution.
     """Test cases for fuzzer-discovered eager/compile divergence issues."""
 
     def setUp(self):
+        # [FUNCTION DOC] Per-test setup: call the base setUp, then turn on dynamo scalar output
+        # capture and dynamic-output-shape capture, and inductor precision-cast emulation.
+        # These config assignments are global and are not reset here.
         """Configure common test settings."""
         super().setUp()
         torch._dynamo.config.capture_scalar_outputs = True
@@ -27,9 +38,16 @@ class TestFuzzerCompileIssues(TestCase):
 
     @pytest.mark.xfail(reason="Issue #164484")
     def test_fuzzer_issue_164484(self):
+        # [FUNCTION DOC] Repro for issue 164484 (bfloat16 matmul, concat, layer norm).
+        # Seeds the RNG, runs eager forward and backward on CUDA inputs, then the compiled version.
+        # Expected to fail (xfail) until the compile bug is fixed.
         torch.manual_seed(9157)
 
         def foo(arg0, arg1, arg2, arg3):
+            # [FUNCTION DOC] HELPER: Fuzzer-generated graph for issue 164484.
+            # Builds constant tensors, a matmul with the first argument, concatenates along dim 1,
+            # subtracts the second argument, adds relu and layer-norm terms, then adds both scalar
+            # arguments. Returns the resulting tensor.
             var_node_2 = torch.full((14, 16), 1.158473253250122, dtype=torch.float32)
             var_node_1 = torch.nn.functional.relu(var_node_2)
             var_node_6 = torch.full((14, 1), -0.94140625, dtype=torch.bfloat16)
@@ -75,9 +93,15 @@ class TestFuzzerCompileIssues(TestCase):
     @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/170259")
     @pytest.mark.xfail(reason="Issue #164185")
     def test_fuzzer_issue_164185(self):
+        # [FUNCTION DOC] Repro for issue 164185 (embedding plus nested pow, big bfloat16).
+        # Skipped on ROCm. Runs eager forward/backward then compiled; expected to fail (xfail).
         torch.manual_seed(0)
 
         def foo(arg0, arg1, arg2):
+            # [FUNCTION DOC] HELPER: Fuzzer-generated graph for issue 164185.
+            # Takes the row mean of the first argument, looks up an embedding row chosen by a
+            # clamped scalar index in the third argument, raises values to nested powers, and
+            # reshapes the result into a three dimensional output.
             t0 = arg0  # size=(349200, 5), stride=(5, 1), dtype=bfloat16, device=cuda
             t1 = t0.mean(
                 dim=1
@@ -110,9 +134,16 @@ class TestFuzzerCompileIssues(TestCase):
 
     @pytest.mark.xfail(reason="Issue #164157")
     def test_fuzzer_issue_164157(self):
+        # [FUNCTION DOC] Repro for issue 164157 (scalar item fill, std, embedding on float16).
+        # Runs eager forward/backward then compiled; expected to fail (xfail).
         torch.manual_seed(0)
 
         def foo(arg0, arg1, arg2, arg3, arg4, arg5):
+            # [FUNCTION DOC] HELPER: Fuzzer-generated graph for issue 164157.
+            # Clones a tanh result, fills it with a scalar taken from a product of two scalar
+            # tensors, concatenates three float16 inputs, takes std over the last dim, then
+            # gathers rows of that result with an embedding lookup using clamped indices.
+            # Returns the lookup.
             t0 = arg0  # size=(47,), stride=(1,), dtype=int64, device=cuda
             t1 = torch.tanh(t0)  # size=(47,), stride=(1,), dtype=int64, device=cuda
             t2 = arg1  # size=(), stride=(), dtype=int64, device=cuda
@@ -160,9 +191,14 @@ class TestFuzzerCompileIssues(TestCase):
 
     @pytest.mark.xfail(reason="Issue #164428")
     def test_fuzzer_issue_164428_already_exists(self):
+        # [FUNCTION DOC] Repro for issue 164428 (float64 div, flatten, matmul, subtraction).
+        # Runs eager forward/backward then compiled; expected to fail (xfail).
         torch.manual_seed(6804)
 
         def foo(arg0, arg1, arg2):
+            # [FUNCTION DOC] HELPER: Fuzzer-generated graph for issue 164428.
+            # Divides the first argument by a constant, flattens it, and subtracts a vector built
+            # from a constant times the second argument minus the third. Returns the difference.
             var_node_4 = (
                 arg0  # size=(7, 1, 32), stride=(1, 1, 0), dtype=float64, device=cuda
             )
@@ -198,9 +234,14 @@ class TestFuzzerCompileIssues(TestCase):
 
     @pytest.mark.xfail(reason="Issue #163894")
     def test_fuzzer_issue_163894(self):
+        # [FUNCTION DOC] Repro for issue 163894 (mixed int dtype arithmetic and empty nonzero).
+        # Runs eager forward/backward then compiled; expected to fail (xfail).
         torch.manual_seed(9)
 
         def foo(arg0):
+            # [FUNCTION DOC] HELPER: Fuzzer-generated graph for issue 163894.
+            # Adds int32 and int64 constants, multiplies by another constant, and adds the
+            # nonzero of an all-false mask (a zero tensor if empty). Returns it as float.
             var_node_1 = arg0  # size=(1, 2), stride=(2, 1), dtype=int64, device=cuda  # noqa: F841
             var_node_5 = torch.full(
                 (1, 2), -66, dtype=torch.int32
@@ -241,9 +282,14 @@ class TestFuzzerCompileIssues(TestCase):
 
     @pytest.mark.xfail(reason="Issue #164486")
     def test_fuzzer_issue_164486(self):
+        # [FUNCTION DOC] Repro for issue 164486 (int16 add and divide with squeeze).
+        # Runs eager forward/backward then compiled; expected to fail (xfail).
         torch.manual_seed(238)
 
         def foo(arg0):
+            # [FUNCTION DOC] HELPER: Fuzzer-generated graph for issue 164486.
+            # Adds a constant int16 scalar to the argument, divides by a squeezed constant, and
+            # returns the quotient converted to float.
             var_node_2 = torch.full(
                 (), 1, dtype=torch.int16
             )  # size=(), stride=(), dtype=int16, device=cuda
