@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the statically launched Triton kernel machinery in Inductor: the CUDA and
+# XPU static launcher classes, the fast CUDA launcher C extension, and their integration with
+# torch.compile and the autotuner. Unit tests use fake objects; GPU tests compile hand-written
+# Triton kernels, dump their binaries to temporary files, and run them through the static
+# launcher. On XPU with Triton, the JIT kernel launcher lookup is patched at test setup so native
+# code is generated.
 import gc
 import os
 import random
@@ -38,9 +44,14 @@ if HAS_XPU_AND_TRITON:
 
 
 def _patched_getitem(self, grid):
+    # [FUNCTION DOC] HELPER: Wraps the original JIT function grid lookup for XPU: returns a
+    # launcher that defaults the generate_native_code keyword to true before delegating to the
+    # original launcher.
     orig_launcher = _orig_getitem(self, grid)
 
     def launcher_with_native_code(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Inner launcher: sets the generate_native_code keyword default to
+        # true and forwards all arguments to the original launcher, returning its result.
         kwargs.setdefault("generate_native_code", True)
         return orig_launcher(*args, **kwargs)
 
@@ -48,13 +59,26 @@ def _patched_getitem(self, grid):
 
 
 class TestStaticTritonLauncherUnit(TestCase):
+    # [CLASS DOC] CPU-capable unit tests with fake objects for the XPU kernel loader, the fast
+    # launcher builder, load device resolution and cubin retention at caching time.
     def test_xpu_load_kernel_uses_existing_three_tuple_abi(self):
+        # [FUNCTION DOC] Builds an XPU static kernel object without running its constructor, sets
+        # its fields by hand and calls load_kernel with device 3. Checks the fake C implementation
+        # was called with path, name, shared memory and device, that the function, register and
+        # spill counts are taken from the returned three-tuple, that module, cubin path and raw
+        # cubin are cleared, and that close resets function and module.
         load_calls = []
         kernel_capsule = object()
 
         class FakeImpl:
+            # [CLASS DOC] HELPER: Fake C implementation holder whose kernel loader records its
+            # arguments and returns a capsule object with fixed register and spill counts of 7 and
+            # 11.
             @staticmethod
             def _load_kernel(path, name, shared, device):
+                # [FUNCTION DOC] HELPER: Records the path, name, shared size and device in the
+                # enclosing list and returns the kernel capsule with register count 7 and spill
+                # count 11.
                 load_calls.append((path, name, shared, device))
                 return kernel_capsule, 7, 11
 
@@ -85,6 +109,12 @@ class TestStaticTritonLauncherUnit(TestCase):
         self.assertIsNone(launcher.module)
 
     def test_fast_launcher_keeps_kernel_owner_alive(self):
+        # [FUNCTION DOC] Verifies that building a fast launcher keeps the owning static kernel
+        # alive. It builds a fake CUDA kernel and a launcher whose runner global refers to the
+        # kernel run method, builds the fast launcher with a fake fast launcher class, then checks
+        # the owner is stored on the fast launcher, the bound method is no longer in its globals,
+        # the kernel survives garbage collection while the fast launcher exists, and is collected
+        # after it is deleted.
         """
         _build_fast_launcher bakes kernel.function into a _FastCudaLauncher and
         replaces the "runner" global, dropping the launcher's only reference to
@@ -95,7 +125,11 @@ class TestStaticTritonLauncherUnit(TestCase):
         import types
 
         class FakeFastLauncher:
+            # [CLASS DOC] HELPER: Fake replacement for the fast CUDA launcher class that just
+            # stores the function handle it is constructed with.
             def __init__(self, func, num_warps, shared, arg_tys, n_scratch):
+                # [FUNCTION DOC] HELPER: Stores the function argument; the other arguments are
+                # accepted and ignored.
                 self.func = func
 
         kernel = object.__new__(StaticallyLaunchedCudaKernel)
@@ -109,6 +143,8 @@ class TestStaticTritonLauncherUnit(TestCase):
         launcher_globals = {"runner": kernel.run}
 
         def _launcher_body(grid_0, grid_1, grid_2, stream, *args):
+            # [FUNCTION DOC] HELPER: Launcher body used only for its code object: forwards its
+            # grid, stream and extra arguments to a global named runner. Never called directly.
             runner(grid_0, grid_1, grid_2, stream, *args)  # noqa: F821
 
         launcher = types.FunctionType(
@@ -138,6 +174,9 @@ class TestStaticTritonLauncherUnit(TestCase):
         self.assertIsNone(owner_ref())
 
     def test_resolve_load_device_cpu_stays_none(self):
+        # [FUNCTION DOC] Checks load-device resolution for CPU: resolving no device returns no
+        # device, an explicit index is returned unchanged, and the result can be used in a device
+        # guard for the CPU interface without raising.
         # CPU has no device index; its DeviceGuard is a no-op. Resolving its None to a
         # concrete index makes the guard call exchange_device, which CPU does not
         # implement, breaking the triton CPU backend's _make_launchers.
@@ -153,6 +192,10 @@ class TestStaticTritonLauncherUnit(TestCase):
 
     @staticmethod
     def _autotuner_with_static_cubin(cubin_raw):
+        # [FUNCTION DOC] HELPER: Static helper that builds a caching autotuner and a static
+        # compile result without running constructors. The result's kernel is a simple namespace
+        # holding the given raw cubin, and the autotuner's compile results list holds that one
+        # result. Returns both.
         autotuner = object.__new__(CachingAutotuner)
         result = object.__new__(StaticTritonCompileResult)
         result.kernel = SimpleNamespace(cubin_raw=cubin_raw)
@@ -160,12 +203,16 @@ class TestStaticTritonLauncherUnit(TestCase):
         return autotuner, result
 
     def test_prepare_for_caching_drops_cubin_raw_by_default(self):
+        # [FUNCTION DOC] Checks that preparing the autotuner for caching drops the raw cubin on
+        # the kernel by default (it becomes none).
         autotuner, result = self._autotuner_with_static_cubin(b"cubin")
         autotuner.prepare_for_caching()
         self.assertIsNone(result.kernel.cubin_raw)
 
     @torch._inductor.config.patch("keep_static_cubin_raw", True)
     def test_prepare_for_caching_keeps_cubin_raw_when_configured(self):
+        # [FUNCTION DOC] Checks that with the keep_static_cubin_raw config enabled, preparing for
+        # caching leaves the raw cubin bytes unchanged.
         autotuner, result = self._autotuner_with_static_cubin(b"cubin")
         autotuner.prepare_for_caching()
         self.assertEqual(result.kernel.cubin_raw, b"cubin")
@@ -173,13 +220,21 @@ class TestStaticTritonLauncherUnit(TestCase):
 
 @requires_gpu_and_triton
 class TestStaticTritonLauncher(TestCase):
+    # [CLASS DOC] GPU tests of the static launcher: each compiles a small Triton kernel, writes
+    # its binary to a temporary file, creates a statically launched kernel from it and runs it
+    # directly with a raw stream, checking results and argument type strings. Temporary files are
+    # tracked and deleted in teardown.
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setup, resets the list of temporary files, and on XPU
+        # with Triton replaces the JIT function getitem with the patched version.
         super().setUp()
         self.tmp_files = []
         if HAS_XPU_AND_TRITON:
             JITFunction.__getitem__ = _patched_getitem
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent teardown, removes every tracked temporary file ignoring
+        # OS errors, and restores the original JIT function getitem on XPU with Triton.
         super().tearDown()
         for tmp_file in self.tmp_files:
             try:
@@ -191,6 +246,10 @@ class TestStaticTritonLauncher(TestCase):
             JITFunction.__getitem__ = _orig_getitem
 
     def write_cubin_to_tmp(self, kernel: CompiledKernel) -> str:
+        # [FUNCTION DOC] HELPER: Writes the compiled kernel's binary (cubin, hsaco on ROCm, or
+        # zebin on XPU) from its assembly dictionary into a new temporary file, tracks the file
+        # for cleanup and returns its name. Returns nothing if the kernel already has a cubin path
+        # attribute.
         """
         Only used for tests where we don't have a cubin path.
         """
@@ -213,6 +272,11 @@ class TestStaticTritonLauncher(TestCase):
         self,
         compiled_kernel: CompiledKernel,
     ) -> StaticallyLaunchedCudaKernel | StaticallyLaunchedXpuKernel:
+        # [FUNCTION DOC] HELPER: Builds a static launcher for a compiled kernel: writes the binary
+        # to a temp file, sets the kernel cubin path, creates the launcher for the GPU type, then
+        # clears the path and reloads the cubin from raw data to exercise that path (raises an
+        # error if no path was set), and loads the kernel on the current device. Returns the
+        # launcher.
         """
         Compiles a Triton kernel with the provided *args,
         writes its cubin to the temporary file, and returns the file path.
@@ -231,12 +295,17 @@ class TestStaticTritonLauncher(TestCase):
         return result
 
     def test_basic(self):
+        # [FUNCTION DOC] Compiles a kernel that adds a scalar to a tensor, creates a static
+        # launcher and checks the first run result, the argument type string for a pointer plus
+        # int, and a second run through the launcher with a fresh tensor.
         """Verify _FastCudaLauncher correctly launches a kernel with tensor + scalar args.
 
         Compiles a simple kernel, wraps it in _FastCudaLauncher, then invokes
         via vectorcall and checks the output tensor has the expected value.
         """
 
+        # [FUNCTION DOC] Triton kernel: loads a value from the first pointer, adds the scalar
+        # argument and stores it back.
         @triton.jit
         def simple_kernel(arg0, arg1):
             x = tl.load(arg0)
@@ -263,6 +332,11 @@ class TestStaticTritonLauncher(TestCase):
     # so I can't even use exec() to generate the test cases.
     # So we'll just make a few kernels by hand
     def test_unsigned_integers(self):
+        # [FUNCTION DOC] Triton kernel: sums its four unsigned integer arguments and adds them to
+        # the loaded value in the tensor.
+        # [FUNCTION DOC] Compiles a kernel with unsigned 8, 16, 32 and 64 bit scalar arguments on
+        # a uint64 tensor, checks the result of 200 and the argument type string for those types,
+        # then runs the launcher on a fresh tensor.
         @triton.jit
         def unsigned_integers(
             arg0, arg1: tl.uint8, arg2: tl.uint16, arg3: tl.uint32, arg4: tl.uint64
@@ -286,6 +360,10 @@ class TestStaticTritonLauncher(TestCase):
         self.assertEqual(new_arg0, arg0)
 
     def test_signed_integers(self):
+        # [FUNCTION DOC] Triton kernel: sums its four signed integer arguments and adds them to
+        # the loaded value in the tensor.
+        # [FUNCTION DOC] Same as the unsigned test for signed 8, 16, 32 and 64 bit integer scalar
+        # arguments on an int64 tensor, checking the type string and launcher results.
         @triton.jit
         def signed_integers(
             arg0, arg1: tl.int8, arg2: tl.int16, arg3: tl.int32, arg4: tl.int64
@@ -309,6 +387,10 @@ class TestStaticTritonLauncher(TestCase):
         self.assertEqual(new_arg0, arg0)
 
     def test_basic_1arg(self):
+        # [FUNCTION DOC] Triton kernel with a single pointer argument: loads a value and stores it
+        # incremented by one.
+        # [FUNCTION DOC] Compiles a kernel with a single pointer argument that increments the
+        # value, and checks static launcher results and the one-character argument type string.
         @triton.jit
         def simple_kernel_1_arg(arg0):
             x = tl.load(arg0)
@@ -333,9 +415,14 @@ class TestStaticTritonLauncher(TestCase):
         self.assertEqual(new_arg0, arg0)
 
     def test_constexpr(self):
+        # [FUNCTION DOC] Compiles a kernel with a compile-time constant argument. The constant is
+        # baked into the binary so the launcher only takes the pointer; checks the argument type
+        # string and results.
         # Constexprs are compiled directly into the cubin file,
         # so we never need to pass it to StaticCudaLauncher.
 
+        # [FUNCTION DOC] Triton kernel adding a compile-time constant to the loaded value and
+        # storing it back.
         @triton.jit
         def kernel_constexpr(arg0, CONSTANT: tl.constexpr):
             x = tl.load(arg0)
@@ -361,9 +448,15 @@ class TestStaticTritonLauncher(TestCase):
         self.assertEqual(new_arg0, arg0)
 
     def test_implied_constant(self):
+        # [FUNCTION DOC] Compiles an Inductor-generated reduction kernel whose size argument is
+        # unused and implied constant, then runs the launcher omitting that argument and checks
+        # the result against the expected boolean output buffer.
         """xnumel is unused in this kernel, but isn't explicitly marked as a constexpr"""
 
         # This kernel was generated by inductor so it has a bunch of unused arguments. We don't change it
+        # [FUNCTION DOC] Triton kernel produced by Inductor for an any-is-infinite reduction over
+        # a float tensor, writing a single boolean. Contains unused arguments on purpose and is
+        # not to be changed.
         @triton.jit
         def triton_red_fused_any_isinf_0(
             in_ptr0,
@@ -413,7 +506,10 @@ class TestStaticTritonLauncher(TestCase):
         self.assertEqual(arg1, arg2)
 
     def test_kernel_no_args(self):
+        # [FUNCTION DOC] Compiles a kernel with no arguments and runs the static launcher with no
+        # arguments to check it works.
         # Just an easy way to test incompatible number of arguments
+        # [FUNCTION DOC] Triton kernel that does nothing and takes no arguments.
         @triton.jit
         def kernel_no_op():
             pass
@@ -425,6 +521,10 @@ class TestStaticTritonLauncher(TestCase):
         launcher.run(1, 1, 1, stream)
 
     def test_high_shared_mem(self):
+        # [FUNCTION DOC] Triton kernel: loads a value, adds a scalar and stores it back.
+        # [FUNCTION DOC] Compiles a simple kernel, sets its shared memory size to 50000 bytes to
+        # force the high shared memory path, enables the slow launch flag on the launcher, runs it
+        # and checks the result.
         @triton.jit
         def simple_kernel(arg0, arg1):
             x = tl.load(arg0)
@@ -449,6 +549,10 @@ class TestStaticTritonLauncher(TestCase):
 
     @skipIfXpu(msg="Only testing CUDA OOM behavior")
     def test_too_high_shared_mem(self):
+        # [FUNCTION DOC] Triton kernel: loads a value, adds a scalar and stores it back.
+        # [FUNCTION DOC] Sets the kernel's shared memory to an absurdly large number and checks
+        # that creating the launcher raises a RuntimeError mentioning the kernel is out of
+        # resource. Skipped on XPU.
         @triton.jit
         def simple_kernel(arg0, arg1):
             x = tl.load(arg0)
@@ -468,6 +572,9 @@ class TestStaticTritonLauncher(TestCase):
         )
 
     def test_kernel_empty_tensor(self):
+        # [FUNCTION DOC] Runs an Inductor-style concatenation kernel on an empty first input and a
+        # 20 element second input, with the first size argument zero, through the static launcher
+        # and checks the output equals a second run's output.
         # Triton kernel generated by torch.compile of the following:
         # @torch.compile()
         # def foo(x, y):
@@ -478,6 +585,8 @@ class TestStaticTritonLauncher(TestCase):
         # x = torch.rand(0, device=GPU_TYPE)
         # y = torch.rand(20, device=GPU_TYPE)
 
+        # [FUNCTION DOC] Triton kernel generated for concatenating a scaled first input and an
+        # offset second input into one output, with masks that handle an empty first input.
         @triton.jit
         def triton_poi_fused_cat_0(
             in_ptr0, in_ptr1, out_ptr0, ks0, xnumel, XBLOCK: tl.constexpr
@@ -528,6 +637,9 @@ class TestStaticTritonLauncher(TestCase):
         self.assertEqual(buf0, buf1)
 
     def test_kernel_many_args(self):
+        # [FUNCTION DOC] Generates source for a Triton kernel with 200 scalar arguments that sum
+        # into a tensor, loads it through the code cache, compiles it with random values and
+        # checks that the static launcher gives the same result on a fresh buffer.
         N = 200
         # Make 200 arguments
         args = [f"arg_{i}" for i in range(N)]
@@ -558,6 +670,10 @@ def kernel_many_args(out_tensor, {decl}):
         self.assertEqual(buf0, buf1)
 
     def test_launcher_keeps_module_owner_alive_until_release(self):
+        # [FUNCTION DOC] Checks that a launcher holding the bound run method of a fake static
+        # kernel keeps the owner alive until the launcher is deleted. After deleting the owner
+        # variable the owner is still alive and nothing was unloaded; after deleting the launcher
+        # the owner is collected and its module was unloaded once.
         """
         Generated launchers capture ``runner=self.kernel.run``.  That closure
         must keep the static kernel owner alive, otherwise its module could be
@@ -566,14 +682,22 @@ def kernel_many_args(out_tensor, {decl}):
         unloaded_modules = []
 
         class FakeImpl:
+            # [CLASS DOC] HELPER: Fake C implementation whose module unloader records the module
+            # handle in a list.
             @staticmethod
             def _unload_kernel(mod):
+                # [FUNCTION DOC] HELPER: Appends the unloaded module handle to the enclosing list.
                 unloaded_modules.append(mod)
 
         class FakeKernelOwner:
+            # [CLASS DOC] HELPER: Fake kernel owner borrowing the real CUDA kernel destructor and
+            # close behavior. It has a name, module and function handles, empty function and
+            # module maps and the fake implementation.
             __del__ = StaticallyLaunchedCudaKernel.__del__
 
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets the name, module handle, function handle, empty
+                # function and module maps and the fake C implementation.
                 self.name = "fake_kernel"
                 self.module = 0xC0FFEE
                 self.function = 0xF00D
@@ -582,19 +706,27 @@ def kernel_many_args(out_tensor, {decl}):
                 self.C_impl = FakeImpl
 
             def close(self):
+                # [FUNCTION DOC] HELPER: Delegates to the real static CUDA kernel close method on
+                # this object and returns its result.
                 return StaticallyLaunchedCudaKernel.close(self)
 
             def run(self, *_args, **_kwargs):
+                # [FUNCTION DOC] HELPER: Accepts any arguments and does nothing, returning none.
                 return None
 
         owner = FakeKernelOwner()
         owner_ref = weakref.ref(owner)
 
         class FakeLauncher:
+            # [CLASS DOC] HELPER: Fake launcher that stores a runner callable and calls it with a
+            # fixed grid on the given stream.
             def __init__(self, runner):
+                # [FUNCTION DOC] HELPER: Stores the runner callable.
                 self.runner = runner
 
             def __call__(self, stream):
+                # [FUNCTION DOC] HELPER: Calls the stored runner with grid 1, 1, 1 and the stream,
+                # returning its result.
                 return self.runner(1, 1, 1, stream)
 
         launcher = FakeLauncher(owner.run)
@@ -615,13 +747,17 @@ def kernel_many_args(out_tensor, {decl}):
     {"use_static_triton_launcher": True, "strict_static_triton_launcher": True}
 )
 class TestStaticTritonCompileResult(TestCase):
+    # [CLASS DOC] End to end tests with the static launcher and strict mode enabled in config:
+    # torch.compile on GPU must use the static Triton launcher or raise.
     """
     Tests static cuda launcher with torch.compile()
     """
 
     def test_basic_compile(self):
+        # [FUNCTION DOC] Compiles an addition of two tensors and checks the result.
         @torch.compile
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Adds two tensors.
             return x + y
 
         x = torch.randn(10, device=GPU_TYPE)
@@ -631,7 +767,12 @@ class TestStaticTritonCompileResult(TestCase):
     # The error gets raised on a worker, so we want to not use a separate process
     @torch._inductor.config.patch("compile_threads", 1)
     def test_incompatible_code(self):
+        # [FUNCTION DOC] Uses a user-defined Triton kernel in a compiled function and checks that
+        # strict static launching raises an Inductor error saying the kernel cannot be statically
+        # launched because it is user defined. Compile threads are forced to 1 so the error occurs
+        # in-process.
         # User defined triton kernel
+        # [FUNCTION DOC] User-defined Triton kernel adding a scalar to a loaded value in place.
         @triton.jit
         def custom_kernel(arg_0, arg_1):
             x = tl.load(arg_0)
@@ -640,6 +781,8 @@ class TestStaticTritonCompileResult(TestCase):
 
         @torch.compile
         def foo(x):
+            # [FUNCTION DOC] HELPER: Launches the user-defined kernel on the input with scalar 5
+            # and returns the input.
             custom_kernel[1,](x, 5)
             return x
 
@@ -655,7 +798,11 @@ class TestStaticTritonCompileResult(TestCase):
         {"compile_threads": 1, "static_launch_user_defined_triton_kernels": True}
     )
     def test_static_launch_user_defined_triton_kernels(self):
+        # [FUNCTION DOC] With static launching of user-defined kernels enabled, runs a compiled
+        # function that launches a user-defined kernel and checks the input is increased by 5
+        # compared to a clone.
         # User defined triton kernel
+        # [FUNCTION DOC] User-defined Triton kernel adding a scalar to a loaded value in place.
         @triton.jit
         def custom_kernel(arg_0, arg_1):
             x = tl.load(arg_0)
@@ -664,6 +811,8 @@ class TestStaticTritonCompileResult(TestCase):
 
         @torch.compile
         def foo(x):
+            # [FUNCTION DOC] HELPER: Launches the user-defined kernel on the input with scalar 5
+            # and returns the input.
             custom_kernel[1,](x, 5)
             return x
 
@@ -674,20 +823,30 @@ class TestStaticTritonCompileResult(TestCase):
     @skipIfXpu(msg="Tests CUDA static launcher dtype validation")
     @torch._inductor.config.patch({"compile_threads": 1, "fx_graph_cache": False})
     def test_custom_op_bad_fake_dtype_fails_fast(self):
+        # [FUNCTION DOC] Registers a custom op whose fake implementation reports bfloat16 but
+        # whose real output is float32, compiles a function using it and checks that a
+        # RuntimeError about the expected and actual dtype and an incorrect fake is raised.
+        # Skipped on XPU; uses one compile thread and disables the FX graph cache.
         namespace = f"test_static_launcher_dtype_validation_{random.randint(0, 2**32)}"
 
         @torch.library.custom_op(f"{namespace}::bad_meta_mul", mutates_args=())
         def bad_meta_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation returning the elementwise product of
+            # its two inputs.
             return a * b
 
         @bad_meta_mul.register_fake
         def _(a, b):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor shaped like the
+            # first input but with dtype bfloat16, which intentionally mismatches the real output
+            # dtype.
             return torch.empty_like(a, dtype=torch.bfloat16)
 
         op = getattr(torch.ops, namespace).bad_meta_mul
 
         @torch.compile(fullgraph=True)
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Applies the custom op to its two inputs and adds one.
             x = op(a, b)
             return x + 1
 
@@ -701,8 +860,12 @@ class TestStaticTritonCompileResult(TestCase):
         )
 
     def test_empty_tensor(self):
+        # [FUNCTION DOC] Compiles a concatenation with a first input of size zero marked as
+        # unbacked and checks it matches eager.
         @torch.compile()
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Concatenates four times the first input with the second input
+            # plus ten.
             return torch.cat(((x * 4), y + 10))
 
         x = torch.rand(0, device=GPU_TYPE)
@@ -712,7 +875,12 @@ class TestStaticTritonCompileResult(TestCase):
         self.assertEqual(result, torch.cat(((x * 4), y + 10)))
 
     def test_any(self):
+        # [FUNCTION DOC] Compiles a function with any and all reductions, including checks for
+        # infinite values, on float64 input, and compares to eager, then repeats after setting one
+        # element to infinity.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns four reductions: any over the last dim, whether any
+            # element is infinite, all infinite along dim 0, and all not-infinite overall.
             return (
                 x.any(-1),
                 x.isinf().any(),
@@ -731,8 +899,13 @@ class TestStaticTritonCompileResult(TestCase):
         self.assertEqual(eager_result, compiled_result)
 
     def test_disable_static_triton_launcher(self):
+        # [FUNCTION DOC] Disables the static launcher in config and checks that the static compile
+        # result's make_launcher method (replaced by a mock) is never called while the result
+        # still matches eager.
         @torch.compile
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Concatenates four times the first input with the second input
+            # plus ten.
             return torch.cat(((x * 4), y + 10))
 
         # Test that static cuda launcher is in fact disabled
@@ -753,13 +926,18 @@ class TestStaticTritonCompileResult(TestCase):
 @skipIfRocm
 @skipIfXpu
 class TestFastCudaLauncher(TestCase):
+    # [CLASS DOC] Tests of the fast CUDA launcher C extension built around a statically launched
+    # kernel. Skipped on ROCm and XPU. Tracks temporary binary files for cleanup.
     """Tests for _FastCudaLauncher vectorcall C extension."""
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setup and resets the list of temporary files.
         super().setUp()
         self.tmp_files = []
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent teardown and removes every tracked temporary file,
+        # ignoring OS errors.
         super().tearDown()
         for tmp_file in self.tmp_files:
             try:
@@ -768,6 +946,9 @@ class TestFastCudaLauncher(TestCase):
                 pass
 
     def write_cubin_to_tmp(self, kernel: CompiledKernel) -> str:
+        # [FUNCTION DOC] HELPER: Writes the kernel binary (hsaco on ROCm, otherwise cubin) into a
+        # temporary file, tracks it and returns its name; returns nothing if the kernel already
+        # has a cubin path.
         if hasattr(kernel, "_cubin_path"):
             return
         binary_key = "hsaco" if torch.version.hip else "cubin"
@@ -780,6 +961,9 @@ class TestFastCudaLauncher(TestCase):
         self,
         compiled_kernel: CompiledKernel,
     ) -> StaticallyLaunchedCudaKernel:
+        # [FUNCTION DOC] HELPER: Builds a static launcher from a compiled kernel: writes the
+        # binary, sets its path, creates the launcher, reloads the cubin from raw data (raising an
+        # error if no path was set), loads the kernel on the current device and returns it.
         cubin_file = self.write_cubin_to_tmp(compiled_kernel)
         compiled_kernel._cubin_path = cubin_file
         result = statically_launched_kernel_by_device(compiled_kernel, GPU_TYPE)
@@ -793,6 +977,9 @@ class TestFastCudaLauncher(TestCase):
         return result
 
     def _make_fast_launcher(self, kernel):
+        # [FUNCTION DOC] HELPER: Builds a fast CUDA launcher object from a static kernel: uses its
+        # function handle, warps, shared memory and argument type string, counting one scratch
+        # slot each for global and profile scratch when present.
         from torch._C import _FastCudaLauncher
 
         n_scratch = 0
@@ -805,6 +992,9 @@ class TestFastCudaLauncher(TestCase):
         )
 
     def test_basic(self):
+        # [FUNCTION DOC] Triton kernel: loads a value, adds a scalar and stores it back.
+        # [FUNCTION DOC] Verifies the fast launcher runs a kernel with a tensor and a scalar
+        # argument and writes the expected value.
         @triton.jit
         def simple_kernel(arg0, arg1):
             x = tl.load(arg0)
@@ -825,8 +1015,12 @@ class TestFastCudaLauncher(TestCase):
         )
 
     def test_multiple_tensor_args(self):
+        # [FUNCTION DOC] Verifies the fast launcher handles two input tensor pointers plus an
+        # output pointer; the output of adding 3 and 7 must be 10.
         """Verify _FastCudaLauncher handles multiple tensor pointer args correctly."""
 
+        # [FUNCTION DOC] Triton kernel adding two loaded values and storing the sum to an output
+        # pointer.
         @triton.jit
         def add_kernel(a, b, out):
             x = tl.load(a)
@@ -847,8 +1041,11 @@ class TestFastCudaLauncher(TestCase):
         self.assertEqual(out2, torch.tensor([10], dtype=torch.int32, device=GPU_TYPE))
 
     def test_zero_grid(self):
+        # [FUNCTION DOC] Verifies that launching with a zero-sized grid does nothing, leaving the
+        # target tensor unchanged.
         """Verify zero-grid launch is a no-op (kernel does not execute)."""
 
+        # [FUNCTION DOC] Triton kernel adding a scalar to a loaded value and storing it back.
         @triton.jit
         def simple_kernel(arg0, arg1):
             x = tl.load(arg0)
@@ -866,8 +1063,11 @@ class TestFastCudaLauncher(TestCase):
         self.assertEqual(target, torch.tensor([0], dtype=torch.int32, device=GPU_TYPE))
 
     def test_wrong_arg_count(self):
+        # [FUNCTION DOC] Verifies that calling the fast launcher with fewer arguments than
+        # expected raises a RuntimeError.
         """Verify _FastCudaLauncher raises RuntimeError on argument count mismatch."""
 
+        # [FUNCTION DOC] Triton kernel adding a scalar to a loaded value and storing it back.
         @triton.jit
         def simple_kernel(arg0, arg1):
             x = tl.load(arg0)
@@ -884,6 +1084,8 @@ class TestFastCudaLauncher(TestCase):
             fast(1, 1, 1, stream, arg0)  # missing arg1
 
     def test_too_many_args_raises_value_error(self):
+        # [FUNCTION DOC] Checks that constructing the fast launcher with 130 pointer arguments,
+        # above the maximum of 121 arguments, raises a ValueError.
         """Verify _FastCudaLauncher raises ValueError when nArgs > MAX_ARGS (121)."""
         from torch._C import _FastCudaLauncher
 
@@ -904,6 +1106,8 @@ class TestFastCudaLauncher(TestCase):
 )
 @skipIfRocm  # see TestFastCudaLauncher
 class TestFastCudaLauncherCompileResult(TestCase):
+    # [CLASS DOC] End to end tests that torch.compile builds the fast CUDA launcher when
+    # configured and does not when it is disabled or on XPU. Skipped on ROCm.
     """E2E tests verifying _FastCudaLauncher handling in torch.compile.
 
     CUDA tests assert both correctness (output matches eager) and that the
@@ -913,6 +1117,9 @@ class TestFastCudaLauncherCompileResult(TestCase):
     """
 
     def _patch_build_fast_launcher(self):
+        # [FUNCTION DOC] HELPER: Returns a pair: a patcher replacing the autotuner method that
+        # builds the fast launcher with a wrapper, and a list that grows by one boolean per call
+        # saying whether a launcher was returned.
         """Context manager that tracks _build_fast_launcher calls.
 
         Returns a list that accumulates True/False for each call,
@@ -924,6 +1131,8 @@ class TestFastCudaLauncherCompileResult(TestCase):
         original = CachingAutotuner._build_fast_launcher
 
         def tracking_build(autotuner_self, launcher):
+            # [FUNCTION DOC] HELPER: Calls the original build method, records whether it returned
+            # a launcher, and returns that result.
             result = original(autotuner_self, launcher)
             results.append(result is not None)
             return result
@@ -934,12 +1143,16 @@ class TestFastCudaLauncherCompileResult(TestCase):
 
     @skipIfXpu(msg="https://github.com/pytorch/pytorch/issues/181491")
     def test_basic_compile(self):
+        # [FUNCTION DOC] Compiles an addition with the build call tracked and checks the result.
+        # On XPU the build must be reached but never produce a launcher; on other devices at least
+        # one launcher must be built. Skipped on XPU for a known issue.
         """Verify torch.compile uses _FastCudaLauncher and produces correct output."""
         patcher, results = self._patch_build_fast_launcher()
         with patcher:
 
             @torch.compile
             def foo(x, y):
+                # [FUNCTION DOC] HELPER: Adds two tensors.
                 return x + y
 
             x = torch.randn(10, device=GPU_TYPE)
@@ -957,12 +1170,15 @@ class TestFastCudaLauncherCompileResult(TestCase):
                 )
 
     def test_disable_fast_launcher(self):
+        # [FUNCTION DOC] Disables the fast launcher config and checks the compiled result is
+        # correct and no fast launcher was built.
         """Verify disabling the config falls back to the regular launcher."""
         patcher, results = self._patch_build_fast_launcher()
         with patcher, torch._inductor.config.patch("use_fast_triton_launcher", False):
 
             @torch.compile
             def foo(x, y):
+                # [FUNCTION DOC] HELPER: Adds two tensors.
                 return x + y
 
             x = torch.randn(10, device=GPU_TYPE)
