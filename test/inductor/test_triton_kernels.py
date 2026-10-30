@@ -2,6 +2,14 @@
 # ruff: noqa: F841
 # flake8: noqa: E731
 # Skip do not assign a lambda expression, use a def
+# [MODULE DOC] Tests for user-defined Triton kernels under torch.compile: dynamo tracing, the
+# Triton kernel higher-order ops, inductor codegen/caching, autotuning, TMA descriptors, mutation
+# analysis, and launch options. Kernels are defined at module level inside a GPU/Triton-available
+# guard; the file also defines helper kernels, a launch-params dump context manager, and the
+# KernelTests class with its device variants.
+# Import side effects: when a GPU is available it imports triton and tl, picks the libdevice
+# fast_dividef (CUDA or XPU), and defines module-level constexpr constants and shared kernels. It
+# star-imports the shared kernels from the internal triton_utils.
 import contextlib
 import functools
 import logging
@@ -64,6 +72,10 @@ from torch.utils._triton import (
 
 @contextlib.contextmanager
 def _dump_launch_params(value: str):
+    # [FUNCTION DOC] HELPER: Context manager that sets the dump-launch-params inductor env var to
+    # the given string for its duration. When the value is 1 it removes any stale launch params
+    # file (named after the running script) before and after the body. The env var is patched via
+    # a mock that restores it on exit; the file cleanup runs in a finally block.
     launch_params_file = f"{os.path.abspath(sys.argv[0])}.launch_params"
     if value == "1" and os.path.exists(launch_params_file):
         os.remove(launch_params_file)
@@ -97,6 +109,10 @@ if HAS_GPU:
         )
 
     def _triton_get_ast_equal_to_str(params):
+        # [FUNCTION DOC] HELPER: Returns the textual form of the "equal to 1" specialization
+        # attribute for a kernel signature. If triton has the AttrsDescriptor class (newer
+        # triton) it returns a text using the attrs-dict key with the given params; otherwise
+        # (ImportError) it returns the older key spelling with the params.
         try:
             from triton.backends.compiler import AttrsDescriptor  # noqa: F401
 
@@ -117,10 +133,17 @@ if HAS_GPU:
         # Helper functions for triton kernels must be in globals.
         @triton.constexpr_function
         def log2(n):
+            # [FUNCTION DOC] HELPER: Triton constexpr function computing floor(log2) of a
+            # positive integer constant as the length of its binary string minus three. Defined
+            # at module level because helpers called from kernels must live in globals. Only
+            # defined if triton provides constexpr_function.
             return len(bin(n)) - 3
 
         _get_int_dtype_test = triton.constexpr_function(tl.core.get_int_dtype)
 
+        # [FUNCTION DOC] HELPER: Triton jit helper used by tests; reinterprets (bitcasts) a
+        # tensor to a signed integer dtype of the same bit width, with the dtype obtained from
+        # the constexpr-wrapped int-dtype lookup.
         @triton.jit
         def _dtype_helper_test(x):
             idtype = _get_int_dtype_test(
@@ -129,6 +152,9 @@ if HAS_GPU:
             return x.to(idtype, bitcast=True)
 
     # Kernel with dunder name for name-mangling regression test (issue #170398).
+    # [FUNCTION DOC] HELPER: Triton kernel elementwise-adding two input buffers into the output,
+    # masked for indices at or beyond n_elements. Its double-underscore name is deliberate: it
+    # checks that generated code does not hit class-based name mangling (issue 170398).
     @triton.jit
     def __dunder_add_kernel(
         in_ptr0,
@@ -147,12 +173,19 @@ if HAS_GPU:
         tl.store(out_ptr + offsets, output, mask=mask)
 
     def _get_backend_options_kernel(*, with_enable_fp_fusion):
+        # [FUNCTION DOC] HELPER: Factory returning a Triton add kernel. With the keyword-only
+        # flag true, the kernel takes an extra constexpr named enable_fp_fusion and computes a
+        # sum or a product depending on it (only to make the kwarg binding observable); otherwise
+        # it takes no such parameter and always adds.
         # These kernels are intentionally illustrative. `enable_fp_fusion` is a
         # real backend option name, but the branch below only makes the kwarg's
         # kernel-argument binding observable; it is not modeling the compiler
         # option's normal optimization behavior.
         if with_enable_fp_fusion:
 
+            # [FUNCTION DOC] HELPER: Variant of the add kernel with an extra constexpr
+            # enable_fp_fusion; adds the inputs when it is true and multiplies them when false.
+            # Masked by n_elements.
             @triton.jit
             def add_kernel(
                 in_ptr0,
@@ -176,6 +209,8 @@ if HAS_GPU:
 
         else:
 
+            # [FUNCTION DOC] HELPER: Plain masked elementwise add
+            # kernel with no enable_fp_fusion parameter.
             @triton.jit
             def add_kernel(
                 in_ptr0,
@@ -195,7 +230,12 @@ if HAS_GPU:
         return add_kernel
 
     def _get_backend_options_fn(add_kernel, **launch_kwargs):
+        # [FUNCTION DOC] HELPER: Builds a function that runs a given kernel with extra launch
+        # keyword arguments (stored in the closure) and returns the output.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Allocates a zero output like the first input, launches the
+            # kernel over a one-dimensional grid sized by cdiv of the element count and the block
+            # size meta parameter, forwards the stored launch kwargs, and returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -212,12 +252,24 @@ if HAS_GPU:
 
 
 class KernelTests(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Test case for user-defined Triton kernels with inductor and dynamo. Most tests
+    # are gated on a GPU with Triton; they compare compiled results to eager, inspect generated
+    # code, or exercise the kernel higher-order ops. Contains small helpers to check whether a
+    # kernel is launched in generated code and to capture the options passed to triton.compile.
     def _kernel_launched_in_code(self, kernel_name: str, code: str) -> bool:
+        # [FUNCTION DOC] HELPER: Returns whether the generated code text contains a launch of the
+        # named kernel. For the cpp wrapper it looks for the launchKernel call prefix with the
+        # kernel name; otherwise for the kernel name followed by the run call.
         if inductor_config.cpp_wrapper:
             return f"launchKernel({kernel_name}" in code
         return f"{kernel_name}.run(" in code
 
     def _run_and_get_triton_compile_options(self, fn, *args):
+        # [FUNCTION DOC] HELPER: Compiles fn fullgraph with torch.compile, running it with the
+        # given args while mocking triton.compile (wrapping the real one) and forcing a single
+        # compile thread. Returns the output, the generated code list, and a list of dicts with
+        # the options keyword passed to every triton.compile call that had one. Asserts at least
+        # one options dict was captured.
         # TestCase already gives each test a fresh compile cache. This patch
         # only keeps compilation in-process while the triton.compile mock is
         # installed, so we can assert on the actual options passed to Triton.
@@ -235,6 +287,8 @@ class KernelTests(torch._inductor.test_case.TestCase):
         return out, codes, compile_options
 
     def _assert_triton_compile_option(self, options, name, expected_value):
+        # [FUNCTION DOC] HELPER: Asserts that at least one captured compile-options dict has the
+        # given option name equal to the expected value, with a message showing all options.
         self.assertTrue(
             any(option.get(name) == expected_value for option in options),
             f"expected triton.compile options to include "
@@ -243,12 +297,18 @@ class KernelTests(torch._inductor.test_case.TestCase):
 
     @requires_gpu
     def test_triton_kernel_with_kernel_param(self):
+        # [FUNCTION DOC] Checks dynamo tolerates a Triton kernel whose parameter is itself named
+        # kernel and is passed a tensor, under the eager backend. The test only requires that
+        # compilation and the call do not crash.
+        # [FUNCTION DOC] HELPER: Empty Triton kernel with a single parameter named kernel.
         @triton.jit
         def pass_kernel(kernel):
             pass
 
         @torch.compile(backend="eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled (eager backend) function launching the empty kernel
+            # over a grid with one program per element, passing x as the kernel parameter.
             grid = (x.numel(),)
             pass_kernel[grid](kernel=x)
 
@@ -259,6 +319,11 @@ class KernelTests(torch._inductor.test_case.TestCase):
 
     @requires_gpu
     def test_triton_kernel_dunder_name_no_name_mangling(self):
+        # [FUNCTION DOC] Regression test for issue 170398: a Triton kernel whose name starts with
+        # double underscores (fetched from module globals to dodge class name mangling) must not
+        # be rewritten by Python name mangling in generated code. Runs eager and compiled,
+        # compares results, then checks the generated code does not contain the double-underscore
+        # name with the call suffix but does contain the single-underscore form.
         # Regression test for https://github.com/pytorch/pytorch/issues/170398
         # Triton kernels whose names start with ``__`` must not trigger
         # Python class-based name mangling in the generated code.
@@ -267,6 +332,8 @@ class KernelTests(torch._inductor.test_case.TestCase):
         kernel = globals()["__dunder_add_kernel"]
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Allocates an empty output, launches the dunder-named kernel
+            # with one program per element and block size 16, and returns the output.
             out = torch.empty_like(x)
             n_elements = x.numel()
             kernel[(n_elements,)](x, y, out, n_elements, BLOCK_SIZE=16)
@@ -288,6 +355,14 @@ class KernelTests(torch._inductor.test_case.TestCase):
     @inductor_config.patch(strict_signed_zero=True)
     @requires_cuda_and_triton
     def test_dim_max_min_reuse_argreduce_value(self):
+        # [FUNCTION DOC] Checks that max/min with indices over the last dim reuses the argreduce
+        # value instead of a second reduction. Runs on float32, float16 and bfloat16 (when
+        # supported) with dynamic shapes and an extreme value planted in a late column; asserts
+        # values and indices match eager, that the generated source uses the with-index helper
+        # once and not the value-only helper, and that the value-only form also uses one with-
+        # index helper and one store. Then verifies signed zeros are preserved (signbit
+        # comparison) for max/min and for separate amax/argmax and amin/argmin pairs. Runs with
+        # strict signed zero enabled.
         dtypes = [torch.float32, torch.float16]
         if torch.cuda.is_bf16_supported(including_emulation=False):
             dtypes.append(torch.bfloat16)
@@ -299,6 +374,8 @@ class KernelTests(torch._inductor.test_case.TestCase):
             torch._dynamo.reset()
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Applies the current reduction op (max or min from the
+                # loop closure) over the last dim and returns its result.
                 return op(x, -1)
 
             for dtype in dtypes:
@@ -319,6 +396,8 @@ class KernelTests(torch._inductor.test_case.TestCase):
                 torch._dynamo.reset()
 
                 def value_only(x):
+                    # [FUNCTION DOC] HELPER: Returns only the values of the reduction op over the
+                    # last dim.
                     return op(x, -1).values
 
                 with fresh_cache():
@@ -340,6 +419,8 @@ class KernelTests(torch._inductor.test_case.TestCase):
             torch._dynamo.reset()
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Applies the loop's reduction op (max or min) over the
+                # last dim and returns its result.
                 return op(x, -1)
 
             expected_values, expected_indices = fn(x)
@@ -354,6 +435,8 @@ class KernelTests(torch._inductor.test_case.TestCase):
             torch._dynamo.reset()
 
             def value_only(x):
+                # [FUNCTION DOC] HELPER: Returns only the values of the reduction op over the
+                # last dim.
                 return op(x, -1).values
 
             expected_values = value_only(x)
@@ -371,6 +454,8 @@ class KernelTests(torch._inductor.test_case.TestCase):
             torch._dynamo.reset()
 
             def separate_value_and_index(x):
+                # [FUNCTION DOC] HELPER: Returns a pair: the value reduction (amax or amin) and
+                # the index reduction (argmax or argmin) of the input over the last dim.
                 return value_op(x, -1), index_op(x, -1)
 
             expected_values, expected_indices = separate_value_and_index(x)
@@ -386,10 +471,18 @@ class KernelTests(torch._inductor.test_case.TestCase):
 
     @requires_gpu
     def test_triton_kernel_ill_formed(self):
+        # [FUNCTION DOC] Checks that a compile error inside a user Triton kernel surfaces through
+        # torch.compile with the inductor backend. Skipped under the cpp wrapper (errors occur
+        # lazily at runtime). Passes if the raised InductorError wraps a Triton CompilationError
+        # directly or a subprocess pool exception whose details mention it; a finally block
+        # asserts this flag.
         if inductor_config.cpp_wrapper:
             # With lazy compile, kernel errors happen at runtime, not codegen
             self.skipTest("kernel errors happen at runtime instead of codegen time")
 
+        # [FUNCTION DOC] HELPER: Deliberately ill-formed Triton kernel; one branch assigns an
+        # int32 value and the other an int64 value to the same variable, and then stores it,
+        # which makes compilation fail.
         @triton.jit
         def ill_formed_kernel(kernel):
             off_n = tl.program_id(0)
@@ -402,6 +495,8 @@ class KernelTests(torch._inductor.test_case.TestCase):
 
         @torch.compile(backend="inductor")
         def f(x):
+            # [FUNCTION DOC] HELPER: Inductor-compiled function launching the ill-formed kernel
+            # over one program per element with x as the kernel argument.
             grid = (x.numel(),)
             ill_formed_kernel[grid](kernel=x)
 
@@ -428,6 +523,11 @@ class KernelTests(torch._inductor.test_case.TestCase):
 
     @requires_gpu
     def test_triton_kernel_higher_order_func(self):
+        # [FUNCTION DOC] Exercises the Triton kernel higher-order ops directly. Registers the add
+        # kernel and its constant args in the kernel side table, then calls the mutation wrapper
+        # with a grid callable and checks the output equals the sum and was changed. Then calls
+        # the functional wrapper with tensors to clone and checks the returned dict holds the sum
+        # while the passed output stays zeros.
         from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 
         add_kernel_id = kernel_side_table.add_kernel(add_kernel)
@@ -479,6 +579,11 @@ class KernelTests(torch._inductor.test_case.TestCase):
 
     @requires_gpu
     def test_triton_kernel_functionalize(self):
+        # [FUNCTION DOC] Checks functionalization of the functional Triton kernel wrapper using
+        # make_fx with the Python functionalize API under FunctionalTensorMode, the C++ API, and
+        # torch.func.functionalize; each time the passed output tensor must not be modified. Then
+        # traces in fake mode and compares the printed graph to an expected inline string (which
+        # hard-codes kernel and constant-arg side table indices after a table reset).
         from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
         from torch._subclasses.functional_tensor import (
             CppFunctionalizeAPI,
@@ -490,6 +595,9 @@ class KernelTests(torch._inductor.test_case.TestCase):
         kernel_side_table.reset_table()
 
         def f(x, output):
+            # [FUNCTION DOC] HELPER: Calls the functional wrapper for the mul2 kernel with
+            # tensors to clone for the input and output, a grid with one program per element and
+            # block size 16, and returns the cloned out_ptr entry of the result.
             out = triton_kernel_wrapper_functional(
                 kernel_idx=kernel_side_table.add_kernel(mul2_kernel),
                 constant_args_idx=kernel_side_table.add_constant_args(
@@ -533,6 +641,10 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_mutation_type(self):
+        # [FUNCTION DOC] Checks the autograd-hidden-mutation flag on functional tensors under
+        # fake mode. An ordinary in-place multiply yields not-all-hidden; a Triton kernel
+        # mutation alone yields all-hidden; an ordinary multiply followed by the kernel mutation
+        # yields not-all-hidden.
         from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch._subclasses.functional_tensor import (
@@ -541,6 +653,9 @@ def forward(self, x_1, output_1):
         )
 
         def prep():
+            # [FUNCTION DOC] HELPER: Creates a ones tensor requiring grad, converts it to a
+            # functional tensor under FunctionalTensorMode, asserts the wrapped tensor is
+            # functional, and returns the functional tensor.
             x = torch.ones(4, device=GPU_TYPE, requires_grad=True)
             with FunctionalTensorMode():
                 x_func = FunctionalTensor.to_functional(x)
@@ -603,6 +718,12 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_clone_wekdeps(self):
+        # [FUNCTION DOC] Checks that cloning for a functional Triton kernel wrapper does
+        # not break buffer lifetimes (weak deps). Traces a function that calls a dual-
+        # output kernel seven times on a large tensor, where both outputs alias the same
+        # buffer, then compiles with all fusion disabled and captures the output code log.
+        # Uses FileCheck to require the deletion of a buffer before the kernel run, and
+        # compares the compiled result with eager.
         from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
         from torch._inductor.choices import InductorChoices
         from torch._inductor.compile_fx import compile_fx_inner
@@ -612,6 +733,9 @@ def forward(self, x_1, output_1):
         TENSOR_SIZE = 30_000_000
         BLOCK_SIZE = 1024
 
+        # [FUNCTION DOC] HELPER: Triton kernel converting the block of inputs to float32 and
+        # storing it to the first output and storing that plus the input to the second output,
+        # masked by n_elements.
         @triton.jit
         def dual_output_kernel_with_inline_asm(
             in_ptr0,
@@ -631,6 +755,10 @@ def forward(self, x_1, output_1):
         kernel_side_table.reset_table()
 
         def f(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Builds a zero-filled large tensor and, in a seven-iteration
+            # loop, calls the functional kernel wrapper with both outputs set to the same tensor
+            # to clone, accumulating the two returned outputs into a running sum. Returns a one-
+            # element tuple holding the sum.
             full_default = torch.full(
                 (TENSOR_SIZE,), 0.0, device=x.device, dtype=x.dtype
             )
@@ -665,7 +793,10 @@ def forward(self, x_1, output_1):
         t = torch.rand(TENSOR_SIZE, device=GPU_TYPE)
 
         class NoFusionChoices(InductorChoices):
+            # [CLASS DOC] HELPER: Inductor choices handler that forbids every fusion.
             def can_fuse(self, scheduler, node1, node2, shared_data_score) -> bool:
+                # [FUNCTION DOC] HELPER: Always returns false so no
+                # pair of scheduler nodes is fused.
                 return False
 
         gm = make_fx(f, tracing_mode="fake")(t)
@@ -689,7 +820,13 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("dynamic", [False, True])
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_with_views(self, dynamic, backend):
+        # [FUNCTION DOC] Parametrized over dynamic shapes and backends (eager, aot_eager,
+        # inductor). Checks that Triton kernels work with view inputs and view outputs: one
+        # compiled function takes a flattened view of a 4x4 tensor, another returns its output
+        # viewed as 4x4; results must equal twice the input.
         def call_triton_take_view(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Runs the mul2 kernel on a zeroed output like x and returns
+            # the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -697,6 +834,8 @@ def forward(self, x_1, output_1):
             return output
 
         def call_triton_return_view(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Runs the mul2 kernel on a zeroed output like x and returns
+            # the output reshaped as a 4 by 4 view.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -720,6 +859,12 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_no_nan_kernels(self):
+        # [FUNCTION DOC] Checks that the generated code for a custom autograd Function using a
+        # Triton kernel contains no NaN literal (cpp or Python form). Runs a compiled forward and
+        # extracts the codecache output code log, dropping its first three lines, and requires
+        # non-empty output.
+        # [FUNCTION DOC] HELPER: Triton kernel adding one to each input element within a masked
+        # block and storing to the output.
         @triton.jit
         def add_one_kernel(
             in_ptr0,
@@ -736,12 +881,18 @@ def forward(self, x_1, output_1):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def add_one(x, out):
+            # [FUNCTION DOC] HELPER: Launches the add-one kernel over one program per element
+            # with block size 4.
             n_elements = x.numel()
             add_one_kernel[(n_elements,)](x, out, n_elements, BLOCK_SIZE=4)
 
         class AddOne(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function whose forward and backward both apply the
+            # add-one kernel to a fresh output; forward saves its output for backward.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Allocates an empty output, applies add-one, saves the
+                # output for backward, and returns it.
                 out = torch.empty_like(x)
                 add_one(x, out)
                 ctx.save_for_backward(out)
@@ -749,6 +900,9 @@ def forward(self, x_1, output_1):
 
             @staticmethod
             def backward(ctx, grad):
+                # [FUNCTION DOC] HELPER: Retrieves the saved tensor, allocates an empty output
+                # shaped like the gradient, applies add-one to the saved tensor, and returns that
+                # (the incoming gradient is not used).
                 (saved,) = ctx.saved_tensors
                 out = torch.empty_like(grad)
                 add_one(saved, out)
@@ -756,6 +910,7 @@ def forward(self, x_1, output_1):
 
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function applying the AddOne autograd function.
             return AddOne.apply(x)
 
         log_stream, ctx = logs_to_string("torch._inductor.codecache", "output_code")
@@ -776,7 +931,14 @@ def forward(self, x_1, output_1):
 
     @requires_cuda_and_triton
     def test_fp_self_sub_rewrite_preserves_nonfinite_semantics(self):
+        # [FUNCTION DOC] Checks that the inductor rewrite of subtracting a value from itself
+        # keeps floating point semantics for non-finite values. For a square-then-self-subtract
+        # function on random input it asserts an exact zero result, that the generated code uses
+        # a conditional select and an infinity test, and does not disable fp fusion. Then runs on
+        # a tensor holding NaN and both infinities plus a finite value and compares to eager with
+        # NaN equal.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Squares the input and returns the square minus itself.
             a = x * x
             return a - a
 
@@ -798,7 +960,14 @@ def forward(self, x_1, output_1):
     @requires_cuda_and_triton
     @common_utils.parametrize("per_subkernel", [False, True])
     def test_combo_fp_self_sub_rewrite(self, per_subkernel):
+        # [FUNCTION DOC] Parametrized on per-subkernel block sizes. With combo kernels enabled
+        # (and benchmarking and memory limits turned off) it compiles a function returning a
+        # square minus itself and an unrelated add-one result, asserts exact equality with eager,
+        # exactly one generated kernel, a combo grid meta marker, the conditional select in the
+        # code, and no fp fusion disabling.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Squares the first input and returns the square minus itself
+            # together with the second input plus one.
             c = a * a
             return c - c, b + 1
 
@@ -824,12 +993,19 @@ def forward(self, x_1, output_1):
 
     @requires_cuda_and_triton
     def test_duplicate_mse_loss_operands_are_zero(self):
+        # [FUNCTION DOC] Checks that for gelu and mish, mean-squared-error loss between two
+        # separate evaluations of the same op on the same input, reduced by max with no
+        # reduction, is exactly zero after compilation (duplicate operands are recognised). Seeds
+        # the RNG and uses fullgraph compilation.
         torch.manual_seed(0)
         x = torch.randn(10000, device=GPU_TYPE)
 
         for op in (F.gelu, F.mish):
 
             def fn(x, op=op):
+                # [FUNCTION DOC] HELPER: Takes x and the activation op bound via a default
+                # argument; returns the maximum of the unreduced MSE loss between two
+                # applications of the op.
                 return F.mse_loss(op(x), op(x), reduction="none").max()
 
             actual = torch.compile(fn, fullgraph=True)(x)
@@ -839,7 +1015,12 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("grad_fn", [torch.no_grad, torch.enable_grad])
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_with_grad_option(self, grad_fn, backend):
+        # [FUNCTION DOC] Parametrized over grad mode context manager (no_grad or enable_grad) and
+        # backend. Checks that a Triton mul2 kernel launched inside a grad-mode context manager
+        # compiles fullgraph and gives twice the input.
         def call_triton(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Inside the parametrized grad-mode context, launches the mul2
+            # kernel into a zero output and returns it.
             with grad_fn():
                 output = torch.zeros_like(x)
                 n_elements = output.numel()
@@ -854,7 +1035,15 @@ def forward(self, x_1, output_1):
     @requires_gpu
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_inner_triton_function(self, backend):
+        # [FUNCTION DOC] Parametrized over backend. Compiles with fullgraph a function that
+        # defines a Triton kernel inside its own body and launches it. The result comparison is
+        # disabled (TODO: not yet supported), so only compile construction is exercised, and the
+        # compiled function is never called.
         def f(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Defines a squaring kernel inline, launches it on a zero
+            # output with block size 16, and returns the output.
+            # [FUNCTION DOC] HELPER: Kernel squaring each masked input element and storing it to
+            # the output.
             @triton.jit
             def pow2_kernel(
                 in_ptr0,
@@ -887,9 +1076,18 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("dynamic", [False, True])
     @inductor_config.patch("implicit_fallbacks", False)
     def test_triton_kernel_no_clones(self, grad, dynamic):
+        # [FUNCTION DOC] Parametrized over grad and dynamic, with implicit fallbacks off.
+        # Compiles a function that runs add_kernel directly via its run method and also
+        # computes an add-one value. Checks equality with eager, that without grad exactly
+        # one kernel is generated, that no copy or clone ops appear in the code, and that
+        # only the expected outputs are returned (the exact return text differs for
+        # dynamic with grad and the cpp wrapper).
         from torch._inductor.utils import run_and_get_code
 
         def call_triton(x: torch.Tensor, y: torch.Tensor, output: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Runs the add kernel through its run method without warmup
+            # with grid one program per element and block 16, writing into the given output; also
+            # computes the input plus one; returns the output and that sum.
             n_elements = output.numel()
 
             tmp = torch.add(x, 1)
@@ -939,12 +1137,18 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_caching(self):
+        # [FUNCTION DOC] Checks Triton kernel caching with an autotuned add kernel invoked four
+        # times in a loop. The compiled result must equal five times ones, and the generated code
+        # must not contain a second copy of the kernel (the name with suffix 1), i.e. the same
+        # kernel is reused.
         from torch._inductor.utils import run_and_get_code
 
         def add_in_loop(
             x: torch.Tensor,
             y: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Allocates a zero output and runs the autotuned add kernel
+            # over it with a callable grid; returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -955,6 +1159,8 @@ def forward(self, x_1, output_1):
             x: torch.Tensor,
             y: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Applies the add-in-loop helper four times, feeding each
+            # output back as the first input.
             for _ in range(4):
                 x = add_in_loop(x, y)
             return x
@@ -968,9 +1174,14 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_caching_duplicate(self):
+        # [FUNCTION DOC] Checks that two different kernels sharing the same name but defined in
+        # different classes are both emitted. Compiles a function calling both, and asserts the
+        # generated code launches kernels with the suffixes 0 and 1.
         from torch._inductor.utils import run_and_get_code
 
         class C:
+            # [CLASS DOC] HELPER: Namespace class holding one Triton kernel named pass_kernel.
+            # [FUNCTION DOC] HELPER: Kernel copying a masked block of the input to the output.
             @triton.jit
             def pass_kernel(
                 in_ptr0,
@@ -986,6 +1197,9 @@ def forward(self, x_1, output_1):
                 tl.store(out_ptr + offsets, x, mask=mask)
 
         class D:
+            # [CLASS DOC] HELPER: Second namespace class with a kernel named pass_kernel whose
+            # body is identical to the one in the first class.
+            # [FUNCTION DOC] HELPER: Kernel copying a masked block of the input to the output.
             @triton.jit
             def pass_kernel(
                 in_ptr0,
@@ -1001,6 +1215,8 @@ def forward(self, x_1, output_1):
                 tl.store(out_ptr + offsets, x, mask=mask)
 
         def call_triton(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Calls each class's kernel on the input into separate outputs
+            # and returns the sum of the outputs.
             output1 = torch.zeros_like(x)
             output2 = torch.zeros_like(x)
             n_elements = output1.numel()
@@ -1017,6 +1233,12 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_various_args(self):
+        # [FUNCTION DOC] Checks that compiling a call to an autotuned Triton kernel with many
+        # argument kinds (None, a tensor, a float, a constexpr) does not crash. Nothing is
+        # asserted on the result.
+        # [FUNCTION DOC] HELPER: Autotuned (one config with block size 128, empty key) kernel
+        # with an empty body; takes an output pointer, element count, None, tensor and float
+        # dummy args and two constexprs.
         @triton.autotune(
             configs=[triton.Config({"BLOCK_SIZE": 128})],
             key=[],
@@ -1035,6 +1257,9 @@ def forward(self, x_1, output_1):
 
         @torch.compile
         def call_triton(output):
+            # [FUNCTION DOC] HELPER: Compiled function launching the kernel with one program per
+            # element, passing None, an empty tensor like the output, a float and the constexpr;
+            # returns the output.
             n_elements = output.numel()
             grid = (n_elements,)
             pass_kernel[grid](
@@ -1053,10 +1278,15 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_dependancies(self):
+        # [FUNCTION DOC] Checks a dependency chain of two autotuned add kernels followed by an
+        # add-one op: compiled output must equal eager.
         def call_triton(
             x: torch.Tensor,
             y: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Runs the autotuned add kernel into a zero output, then runs
+            # it again with that output as input into a second zero output, and returns the
+            # second plus one.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -1074,10 +1304,16 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_reinplace_inplaceable_pass(self):
+        # [FUNCTION DOC] Checks that the reinplace pass is correct for Triton
+        # kernels: compiled output must equal eager for two launches where
+        # the second reads and writes the output buffer.
         def call_triton(
             x: torch.Tensor,
             y: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Runs the autotuned add kernel into a zero output, then runs
+            # it again with the output as first input and the same output as destination; returns
+            # the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -1094,6 +1330,15 @@ def forward(self, x_1, output_1):
     @requires_gpu
     @common_utils.parametrize("grad", [False, True])
     def test_triton_kernel_multi_kernel(self, grad):
+        # [FUNCTION DOC] Parametrized on grad. Checks nested Triton kernel calls and constexpr
+        # activation selection: a kernel that calls an indirection kernel (which doubles inputs
+        # in place) on both inputs and optionally applies zero-negatives. Runs a compiled
+        # function launching it for a float case with the zero-negs activation and an integer
+        # case without activation, then compares to the expected values: floats double-sum then
+        # negatives zeroed; ints double-sum.
+        # [FUNCTION DOC] HELPER: Kernel that doubles both inputs in place through the indirection
+        # kernel, loads both, adds them, optionally zeroes negatives per the activation
+        # constexpr, and stores the result masked.
         @triton.jit
         def mul2_and_add_and_zero_negatives_kernel(
             in_ptr0,
@@ -1137,6 +1382,9 @@ def forward(self, x_1, output_1):
             output: torch.Tensor,
             outputi: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Compiled function launching the combined kernel once with
+            # the zero-negs activation on the float tensors and once without activation on the
+            # integer tensors; returns both outputs.
             n_elements = output.numel()
 
             grid = (x.numel(),)
@@ -1170,6 +1418,14 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_constants(self):
+        # [FUNCTION DOC] Checks how global constexpr constants are handled in kernels:
+        # temporarily rebinds the global constant to a different value after the kernel was
+        # parsed, then compares eager and compiled results (they must match, since kernels
+        # capture constants at parse time). Restores the original global at the end (not in a
+        # finally block, so a failure leaves it modified).
+        # [FUNCTION DOC] HELPER: Kernel that reads a constexpr name; if it equals the string
+        # constant, multiplies the input by the global constant; if the bool constant is true,
+        # multiplies again by the constant; stores the result.
         @triton.jit
         def mulC_kernel(
             in_ptr0,
@@ -1193,6 +1449,8 @@ def forward(self, x_1, output_1):
         def call_triton(
             x: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Launches the constants kernel on a zero output with one
+            # program per element, block 16 and the constant name; returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
 
@@ -1226,10 +1484,18 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     @common_utils.parametrize("grid_type", [1, 2, 3])
     def test_triton_kernel_autotune(self, grad, dynamic, backend, grid_type):
+        # [FUNCTION DOC] Parametrized over grad, dynamic, backend and grid type (tuple, lambda,
+        # or named function). Compiles with fullgraph a function launching the autotuned add
+        # kernel and compares to eager.
         def call_triton(x: torch.Tensor, y: torch.Tensor, output: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Builds the grid according to grid_type, either a fixed
+            # tuple, a lambda of the meta or a named function, then launches the autotuned add
+            # kernel and returns the output.
             n_elements = output.numel()
 
             def grid_fn(meta):
+                # [FUNCTION DOC] HELPER: Returns a one-element grid using ceiling division of the
+                # element count by the block size meta parameter.
                 return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
             if grid_type == 1:
@@ -1258,7 +1524,12 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     @inductor_config.patch("unsafe_ignore_unsupported_triton_autotune_args", True)
     def test_triton_kernel_autotune_with_unsupported_args(self, backend):
+        # [FUNCTION DOC] Parametrized over backend, with inductor config to ignore unsupported
+        # autotune args. Checks that a kernel autotuned with options not supported by tooling
+        # still compiles under fullgraph and matches eager.
         def call_triton(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Runs the kernel with unsupported autotune args on a zero
+            # output with one program per element and returns it.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             add_kernel_autotuned_with_unsupported_args[(n_elements,)](
@@ -1281,11 +1552,19 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("grid_type", [1, 2, 3])
     @common_utils.parametrize("tdlp", ["0", "1"])
     def test_triton_kernel_2d_autotune(self, grad, dynamic, backend, grid_type, tdlp):
+        # [FUNCTION DOC] Parametrized over grad, dynamic, backend, grid type and the dump-launch-
+        # params setting. Compiles a 2D autotuned kernel launch and compares to eager, with
+        # compilation and the call running inside the dump launch params context manager.
         def call_triton(x: torch.Tensor, y: torch.Tensor, output: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Builds a grid from the output's two dims
+            # (tuple, lambda or named function by grid_type), runs the 2D
+            # autotuned add kernel, and returns the output.
             x_elements = output.size()[0]
             y_elements = output.size()[1]
 
             def grid_fn(meta):
+                # [FUNCTION DOC] HELPER: Returns a two-dimensional grid using ceiling division of
+                # each dim by the matching block meta parameter.
                 return (
                     triton.cdiv(x_elements, meta["BLOCK_SIZE_X"]),
                     triton.cdiv(y_elements, meta["BLOCK_SIZE_Y"]),
@@ -1320,6 +1599,10 @@ def forward(self, x_1, output_1):
     @requires_gpu
     @common_utils.parametrize("dynamic", [False, True])
     def test_triton_kernel_tracing(self, dynamic):
+        # [FUNCTION DOC] Parametrized on dynamic. Traces several launch variants with make_fx in
+        # symbolic or fake mode using the capture wrapper for kernels, covering tuple, lambda,
+        # named function and list grids, positional and keyword block size, and autotuned
+        # kernels. Also runs each variant eagerly and checks it equals the plain sum.
         def call_triton_add(
             x: torch.Tensor,
             y: torch.Tensor,
@@ -1328,10 +1611,16 @@ def forward(self, x_1, output_1):
             positional=False,
             autotuned=False,
         ):
+            # [FUNCTION DOC] HELPER: Allocates an empty output, selects the grid per grid_type
+            # (tuple, lambda, named function, or list), and launches add_kernel or the autotuned
+            # add kernel through the capture wrapper (positional or keyword block size); returns
+            # the output.
             output = torch.empty_like(x)
             n_elements = output.numel()
 
             def grid_fn(meta):
+                # [FUNCTION DOC] HELPER: Returns a one-element grid from the num parameter and
+                # the block size meta parameter.
                 return (triton.cdiv(num, meta["BLOCK_SIZE"]),)
 
             if grid_type == 0:
@@ -1387,6 +1676,10 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     @inductor_config.patch("implicit_fallbacks", False)
     def test_triton_kernel_native(self, grad, dynamic, backend):
+        # [FUNCTION DOC] Parametrized over grad, dynamic and backend with implicit fallbacks off.
+        # Checks that launching add_kernel natively works eagerly (keyword and positional block
+        # size) and compiled with fullgraph for a plain tuple grid, a lambda grid (keyword and
+        # positional) and a named grid function.
         def call_triton_add(
             x: torch.Tensor,
             y: torch.Tensor,
@@ -1395,9 +1688,14 @@ def forward(self, x_1, output_1):
             num=1,
             positional=False,
         ):
+            # [FUNCTION DOC] HELPER: Selects the grid per grid_type (tuple, lambda, named
+            # function) and launches add_kernel with a keyword or positional block size of 16;
+            # returns the output.
             n_elements = output.numel()
 
             def grid_fn(meta):
+                # [FUNCTION DOC] HELPER: Returns a one-element grid from the num parameter and
+                # the block size meta parameter.
                 return (triton.cdiv(num, meta["BLOCK_SIZE"]),)
 
             if grid_type == 0:
@@ -1445,8 +1743,14 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_mutation_not_mark_dirty(self):
+        # [FUNCTION DOC] Checks that a compiled in-place Triton add on a clone does not mark the
+        # input dirty in a way that breaks autograd. Runs a compiled function launching
+        # add_kernel with the same tensor as inputs and output, after taking a sine of the clone,
+        # and backpropagates the sum with no exception expected.
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function running add_kernel in place with x for
+            # both inputs and the output, returning x.
             n_elements = x.numel()
             add_kernel[(n_elements,)](x, x, x, n_elements, 16)
             return x
@@ -1460,7 +1764,12 @@ def forward(self, x_1, output_1):
     @requires_gpu
     @inductor_config.patch("allow_buffer_reuse", True)
     def test_triton_kernel_inputs_buffer_reuse(self):
+        # [FUNCTION DOC] With buffer reuse allowed, checks buffer reuse across chained Triton
+        # kernel calls: four doublings in a loop plus one. Verifies compiled equals eager, that
+        # exactly two buffers are allocated in the generated code and three buffers are reused.
         def _mul2(x):
+            # [FUNCTION DOC] HELPER: Allocates an empty output like x, launches the mul2 kernel
+            # on ten programs of block size 1, and returns the output.
             y = torch.empty_like(x)
             mul2_kernel[(10,)](
                 in_ptr0=x,
@@ -1472,6 +1781,8 @@ def forward(self, x_1, output_1):
 
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function applying the helper four times in sequence
+            # and adding one.
             for _ in range(4):
                 # The output of one kernel is the input to the next kernel, but
                 # at some point we should reuse buffers not allocate new ones.
@@ -1500,6 +1811,11 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_matmul_tracking(self):
+        # [FUNCTION DOC] Checks that a Triton kernel writing ones into a buffer is tracked before
+        # a matmul: the compiled function zeroes a tensor, fills it with the kernel, then
+        # multiplies it by the input and adds ten; result must equal the matmul of ones with the
+        # input plus ten.
+        # [FUNCTION DOC] HELPER: Kernel storing the constant one for every masked element.
         @triton.jit
         def ones_kernel(x_ptr, n_elements, BLOCK_SIZE: "tl.constexpr"):
             pid = tl.program_id(axis=0)
@@ -1511,6 +1827,8 @@ def forward(self, x_1, output_1):
 
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function that zeroes a tensor, runs the ones kernel
+            # on it with a grid of four programs, and returns its matmul with x plus ten.
             out = torch.zeros_like(x)
             ones_kernel[(4,)](out, 16, BLOCK_SIZE=16)
             return torch.mm(out, x) + 10
@@ -1522,7 +1840,13 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_strided_input(self):
+        # [FUNCTION DOC] Checks a Triton kernel with a strided input: splits a 64 by 256 tensor
+        # into two column halves and runs the double-strided kernel on the first, which has row
+        # stride 256. Compares compiled with eager.
         def f(inp):
+            # [FUNCTION DOC] HELPER: Splits the input along dim 1 into two
+            # halves, runs the double-strided kernel on the left half with
+            # its row strides, and returns the output.
             # left has strides [256, 1]
             left, right = torch.split(inp, [128, 128], dim=1)
             out = torch.empty_like(left)
@@ -1549,13 +1873,22 @@ def forward(self, x_1, output_1):
     )
     @requires_gpu
     def test_layout_constraint_needs_fixed_stride_order(self):
+        # [FUNCTION DOC] Under the config choosing the needs-fixed-stride-order default layout
+        # constraint, checks that inductor forces a custom op's output to the stride order seen
+        # at tracing time before passing it to a Triton kernel that fills values by flat offset.
+        # The custom op's lowering would otherwise produce a different layout; compiled output
+        # must equal eager.
         # Construct a custom op whose output strides are (1, 2)
         @torch.library.custom_op("mylib::weird_op_with_lowering", mutates_args={})
         def weird_op_with_lowering(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op body returning an uninitialized 2 by 2 tensor with
+            # column-major strides.
             return torch.empty_strided((2, 2), (1, 2), dtype=x.dtype, device=x.device)
 
         @weird_op_with_lowering.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: Fake implementation of the custom op returning an empty
+            # strided tensor with column-major strides.
             return torch.empty_strided((2, 2), (1, 2), dtype=x.dtype, device=x.device)
 
         # The lowering for the custom op produces output strides (2, 1).
@@ -1563,11 +1896,16 @@ def forward(self, x_1, output_1):
 
         @register_lowering(torch.ops.mylib.weird_op_with_lowering)
         def _(x):
+            # [FUNCTION DOC] HELPER: Inductor lowering for the custom op
+            # producing an empty strided buffer on the GPU with row-major
+            # strides (differing from the traced strides).
             return empty_strided(
                 x.shape, (2, 1), dtype=x.dtype, device=torch.device(GPU_TYPE, 0)
             )
 
         # Triton kernel that has different behavior depending on the input strides.
+        # [FUNCTION DOC] HELPER: Kernel storing each flat offset index into the output, masked by
+        # element count; its result depends on the input strides.
         @triton.jit
         def kernel(
             in_ptr0,
@@ -1583,11 +1921,15 @@ def forward(self, x_1, output_1):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def arange_out(x, out):
+            # [FUNCTION DOC] HELPER: Launches the offset-filling kernel with block size 4 over
+            # the output.
             n_elements = x.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
             kernel[grid](x, out, n_elements, BLOCK_SIZE=4)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls the custom op, fills its output in place with the
+            # kernel, and returns the input plus that output.
             y = weird_op_with_lowering(x)
             # Inductor lowering will decide that y is better having strides (2, 1).
             # This is different from the strides at tracing time (1, 2).
@@ -1606,7 +1948,11 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_strided_input_nonzero_offset(self):
+        # [FUNCTION DOC] Checks a Triton kernel with a strided input that has a nonzero storage
+        # offset (the second column half). Compares compiled with eager.
         def f(inp):
+            # [FUNCTION DOC] HELPER: Splits the input along dim 1, runs the double-strided kernel
+            # on the right half with its strides, and returns the output.
             # right has strides [256, 1] and storage offset 128
             left, right = torch.split(inp, [128, 128], dim=1)
             out = torch.empty_like(right)
@@ -1630,7 +1976,11 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_slice_and_view_input(self):
+        # [FUNCTION DOC] Checks a Triton kernel on a sliced and viewed input (first 128 columns
+        # reshaped to three dims). Compares compiled with eager.
         def f(inp):
+            # [FUNCTION DOC] HELPER: Slices and reshapes the input, runs the double-strided
+            # kernel using the leading stride, and returns the output plus the input view.
             # left has strides [256, 1]
             left = inp[:, :128]
             left = left.view(64, 4, 32)
@@ -1658,7 +2008,13 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_fallback(self):
+        # [FUNCTION DOC] Checks Triton kernels fed by extern and fallback kernel outputs: one
+        # launch takes a matrix multiply result, another a sort result (a multi-output fallback).
+        # Compares compiled with eager.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Launches add_kernel with a matmul result as
+            # the second input and then with the values of a sort; returns the
+            # destination and an untouched zeros tensor.
             out = torch.zeros_like(x)
             out2 = torch.zeros_like(x)
             # torch.mm is ExternKernelOut
@@ -1675,7 +2031,11 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_to_cpu(self):
+        # [FUNCTION DOC] Checks a Triton kernel followed by a device-to-host copy in the same
+        # compiled function. Compares compiled with eager.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Runs add_kernel on one program into a zero output, copies
+            # the output to the CPU, adds one, and returns it.
             out = torch.zeros_like(x)
             add_kernel[(1,)](x, y, out, 16, 16)
             out_cpu = out.cpu() + 1
@@ -1689,6 +2049,10 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_out_of_order(self):
+        # [FUNCTION DOC] Checks a Triton kernel whose constexpr parameter sits in the middle of
+        # its argument list. The compiled launch with positional arguments must match eager.
+        # [FUNCTION DOC] HELPER: Local add kernel whose parameter order is two inputs, then
+        # block-size constexpr, then output pointer and element count.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -1707,6 +2071,8 @@ def forward(self, x_1, output_1):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Zero output; launches the out-of-order add kernel
+            # positionally with block size 4; returns the output.
             out = torch.zeros_like(x)
             n_elements = x.numel()
             add_kernel[(n_elements,)](x, y, 4, out, n_elements)
@@ -1723,6 +2089,10 @@ def forward(self, x_1, output_1):
     @dynamo_config.patch(capture_scalar_outputs=True)
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_unbacked_shape_tensor(self, backend):
+        # [FUNCTION DOC] Parametrized over backend, with dynamo configs capturing dynamic-output-
+        # shape ops and scalar outputs. Checks a Triton kernel launched on a tensor whose size is
+        # data dependent (boolean mask selection), compiled with fullgraph, equals eager.
+        # [FUNCTION DOC] HELPER: Kernel squaring each masked element.
         @triton.jit
         def square(
             in_ptr,
@@ -1739,6 +2109,9 @@ def forward(self, x_1, output_1):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Selects elements greater than two, then launches the
+            # squaring kernel on the selection with a grid from the data-dependent element count;
+            # returns the output.
             x = x[x > 2]
             n_elements = x.numel()
             output = torch.zeros_like(x)
@@ -1755,6 +2128,13 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("dump_launch_params", ["0", "1"])
     @common_utils.parametrize("dynamic", [False, True])
     def test_triton_kernel_equal_to_1_arg(self, dynamic, dump_launch_params):
+        # [FUNCTION DOC] Parametrized over dynamic and dump-launch-params. Checks the equal-to-
+        # one argument specialization in generated Triton source for a kernel receiving half the
+        # element count (equal to one). With attrs-dict style triton the source must not mention
+        # it; otherwise the dynamic case must show an empty specialization tuple and the static
+        # case one containing the argument position three. Output must equal eager.
+        # [FUNCTION DOC] HELPER: Kernel adding two inputs for indices below twice its
+        # half_n_elements argument.
         @triton.jit
         def add_kernel_half_n_elements(
             in_ptr0,
@@ -1773,6 +2153,8 @@ def forward(self, x_1, output_1):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Computes half of the input size and launches the half-count
+            # kernel over that many programs with block 16; returns the output.
             out = torch.empty_like(x)
             half_n_elements = x.numel() // 2
             add_kernel_half_n_elements[(half_n_elements,)](
@@ -1806,7 +2188,13 @@ def forward(self, x_1, output_1):
     @requires_gpu
     @common_utils.parametrize("dynamic", [False, True])
     def test_triton_kernel_equal_to_1_float_arg(self, dynamic):
+        # [FUNCTION DOC] Parametrized on dynamic. Checks that a float argument equal to 1.0
+        # (derived from a size expression to the power zero divided by one) is not added to the
+        # equal-to-1 specialization: for non-attrs-dict triton the source shows an empty tuple.
+        # Output must equal eager.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Computes a float scale of one from the element count and
+            # launches the scaling add kernel, passing it; returns the output.
             out = torch.empty_like(x)
             n_elements = x.numel()
             scaling_factor = (n_elements**0) / 1.0
@@ -1835,6 +2223,10 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_with_imported_symbol(self):
+        # [FUNCTION DOC] Checks a kernel that calls an imported function (the libdevice fast
+        # divide) works compiled. Compares with eager.
+        # [FUNCTION DOC] HELPER: Kernel storing the fast division of each masked input element by
+        # the constant 3.14.
         @triton.jit
         def add_kernel_with_imported_symbol(
             in_ptr,
@@ -1851,6 +2243,8 @@ def forward(self, x_1, output_1):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Launches the kernel with one program per element, block 16,
+            # and returns the output.
             out = torch.empty_like(x)
             n_elements = x.numel()
             add_kernel_with_imported_symbol[(n_elements,)](
@@ -1869,6 +2263,11 @@ def forward(self, x_1, output_1):
         "newer triton version required",
     )
     def test_triton_kernel_with_constexpr_function(self):
+        # [FUNCTION DOC] Skipped unless triton provides constexpr_function. Checks that a kernel
+        # calling a module-level constexpr function (log2) is compiled with fullgraph, and that
+        # the generated source contains the constexpr function decorator. Compares with eager.
+        # [FUNCTION DOC] HELPER: Kernel adding the log2 of the loaded block's first dimension (a
+        # constexpr) to each element.
         @triton.jit
         def kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(axis=0)  # We use a 1D launch grid so axis is 0.
@@ -1882,6 +2281,8 @@ def forward(self, x_1, output_1):
             tl.store(output_ptr + offsets, output, mask=mask)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Zero output; launches the kernel with callable grid and
+            # block 16; returns the output.
             out = torch.zeros_like(x)
             n_elements = x.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -1902,6 +2303,11 @@ def forward(self, x_1, output_1):
         "newer triton version required",
     )
     def test_triton_kernel_with_constexpr_dtype_annotations(self):
+        # [FUNCTION DOC] Skipped unless triton provides constexpr_function. Checks codegen of a
+        # jit helper that takes a dtype produced by a constexpr function: generated source must
+        # import the dtype class, include the constexpr decorator, alias the int dtype lookup,
+        # emit the int8 dtype instance assignment, the jit decorator and helper definition. The
+        # result must equal eager and be all ones.
         """
         Test that constexpr functions with dtype type annotations work correctly.
         This tests the fix for proper handling of:
@@ -1910,6 +2316,8 @@ def forward(self, x_1, output_1):
         3. Function name aliasing
         """
 
+        # [FUNCTION DOC] HELPER: Kernel building a float tensor of ones, passing it through the
+        # dtype helper (bitcast to an int type and back), and storing it to the output.
         @triton.jit
         def kernel_with_dtype_annotation(out_ptr, n: tl.constexpr):
             offs = tl.arange(0, n)
@@ -1918,6 +2326,8 @@ def forward(self, x_1, output_1):
             tl.store(out_ptr + offs, y.to(tl.float32, bitcast=True))
 
         def f(n):
+            # [FUNCTION DOC] HELPER: Allocates an empty output of size n and launches the kernel
+            # with one program; returns the output.
             out = torch.empty(n, device=GPU_TYPE)
             kernel_with_dtype_annotation[(1,)](out, n)
             return out
@@ -1943,6 +2353,10 @@ def forward(self, x_1, output_1):
 
     @requires_gpu
     def test_triton_kernel_with_imported_symbol_with_custom_name(self):
+        # [FUNCTION DOC] Same as the imported-symbol test but the imported function is referenced
+        # through an alias name defined at module level. Checks compiled equals eager.
+        # [FUNCTION DOC] HELPER: Kernel storing the fast division by 3.14 using the aliased
+        # function name.
         @triton.jit
         def add_kernel_with_imported_symbol(
             in_ptr,
@@ -1959,6 +2373,8 @@ def forward(self, x_1, output_1):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Launches the kernel with one program per element, block 16;
+            # returns the output.
             out = torch.empty_like(x)
             n_elements = x.numel()
             add_kernel_with_imported_symbol[(n_elements,)](
@@ -1976,9 +2392,15 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("size", [4, 16])
     @common_utils.parametrize("dynamic", [False, True])
     def test_triton_kernel_different_shapes(self, size, dynamic):
+        # [FUNCTION DOC] Parametrized over size and dynamic. Calls add_kernel with a one-
+        # dimensional and a two-dimensional input; asserts that, for size four and static shapes,
+        # two separately specialized kernels are launched (divisibility), otherwise only one.
+        # Output must match eager.
         from torch._inductor.utils import run_and_get_code
 
         def f(x, y, xx, yy):
+            # [FUNCTION DOC] HELPER: Launches add_kernel (block 4) on the first pair into one
+            # output and on the second pair into another; returns both outputs.
             n_elements = x.numel()
             output_1 = torch.zeros_like(x)
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -2017,6 +2439,11 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("dynamic", [False, True])
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_triton_dtype(self, dynamic, backend):
+        # [FUNCTION DOC] Parametrized over dynamic and backend. Checks passing triton dtype
+        # objects as constexpr kernel args: float32 always, and bfloat16 when supported. Compiled
+        # fullgraph results equal eager.
+        # [FUNCTION DOC] HELPER: Kernel loading both inputs, casting them to the constexpr dtype,
+        # adding them and storing.
         @triton.jit
         def add_kernel_with_dtype(
             in_ptr0,
@@ -2036,6 +2463,8 @@ def forward(self, x_1, output_1):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def f(x, y, dtype_torch, dtype_triton):
+            # [FUNCTION DOC] HELPER: Zero output cast to the given torch dtype; launches the
+            # dtype kernel with the triton dtype; returns the output.
             output = torch.zeros_like(x).to(dtype=dtype_torch)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -2060,6 +2489,10 @@ def forward(self, x_1, output_1):
     @requires_gpu
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_special_kwargs_with_autotune(self, backend):
+        # [FUNCTION DOC] Parametrized on backend. Checks that the special launch kwargs for warps
+        # and stages are accepted together with an autotuned kernel (two block-size configs,
+        # keyed on element count). The test only requires the call not to fail.
+        # [FUNCTION DOC] HELPER: Autotuned (two configs) elementwise add kernel with a mask.
         @triton.autotune(
             configs=[
                 triton.Config({"BLOCK_SIZE": 128}),
@@ -2086,6 +2519,8 @@ def forward(self, x_1, output_1):
 
         @torch.compile(fullgraph=True, backend=backend)
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Compiled fullgraph function launching the autotuned kernel
+            # with the warps and stages kwargs set; returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -2105,6 +2540,11 @@ def forward(self, x_1, output_1):
     @requires_gpu
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_empty_autotune_config_dict(self, backend):
+        # [FUNCTION DOC] Parametrized on backend. Checks an autotuner whose configs have empty
+        # dicts and differ only in stage count, while block size is passed at launch. The test
+        # only requires the call not to fail.
+        # [FUNCTION DOC] HELPER: Autotuned (two empty-dict
+        # configs) elementwise add kernel with a mask.
         @triton.autotune(
             configs=[
                 triton.Config({}, num_stages=2),
@@ -2131,6 +2571,8 @@ def forward(self, x_1, output_1):
 
         @torch.compile(fullgraph=True, backend=backend)
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Compiled fullgraph function launching the kernel with block
+            # size 128; returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -2150,11 +2592,17 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("autotune", [False, True])
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_special_params(self, autotune, backend):
+        # [FUNCTION DOC] Parametrized over autotune and backend. Skipped for inductor with the
+        # cpp wrapper. Checks a kernel that declares warps and stages as constexpr parameters and
+        # uses them in arithmetic: passed as launch kwargs, or through an autotuner with matching
+        # configs. The eager and compiled outputs must equal x times stages plus warps.
         if backend == "inductor" and inductor_config.cpp_wrapper:
             raise unittest.SkipTest(
                 "cpp-wrapper doesn't support num_warps/num_stages as constexpr"
             )
 
+        # [FUNCTION DOC] HELPER: Kernel storing the input times the stages constexpr plus the
+        # warps constexpr.
         @triton.jit
         def special_params_kernel(
             in_ptr,
@@ -2200,6 +2648,8 @@ def forward(self, x_1, output_1):
             }
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Zero output; launches the kernel using the extra kwargs
+            # chosen by the autotune flag; returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -2222,6 +2672,10 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("dynamic", [False, True])
     @common_utils.parametrize("tma_version", ["new", "old"])
     def test_on_device_tma(self, dynamic, tma_version):
+        # [FUNCTION DOC] Parametrized over dynamic and TMA API version. Skips when the host lacks
+        # support for that API. Checks launching an add kernel that builds TMA descriptors on the
+        # device: allocates a zeroed 3 by 128 byte workspace for the old API, passes none for the
+        # new API, and sets an allocator for triton. Eager and compiled outputs equal the sum.
         if tma_version == "new" and not has_triton_tensor_descriptor_host_tma():
             self.skipTest("requires triton.tools.tensor_descriptor TMA support")
         if tma_version == "old" and not has_triton_experimental_host_tma():
@@ -2233,6 +2687,8 @@ def forward(self, x_1, output_1):
         )
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Zero output; for the old API allocates a workspace of bytes;
+            # launches the on-device TMA kernel over a 2D grid with block 32; returns the output.
             BLOCK_SIZE = 32
             out = torch.zeros_like(a)
             m, n = out.size()
@@ -2280,6 +2736,12 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("dynamic", [False, True])
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_multiple_outputs(self, dynamic, backend):
+        # [FUNCTION DOC] Parametrized over dynamic and backend. Checks a kernel with two output
+        # buffers (the sum and the sum plus one), compiled fullgraph with inputs requiring grad;
+        # the third value returned is the square of another input to exercise training. Compares
+        # results with expected values.
+        # [FUNCTION DOC] HELPER: Kernel storing the sum of two inputs to the first output and
+        # that sum plus one to the second.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -2301,6 +2763,8 @@ def forward(self, x_1, output_1):
 
         @torch.compile(fullgraph=True, backend=backend, dynamic=dynamic)
         def f(x, y, z):
+            # [FUNCTION DOC] HELPER: Compiled function launching the two-output kernel and
+            # returning both outputs and the square of the third argument.
             output = torch.empty_like(x)
             output2 = torch.empty_like(x)
             n_elements = output.numel()
@@ -2321,6 +2785,12 @@ def forward(self, x_1, output_1):
     @common_utils.parametrize("dynamic", [False, True])
     @common_utils.parametrize("tma_version", ["new", "old"])
     def test_tma_capture_and_functionalize(self, dynamic, tma_version):
+        # [FUNCTION DOC] Parametrized over dynamic and TMA version. Skips if unsupported; resets
+        # the kernel side table. Compiles a function creating host TMA descriptors for three
+        # tensors and launching a 1D TMA add kernel, using a backend recording the ahead-of-time
+        # forward graphs. Checks the forward graph text matches the expected string for the four
+        # combinations of dynamic and API version; the expected strings show the functional
+        # triton wrapper with TMA descriptor metadata.
         if tma_version == "new" and not has_triton_tensor_descriptor_host_tma():
             self.skipTest("requires triton.tools.tensor_descriptor TMA support")
         if tma_version == "old" and not has_triton_experimental_host_tma():
@@ -2336,6 +2806,8 @@ def forward(self, x_1, output_1):
         )
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Zero output; builds three TMA descriptors with block 256;
+            # launches the 1D TMA kernel on the descriptors; returns the output.
             BLOCK_SIZE = 256
             out = torch.zeros_like(a)
             n_elements = out.numel()
@@ -2423,6 +2895,10 @@ def forward(self, arg0_1, arg1_1):
     @common_utils.parametrize("after_create_desc", [False, True])
     @common_utils.parametrize("tma_version", ["new", "old"])
     def test_tma_graph_breaks(self, after_data_ptr, after_create_desc, tma_version):
+        # [FUNCTION DOC] Parametrized over graph-break placement and TMA version. Skips when
+        # unsupported. Checks that graph breaks placed before descriptor creation, after it, or
+        # both do not break correctness: compiled (eager backend, not fullgraph, static) equals
+        # eager and the sum.
         if tma_version == "new" and not has_triton_tensor_descriptor_host_tma():
             self.skipTest("requires triton.tools.tensor_descriptor TMA support")
         if tma_version == "old" and not has_triton_experimental_host_tma():
@@ -2435,6 +2911,9 @@ def forward(self, arg0_1, arg1_1):
         )
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Zero output; optionally forces a graph break, creates three
+            # descriptors, optionally forces another break, then launches the TMA kernel with the
+            # descriptors; returns the output.
             BLOCK_SIZE = 256
             out = torch.zeros_like(a)
             n_elements = out.numel()
@@ -2480,6 +2959,11 @@ def forward(self, arg0_1, arg1_1):
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     @common_utils.parametrize("tma_version", ["new", "old"])
     def test_tma_descriptor_1d(self, dynamic, backend, tma_version):
+        # [FUNCTION DOC] Parametrized over dynamic, backend and TMA version. Skips when
+        # unsupported. Checks a kernel using host TMA descriptors for 1D tensors of 301 elements.
+        # For the inductor backend it also captures the post-fusion IR debug log and uses
+        # FileCheck to require a weak dependency between buffers three and four in the fourth
+        # op's unmet dependencies.
         if tma_version == "new" and not has_triton_tensor_descriptor_host_tma():
             self.skipTest("requires triton.tools.tensor_descriptor TMA support")
         if tma_version == "old" and not has_triton_experimental_host_tma():
@@ -2492,6 +2976,8 @@ def forward(self, arg0_1, arg1_1):
         )
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Zero output; builds descriptors for the two inputs and the
+            # output with block 256; launches the 1D TMA kernel; returns the output.
             BLOCK_SIZE = 256
             out = torch.zeros_like(a)
             n_elements = out.numel()
@@ -2546,6 +3032,11 @@ def forward(self, arg0_1, arg1_1):
     @requires_gpu
     @common_utils.parametrize("tma_version", ["new", "old"])
     def test_tma_descriptor_dedup(self, tma_version):
+        # [FUNCTION DOC] Parametrized on TMA version; compiles with inductor and dynamic shapes.
+        # Passes the same descriptor twice for both inputs; the sum must equal twice the input.
+        # Checks the generated code creates exactly two descriptors (one deduplicated for the two
+        # inputs, one for the output), counting the new-API from-tensor calls (only when not the
+        # cpp wrapper or with compile-time autotuning) or the old-API 1D creation calls.
         if tma_version == "new" and not has_triton_tensor_descriptor_host_tma():
             self.skipTest("requires triton.tools.tensor_descriptor TMA support")
         if tma_version == "old" and not has_triton_experimental_host_tma():
@@ -2558,6 +3049,9 @@ def forward(self, arg0_1, arg1_1):
         )
 
         def f(a):
+            # [FUNCTION DOC] HELPER: Zero output; creates descriptors for the input and the
+            # output with block 256; launches the 1D TMA kernel with the input descriptor twice;
+            # returns the output.
             BLOCK_SIZE = 256
             out = torch.zeros_like(a)
             n_elements = out.numel()
@@ -2610,6 +3104,12 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_wrap_tma_args_skips_constexpr(self):
+        # [FUNCTION DOC] Skips unless the new tensor-descriptor host TMA API is available. Checks
+        # the helper wrapping runtime arguments into TMA descriptors when the signature has
+        # constexpr entries before and after the descriptor params: it uses a mock kernel whose
+        # signature lists a constexpr then three tensor descriptor entries then a constexpr,
+        # passes three tensors, and requires three descriptor objects in the result, so the index
+        # offset for skipped constexprs is correct.
         if not has_triton_tensor_descriptor_host_tma():
             self.skipTest("requires triton.tools.tensor_descriptor TMA support")
 
@@ -2651,6 +3151,10 @@ def forward(self, arg0_1, arg1_1):
     @common_utils.parametrize("backend", ["eager", "aot_eager"])
     @common_utils.parametrize("tma_version", ["new", "old"])
     def test_tma_descriptor_2d(self, dynamic, backend, tma_version):
+        # [FUNCTION DOC] Parametrized over dynamic, backend (eager, aot_eager) and TMA version;
+        # skips when unsupported. Launches a 2D TMA add kernel on 25 by 16 tensors with
+        # descriptors of block sizes 16 and 32, over a 2D grid; eager and compiled results equal
+        # the sum.
         if tma_version == "new" and not has_triton_tensor_descriptor_host_tma():
             self.skipTest("requires triton.tools.tensor_descriptor TMA support")
         if tma_version == "old" and not has_triton_experimental_host_tma():
@@ -2663,6 +3167,8 @@ def forward(self, arg0_1, arg1_1):
         )
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Zero output; creates three 2D descriptors; launches the 2D
+            # TMA kernel with a grid from the output size; returns the output.
             BLOCK_SIZE_X = 16
             BLOCK_SIZE_Y = 32
             out = torch.zeros_like(a)
@@ -2707,12 +3213,18 @@ def forward(self, arg0_1, arg1_1):
     @requires_gpu
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_num_ctas(self, backend):
+        # [FUNCTION DOC] Parametrized on backend. Checks that passing num_ctas directly to a
+        # Triton kernel launch, either by index call or the run method, raises the dynamo
+        # Unsupported error with the message to use an autotune Config instead.
+        # [FUNCTION DOC] HELPER: Triton kernel with one parameter and an empty body.
         @triton.jit
         def kernel(X):
             return
 
         @torch.compile(fullgraph=True, backend=backend)
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled fullgraph function that launches the kernel with
+            # num_ctas set via index call and via the run method, then returns x.
             kernel[(1,)](x, num_ctas=1)
             kernel.run(x, num_ctas=1, grid=(1,), warmup=False)
             return x
@@ -2725,6 +3237,10 @@ def forward(self, arg0_1, arg1_1):
     @requires_gpu
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_special_kwargs_without_autotune(self, backend):
+        # [FUNCTION DOC] Parametrized on backend. Checks a plain (not
+        # autotuned) kernel accepts the warps and stages launch kwargs with
+        # fullgraph compile. Only requires the call to succeed.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -2744,6 +3260,8 @@ def forward(self, arg0_1, arg1_1):
 
         @torch.compile(fullgraph=True, backend=backend)
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Compiled fullgraph function launching the add kernel with
+            # block size 128, warps 8 and stages 3; returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -2763,6 +3281,10 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_backend_options_without_signature(self):
+        # [FUNCTION DOC] Checks that a launch kwarg that is not in the kernel signature is
+        # preserved as a backend compile option. Builds an add kernel without such a parameter,
+        # runs it launching with a false fp fusion kwarg, and asserts the sum, and that a compile
+        # call captured the option false.
         # A launch kwarg that is not in the kernel signature should be kept as
         # a backend option and emitted in the generated Triton metadata.
         add_kernel = _get_backend_options_kernel(with_enable_fp_fusion=False)
@@ -2775,6 +3297,9 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_invalid_backend_options_error(self):
+        # [FUNCTION DOC] Checks that launch kwargs which are neither kernel parameters nor valid
+        # backend options produce a RuntimeError at compile time with the message about launch
+        # kwargs; dynamo accepts them but inductor validates once the backend is known.
         # Dynamo leaves the determination of the target triton backend to
         # inductor, so it will accept constant non-kernel arguments provided
         # to a user defined triton kernels launch. Inductor will then validate
@@ -2794,6 +3319,10 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_backend_options_also_used_as_kernel_kwarg(self):
+        # [FUNCTION DOC] Checks the dual-meaning launch kwarg: a kernel with a constexpr
+        # parameter named like a backend option, launched with that name false. The eager-backend
+        # result must be the product (the kernel branch), and the inductor result must be the
+        # product too and the compile options must also include the option as false.
         # For `def kernel(..., enable_fp_fusion: tl.constexpr)`, the call
         # `kernel[grid](..., enable_fp_fusion=False)` has two meanings in
         # direct Triton: the binder uses it as a kernel parameter, and
@@ -2816,6 +3345,10 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_backend_options_also_kernel_kwarg_with_autotune(self):
+        # [FUNCTION DOC] Same dual-meaning kwarg as the previous test but through a user
+        # autotuner with one config. Compares eager-backend and inductor results to the product,
+        # requires the generated code to contain the user autotune decorator text, and the
+        # compile options to include the option as false.
         # Same dual-meaning kwarg case as above, but through a user-provided
         # triton.Config. The launch kwarg should remain both a kernel
         # parameter and a backend option after the autotune wrapper is applied.
@@ -2837,6 +3370,9 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_autotune_config_conflicts_with_launch_kwarg(self):
+        # [FUNCTION DOC] Checks that a launch kwarg also present in an autotune config raises
+        # Unsupported with the conflict message, both with the eager backend and with the default
+        # inductor backend. The autotune has two configs, one of which sets the same key.
         # Direct Triton errors when a generic autotune config kwarg is also
         # passed as a launch kwarg. The config does not override the launch
         # kwarg; it would create duplicate keyword arguments at launch.
@@ -2861,6 +3397,9 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_backend_options_with_autotune(self):
+        # [FUNCTION DOC] Checks that backend options passed at launch survive the user autotune
+        # wrapper: the result equals the sum, the generated code contains the user autotune
+        # decorator, and the compile options include fp fusion false.
         # Backend options passed at launch should survive through the
         # user-defined Triton autotune wrapper as compile metadata.
         add_kernel = triton.autotune(
@@ -2877,6 +3416,11 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_backend_options_preserved_in_fx_wrapper_hop(self):
+        # [FUNCTION DOC] Checks that with the FX wrapper codegen enabled (single compile thread)
+        # the recorded Triton kernel mutation higher-order-op node keeps the backend option name
+        # in its launch kwargs and the option value in the combined kwargs and constant args, so
+        # a direct run compiles the same kernel. Patches the FX converter generate method to
+        # record each generated graph module.
         add_kernel = _get_backend_options_kernel(with_enable_fp_fusion=False)
         f = _get_backend_options_fn(add_kernel, BLOCK_SIZE=128, enable_fp_fusion=False)
 
@@ -2887,6 +3431,8 @@ def forward(self, arg0_1, arg1_1):
         orig_generate = FxConverter.generate
 
         def record_generate(self):
+            # [FUNCTION DOC] HELPER: Replacement for the converter generate method; calls the
+            # original, records the resulting graph module in a list and returns it.
             gm = orig_generate(self)
             captured_gms.append(gm)
             return gm
@@ -2921,6 +3467,10 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_special_kwargs_with_autotune_use_configs(self):
+        # [FUNCTION DOC] Checks that the special launch names for warps and stages update the
+        # autotune configs rather than being kept as backend options: with launch warps 8 the
+        # generated code contains the warps entry 8 and no backend options text; result equals
+        # the sum.
         # SPECIAL_CONFIG_NAMES keep the existing behavior: they update Triton
         # configs instead of being preserved as generic backend options.
         add_kernel = triton.autotune(
@@ -2937,6 +3487,11 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_capture_triton_backend_options_preserve_launch_kwarg_names(self):
+        # [FUNCTION DOC] Traces with make_fx in symbolic mode a capture_triton launch with
+        # keyword args including a non-signature backend option, and checks the higher-order-op
+        # node launch kwargs equals the set of the three keyword names (element count, block
+        # size, option).
+        # [FUNCTION DOC] HELPER: Add kernel with an empty body used only for tracing.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -2948,6 +3503,9 @@ def forward(self, arg0_1, arg1_1):
             pass
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Empty output; launches the captured
+            # kernel with positional tensors and keyword element count, block
+            # size and fp fusion false; returns the output.
             output = torch.empty_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -2990,6 +3548,11 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_capture_triton_backend_options_also_kernel_kwarg(self):
+        # [FUNCTION DOC] Traces a capture_triton launch where the kernel has a constexpr
+        # parameter with the same name as a backend option, and checks the node's launch kwargs
+        # keep both launch-site names (block size and the option).
+        # [FUNCTION DOC] HELPER: Kernel with an empty body and constexpr parameters including one
+        # named like a backend option.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -3001,6 +3564,8 @@ def forward(self, arg0_1, arg1_1):
             pass
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Empty output; launches the captured kernel with block size
+            # 16 and the option false; returns the output.
             output = torch.empty_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -3035,6 +3600,12 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_capture_triton_autotune_config_does_not_materialize_default_args(self):
+        # [FUNCTION DOC] Checks that tracing a capture_triton launch of an autotuned kernel with
+        # a default-valued constexpr parameter keeps the omitted default out of the node kwargs
+        # and constant args; the grid is the single program computed from the config's block
+        # size, and no launch kwargs are recorded.
+        # [FUNCTION DOC] HELPER: Autotuned (one config, block 16) kernel with an empty body and a
+        # constexpr block size defaulting to two.
         @triton.autotune(
             configs=[triton.Config({"BLOCK_SIZE": 16}, num_warps=4)],
             key=[],
@@ -3049,6 +3620,8 @@ def forward(self, arg0_1, arg1_1):
             pass
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Empty output; launches the captured kernel without block
+            # size; returns the output.
             output = torch.empty_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -3088,6 +3661,10 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_capture_triton_dynamic_backend_options_error(self):
+        # [FUNCTION DOC] Checks that make_fx in symbolic mode raises a RuntimeError saying Triton
+        # backend options must be concrete values when a non-signature launch kwarg (a register
+        # limit) is a symbolic size.
+        # [FUNCTION DOC] HELPER: Kernel with an empty body.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -3098,6 +3675,8 @@ def forward(self, arg0_1, arg1_1):
             pass
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Empty output; launches the captured kernel with a register-
+            # limit kwarg equal to the element count; returns the output.
             output = torch.empty_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -3124,9 +3703,15 @@ def forward(self, arg0_1, arg1_1):
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     @common_utils.parametrize("autotune_at_compile_time", [True, False])
     def test_triton_kernel_restore_value(self, backend, autotune_at_compile_time):
+        # [FUNCTION DOC] Parametrized over backend and compile-time autotuning (only meaningful
+        # for inductor, else skipped). Checks restore_value on an autotuned in-place increment
+        # kernel: after one compiled call the input must equal the original plus exactly one,
+        # i.e. the buffer was restored after benchmarking configs.
         if autotune_at_compile_time and backend != "inductor":
             raise unittest.SkipTest("compile-time autotuning only exists in inductor")
 
+        # [FUNCTION DOC] HELPER: Autotuned (two configs, restore_value for the input pointer)
+        # kernel that adds one to each masked element in place.
         @triton.autotune(
             configs=[
                 triton.Config({"BLOCK_SIZE": 16}, num_stages=3, num_warps=8),
@@ -3151,6 +3736,8 @@ def forward(self, arg0_1, arg1_1):
 
         @torch.compile(fullgraph=True, backend=backend)
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled fullgraph function launching the increment kernel
+            # on x; returns x.
             n_elements = x.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
             increment_kernel[grid](x, n_elements=n_elements)
@@ -3170,7 +3757,11 @@ def forward(self, arg0_1, arg1_1):
     @requires_gpu
     @parametrize("dtype", (torch.float16, torch.float32, torch.float64))
     def test_triton_kernel_float64_constant(self, dtype):
+        # [FUNCTION DOC] Parametrized on float dtype. Checks that a Python float constant
+        # combined with a dynamic size multiplies correctly in half, single and double precision:
+        # compiled dynamic result equals eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Multiplies x by 0.12 times its first dimension size.
             return x * (0.12 * x.shape[0])
 
         x = torch.ones(200, device=GPU_TYPE, dtype=dtype)
@@ -3184,6 +3775,10 @@ def forward(self, arg0_1, arg1_1):
     @requires_gpu_and_triton
     @parametrize("cfg", ["normal", "cpp_wrapper"])
     def test_triton_kernel_dtype_view(self, cfg):
+        # [FUNCTION DOC] Parametrized on normal or cpp wrapper config (skipped on ROCm for issue
+        # 180126). Regression for issue 136159: a Triton kernel writes ones into a half-precision
+        # buffer through its bfloat16 view. Both eager and compiled outputs must have the two
+        # tensors sharing a data pointer and equal values.
         # https://github.com/pytorch/pytorch/issues/136159
         if cfg == "normal":
             config_kwargs = {"cpp_wrapper": False}
@@ -3192,6 +3787,8 @@ def forward(self, arg0_1, arg1_1):
 
         with inductor_config.patch(**config_kwargs):
 
+            # [FUNCTION DOC] HELPER: Kernel storing the half-
+            # precision constant one for masked offsets.
             @triton.jit
             def _triton_kernel(out_ptr, numel, BLOCK_SIZE: tl.constexpr):
                 pid = tl.program_id(0)
@@ -3201,6 +3798,8 @@ def forward(self, arg0_1, arg1_1):
                 tl.store(out_ptr + offsets, ones, mask)
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Allocates an empty half buffer, makes a bfloat16 view of
+                # it, launches the kernel on the view, returns both tensors.
                 buf = torch.empty(x.shape, device=x.device, dtype=torch.float16)
                 # the buf.view() should be a view sharing the same storage as buf.
                 bfloat_buf = buf.view(dtype=torch.bfloat16)
@@ -3228,7 +3827,13 @@ def forward(self, arg0_1, arg1_1):
     # TODO enable this test case on XPU.
     @requires_gpu
     def test_i64_input(self):
+        # [FUNCTION DOC] Checks a 64-bit integer scalar argument (a seed from a random int item,
+        # captured as a scalar output with a dynamic input) is typed as 64 bit in the signature,
+        # with fullgraph compile. Result values (add random noise to a squared uniform input)
+        # must lie in the unit-to-two range.
         # The i64 "seed" input needs to be marked as "i64", not "i32".
+        # [FUNCTION DOC] HELPER: Kernel adding uniform noise generated from a seed and offsets to
+        # each masked input and storing the result.
         @triton.jit
         def triton_add_noise_(x_ptr, y_ptr, seed, numel, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -3240,17 +3845,23 @@ def forward(self, arg0_1, arg1_1):
             tl.store(y_ptr + offsets, res, mask=(offsets < numel))
 
         def add_noise(x, seed):
+            # [FUNCTION DOC] HELPER: Empty output; launches the noise kernel with a grid by cdiv
+            # and block 256; returns the output.
             y = torch.empty_like(x)
             numel = x.numel()
             BLOCK_SIZE = 256
 
             def grid(meta):
+                # [FUNCTION DOC] HELPER: Returns a one-element grid by dividing the element count
+                # by the block size meta parameter.
                 return (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
 
             triton_add_noise_[grid](x, y, seed, numel, BLOCK_SIZE)
             return y
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Squares x, draws a 64 bit integer seed in a large range as a
+            # Python scalar, and returns the noise-added result.
             x = x * x
             seed = torch.randint(
                 low=2**32, high=2**62, size=(1,), dtype=torch.int64
@@ -3270,7 +3881,13 @@ def forward(self, arg0_1, arg1_1):
     @parametrize("wrapped", [False, True])
     @parametrize("autotune", [False, True])
     def test_constexpr_dynamic_shapes(self, wrapped, autotune):
+        # [FUNCTION DOC] Parametrized over wrapped (capture and triton op) and autotune.
+        # Regression for issue 136504: constexpr arguments derived from dynamic sizes (the
+        # element count and its parity). Runs the compiled function on sizes 517 and 1029 and
+        # requires the result to equal x squared.
         # https://github.com/pytorch/pytorch/issues/136504
+        # [FUNCTION DOC] HELPER: Kernel squaring each masked element and adding one when the odd
+        # constexpr is true.
         @triton.jit
         def triton_(
             x_ptr,
@@ -3300,6 +3917,9 @@ def forward(self, arg0_1, arg1_1):
             )(triton_)
 
         def triton_kernel_impl(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Builds args from the input, output, element count and odd
+            # flag (plus block 256 when not autotuned), and launches the kernel directly or
+            # through capture; returns the output.
             y = torch.empty_like(x)
             numel = x.numel()
 
@@ -3308,6 +3928,8 @@ def forward(self, arg0_1, arg1_1):
                 args.append(256)  # BLOCK_SIZE
 
             def grid(meta):
+                # [FUNCTION DOC] HELPER: Returns a one-element grid by dividing the element count
+                # by the block size meta parameter.
                 return (triton.cdiv(numel, meta["BLOCK_SIZE"]),)
 
             if wrapped:
@@ -3324,6 +3946,8 @@ def forward(self, arg0_1, arg1_1):
             triton_kernel = triton_kernel_impl
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the kernel implementation (possibly a registered
+            # triton op) on x.
             return triton_kernel(x)
 
         fn_c = torch.compile(fn, dynamic=True)
@@ -3338,7 +3962,12 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_none_args(self):
+        # [FUNCTION DOC] Regression for issue 115344: passing None for a pointer argument to an
+        # autotuned kernel works with fullgraph compile. Runs the kernel with a real tensor and
+        # then with none and requires compiled outputs to equal eager.
         # https://github.com/pytorch/pytorch/issues/115344
+        # [FUNCTION DOC] HELPER: Autotuned (two configs) kernel that loads the input if given,
+        # otherwise uses zero, then stores the sine.
         @triton.autotune(
             configs=[
                 triton.Config({"BLOCK_SIZE": 32}, num_stages=5, num_warps=2),
@@ -3365,6 +3994,7 @@ def forward(self, arg0_1, arg1_1):
             tl.store(out_ptr + offsets, output, mask=mask)
 
         def sin_triton(x, out):
+            # [FUNCTION DOC] HELPER: Launches the sine kernel with one program per element.
             n_elements = out.numel()
             sin_kernel[(n_elements,)](x, out, n_elements)
 
@@ -3383,6 +4013,10 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_global_constexpr(self):
+        # [FUNCTION DOC] Checks a kernel using a global constexpr float that is not type-
+        # annotated at module level: asserts it is absent from the module annotations while the
+        # string constant is present, then compares compiled output to x plus 3.14.
+        # [FUNCTION DOC] HELPER: Kernel adding the global float constexpr to each element.
         @triton.jit
         def triton_(in_ptr, out_ptr, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -3392,6 +4026,8 @@ def forward(self, arg0_1, arg1_1):
             tl.store(out_ptr + offsets, output)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel with block 256; returns
+            # the output.
             y = torch.empty_like(x)
             BLOCK_SIZE = 256
             grid = (triton.cdiv(x.numel(), BLOCK_SIZE),)
@@ -3410,6 +4046,11 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_triton_kernel_constexpr_arg(self):
+        # [FUNCTION DOC] Checks that a global constexpr integer can be passed as a constexpr
+        # kernel argument that selects a branch (absolute value or square). Compiled fullgraph
+        # output must equal eager.
+        # [FUNCTION DOC] HELPER: Kernel storing either the absolute value or the square of each
+        # masked element depending on the mode constexpr.
         @triton.jit
         def kernel(in_ptr, out_ptr, n, MODE: tl.constexpr, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -3423,6 +4064,8 @@ def forward(self, arg0_1, arg1_1):
             tl.store(out_ptr + offsets, out, mask=mask)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel with the mode set to the
+            # global constexpr and block 1024; returns the output.
             out = torch.empty_like(x)
             n = x.numel()
             grid = (triton.cdiv(n, 1024),)
@@ -3440,6 +4083,13 @@ def forward(self, arg0_1, arg1_1):
         "Test is only valid for new triton versions where attrs is represented by a raw dict",
     )
     def test_triton_attrs_dict_equal_1_None_format(self):
+        # [FUNCTION DOC] Only runs when triton represents attributes as a raw dict. Checks that
+        # for a kernel called with a None argument and a one-element input, the generated triton
+        # metadata lists the element count and the None value among constants, and the signature
+        # marks the count, the None argument and block size as constexpr. Uses FileCheck on the
+        # generated code; the compiled output must equal eager.
+        # [FUNCTION DOC] HELPER: Kernel squaring the input and optionally adding an amount when
+        # it is not None.
         @triton.jit
         def triton_(in_ptr, out_ptr, numel, add_amount, BLOCK_SIZE: tl.constexpr):
             offsets = tl.arange(0, BLOCK_SIZE)
@@ -3450,6 +4100,8 @@ def forward(self, arg0_1, arg1_1):
             tl.store(out_ptr + offsets, output, mask=(offsets < numel))
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel with a single program, the
+            # element count, None as the amount and block 256; returns the output.
             y = torch.empty_like(x)
             BLOCK_SIZE = 256
             grid = (1,)
@@ -3487,6 +4139,9 @@ def forward(self, arg0_1, arg1_1):
     @inductor_config.patch({"triton.autotune_at_compile_time": True})
     @parametrize("quotes", ["single", "double"])
     def test_kernel_with_docstring(self, quotes):
+        # [FUNCTION DOC] Parametrized on single or double quotes in the kernel's docstring; runs
+        # with compile-time autotuning on. Regression for issue 155006: kernels with docstrings
+        # must compile. Compares eager and compiled outputs for size 345.
         kernel = (
             kernel_with_docstring_single_quotes
             if quotes == "single"
@@ -3495,6 +4150,8 @@ def forward(self, arg0_1, arg1_1):
 
         # https://github.com/pytorch/pytorch/issues/155006
         def fn(sz):
+            # [FUNCTION DOC] HELPER: Allocates an empty tensor of the given size and launches the
+            # docstring kernel over a grid by cdiv with block 32; returns the tensor.
             x = torch.empty(sz, device=GPU_TYPE)
             BLOCK_SIZE = 32
             grid = (triton.cdiv(sz, BLOCK_SIZE),)
@@ -3508,12 +4165,18 @@ def forward(self, arg0_1, arg1_1):
     @requires_gpu
     @inductor_config.patch({"triton.autotune_at_compile_time": True})
     def test_kernel_with_backslash_in_docstring(self):
+        # [FUNCTION DOC] Regression for issue 183420: a kernel with backslash escapes in its
+        # docstring must be spliced into the generated wrapper without turning escape sequences
+        # into real newlines (a syntax error). Runs with compile-time autotuning; compares eager
+        # and compiled outputs for size 345.
         # https://github.com/pytorch/pytorch/issues/183420
         # Backslash escapes in the kernel source text must be doubled before
         # the source is spliced into the generated triple-quoted wrapper,
         # otherwise '\n' becomes a real newline in the second-stage .py file
         # and parsing fails with SyntaxError.
         def fn(sz):
+            # [FUNCTION DOC] HELPER: Allocates an empty tensor of the given size and launches the
+            # backslash-docstring kernel with block 32; returns the tensor.
             x = torch.empty(sz, device=GPU_TYPE)
             BLOCK_SIZE = 32
             grid = (triton.cdiv(sz, BLOCK_SIZE),)
@@ -3532,6 +4195,10 @@ def forward(self, arg0_1, arg1_1):
     @inductor_config.patch({"triton.autotune_at_compile_time": True})
     @parametrize("quotes", ["single", "double"])
     def test_kernel_inline_asm(self, quotes):
+        # [FUNCTION DOC] Parametrized on quote style; skipped on XPU. Chooses an inline-assembly
+        # kernel variant for CUDA or ROCm and single or double quotes, runs with compile-time
+        # autotuning, and compares eager and compiled outputs on 345 random elements (regression
+        # for issue 155006).
         if torch.version.cuda:
             kernel = (
                 kernel_inline_asm_single_quotes
@@ -3547,6 +4214,8 @@ def forward(self, arg0_1, arg1_1):
 
         # https://github.com/pytorch/pytorch/issues/155006
         def fn(inp):
+            # [FUNCTION DOC] HELPER: Allocates an empty output sized like the input and launches
+            # the inline-asm kernel over cdiv grid with block 32; returns the output.
             sz = inp.size(0)
             x = torch.empty(sz, device=GPU_TYPE)
             BLOCK_SIZE = 32
@@ -3562,6 +4231,10 @@ def forward(self, arg0_1, arg1_1):
     @requires_gpu
     @inductor_config.patch("emulate_precision_casts", True)
     def test_triton_kernel_emulate_precision_unaffected(self):
+        # [FUNCTION DOC] With the emulate-precision-casts config on, checks that a user Triton
+        # kernel's generated code is not given the fp fusion disabling option.
+        # [FUNCTION DOC] HELPER: Kernel squaring the input and optionally adding an amount when
+        # it is not None.
         @triton.jit
         def triton_(in_ptr, out_ptr, numel, add_amount, BLOCK_SIZE: tl.constexpr):
             offsets = tl.arange(0, BLOCK_SIZE)
@@ -3572,6 +4245,8 @@ def forward(self, arg0_1, arg1_1):
             tl.store(out_ptr + offsets, output, mask=(offsets < numel))
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel with one program, None
+            # amount and block 256; returns the output.
             y = torch.empty_like(x)
             BLOCK_SIZE = 256
             grid = (1,)
@@ -3587,10 +4262,15 @@ def forward(self, arg0_1, arg1_1):
     @inductor_config.patch("emulate_precision_casts", True)
     @inductor_config.patch("max_autotune_gemm_backends", "TRITON")
     def test_triton_kernel_emulate_precision_mm_kernels_do_not_change(self):
+        # [FUNCTION DOC] With emulate-precision-casts on and the Triton gemm backend only,
+        # compiles a matrix multiply with max-autotune mode and checks the generated code lacks
+        # the fp fusion disabling option. If inductor reports no valid choices the test is
+        # skipped; other errors are re-raised.
         from torch._inductor.utils import run_and_get_code
 
         @torch.compile(mode="max-autotune")
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Returns the matrix product of the two inputs.
             return a @ b
 
         t1 = torch.rand(512, 512, device=GPU_TYPE)
@@ -3607,6 +4287,12 @@ def forward(self, arg0_1, arg1_1):
 
     @requires_gpu
     def test_constexpr_handling(self):
+        # [FUNCTION DOC] Uses the ttir generation helper directly on a copy kernel whose
+        # arguments include a None value and constexpr block size. Checks that the textual module
+        # contains the pointer, element count and stride parameters but not the constexpr block
+        # size or None-valued parameter, which are inlined.
+        # [FUNCTION DOC] HELPER: Kernel loading with a stride, scaling by one half or one
+        # depending on a parameter, and storing back.
         @triton.jit
         def copy_kernel(
             src_ptr,
@@ -3650,8 +4336,14 @@ def forward(self, arg0_1, arg1_1):
 
 
 def make_mutation_test(fn):
+    # [FUNCTION DOC] HELPER: Test factory. Takes a function returning a kernel, its inputs, TMA
+    # metadata and expected mutated names, and returns a GPU-gated test method that runs the
+    # access analysis and asserts the names of written tensors equal the expected list in order.
     @requires_gpu
     def test_fn(self):
+        # [FUNCTION DOC] HELPER: Calls the factory's function to obtain the case, runs the
+        # accessed-tensor analysis on it, collects the names of written dependencies, and asserts
+        # they equal the expected list.
         from torch._higher_order_ops.triton_kernel_wrap import identify_accessed_tensors
 
         kernel, inputs, tma_descriptor_metadata, outputs = fn()
@@ -3671,26 +4363,40 @@ def make_mutation_test(fn):
 # Define helpers here
 if HAS_GPU:
 
+    # [FUNCTION DOC] HELPER: Triton helper returning its argument; defined at module level
+    # because kernel scoping requires it.
     @triton.jit
     def helper_id(p):
         return p
 
+    # [FUNCTION DOC] HELPER: Triton helper returning the sum of
+    # two values and the given output pointer.
     @triton.jit
     def helper_add_and_out(x, y, out_ptr):
         return x + y, out_ptr
 
 
 class MutationTests(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Test case for the mutation analysis of Triton kernels. Most tests are generated
+    # by wrapping a function in the test factory: each function defines a kernel and returns the
+    # kernel, inputs, TMA metadata and expected list of mutated argument names, and the generated
+    # test asserts the analysis finds exactly those writes. The class also has one ordinary test
+    # for inference mode.
     # Tests injected below
 
     # Test that a scalar args are not flagged as mutated when passed
     # to a tt.call op.
     @make_mutation_test
     def test_scalar_via_nested_write():
+        # [FUNCTION DOC] Checks that a scalar argument passed on to a nested kernel call is not
+        # reported as mutated; only the output pointer is.
+        # [FUNCTION DOC] HELPER: Kernel storing one at the pointer plus a scalar offset.
         @triton.jit
         def inner(ptr, scalar_offset):
             tl.store(ptr + scalar_offset, 1.0)
 
+        # [FUNCTION DOC] HELPER: Kernel calling the inner kernel with its output pointer and
+        # element count.
         @triton.jit
         def outer(out_ptr, n_elements):
             inner(out_ptr, n_elements)
@@ -3706,6 +4412,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
     # Regression test for #169782
     @make_mutation_test
     def test_with_none_arg():
+        # [FUNCTION DOC] Regression test for issue 169782: a kernel with an optional pointer
+        # argument given as None; only the output pointer is expected as mutated.
+        # [FUNCTION DOC] HELPER: Kernel adding an optional second input if it is not None, then
+        # storing to the output.
         @triton.jit
         def add_kernel_with_none_arg(
             in_ptr0,
@@ -3740,6 +4450,11 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_out_of_order_kernel():
+        # [FUNCTION DOC] Checks mutation analysis on a kernel whose
+        # parameters are not in the usual order (element count before the
+        # second input); only the output pointer is mutated.
+        # [FUNCTION DOC] HELPER: Elementwise add kernel with
+        # element count in the middle of its parameters.
         @triton.jit
         def add_kernel_out_of_order(
             in_ptr0,
@@ -3773,6 +4488,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_out_of_order_kernel_call():
+        # [FUNCTION DOC] Checks that a kernel calling another kernel with arguments in a
+        # different order is analysed correctly; the output pointer is expected as mutated.
+        # [FUNCTION DOC] HELPER: Kernel that calls the reordered add kernel with the inputs,
+        # element count and output pointer.
         @triton.jit
         def add_kernel_out_of_order_fn1(
             in_ptr0,
@@ -3805,6 +4524,11 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_reduce_sum():
+        # [FUNCTION DOC] Checks a kernel using a sum reduction. With the newer MLIR-based
+        # analysis the expected mutated list is just the output pointer; with the older text-
+        # parsing analysis (when the module has no walk method) both pointers are expected.
+        # [FUNCTION DOC] HELPER: Kernel loading a 4 by 4 block, summing along axis one and
+        # storing the result at the output pointer.
         @triton.jit
         def reduce_sum_kernel(a_ptr, c_ptr, stride_am, stride_an):
             offs_am = tl.arange(0, 4)
@@ -3847,6 +4571,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_argmax():
+        # [FUNCTION DOC] Same as the reduction test but with an argmax reduction; the expected
+        # mutated list depends on whether the MLIR-based analysis is used.
+        # [FUNCTION DOC] HELPER: Kernel loading a 4 by 4 block, taking argmax along axis one and
+        # storing the result.
         @triton.jit
         def argmax_kernel(a_ptr, c_ptr, stride_am, stride_an):
             offs_am = tl.arange(0, 4)
@@ -3889,7 +4617,11 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @requires_gpu
     def test_triton_kernel_inference_mode(self):
+        # [FUNCTION DOC] Checks a Triton kernel launch under inference mode: compiled output
+        # equals the eager output.
         def f(x, y, out):
+            # [FUNCTION DOC] HELPER: Launches add_kernel with block 4 on the given tensors,
+            # writing into out.
             n_elements = x.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
             add_kernel[grid](x, y, out, n_elements, BLOCK_SIZE=4)
@@ -3905,6 +4637,11 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_cumsum():
+        # [FUNCTION DOC] Checks mutation analysis for a kernel with a cumulative sum and device
+        # assertion; the expected list is the output pointer with the MLIR analysis and both
+        # pointers with the older text-parsing analysis.
+        # [FUNCTION DOC] HELPER: Kernel loading a row, computing its cumulative sum, asserting it
+        # does not exceed the sum, and storing it to the output.
         @triton.jit
         def cumsum_kernel(in_ptr, out_ptr, XBLOCK: tl.constexpr, RBLOCK: tl.constexpr):
             rindex = tl.arange(0, RBLOCK)[None, :]
@@ -3946,6 +4683,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_fn_call_one_return():
+        # [FUNCTION DOC] Checks that a helper kernel returning the output pointer used for a
+        # store is tracked; the output pointer must be reported mutated.
+        # [FUNCTION DOC] HELPER: Add kernel that stores through the pointer returned by the
+        # identity helper.
         @triton.jit
         def add_kernel_with_fn_call(
             in_ptr0,
@@ -3980,6 +4721,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_fn_call_multi_return():
+        # [FUNCTION DOC] Checks tracking of the output pointer through a helper returning
+        # multiple values (the sum and the pointer); the output pointer must be reported mutated.
+        # [FUNCTION DOC] HELPER: Add kernel that gets its output value and pointer from the add-
+        # and-out helper and stores.
         @triton.jit
         def add_kernel_with_fn_call(
             in_ptr0,
@@ -4013,6 +4758,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_nested_cond_op_kernel():
+        # [FUNCTION DOC] Checks that a store inside nested conditionals on program ids is still
+        # reported as a write to the output pointer.
+        # [FUNCTION DOC] HELPER: Kernel that stores the sum only inside two nested conditions on
+        # program ids.
         @triton.jit
         def nested_cond_op_kernel(
             in_ptr0,
@@ -4050,6 +4799,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_add_for_loop():
+        # [FUNCTION DOC] Checks mutation analysis of a store following a loop that accumulates
+        # four times.
+        # [FUNCTION DOC] HELPER: Kernel accumulating the sum of two inputs four times in a loop
+        # then storing it.
         @triton.jit
         def add_4_times_kernel(
             in_ptr0,
@@ -4085,6 +4838,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_add_for_loop2():
+        # [FUNCTION DOC] Checks mutation analysis for a loop over the block size with a multiple-
+        # of hint inside; output pointer expected as mutated.
+        # [FUNCTION DOC] HELPER: Kernel with a loop applying a
+        # multiple-of hint, then storing the sum.
         @triton.jit
         def add_1_time_kernel(
             in_ptr0,
@@ -4120,6 +4877,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_add_nested_for_loop():
+        # [FUNCTION DOC] Checks mutation analysis of a kernel with a doubly nested loop
+        # accumulating the sum.
+        # [FUNCTION DOC] HELPER: Kernel accumulating the sum in two nested loops of two
+        # iterations and storing it.
         @triton.jit
         def add_4_times_kernel(
             in_ptr0,
@@ -4156,6 +4917,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_add_nested_for_loop_multi_return():
+        # [FUNCTION DOC] Checks mutation analysis of a kernel with two accumulators updated
+        # inside nested loops.
+        # [FUNCTION DOC] HELPER: Kernel accumulating one input in one buffer and the other in
+        # another buffer inside nested loops, then storing their sum.
         @triton.jit
         def add_4_times_kernel(
             in_ptr0,
@@ -4195,6 +4960,9 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_labels():
+        # [FUNCTION DOC] Checks mutation analysis of a kernel with an early return (a label in
+        # the lowered code) for program ids above one.
+        # [FUNCTION DOC] HELPER: Add kernel that returns early when the program id exceeds one.
         @triton.jit
         def kernel_with_label(
             in_ptr0,
@@ -4230,6 +4998,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_for_loop_arg():
+        # [FUNCTION DOC] Checks mutation analysis of a kernel with a loop-carried pointer
+        # argument and matrix products; only the output pointer is expected.
+        # [FUNCTION DOC] HELPER: Kernel looping over column blocks, computing a matrix product of
+        # the input block with a weight block plus bias, and storing it to the output.
         @triton.jit
         def fwd_kernel(
             X_ptr,
@@ -4290,6 +5062,11 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_for_loop_arg_2():
+        # [FUNCTION DOC] Checks mutation analysis of a kernel that copies batches through block
+        # pointers in a counted loop, advancing both pointers each iteration; only the output
+        # pointer is expected.
+        # [FUNCTION DOC] HELPER: Kernel creating input and output block pointers and, for each
+        # batch iteration, loading a block, storing it and advancing both pointers.
         @triton.jit
         def fwd_kernel(
             x_ptr,
@@ -4350,6 +5127,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_while_loop():
+        # [FUNCTION DOC] Checks mutation analysis of a kernel that copies blocks in a while loop
+        # with block pointers; only the output pointer is expected.
+        # [FUNCTION DOC] HELPER: Kernel creating block pointers and, in a while loop up to the
+        # batch count, loading, storing and advancing both pointers.
         @triton.jit
         def fwd_kernel(
             x_ptr,
@@ -4412,6 +5193,11 @@ class MutationTests(torch._inductor.test_case.TestCase):
 
     @make_mutation_test
     def test_branch_with_multiple_yield_args():
+        # [FUNCTION DOC] Checks that a conditional branch yielding several
+        # pointers (inputs and output shifted by one, from a loaded flag)
+        # still reports only the output pointer as mutated.
+        # [FUNCTION DOC] HELPER: Kernel that, depending on a loaded flag, offsets the three
+        # pointers by one, then adds the two inputs and stores the sum to the output.
         @triton.jit
         def branch_with_multiple_yield_args(
             in_ptr0,
@@ -4457,6 +5243,11 @@ class MutationTests(torch._inductor.test_case.TestCase):
         )
 
     def test_get_tma_stores(self):
+        # [FUNCTION DOC] Unit test of the TMA-store discovery helper on hand-built function
+        # graphs. A helper function that only reinterprets a descriptor, called from main, yields
+        # empty sets for both. After adding an experimental descriptor store op in the helper and
+        # resetting the cache, the helper reports its first parameter and intermediate, and main
+        # reports its first parameter.
         from torch._higher_order_ops.triton_kernel_wrap import (
             get_tma_stores,
             Intermediate,
@@ -4506,6 +5297,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
         self.assertEqual(get_tma_stores(functions, "main"), {Param(idx=0)})
 
     def test_tensormap_create_marks_descriptor_write(self):
+        # [FUNCTION DOC] Checks that the tensormap-create operation marks its first
+        # argument (the workspace) as written, not the second (a global pointer).
+        # Builds a one-function graph, resets the cache, runs the access analysis
+        # with two argument names and compares write names.
         from torch._higher_order_ops.triton_kernel_wrap import (
             analyze_kernel_access,
             Intermediate,
@@ -4539,6 +5334,11 @@ class MutationTests(torch._inductor.test_case.TestCase):
         self.assertListEqual(write_names, ["workspace"])
 
     def test_register_kernel_access_op_updates_direct_analysis_after_reset(self):
+        # [FUNCTION DOC] Checks that registering a custom kernel access op changes
+        # later analysis. Before registration the custom op writes nothing; after
+        # registering it with write index zero and resetting the analysis cache, the
+        # first argument is reported written. The finally block unregisters the op
+        # and resets the analysis and TMA store caches.
         from torch._higher_order_ops import triton_kernel_wrap as tkw
         from torch._higher_order_ops.triton_kernel_wrap import (
             analyze_kernel_access,
@@ -4587,6 +5387,9 @@ class MutationTests(torch._inductor.test_case.TestCase):
             get_tma_stores.reset()
 
     def test_register_kernel_access_op_rejects_ignore_with_indexes(self):
+        # [FUNCTION DOC] Checks that registering a kernel access op with an ignore predicate
+        # together with write indexes raises an AssertionError with the message that ignore_if
+        # cannot be combined with read/write indexes.
         from torch._higher_order_ops import triton_kernel_wrap as tkw
 
         msg = "custom_tma.invalid: ignore_if cannot be combined with read/write indexes"
@@ -4596,6 +5399,8 @@ class MutationTests(torch._inductor.test_case.TestCase):
             )
 
     def test_kernel_access_op_can_read_and_write(self):
+        # [FUNCTION DOC] Checks that the atomic read-modify-write op is reported as both a read
+        # and a write of its single pointer argument.
         from torch._higher_order_ops.triton_kernel_wrap import (
             analyze_kernel_access,
             Intermediate,
@@ -4630,6 +5435,9 @@ class MutationTests(torch._inductor.test_case.TestCase):
     )
     @make_mutation_test
     def test_add_kernel_on_device_tma_old_api():
+        # [FUNCTION DOC] Skipped when the experimental host TMA API is missing. Mutation test for
+        # the old-API on-device TMA add kernel on large tensors and a workspace: the output and
+        # the workspace are expected as written.
         a = torch.randn(1024, 1024)
         b = torch.randn(1024, 1024)
         c = torch.empty(1024, 1024)
@@ -4655,6 +5463,9 @@ class MutationTests(torch._inductor.test_case.TestCase):
     )
     @make_mutation_test
     def test_add_kernel_on_device_tma_new_api():
+        # [FUNCTION DOC] Skipped when the tensor-descriptor TMA API is missing. Mutation test for
+        # the new-API on-device TMA add kernel; only the output is expected as written (the
+        # workspace is unused).
         a = torch.randn(1024, 1024)
         b = torch.randn(1024, 1024)
         c = torch.empty(1024, 1024)
@@ -4682,6 +5493,10 @@ class MutationTests(torch._inductor.test_case.TestCase):
     )
     @requires_gpu
     def test_descriptor_load_store_read_write_detection(self):
+        # [FUNCTION DOC] Skipped without the tensor-descriptor API; GPU only. Regression test
+        # that descriptor loads and stores created by device-side make-tensor-descriptor are
+        # recognised by the access analysis: for a kernel loading from two descriptors and
+        # storing to a third, the reads are the two inputs and the write is the output.
         """
         Regression test: tl.make_tensor_descriptor + desc.load()/desc.store()
         generates tt.descriptor_load/tt.descriptor_store ops in TTIR. These
@@ -4690,6 +5505,8 @@ class MutationTests(torch._inductor.test_case.TestCase):
         """
         from torch._higher_order_ops.triton_kernel_wrap import identify_accessed_tensors
 
+        # [FUNCTION DOC] HELPER: Kernel building three tensor descriptors and storing the sum of
+        # two loaded tiles to the output descriptor.
         @triton.jit
         def add_kernel_descriptor_method(
             in_ptr0,
@@ -4750,6 +5567,13 @@ class MutationTests(torch._inductor.test_case.TestCase):
         "requires gpu or triton cpu",
     )
     def test_custom_tma_descriptor_ops_keep_triton_launcher(self):
+        # [FUNCTION DOC] Runs on GPU or Triton CPU. Registers custom descriptor store (write
+        # index zero, marked as a TMA store) and load (read index zero) ops, patches TTIR
+        # generation and function parsing with canned values, and checks the analysis reports
+        # in_ptr0 as read and out_ptr as written. Then compiles a function using mul2_kernel (CPU
+        # Triton backend if on CPU) and checks the output is doubled and the code still uses the
+        # normal Triton launcher (cpp wrapper or run form). The finally block unregisters both
+        # ops and resets the caches.
         import triton
 
         from torch._higher_order_ops import triton_kernel_wrap as tkw
@@ -4831,6 +5655,8 @@ class MutationTests(torch._inductor.test_case.TestCase):
                 self.assertListEqual(write_names, ["out_ptr"])
 
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Zero output; launches mul2_kernel with grid by cdiv
+                    # and block 16; returns the output.
                     output = torch.zeros_like(x)
                     grid = (triton.cdiv(x.numel(), 16),)
                     mul2_kernel[grid](x, output, x.numel(), BLOCK_SIZE=16)
@@ -5023,12 +5849,19 @@ if HAS_GPU:
 
 
 class CustomOpTests(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Tests of custom ops that wrap Triton kernels via the triton op decorator and
+    # the capture wrapper.
     """Tests for custom ops wrapping triton kernels"""
 
     @requires_gpu
     @common_utils.parametrize("autotuned", [False, True])
     @common_utils.parametrize("dynamic", [False, True])
     def test_add_kernel(self, autotuned, dynamic):
+        # [FUNCTION DOC] Parametrized on autotune and dynamic. Registers a triton op
+        # that adds two tensors using the capture wrapper (autotuned or fixed block 16
+        # kernel). Eager result equals the sum; compiled result equals it with exactly
+        # one generated code object, and the generated code contains neither the
+        # library nor the op name (the op is decomposed).
         from torch._inductor.utils import run_and_get_code
 
         libname = "my_cool_namespace"
@@ -5036,10 +5869,15 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
         @torch.library.triton_op(f"{libname}::{opname}", mutates_args={})
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Triton op body; empty output; launches
+            # the (autotuned or fixed) add kernel through the capture wrapper
+            # with a callable grid; returns the output.
             output = torch.empty_like(x)
             n_elements = output.numel()
 
             def grid(meta):
+                # [FUNCTION DOC] HELPER: Returns a one-element grid by dividing the element count
+                # by the block size meta parameter.
                 return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
             if autotuned:
@@ -5049,6 +5887,7 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
             return output
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Calls the registered op on the two tensors.
             return add(x, y)
 
         x = torch.randn(3, device=GPU_TYPE)
@@ -5068,21 +5907,28 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
     @requires_gpu
     def test_subclass(self):
+        # [FUNCTION DOC] Checks the triton op with a tensor subclass holding two inner tensors:
+        # the fullgraph compiled result's inner tensors must equal those of the eager result.
         libname = "my_cool_namespace"
         opname = "my_triton_operator"
 
         @torch.library.triton_op(f"{libname}::{opname}", mutates_args={})
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Triton op body that launches add_kernel through the capture
+            # wrapper with block 16 and returns the output.
             output = torch.empty_like(x)
             n_elements = output.numel()
 
             def grid(meta):
+                # [FUNCTION DOC] HELPER: Returns a one-element grid by dividing the element count
+                # by the block size meta parameter.
                 return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
             capture_triton(add_kernel)[grid](x, y, output, n_elements, 16)
             return output
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Calls the registered op on the two tensors.
             return add(x, y)
 
         x0 = torch.randn(3, device=GPU_TYPE)
@@ -5103,11 +5949,16 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
     @requires_gpu
     @dynamo_config.patch("recompile_limit", 1)
     def test_triton_dynamic_grid_no_recompile(self):
+        # [FUNCTION DOC] With a recompile limit of one, checks that a dynamic compiled function
+        # calling a triton op whose grid depends on the element count does not recompile when
+        # called with sizes 8 and 16.
         libname = "my_cool_namespace"
         opname = "my_triton_operator"
 
         @torch.library.triton_op(f"{libname}::{opname}", mutates_args={})
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Triton op body launching add_kernel with a grid of one
+            # program per element through the capture wrapper; returns the output.
             output = torch.empty_like(x)
             n_elements = output.numel()
             capture_triton(add_kernel)[(n_elements,)](x, y, output, n_elements, 16)
@@ -5115,6 +5966,8 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
         @torch.compile(fullgraph=True, dynamic=True)
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled (fullgraph, dynamic) function calling the op with
+            # the same tensor twice.
             return add(x, x)
 
         f(torch.randn(8, device=GPU_TYPE))
@@ -5122,9 +5975,13 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
     @unittest.skipIf(not has_triton_package(), "requires triton")
     def test_capture_triton_meta(self):
+        # [FUNCTION DOC] Skipped without triton. Checks the meta device implementation of a
+        # triton op (derived from the captured kernel) returns an empty tensor shaped like the
+        # input when called on meta tensors.
         import triton
         import triton.language as tl
 
+        # [FUNCTION DOC] HELPER: Local masked elementwise add kernel.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -5144,16 +6001,21 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
         @torch.library.triton_op("mylib::add", mutates_args=())
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Triton op body that launches the local kernel through the
+            # capture wrapper with block 16; returns the output.
             output = torch.empty_like(x)
             n_elements = output.numel()
 
             def grid(meta):
+                # [FUNCTION DOC] HELPER: Returns a one-element grid by dividing the element count
+                # by the block size meta parameter.
                 return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
             capture_triton(add_kernel)[grid](x, y, output, n_elements, 16)
             return output
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Calls the op on the two tensors.
             return add(x, y)
 
         x = torch.randn(3, device="meta")
@@ -5165,9 +6027,15 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
     @requires_gpu
     def test_wrap_triton_disabled_in_triton_op(self):
+        # [FUNCTION DOC] Checks that wrap_triton is disabled while a triton op body runs. A
+        # registered op records whether wrapping is enabled into a status list, asserts
+        # wrap_triton returns the kernel itself, launches a pre-wrapped kernel both by index and
+        # by the run method into two outputs, and returns their sum. The test requires the last
+        # status false and the result equal to twice the sum.
         import triton  # @manual
         import triton.language as tl  # @manual
 
+        # [FUNCTION DOC] HELPER: Local masked elementwise add kernel.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -5191,6 +6059,9 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
         @torch.library.triton_op("mylib::add", mutates_args=())
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Triton op body; records whether wrap_triton is enabled,
+            # asserts wrap_triton returns the same kernel object, runs the pre-wrapped kernel by
+            # index and by the run method into two outputs, and returns the sum of the outputs.
             import torch._higher_order_ops.triton_kernel_wrap
 
             status.append(torch._library.triton.is_wrap_triton_enabled())
@@ -5221,6 +6092,11 @@ class CustomOpTests(torch._inductor.test_case.TestCase):
 
     @unittest.skipIf(not HAS_CUDA_AND_TRITON, "requires CUDA and Triton")
     def test_wrap_triton_triton_interpret_eager(self):
+        # [FUNCTION DOC] Needs CUDA and Triton. Runs a script in a subprocess (with the Triton
+        # interpreter env var set) that defines plain and autotuned add kernels, launches both
+        # through the wrap_triton wrapper in eager mode comparing with the sum, and checks that
+        # wrapping an arbitrary object with a fn attribute raises a RuntimeError mentioning that
+        # wrap_triton only works for kernels. The subprocess must exit successfully.
         script = """
 import os
 os.environ["TRITON_INTERPRET"] = "1"
@@ -5314,9 +6190,16 @@ else:
         "variant", ["triton_kernel", "custom_op", "mutable_custom_op"]
     )
     def test_preserves_strides(self, variant):
+        # [FUNCTION DOC] Parametrized over variant (direct kernel, custom op, mutable custom op).
+        # Registers a graph pattern replacing permute with a version followed by a forced
+        # channels-last custom op and registers custom ops in a scoped library, one returning a
+        # freshly allocated contiguous result and one writing into an out argument. Checks the
+        # compiled function (fullgraph, using the custom post-grad pass) equals eager, that the
+        # pattern was applied, i.e. strides are preserved around the Triton kernel.
         import triton
         import triton.language as tl
 
+        # [FUNCTION DOC] HELPER: Local masked elementwise add kernel.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -5338,16 +6221,22 @@ else:
         other = torch.randn(4, 4, 2, 2, device=GPU_TYPE)
 
         def add_triton(y, z):
+            # [FUNCTION DOC] HELPER: Allocates a contiguous empty tensor like the second input
+            # and runs the add kernel with block 16; returns the output.
             grid = (z.numel(),)
             out = torch.empty_like(z, memory_format=torch.contiguous_format)
             add_kernel[grid](y, z, out, z.numel(), BLOCK_SIZE=16)
             return out
 
         class _CustomPass(PatternMatcherPass):
+            # [CLASS DOC] HELPER: Pattern matcher pass subclass whose call applies its registered
+            # patterns to the graph.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the parent constructor with no extra state.
                 super().__init__()
 
             def __call__(self, g: torch.fx.Graph):
+                # [FUNCTION DOC] HELPER: Applies the pass's patterns to the given graph.
                 self.apply(g)
 
         g = _CustomPass()
@@ -5358,9 +6247,14 @@ else:
             pass_dict=g,
         )
         def _(match, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Pattern handler for permute nodes: flattens the matched
+            # args, defines a replacement that applies permute then the force-channels-last
+            # custom op, marks the outer flag as called, and replaces the match by that example.
             flat_args, spec = pytree.tree_flatten((args, kwargs))
 
             def decomp(*flat_args):
+                # [FUNCTION DOC] HELPER: Rebuilds the original args and kwargs from the flat list
+                # and returns the permute result passed through the force-channels-last op.
                 args, kwargs = pytree.tree_unflatten(flat_args, spec)
                 return torch.ops.mylib.force_channels_last(
                     torch.ops.aten.permute(*args, **kwargs)
@@ -5379,6 +6273,8 @@ else:
             )
 
             def impl2(x):
+                # [FUNCTION DOC] HELPER: Implementation of the custom op returning a clone in
+                # channels-last memory format.
                 return x.clone(memory_format=torch.channels_last)
 
             lib.impl("force_channels_last", impl2, "CompositeExplicitAutograd")
@@ -5388,9 +6284,13 @@ else:
             )
 
             def impl(x, y):
+                # [FUNCTION DOC] HELPER: Implementation of the add
+                # op that runs the Triton add wrapper.
                 return add_triton(x, y)
 
             def meta(x, y):
+                # [FUNCTION DOC] HELPER: Meta implementation returning an empty contiguous tensor
+                # like the second input.
                 return torch.empty_like(y, memory_format=torch.contiguous_format)
 
             lib.impl("add_op", impl, "CompositeExplicitAutograd")
@@ -5401,6 +6301,8 @@ else:
             )
 
             def impl_out(x, y, out):
+                # [FUNCTION DOC] HELPER: Implementation of the out-argument op; launches the add
+                # kernel writing into out with block 16.
                 grid = (y.numel(),)
                 add_kernel[grid](x, y, out, y.numel(), BLOCK_SIZE=16)
 
@@ -5408,6 +6310,10 @@ else:
             lib.impl("add_out_op", lambda x, y, out: None, "Meta")
 
             def f(x, other):
+                # [FUNCTION DOC] HELPER: Builds a transposed, contiguous, transposed-back tensor
+                # and a sine of it transposed; depending on the variant, returns the Triton add,
+                # the custom op result, or the output filled by the mutable op; raises an
+                # AssertionError for unknown variants.
                 y = x.transpose(2, 3).contiguous().transpose(2, 3)
                 z = y.sin().transpose(2, 3)
                 if variant == "triton_kernel":
@@ -5432,6 +6338,11 @@ else:
     @common_utils.parametrize("dynamic", [False, True])
     @common_utils.parametrize("autotune", [False, True])
     def test_capture_triton_special_kwargs(self, dynamic, autotune):
+        # [FUNCTION DOC] Parametrized over dynamic and autotune. Checks that the capture wrapper
+        # accepts warps and stages launch kwargs (with block size given directly or via an
+        # autotuner). Eager result equals the sum and the graph traced by make_fx (symbolic or
+        # fake mode) also computes the sum.
+        # [FUNCTION DOC] HELPER: Local masked elementwise add kernel.
         @triton.jit
         def add_kernel(
             in_ptr0,
@@ -5459,6 +6370,8 @@ else:
             )(add_kernel)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Zero output; launches the captured kernel with warps 8 and
+            # stages 3 and, when not autotuned, block 128; returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -5493,10 +6406,17 @@ else:
     @inductor_config.patch("cpp_wrapper", True)
     @inductor_config.patch("triton.autotune_at_compile_time", True)
     def test_autotune_unbacked(self):
+        # [FUNCTION DOC] Skipped on Windows; GPU only, with the cpp wrapper and compile-time
+        # autotuning on. Checks the grid expressions emitted during compile-time autotuning for
+        # an unbacked first dimension: the log must contain the compile-time auto-tuning marker,
+        # a precomputed grid, and ceiling divisions by 32 and 128 of the launcher symbol (one per
+        # config block size).
         import triton
         import triton.language as tl
 
         def get_op_configs():
+            # [FUNCTION DOC] HELPER: Returns two autotune configs with different block sizes,
+            # stage counts and warp counts.
             return [
                 triton.Config(
                     {
@@ -5520,6 +6440,8 @@ else:
                 ),
             ]
 
+        # [FUNCTION DOC] HELPER: Autotuned (keyed on the matrix sizes) kernel that writes zeros
+        # into a tile of the output with grouped program ordering; reads nothing.
         @triton.autotune(
             configs=get_op_configs(),
             key=["N", "K"],
@@ -5568,6 +6490,10 @@ else:
 
         @torch.compile()
         def foo(x, w):
+            # [FUNCTION DOC] HELPER: Compiled function that checks inner
+            # dimensions agree (raising an AssertionError otherwise), allocates
+            # an uninitialized output and launches the zeros kernel with a grid
+            # by cdiv of the block sizes; returns the output.
             M, K = x.shape
             KB, N = w.shape
             assert K == KB, f"incompatible dimensions {K}, {KB}"  # noqa: S101
@@ -5575,6 +6501,8 @@ else:
             z = torch.empty((M, N), device=x.device, dtype=x.dtype)
 
             def grid(META):
+                # [FUNCTION DOC] HELPER: Returns a one-element grid with the product of the
+                # ceiling divisions of the sizes by the block meta parameters.
                 return (
                     triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
                 )
@@ -5620,11 +6548,19 @@ else:
     # PR: https://github.com/triton-lang/triton/pull/5092
     @requires_gpu
     def test_autotune_no_pre_or_post_hook_user_defined(self):
+        # [FUNCTION DOC] Checks that a kernel autotuned with pre and post hooks (and a per-config
+        # pre hook) is flagged on the Autotuner object (skipped for old triton lacking the flag
+        # attributes) and that compiling it raises dynamo Unsupported with the message that hooks
+        # are not supported. The eager call must work first and give an output of all twos.
         from triton.runtime.autotuner import Autotuner
 
         def init_to_zero(name):
+            # [FUNCTION DOC] HELPER: Returns a hook that zeroes the named tensor from the hook's
+            # argument mapping in place.
             return lambda nargs: nargs[name].zero_()
 
+        # [FUNCTION DOC] HELPER: Autotuned kernel (hooks reset the output) that atomically adds
+        # the sum of two inputs into the output.
         @triton.autotune(
             configs=[
                 triton.Config(
@@ -5652,6 +6588,8 @@ else:
             tl.atomic_add(output_ptr + offsets, output, mask=mask)
 
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Output of ones; launches the kernel with callable grid;
+            # returns the output.
             output = torch.ones(x.shape, device=x.device, dtype=x.dtype)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -5687,9 +6625,15 @@ else:
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     @common_utils.parametrize("autotune_at_compile_time", [True, False])
     def test_triton_kernel_reset_to_zero(self, backend, autotune_at_compile_time):
+        # [FUNCTION DOC] Parametrized over backend and compile-time autotuning (skipped for non-
+        # inductor with it). Checks reset_to_zero on an autotuned kernel: the increment pointer
+        # is zeroed before each autotune benchmark so that the input is only incremented once by
+        # the real run; after the call the input equals the original plus the increment.
         if autotune_at_compile_time and backend != "inductor":
             raise unittest.SkipTest("compile-time autotuning only exists in inductor")
 
+        # [FUNCTION DOC] HELPER: Autotuned (three configs, reset the increment pointer to zero)
+        # kernel adding the loaded increment values to the input in place.
         @triton.autotune(
             configs=[
                 triton.Config({"BLOCK_SIZE": 64}, num_stages=3, num_warps=8),
@@ -5718,6 +6662,8 @@ else:
 
         @torch.compile(fullgraph=True, backend=backend)
         def f(x, increment):
+            # [FUNCTION DOC] HELPER: Compiled fullgraph function launching the increment kernel
+            # on x; returns x.
             n_elements = x.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
             increment_kernel[grid](x, increment, n_elements=n_elements)
@@ -5739,6 +6685,13 @@ else:
     @requires_gpu
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_single_autotune(self, backend):
+        # [FUNCTION DOC] Parametrized on backend. Checks that stacking two autotune decorators on
+        # a kernel raises dynamo Unsupported with the message that multiple autotune decorators
+        # are not supported.
+        # [FUNCTION DOC] HELPER: Add kernel decorated by two autotune decorators; per the comment
+        # only one is supported.
+        # KNOWN ISSUE: the comment before the expected exception says pre_hook is not allowed,
+        # copied from another test; the actual message concerns multiple autotune decorators.
         @triton.autotune(
             configs=[
                 triton.Config(
@@ -5771,6 +6724,8 @@ else:
             tl.store(output_ptr + offsets, output, mask=mask)
 
         def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Output of ones; launches the add kernel with callable grid;
+            # returns the output.
             output = torch.ones(x.shape, device=x.device, dtype=x.dtype)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -5793,6 +6748,12 @@ else:
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     @common_utils.parametrize("with_perf_model", [True, False])
     def test_triton_kernel_prune_configs_by(self, backend, with_perf_model, non_strict):
+        # [FUNCTION DOC] Parametrized over backend, perf-model use and non-strict (triton op with
+        # wrap_triton) mode. Builds an autotuned kernel pruned either by a perf model keeping the
+        # top one or by an early config prune hook that keeps the first config, which records
+        # calls in a dict. With the perf model the largest block is chosen, one record exists and
+        # destination equals source plus 1.5. Without it block 32 is chosen, destination equals
+        # source, and three records show the hook ran with the size kwarg and the named args.
         # for non-strict mode
         libname = "my_cool_namespace"
         opname = "my_triton_operator"
@@ -5800,6 +6761,9 @@ else:
         records = {}
 
         def early_config_prune(configs, named_args, **kwargs):
+            # [FUNCTION DOC] HELPER: Early prune hook that records that it ran, records if the
+            # size kwarg is 1024 and if named args hold destination and source with three
+            # entries, and returns only the first config.
             # we need to save the records to the returned config
             records["run_early_config_prune"] = True
             if "N" in kwargs and kwargs["N"] == 1024:
@@ -5810,6 +6774,8 @@ else:
             return [configs[0]]
 
         def perf_model(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Perf model hook that records it ran and returns the negative
+            # of the block size, making larger blocks better.
             records["run_perf_model"] = True
             return kwargs["BLOCK_SIZE"] * -1
 
@@ -5818,6 +6784,8 @@ else:
         else:
             prune_configs_by = {"early_config_prune": early_config_prune}
 
+        # [FUNCTION DOC] HELPER: Autotuned (two block sizes, pruned) kernel that copies the
+        # source to the destination, adding a float when block size is 128.
         @triton.autotune(
             configs=[
                 triton.Config(kwargs={"BLOCK_SIZE": 32}),
@@ -5847,6 +6815,8 @@ else:
             add_float: float,
             N: int,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Launches the pruned kernel through wrap_triton (non-strict)
+            # or directly, with a callable grid by cdiv of the size.
             grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
             if non_strict:
                 torch.library.wrap_triton(prune_by_kernel)[grid](
@@ -5885,6 +6855,10 @@ else:
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     @common_utils.parametrize("with_perf_model", [True, False])
     def test_triton_kernel_prune_configs_by_recompile(self, backend, with_perf_model):
+        # [FUNCTION DOC] Parametrized over backend and perf-model use. Checks guards: the compile
+        # counter's op count stays one on repeated calls, becomes two after the autotuner's
+        # configs are replaced with a single block-64 config, and stays two on a further call,
+        # i.e. changing autotuner configs triggers a recompile. Resets dynamo first.
         """
         We want to recompile if anyone changes configs in the autotuner object
         In short if for example the following sequence of events happens:
@@ -5902,9 +6876,13 @@ else:
         # If we modified the non-local records dict here, this would trigger
         # recompile events.
         def early_config_prune(configs, named_args, **kwargs):
+            # [FUNCTION DOC] HELPER: Early prune hook returning only the first config;
+            # deliberately records nothing to avoid triggering recompiles.
             return [configs[0]]
 
         def perf_model(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Perf model returning the
+            # negative block size; records nothing.
             return kwargs["BLOCK_SIZE"] * -1
 
         if with_perf_model:
@@ -5912,6 +6890,8 @@ else:
         else:
             prune_configs_by = {"early_config_prune": early_config_prune}
 
+        # [FUNCTION DOC] HELPER: Autotuned (two block sizes, pruned) kernel that copies the
+        # source to the destination, adding a float when block size is 128.
         @triton.autotune(
             configs=[
                 triton.Config(kwargs={"BLOCK_SIZE": 32}),
@@ -5940,6 +6920,8 @@ else:
 
         @torch.compile(fullgraph=True, backend=counter)
         def f(dst, src, add_float, N):
+            # [FUNCTION DOC] HELPER: Compiled (fullgraph, counting backend) function launching
+            # the pruned kernel with a callable grid.
             grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
             prune_by_kernel[grid](dst, src, add_float, N=N)
 
@@ -5976,9 +6958,15 @@ else:
     @requires_gpu
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_prune_configs_by_called_twice(self, backend):
+        # [FUNCTION DOC] Parametrized on backend. Checks that an autotuned kernel with an early
+        # prune hook can be launched twice in one compiled function (the second call using the
+        # first output) and that the result equals the input plus the second input twice.
         def early_config_prune(configs, named_args, **kwargs):
+            # [FUNCTION DOC] HELPER: Early prune hook returning only the first config.
             return [configs[0]]
 
+        # [FUNCTION DOC] HELPER: Autotuned (two block sizes, pruned) elementwise add kernel with
+        # a mask.
         @triton.autotune(
             configs=[
                 triton.Config(kwargs={"BLOCK_SIZE": 128}),
@@ -6002,6 +6990,8 @@ else:
             tl.store(out_ptr + offsets, x + y, mask=mask)
 
         def call_kernel(x, y):
+            # [FUNCTION DOC] HELPER: Empty output; launches the add kernel with a callable grid;
+            # returns the output.
             out = torch.empty_like(x)
             n_elements = x.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
@@ -6010,6 +7000,8 @@ else:
 
         @torch.compile(fullgraph=True, backend=backend)
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Calls the kernel helper on x and y, then again on that
+            # output and y; returns the result.
             out = call_kernel(x, y)
             return call_kernel(out, y)
 
@@ -6021,9 +7013,15 @@ else:
     @requires_gpu
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_heuristics_and_prune_configs_by(self, backend):
+        # [FUNCTION DOC] Parametrized on backend. Checks that an autotuner combined with a
+        # heuristics decorator and a no-op prune hook works with fullgraph compile: the kernel
+        # doubles its input, and the compiled result equals twice the input.
         def noop_prune(configs, named_args, **kwargs):
+            # [FUNCTION DOC] HELPER: Prune hook that returns all configs unchanged.
             return configs
 
+        # [FUNCTION DOC] HELPER: Kernel decorated by autotune (two block sizes, no-op pruning)
+        # and a heuristics decorator for an even-size flag; stores twice the masked input.
         @triton.autotune(
             configs=[
                 triton.Config({"BLOCK": 128}),
@@ -6041,6 +7039,8 @@ else:
             tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) * 2, mask=mask)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel with a grid of cdiv of the
+            # size by 128; returns the output.
             out = torch.empty_like(x)
             kernel[(triton.cdiv(x.numel(), 128),)](x, out, x.numel())
             return out
@@ -6052,9 +7052,14 @@ else:
     @requires_gpu
     @common_utils.parametrize("backend", ["eager", "aot_eager", "inductor"])
     def test_triton_kernel_run_with_prune_configs_by(self, backend):
+        # [FUNCTION DOC] Parametrized on backend. Checks the run method of an autotuned kernel
+        # with a no-op prune hook under fullgraph compile: the output equals the input plus one.
         def noop_prune(configs, named_args, **kwargs):
+            # [FUNCTION DOC] HELPER: Prune hook that returns all configs unchanged.
             return configs
 
+        # [FUNCTION DOC] HELPER: Autotuned (two block sizes, no-op pruning) kernel storing the
+        # masked input plus one.
         @triton.autotune(
             configs=[
                 triton.Config({"BLOCK": 64}),
@@ -6071,6 +7076,8 @@ else:
             tl.store(out_ptr + offs, tl.load(x_ptr + offs, mask=mask) + 1, mask=mask)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Empty output; calls the kernel run method with a grid of
+            # cdiv by 64 and no warmup; returns the output.
             out = torch.empty_like(x)
             kernel.run(
                 x,
@@ -6093,10 +7100,19 @@ else:
     def test_triton_kernel_heuristic(
         self, backend, autotune_at_compile_time, non_strict
     ):
+        # [FUNCTION DOC] Parametrized over backend, compile-time autotuning and non-strict
+        # mode (triton op). Checks that heuristics decorators are applied in order
+        # (including modifying an existing key, chained updates, and a flag from a None
+        # check) in dynamo: the compiled results must match direct Triton (first element
+        # 2120 and second zero). For direct launches it also redefines the kernel with a
+        # heuristic returning a non-constant tensor and expects dynamo Unsupported with the
+        # message that heuristics must return constants.
         # for non-strict mode
         libname = "my_cool_namespace"
         opname = "my_triton_operator"
 
+        # [FUNCTION DOC] HELPER: Kernel with autotune (block 32) plus several heuristics
+        # decorators; stores the sum of the even-N and block size constexprs and the None-flag.
         @triton.autotune(
             configs=[
                 triton.Config(kwargs={"BLOCK_SIZE": 32}),
@@ -6133,6 +7149,8 @@ else:
             src: torch.Tensor,
             N: int,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Launches the heuristics kernel through wrap_triton (non-
+            # strict) or directly with a grid by cdiv of N.
             grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
             if non_strict:
                 torch.library.wrap_triton(heuristics_kernel)[grid](dst, src, N=N)
@@ -6177,6 +7195,8 @@ else:
         # check for the exception
         if not non_strict:
 
+            # [FUNCTION DOC] HELPER: Redefined kernel whose heuristic returns a non-constant
+            # tensor value; stores N.
             @triton.autotune(
                 configs=[
                     triton.Config(kwargs={"BLOCK_SIZE": 32}),
@@ -6202,6 +7222,8 @@ else:
                 src: torch.Tensor,
                 N: int,
             ) -> None:
+                # [FUNCTION DOC] HELPER: Launches the redefined kernel with a callable grid by
+                # cdiv of N.
                 grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
                 heuristics_kernel[grid](dst, src, N=N)
 
@@ -6215,18 +7237,32 @@ else:
 
 
 class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Tests of epilogue fusion into user-defined Triton kernels (config flag enabled
+    # for the class). Each test compiles a function calling a user kernel followed by a pointwise
+    # op, and checks numerics plus kernel, allocation and deletion counts in the generated code.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: calls the parent setup, creates an exit stack stored on the
+        # class, and enables the config for epilogue fusion of user-defined kernels.
+        # KNOWN ISSUE: the exit stack is never used or closed, and teardown sets the flag to
+        # false instead of restoring its previous value.
         super().setUpClass()
         cls._stack = contextlib.ExitStack()
         torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = True
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class teardown: disables the epilogue fusion for user-defined kernels
+        # config and calls the parent teardown.
         torch._inductor.config.epilogue_fusion_user_defined_triton_kernel = False
         super().tearDownClass()
 
     def check_code(self, code_str, num_kernels, num_allocs, num_deallocs):
+        # [FUNCTION DOC] HELPER: Asserts on generated code text, using FileCheck after
+        # the call function marker: exactly the given number of kernel launches (call
+        # prefix for cpp wrapper, run otherwise); if given, the exact count of
+        # empty_strided allocations; and, unless using the cpp wrapper or when none is
+        # given, the exact count of delete statements.
         from torch._inductor import config
 
         kernel_launch = "call_" if config.cpp_wrapper else ".run("
@@ -6250,6 +7286,9 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_fusion_relu_epilogue(self):
+        # [FUNCTION DOC] CUDA only. A user add kernel followed by relu should fuse into one
+        # kernel (one allocation, two deletions); output equals eager within tolerance.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6260,6 +7299,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + y, mask=mask)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the add kernel; returns the relu of
+            # the output.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
@@ -6276,6 +7317,9 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_fusion_sigmoid_epilogue(self):
+        # [FUNCTION DOC] CUDA only. A user kernel doubling its input followed by sigmoid should
+        # fuse into one kernel (one allocation, one deletion).
+        # [FUNCTION DOC] HELPER: Kernel storing the input added to itself, masked.
         @triton.jit
         def add_kernel(in_ptr0, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6285,6 +7329,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + x, mask=mask)
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel; returns the sigmoid of
+            # the output.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, out, a.numel(), BLOCK_SIZE=1024)
@@ -6300,6 +7346,10 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_fusion_with_unused_buffer(self):
+        # [FUNCTION DOC] CUDA only. A kernel with an extra unused buffer argument followed by
+        # relu fuses to one kernel with two allocations and two deletions; output equals eager.
+        # [FUNCTION DOC] HELPER: Kernel storing twice the masked input and ignoring its third
+        # pointer argument.
         @triton.jit
         def kernel_unused_tensor(
             X,
@@ -6314,6 +7364,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(Y + idx, x * 2, mask=mask)
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Empty output and unused buffer; launches the kernel with
+            # block 16; returns the relu of the output.
             out = torch.empty_like(a)
             unused = torch.empty(a.numel(), device="cuda")
             kernel_unused_tensor[(1,)](a, out, unused, a.numel(), BLOCK_SIZE=16)
@@ -6327,6 +7379,9 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_fusion_with_ordering_constraints(self):
+        # [FUNCTION DOC] CUDA only. Two chained user kernel adds followed by relu: expects two
+        # kernel launches (epilogue fused into the second), two allocations and three deletions.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6337,11 +7392,14 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + y, mask=mask)
 
         def add(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the add kernel with one program per
+            # element and block 1; returns the output.
             out = torch.empty_like(a)
             add_kernel[(a.numel(),)](a, b, out, a.numel(), BLOCK_SIZE=1)
             return out
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Adds a and b, adds b to the result, and returns the relu.
             c = add(a, b)
             c = add(c, b)
             return c.relu()
@@ -6355,6 +7413,10 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_fusion_cache(self):
+        # [FUNCTION DOC] CUDA only. Two chained user adds, each followed by a pointwise op
+        # (sigmoid then relu); expects two kernel launches, two allocations and three deletions;
+        # output equals eager.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6365,11 +7427,15 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + y, mask=mask)
 
         def add(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the add kernel with one program per
+            # element and block 1; returns the output.
             out = torch.empty_like(a)
             add_kernel[(a.numel(),)](a, b, out, a.numel(), BLOCK_SIZE=1)
             return out
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Adds a and b and applies sigmoid, adds b to that and applies
+            # relu, and returns the result.
             c = add(a, b).sigmoid()
             c = add(c, b).relu()
             return c
@@ -6383,9 +7449,15 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_fusion_custom_kernel_with_linebreaks(self):
+        # [FUNCTION DOC] CUDA only. Checks that fusion handles a user kernel source with awkward
+        # line breaks (blank line before the store and a multi-line value expression with
+        # comments), which the source rewriting must handle. Expects one kernel, one allocation
+        # and one deletion.
         # we do AST manipulation / string manipulation of the kernel source code
         # so we wanna make sure to correctly handle edge cases with tricky line breaks
         # which `ast.parse`-`ast.unparse` roundtrip does not recover
+        # [FUNCTION DOC] HELPER: Kernel doubling its input with a store call split across lines
+        # with comments.
         @triton.jit
         def add_kernel(in_ptr0, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6405,6 +7477,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             )
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel; returns the sigmoid of
+            # the output.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, out, a.numel(), BLOCK_SIZE=1024)
@@ -6420,7 +7494,11 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_no_fusion_for_read_write_tensors(self):
+        # [FUNCTION DOC] CUDA only. No fusion when the kernel reads the output before writing it:
+        # expects two kernels (user kernel and relu), two allocations and three deletions.
         # cannot epilogue-fuse this one because the kernel reads from `out_ptr` before writing to it
+        # [FUNCTION DOC] HELPER: Kernel that loads the two inputs and the original output and
+        # stores their sum.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6432,6 +7510,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + y + original_out, mask=mask)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the
+            # kernel; returns the relu of the output.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
@@ -6448,6 +7528,10 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_no_fusion_for_multiple_stores(self):
+        # [FUNCTION DOC] CUDA only. No fusion when the kernel stores twice, once directly and
+        # once through another jit function (defined at module level after the class because
+        # local jit functions referencing each other are problematic). Expects two kernels, two
+        # allocations, three deletions.
         # cannot epilogue-fuse this one because the kernel stores twice (once directly and once indirectly via another triton func)
         """
         We defined these globally after this class, because triton doesn't like local jit functions that reference each other..
@@ -6468,6 +7552,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
         """
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the module-level double-store kernel;
+            # returns the relu of the output.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel_with_custom_store[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
@@ -6484,7 +7570,11 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_no_fusion_for_non_empty_outputs(self):
+        # [FUNCTION DOC] CUDA only. No fusion when the output starts as ones and the kernel
+        # writes only half of its indices (not an uninitialized buffer). Expects three kernels
+        # (ones, user kernel, relu), two allocations, three deletions; output equals eager.
         # cannot epilogue-fuse this one because the kernel writes to buffer initialized with non-UB values
+        # [FUNCTION DOC] HELPER: Kernel storing the sum at half the offsets.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6495,6 +7585,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs // 2, x + y, mask=mask)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Output of ones; launches the
+            # kernel; returns the relu of the output.
             out = torch.ones_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
@@ -6512,6 +7604,9 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_no_fusion_for_concat_outputs(self):
+        # [FUNCTION DOC] CUDA only. No fusion when the output is a concatenation of two buffers:
+        # expects three kernels (concat, user kernel, relu), two allocations, three deletions.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6522,6 +7617,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + y, mask=mask)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Allocates two half-size buffers, concatenates them, launches
+            # the kernel into the result and returns its relu.
             out_first_half = torch.empty(int(len(a) / 2), dtype=a.dtype, device="cuda")
             out_second_half = torch.empty(int(len(a) / 2), dtype=a.dtype, device="cuda")
             out = torch.concat((out_first_half, out_second_half))
@@ -6541,6 +7638,10 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_no_fusion_for_multiple_reads_on_mutated_tensor(self):
+        # [FUNCTION DOC] CUDA only. No fusion when the kernel output feeds two consumers (relu
+        # and sigmoid): expects two kernels (user kernel and one generated for both), three
+        # allocations, three deletions.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6551,6 +7652,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + y, mask=mask)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel; returns both the relu and
+            # sigmoid of the output.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
@@ -6568,10 +7671,15 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_no_fusion_for_atomic_store(self):
+        # [FUNCTION DOC] CUDA only; returns immediately (passing) when not built
+        # with CUDA because the atomic exchange fails to compile on ROCm. No
+        # fusion for a kernel using an atomic exchange store: two kernels, two
+        # allocations, three deletions; output equals eager.
         # on ROCm we skip this because `tl.atomic_xchg` fails to compile in ROCm
         if torch.version.cuda is None:
             return
 
+        # [FUNCTION DOC] HELPER: Kernel storing the sum using an atomic exchange.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6582,6 +7690,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.atomic_xchg(out_ptr + offs, x + y, mask=mask)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the
+            # kernel; returns the relu of the output.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
@@ -6598,6 +7708,10 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_no_fusion_indexing_var_usage(self):
+        # [FUNCTION DOC] CUDA only. No fusion when the epilogue needs an
+        # index variable (adding an arange) not available in the user kernel:
+        # two kernels, two allocations, three deletions.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6608,6 +7722,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + y, mask=mask)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel; returns relu of the
+            # output plus an arange over its length.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
@@ -6625,6 +7741,9 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_no_fusion_non_unary_epilogue(self):
+        # [FUNCTION DOC] CUDA only. No fusion when the epilogue adds a third tensor (non-unary):
+        # two kernels, two allocations, four deletions; output equals eager.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel with one program per element.
         @triton.jit
         def add_kernel(a_ptr, b_ptr, out_ptr, numel, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6636,6 +7755,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, out, mask=mask)
 
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Empty output; launches the add kernel with block size 1;
+            # returns the output plus c.
             out = torch.empty_like(a)
             GRID = (a.numel(),)
             add_kernel[GRID](a, b, out, a.numel(), 1)
@@ -6651,6 +7772,9 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_fusion_cast_epilogue(self):
+        # [FUNCTION DOC] CUDA only. A cast of the kernel output to half precision fuses into one
+        # kernel (one allocation, two deletions); output equals eager.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6661,6 +7785,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + y, mask=mask)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel; returns the output cast
+            # to float16.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
@@ -6675,6 +7801,9 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
     @requires_cuda_and_triton
     def test_no_fusion_for_out_of_place_epilogue(self):
+        # [FUNCTION DOC] CUDA only. No fusion for an epilogue that transposes the output to
+        # contiguous then relu (out-of-place): two kernels, two allocations, three deletions.
+        # [FUNCTION DOC] HELPER: Masked elementwise add kernel.
         @triton.jit
         def add_kernel(in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(0)
@@ -6685,6 +7814,8 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
             tl.store(out_ptr + offs, x + y, mask=mask)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Empty output; launches the kernel; returns the transposed,
+            # made contiguous, relu of the output.
             out = torch.empty_like(a)
             grid = (triton.cdiv(a.numel(), 1024),)
             add_kernel[grid](a, b, out, a.numel(), BLOCK_SIZE=1024)
@@ -6699,10 +7830,14 @@ class TestUserKernelEpilogueFusion(torch._inductor.test_case.TestCase):
 
 if HAS_CUDA_AND_TRITON:
 
+    # [FUNCTION DOC] HELPER: Module-level jit helper storing a value at a pointer with a mask;
+    # used by the double-store kernel.
     @triton.jit
     def custom_store(ptr, val, mask):
         tl.store(ptr, val, mask)
 
+    # [FUNCTION DOC] HELPER: Kernel storing the sum of two masked inputs and then storing it
+    # again via the custom store helper.
     @triton.jit
     def add_kernel_with_custom_store(
         in_ptr0, in_ptr1, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr
