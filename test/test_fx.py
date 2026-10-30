@@ -1,6 +1,15 @@
 # Owner(s): ["module: fx"]
 # ruff: noqa: F841
 # flake8: noqa: E221
+# [MODULE DOC] Test suite for torch.fx: symbolic tracing (Tracer, symbolic_trace, wrap), Graph and
+# Node manipulation, GraphModule code generation and recompilation, Interpreter and Transformer,
+# pickling/copying of graph modules, TorchScript compatibility, profiler stack-trace enrichment,
+# backward-compatibility signature checks and OpInfo-driven tracing tests. Defines module-level
+# fixtures (wrapped functions, namedtuples, simple modules) that must be global because FX
+# patching and pickling need importable names. Also re-exports test classes from the fx/ test
+# package so they are collected here. Import-time side effects: registers functions with
+# torch.fx.wrap (including by name), and defines the skipIfNoTorchVision marker after probing for
+# torchvision. Running the file as a script calls run_tests.
 
 import builtins
 import collections
@@ -100,20 +109,27 @@ from torch.testing._internal.common_quantization import skipIfNoDynamoSupport
 
 
 class SimpleTest(torch.nn.Module):
+    # [CLASS DOC] HELPER: trivial module whose forward adds 3.0 to the input and applies relu.
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: returns relu applied to the input plus 3.0.
         return torch.relu(x + 3.0)
 
 
 def a_non_torch_leaf(a, b):
+    # [FUNCTION DOC] HELPER: plain non-torch function returning the sum of its two arguments; used
+    # as a call_function target that tracing must not see through.
     return a + b
 
 
 # Used for test_autowrap_function. Autowrapped functions need to be global
 def fx_int(x: float) -> int:
+    # [FUNCTION DOC] HELPER: converts a float to an int; global so it can be autowrapped
+    # in tracing.
     return int(x)
 
 
 def fx_int_x2(x: float) -> int:
+    # [FUNCTION DOC] HELPER: converts a float to an int and doubles it; global autowrap fixture.
     return int(x) * 2
 
 
@@ -125,6 +141,8 @@ Point = namedtuple("Point", ["x", "y"])
 # Test wrap() passing both a function name as well as a function
 # directly
 def a_lifted_leaf(a, b):
+    # [FUNCTION DOC] HELPER: adds the first two items of the first argument to the second
+    # argument. Registered with wrap by name so tracing records it as a single call node.
     return a[0] + a[1] + b
 
 
@@ -134,6 +152,8 @@ wrap("a_lifted_leaf")
 
 
 def a_lifted_leaf2(a, b):
+    # [FUNCTION DOC] HELPER: same arithmetic as a_lifted_leaf; registered with wrap by passing the
+    # function object itself rather than its name.
     return a[0] + a[1] + b
 
 
@@ -145,6 +165,8 @@ wrap("getattr")
 
 
 def wrapped_named_tup(p1, *, p2):
+    # [FUNCTION DOC] HELPER: adds the x field of the first namedtuple to the y field of the
+    # keyword-only second one; wrapped so it is kept as a leaf call during tracing.
     return p1.x + p2.y
 
 
@@ -153,6 +175,8 @@ wrap(wrapped_named_tup)
 
 @wrap
 def wrapped_via_decorator(a):
+    # [FUNCTION DOC] HELPER: returns the input plus one; registered as a leaf via the
+    # wrap decorator.
     return a + 1
 
 
@@ -160,12 +184,18 @@ wrap("wrapped_with_submodule")
 
 
 def wrapped_with_submodule(x: torch.Tensor, batchnorm1d: torch.nn.BatchNorm1d):
+    # [FUNCTION DOC] HELPER: applies the given BatchNorm1d module to x; registered with wrap by
+    # name (before definition) to test wrapped functions that receive a submodule argument.
     return batchnorm1d(x)
 
 
 def my_decorator(f):
+    # [FUNCTION DOC] HELPER: decorator that returns a pass-through wrapper (preserving metadata
+    # via functools.wraps) calling the original function with the same arguments.
     @functools.wraps(f)
     def wrapper_inside_decorator(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: forwards all positional and keyword arguments to the decorated
+        # function and returns its result.
         return f(*args, **kwargs)
 
     return wrapper_inside_decorator
@@ -174,6 +204,8 @@ def my_decorator(f):
 @wrap
 @my_decorator
 def wrapped_decorated_fn(x):
+    # [FUNCTION DOC] HELPER: identity function, decorated with my_decorator and then wrap, to test
+    # wrapping of an already-decorated function.
     return x
 
 
@@ -186,32 +218,45 @@ wrap("wrapper_fn")
 
 
 def wrapper_fn(x):
+    # [FUNCTION DOC] HELPER: calls torch.foo on x, which does not exist; registered by name with
+    # wrap so the call is only an error if the wrapper is not substituted during tracing.
     return torch.foo(x)
 
 
 class Pair(NamedTuple):
+    # [CLASS DOC] HELPER: NamedTuple of two tensors, x and y, used to test namedtuple handling in
+    # graphs. Provides a custom repr hook that code generation uses to print it.
     x: torch.Tensor
     y: torch.Tensor
 
     def _custom_fx_repr_fn(self) -> str:
+        # [FUNCTION DOC] HELPER: returns a string constructing a Pair from the formatted x and
+        # y values.
         return f"Pair(x={_format_arg(self.x)}, y={_format_arg(self.y)})"
 
 
 # for testing pytrees
 class Foo:
+    # [CLASS DOC] HELPER: plain object holding two attributes a and b; used as a custom pytree
+    # container in the pytree tests.
     def __init__(self, a, b):
+        # [FUNCTION DOC] HELPER: stores the two arguments as attributes a and b.
         self.a = a
         self.b = b
 
 
 class Add(torch.nn.Module):
+    # [CLASS DOC] HELPER: trivial module whose forward returns the input added to itself.
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: returns x plus x.
         return x + x
 
 
 @torch.fx.has_side_effect
 @torch.fx.wrap
 def side_effect_func(x: torch.Tensor):
+    # [FUNCTION DOC] HELPER: wrapped function marked with has_side_effect that prints its tensor
+    # argument and returns nothing; used to check such calls survive dead-code elimination.
     print(x)
 
 
@@ -219,10 +264,16 @@ def side_effect_func(x: torch.Tensor):
 def wrapped_optional_typing_dict(
     value: dict[int, tuple[torch.Tensor, torch.Tensor]] | None,
 ):
+    # [FUNCTION DOC] HELPER: wrapped function that returns its optional dict argument unchanged;
+    # used to test tracing of an optional dict-of-tensor-tuples type annotation.
     return value
 
 
 def _enrich_profiler_traces(prof):
+    # [FUNCTION DOC] HELPER: exports the profiler trace to a temporary JSON file, loads it, runs
+    # map_recorded_events_to_aten_ops_with_stack_trace on the loaded data in place, keeps only
+    # events whose args contain a stack_trace, and returns their canonicalized text form. Side
+    # effects: writes and reads a temporary file.
     """
     Helper function to extract and augment profiler events with stack traces.
 
@@ -253,6 +304,9 @@ def _enrich_profiler_traces(prof):
 
 
 def _parse_profiler_trace_lines(traces: str) -> list[tuple[str, str, str]]:
+    # [FUNCTION DOC] HELPER: parses canonicalized profiler text into a list of (event, node,
+    # stack_trace) string triples. Blank lines are skipped; each other line must contain the node
+    # marker and the stack trace marker or a ValueError from unpacking is raised.
     lines = []
     for line in traces.splitlines():
         if not line:
@@ -265,7 +319,14 @@ def _parse_profiler_trace_lines(traces: str) -> list[tuple[str, str, str]]:
 
 
 class TestFX(JitTestCase):
+    # [CLASS DOC] Main FX test case (JitTestCase). Covers tracing, graph editing, code generation,
+    # interpreters and transformers, serialization and compatibility. setUp enables
+    # mutable-operation checking on TracerBase and loads the torchbind test library where
+    # supported; tearDown restores the flag.
     def setUp(self):
+        # [FUNCTION DOC] Saves the current TracerBase mutable-operation check flag, forces it
+        # on, and on non-FBCODE, non-Windows, non-macOS platforms loads libtorchbind_test.so
+        # via torch.ops.
         super().setUp()
         # Checking for mutable operations while tracing is feature flagged
         # Enable it in testing but not by default
@@ -279,6 +340,8 @@ class TestFX(JitTestCase):
             torch.ops.load_library(str(lib_file_path))
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the saved TracerBase mutable-operation flag after calling
+        # the parent.
         super().tearDown()
         torch.fx.proxy.TracerBase.check_mutable_operations = (
             self.orig_tracer_mutable_flag
@@ -289,6 +352,9 @@ class TestFX(JitTestCase):
         traces: str,
         node_requirements: dict[str, tuple[str, ...]],
     ) -> None:
+        # [FUNCTION DOC] HELPER: parses canonicalized profiler text and asserts that it is
+        # non-empty and that, for every node in the requirements mapping, some recorded stack
+        # trace of that node contains all of the required substrings. Fails the test otherwise.
         parsed = _parse_profiler_trace_lines(traces)
         self.assertTrue(len(parsed) > 0, "expected enriched profiler events with stack traces")
 
@@ -308,6 +374,8 @@ class TestFX(JitTestCase):
             )
 
     def checkGraphModule(self, m: torch.nn.Module, args, kwargs=None):
+        # [FUNCTION DOC] HELPER: runs module m on the args and kwargs, symbolically traces it,
+        # lints the graph, runs the traced module on the same inputs and asserts equal outputs.
         """Check that an nn.Module's results match the GraphModule version
         for a given set of args/kwargs.
         """
@@ -319,22 +387,36 @@ class TestFX(JitTestCase):
         self.assertEqual(ref_outs, test_outs)
 
     def test_graph_module(self):
+        # [FUNCTION DOC] Builds modules with submodules, parameters and varargs forwards, traces
+        # them, scripts one traced module with TorchScript, and checks that a GraphModule
+        # created through the raw constructor on an existing instance computes the same result
+        # (issue 63883).
         class MySub(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding a 4x3 random parameter that is added to
+            # its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates parameter w of shape 4 by 3.
                 super().__init__()
                 self.w = torch.nn.Parameter(torch.rand(4, 3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the parameter plus x.
                 return self.w + x
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a Linear layer, a MySub submodule and a parameter,
+            # to exercise many tensor operators during tracing.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates lin (4 to 3), sub_mod and parameter w of shape 3.
                 super().__init__()
                 self.lin = torch.nn.Linear(4, 3)
                 self.sub_mod = MySub()
                 self.w = torch.nn.Parameter(torch.rand(3))
 
             def forward(self, A, B, c):
+                # [FUNCTION DOC] HELPER: combines sigmoid of A with the linear of c, mixes in
+                # many arithmetic operations with A and B, and returns the result of passing it
+                # through sub_mod.
                 t = torch.sigmoid(A) + self.lin(c)
                 return self.sub_mod(
                     t.data + self.w + t + 1 - A + B // A + -A + A.add(B, alpha=3)
@@ -346,7 +428,11 @@ class TestFX(JitTestCase):
         ms = torch.jit.script(gm)
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning max values and indices of the input plus
+            # one each.
             def forward(self, A):
+                # [FUNCTION DOC] HELPER: returns the max over dim 0 and its index, each increased
+                # by one.
                 m, idx = torch.max(A, 0)
                 return m + 1, idx + 1
 
@@ -354,7 +440,11 @@ class TestFX(JitTestCase):
         gm2 = symbolic_trace(m2)
 
         class T(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a forward taking default, varargs, keyword-only
+            # and kwargs.
             def forward(self, A, b=4, *args, c=5, **kwargs):
+                # [FUNCTION DOC] HELPER: returns A plus one plus the first vararg plus the kwarg
+                # named 3.
                 x = A + 1 + args[0] + kwargs["3"]
                 return x
 
@@ -363,7 +453,10 @@ class TestFX(JitTestCase):
 
         # test for issue described at https://github.com/pytorch/pytorch/issues/63883
         class M3(torch.nn.Module):
+            # [CLASS DOC] HELPER: module applying relu, used for the GraphModule
+            # re-initialization check.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns relu of x.
                 return torch.relu(x)
 
         m3 = M3()
@@ -375,14 +468,21 @@ class TestFX(JitTestCase):
         torch.testing.assert_close(new_instance(x), torch.relu(x))
 
     def test_informative_co_filename(self):
+        # [FUNCTION DOC] Checks that the traced module's forward code object reports this test
+        # file as its filename.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module multiplying its input by two.
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: returns a times two.
                 return a * 2
 
         gm = symbolic_trace(MyModule())
         self.assertIn(os.path.basename(__file__), gm.forward.__code__.co_filename)
 
     def test_custom_import(self):
+        # [FUNCTION DOC] Builds a graph by hand with a non-torch Python function and
+        # torch.sin as call targets, wraps it in a GraphModule and checks the result against
+        # the direct computation.
         graph = torch.fx.Graph()
         a = graph.placeholder("x")
         b = graph.placeholder("y")
@@ -394,6 +494,9 @@ class TestFX(JitTestCase):
         self.assertEqual(torch.sin(x + y), gm(x, y))
 
     def test_tuple_return_annotation_for_schemas(self):
+        # [FUNCTION DOC] Checks that the schema signature of an op returning several tensors
+        # (var_mean) has a generic tuple return annotation whose origin is tuple and whose
+        # arguments are all Tensor subclasses, not a raw tuple of types.
 
         # Target an op that returns multiple tensors (e.g., var_mean)
         op = torch.ops.aten.var_mean.default
@@ -428,7 +531,13 @@ class TestFX(JitTestCase):
         )
 
     def test_boxed_arg_indices_codegen(self):
+        # [FUNCTION DOC] Checks code generation for call nodes with boxed_arg_indices metadata:
+        # boxed list arguments are assigned to named temporaries, inputs are cleared after last
+        # use, temporaries are cleared after the call, and a shared input still used later is not
+        # cleared too early.
         def multi_boxed_call(left, passthrough, right):
+            # [FUNCTION DOC] HELPER: returns the sum of the first two entries of left, passthrough
+            # and the first entry of right.
             return left[0] + left[1] + passthrough + right[0]
 
         graph = torch.fx.Graph()
@@ -464,8 +573,13 @@ class TestFX(JitTestCase):
         self.assertNotIn("a = b = None", gm.code)
 
     def test_args_kwargs(self):
+        # [FUNCTION DOC] Traces a module taking varargs and kwargs and compares outputs with
+        # the original.
         class T(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward adds the first vararg to the keyword foo.
             def forward(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: returns the first positional argument plus the foo
+                # keyword argument.
                 x = args[0] + kwargs["foo"]
                 return x
 
@@ -473,8 +587,12 @@ class TestFX(JitTestCase):
         self.checkGraphModule(t, (torch.rand(1), torch.rand(1)), {"foo": torch.rand(1)})
 
     def test_varargs_concrete(self):
+        # [FUNCTION DOC] Traces a varargs module using placeholder concrete_args to expand two
+        # varargs and checks outputs match the eager module.
         class T(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward sums the first two varargs.
             def forward(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: returns args zero plus args one.
                 x = args[0] + args[1]
                 return x
 
@@ -488,8 +606,14 @@ class TestFX(JitTestCase):
         self.assertEqual(ref_outs, test_outs)
 
     def test_args_kwargs_no_self(self):
+        # [FUNCTION DOC] Checks that tracing a forward written without a self parameter and with
+        # varargs raises RuntimeError mentioning that self cannot be part of the args expansion.
         class T(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward has no named self parameter, only varargs
+            # and kwargs.
             def forward(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: takes self from the first vararg and returns relu of
+                # the second.
                 self = args[0]
                 return torch.relu(args[1])
 
@@ -502,8 +626,11 @@ class TestFX(JitTestCase):
             )
 
     def test_fx_shifts(self):
+        # [FUNCTION DOC] Checks tracing of left and right shift operators on a long tensor.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning x shifted left by 3 and right by 3.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the pair of shifted tensors.
                 return x << 3, x >> 3
 
         input = torch.LongTensor(10).random_(0, 1024)
@@ -512,8 +639,11 @@ class TestFX(JitTestCase):
         self.checkGraphModule(m, (input,))
 
     def test_fx_and_or(self):
+        # [FUNCTION DOC] Checks tracing of bitwise and/or operators on a long tensor.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning bitwise and and bitwise or of x with itself.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the pair (x and x, x or x) computed bitwise.
                 return x & x, x | x
 
         input = torch.LongTensor(10).random_(0, 1024)
@@ -522,8 +652,13 @@ class TestFX(JitTestCase):
         self.checkGraphModule(m, (input,))
 
     def test_dict(self):
+        # [FUNCTION DOC] Checks tracing of a module taking a dict input and returning a tuple
+        # holding a tensor and a dict.
         class MyDictMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that reads key 3 from a dict input.
             def forward(self, d):
+                # [FUNCTION DOC] HELPER: returns relu of the entry under string key 3 and a
+                # dict mapping string key 4 to the negation of that entry.
                 return d["3"].relu(), {"4": d["3"].neg()}
 
         input_dict = {"3": torch.rand(3, 4)}
@@ -532,9 +667,12 @@ class TestFX(JitTestCase):
         self.checkGraphModule(m, (input_dict,))
 
     def test_matmul_tracing(self):
+        # [FUNCTION DOC] Checks that the matmul operator is traceable both with a proxy on the
+        # left and with a constant tensor on the left, and that results equal the eager functions.
         const = torch.randn(3)
 
         def matmul_f(x):
+            # [FUNCTION DOC] HELPER: matrix-multiplies x with a captured constant tensor.
             return x @ const
 
         mod = symbolic_trace(matmul_f)
@@ -542,6 +680,7 @@ class TestFX(JitTestCase):
         self.assertEqual(mod(inp), matmul_f(inp))
 
         def rmatmul_f(x):
+            # [FUNCTION DOC] HELPER: matrix-multiplies the captured constant tensor with x.
             return const @ x
 
         mod = symbolic_trace(rmatmul_f)
@@ -550,13 +689,20 @@ class TestFX(JitTestCase):
 
     @skipIfNoDynamoSupport
     def test_control_flow_tracing(self):
+        # [FUNCTION DOC] Checks that tracing a function calling control_flow.cond with a
+        # proxy predicate raises RuntimeError saying the predicate must be bool or tensor but
+        # got a Proxy.
         def true(x, y):
+            # [FUNCTION DOC] HELPER: branch function returning x plus y.
             return x + y
 
         def false(x, y):
+            # [FUNCTION DOC] HELPER: branch function returning x minus y.
             return x - y
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: calls cond on a predicate comparing the first element of
+            # x to zero with the two branches; assigns the result to x, returns nothing.
             x = control_flow.cond(x[0] == 0, true, false, [x, y])
 
         with self.assertRaisesRegex(
@@ -565,8 +711,13 @@ class TestFX(JitTestCase):
             _ = symbolic_trace(f)
 
     def test_disallow_override(self):
+        # [FUNCTION DOC] Uses a custom Tracer that rejects node creation for targets whose name
+        # ends in an underscore, and checks RuntimeError is raised for in-place method calls,
+        # in-place free functions, and in-place ops where the proxy is an argument.
         # Custom delegate to disallow in-place tensor operations
         class NoMutableCallTracer(Tracer):
+            # [CLASS DOC] HELPER: Tracer overriding create_node to raise RuntimeError for
+            # in-place targets.
             def create_node(
                 self,
                 kind: str,
@@ -576,6 +727,9 @@ class TestFX(JitTestCase):
                 name: str | None = None,
                 type_expr: Any | None = None,
             ) -> Node:
+                # [FUNCTION DOC] HELPER: derives a name from the target (the string itself or its
+                # torch type name); raises RuntimeError if it ends with an underscore, otherwise
+                # delegates to the parent.
                 name = target if isinstance(target, str) else torch.typename(target)
                 if name[-1] == "_":
                     raise RuntimeError("In-place operations are not supported")
@@ -583,7 +737,9 @@ class TestFX(JitTestCase):
 
         # Test method
         class MyInplaceMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with an in-place add_ on its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: adds 3.0 in place to x and returns x.
                 x.add_(3.0)
                 return x
 
@@ -594,7 +750,9 @@ class TestFX(JitTestCase):
 
         # Test free function
         class MyInplaceMod2(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling the in-place free function log_ on its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: applies log_ to x in place and returns x.
                 torch.log_(x)
                 return x
 
@@ -604,7 +762,11 @@ class TestFX(JitTestCase):
 
         # Test symbolic node as an arg
         class MyInplaceMod3(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that calls add_ on a fresh ones tensor using x as
+            # the argument.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: adds x in place into a new 3 by 4 ones tensor and
+                # returns x.
                 y = torch.ones(3, 4)
                 y.add_(x)
                 return x
@@ -614,18 +776,26 @@ class TestFX(JitTestCase):
             NoMutableCallTracer().trace(m3)
 
     def test_leaf_module(self):
+        # [FUNCTION DOC] Traces a module with a Tracer whose is_leaf_module always returns False
+        # and checks the resulting graph contains no call_module node and passes lint.
         # Custom delegate to make it so that there are no leaf modules, everything
         # should get traced through
         class NoLeafModulesTracer(Tracer):
+            # [CLASS DOC] HELPER: Tracer that treats no module as a leaf, so everything is
+            # traced through.
             def is_leaf_module(self, m, qualname):
+                # [FUNCTION DOC] HELPER: always returns False.
                 return False
 
         class MyReluMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module owning a ReLU submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the relu submodule.
                 super().__init__()
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the relu submodule applied to x.
                 return self.relu(x)
 
         mrm = MyReluMod()
@@ -635,9 +805,14 @@ class TestFX(JitTestCase):
         sym.lint()
 
     def test_wrap(self):
+        # [FUNCTION DOC] Checks that a function registered through wrap by name is recorded as a
+        # call in generated code, still computes correctly, and the module-level name is
+        # restored afterwards.
         self.assertEqual(3 + 4 + 5, a_lifted_leaf((3, 4), 5))
 
         def to_trace(y):
+            # [FUNCTION DOC] HELPER: sums three calls of a_lifted_leaf with the argument y mixed
+            # into tuples.
             return (
                 a_lifted_leaf((4, y), 3)
                 + a_lifted_leaf((3, 4), 5)
@@ -650,9 +825,13 @@ class TestFX(JitTestCase):
         self.assertIs(a_lifted_leaf, real_a_lifed_leaf)
 
     def test_wrap_fn_directly(self):
+        # [FUNCTION DOC] Same as test_wrap but for a function registered through wrap by passing
+        # the function object directly.
         self.assertEqual(3 + 4 + 5, a_lifted_leaf2((3, 4), 5))
 
         def to_trace(y):
+            # [FUNCTION DOC] HELPER: sums three calls of a_lifted_leaf2 with the argument y mixed
+            # into tuples.
             return (
                 a_lifted_leaf2((4, y), 3)
                 + a_lifted_leaf2((3, 4), 5)
@@ -665,9 +844,13 @@ class TestFX(JitTestCase):
         self.assertIs(a_lifted_leaf2, real_a_lifed_leaf2)
 
     def test_wrapped_via_decorator(self):
+        # [FUNCTION DOC] Checks a function registered with the wrap decorator is traced as a
+        # call, gives the right result, is restored after tracing, and has no already-patched
+        # marker attribute.
         self.assertEqual(wrapped_via_decorator(0), 1)
 
         def to_trace(y):
+            # [FUNCTION DOC] HELPER: returns the decorator-wrapped function applied to y.
             return wrapped_via_decorator(y)
 
         m = symbolic_trace(to_trace)
@@ -677,9 +860,12 @@ class TestFX(JitTestCase):
         self.assertFalse(hasattr(wrapped_via_decorator, "__fx_already_patched"))
 
     def test_wrapped_via_decorator_and_transformed(self):
+        # [FUNCTION DOC] Same as the decorator test, and additionally runs a Transformer over the
+        # traced module and checks the wrapped call survives and the global is again unpatched.
         self.assertEqual(wrapped_via_decorator(0), 1)
 
         def to_trace(y):
+            # [FUNCTION DOC] HELPER: returns the decorator-wrapped function applied to y.
             return wrapped_via_decorator(y)
 
         m = symbolic_trace(to_trace)
@@ -695,12 +881,21 @@ class TestFX(JitTestCase):
         self.assertFalse(hasattr(wrapped_via_decorator, "__fx_already_patched"))
 
     def test_wrap_with_submodule(self):
+        # [FUNCTION DOC] Checks tracing of a module that passes a BatchNorm1d submodule to a
+        # wrapped function: the wrapper name appears in generated code and the output equals a
+        # fresh eval-free BatchNorm1d applied to the same input.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module owning an affine-free BatchNorm1d and calling the
+            # wrapped function.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the batchnorm1d submodule with 2 features and no
+                # affine params.
                 super().__init__()
                 self.batchnorm1d = torch.nn.BatchNorm1d(2, affine=False)
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns the wrapped function applied to x and the
+                # batchnorm1d submodule.
                 return wrapped_with_submodule(x, self.batchnorm1d)
 
         m = symbolic_trace(M())
@@ -712,7 +907,11 @@ class TestFX(JitTestCase):
         self.assertEqual(ref_batchnorm1d(input), m(input))
 
     def test_wrapped_retrace(self):
+        # [FUNCTION DOC] Traces a function that calls a wrapped function, then traces the
+        # resulting GraphModule again, checking the wrapped call remains in the code and results
+        # stay correct.
         def to_trace(y):
+            # [FUNCTION DOC] HELPER: returns the decorator-wrapped function applied to y.
             return wrapped_via_decorator(y)
 
         m = symbolic_trace(to_trace)
@@ -724,7 +923,10 @@ class TestFX(JitTestCase):
         self.assertEqual(retraced(0), 1)
 
     def test_wrap_decorated_function(self):
+        # [FUNCTION DOC] Checks that a function that was both decorated and wrapped is recorded by
+        # name in the generated code and evaluates to the identity.
         def to_trace(y):
+            # [FUNCTION DOC] HELPER: returns the decorated wrapped identity applied to y.
             return wrapped_decorated_fn(y)
 
         m = symbolic_trace(to_trace)
@@ -732,8 +934,13 @@ class TestFX(JitTestCase):
         self.assertEqual(m(1), 1)
 
     def test_graph_edit_with_proxy(self):
+        # [FUNCTION DOC] Copies a traced graph into a new graph, wraps the copy's output in a
+        # Proxy, emits an extra addition on it, and checks the GraphModule built from that graph
+        # passes lint and doubles the sum of its inputs.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning the sum of two inputs.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: returns a plus b.
                 return a + b
 
         m = M()
@@ -749,11 +956,16 @@ class TestFX(JitTestCase):
         self.assertEqual(gm(3, 4), 14)
 
     def test_proxy_deepcopy_without_tracer(self):
+        # [FUNCTION DOC] Checks that deep copying a Proxy that has no tracer yields a new Proxy
+        # with a distinct node object but the same node name and target.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module doubling its input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: calls the parent initializer only.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns two times x.
                 return 2 * x
 
         module = MyModule()
@@ -768,19 +980,29 @@ class TestFX(JitTestCase):
         self.assertNotEqual(id(p2.node), id(node))
 
     def test_proxy_deepcopy_with_tracer(self):
+        # [FUNCTION DOC] Checks that deep copying a Proxy with a tracer also copies the tracer
+        # (a new distinct Tracer object with the same name attribute) along with a distinct
+        # node copy.
         class TestTracer(Tracer):
+            # [CLASS DOC] HELPER: Tracer subclass that has a user name attribute and treats every
+            # module as a leaf.
             def __init__(self, name):
+                # [FUNCTION DOC] HELPER: initializes the Tracer and records the given name.
                 super().__init__()
                 self.name = name
 
             def is_leaf_module(self, module, name):
+                # [FUNCTION DOC] HELPER: always returns True.
                 return True
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module doubling its input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: calls the parent initializer only.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns two times x.
                 return 2 * x
 
         module = MyModule()
@@ -799,8 +1021,14 @@ class TestFX(JitTestCase):
         self.assertNotEqual(id(p2.tracer), id(tracer))
 
     def test_concrete_arg_none_assert(self):
+        # [FUNCTION DOC] Traces with a concrete argument of None for the optional parameter and
+        # checks that calling the traced module with a non-None value raises AssertionError
+        # saying the argument was specialized to None, while calling with only x matches the
+        # eager module.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with an optional second argument.
             def forward(self, x, val=None):
+                # [FUNCTION DOC] HELPER: returns x when val is None, otherwise x plus val.
                 return x if val is None else x + val
 
         f = Foo()
@@ -814,14 +1042,22 @@ class TestFX(JitTestCase):
         torch.testing.assert_close(traced(x), f(x))
 
     def test_trace_multiple_funcs(self):
+        # [FUNCTION DOC] Checks that Tracer.traced_func_name selects which method is traced
+        # (forward by default, then two alternative methods), and that an unknown method name
+        # raises AssertionError stating it does not exist. Also prints the torch version.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with three binary methods: forward adds, minus_forward
+            # subtracts and multiply_forward multiplies.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: returns x plus y.
                 return x + y
 
             def minus_forward(self, x, y):
+                # [FUNCTION DOC] HELPER: returns x minus y.
                 return x - y
 
             def multiply_forward(self, x, y):
+                # [FUNCTION DOC] HELPER: returns x times y.
                 return x * y
 
         f = Foo()
@@ -849,8 +1085,12 @@ class TestFX(JitTestCase):
             tracer.trace(f)
 
     def test_graph_unique_names(self):
+        # [FUNCTION DOC] Builds a graph by copying and appending a node via a Proxy and checks
+        # that all node names in the resulting graph are unique.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning the sum of two inputs.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: returns a plus b.
                 return a + b
 
         m = M()
@@ -869,14 +1109,23 @@ class TestFX(JitTestCase):
             seen_names.add(node.name)
 
     def test_stack_traces(self):
+        # [FUNCTION DOC] Traces with stack-trace recording enabled and uses FileCheck to verify
+        # that the recorded node stack traces contain each source line of the forward and of a
+        # helper function exactly once.
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: returns a times b.
             return a * b
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that adds its inputs and then calls the free
+            # function foo.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: calls the parent initializer only.
                 super().__init__()
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: adds a and b, passes the sum through foo with a, and
+                # returns it.
                 c = a + b
                 c = foo(a, c)
                 return c
@@ -898,8 +1147,13 @@ class TestFX(JitTestCase):
         ).run(stack_traces.strip())
 
     def test_stack_traces_with_transformer(self):
+        # [FUNCTION DOC] Traces with stack-trace recording, runs a Transformer over the module,
+        # and checks every non-placeholder, non-output node in the result keeps a stack trace that
+        # mentions this test file.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning the sum of two inputs.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: returns a plus b.
                 return a + b
 
         tracer = torch.fx.Tracer()
@@ -920,6 +1174,8 @@ class TestFX(JitTestCase):
                 )
 
     def test_node_pickle_type_preservation(self):
+        # [FUNCTION DOC] Checks that pickling and unpickling a Node and a Graph preserves the node
+        # type annotation and does not confuse the type with the node target.
         g = Graph()
         n = g.placeholder("x")
         n.type = torch.Tensor
@@ -935,8 +1191,14 @@ class TestFX(JitTestCase):
         self.assertEqual(restored_n.type, torch.Tensor)
 
     def test_lineno_map(self):
+        # [FUNCTION DOC] Checks the generated-code line-number map of a GraphModule and the
+        # recorded prologue start line, both for default codegen and after installing a
+        # generated-code hook that prepends one extra line and recompiling. Expectations are about
+        # generated code, not about this file's source lines.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module applying sin and cos to its inputs and returning the sum.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: returns sin of a plus cos of b.
                 a = torch.sin(a)
                 b = torch.cos(b)
                 return a + b
@@ -950,6 +1212,8 @@ class TestFX(JitTestCase):
 
         # test custom codegen
         def transform_code(code):
+            # [FUNCTION DOC] HELPER: returns a new list with a print statement line prepended to
+            # the given generated code lines.
             return ["print('hello!')\n", *code]
 
         gm.graph.on_generate_code(lambda _: transform_code)
@@ -959,6 +1223,8 @@ class TestFX(JitTestCase):
         self.assertEqual(gm._prologue_start, 4)
 
     def test_graph_unique_names_manual(self):
+        # [FUNCTION DOC] Creates nodes with colliding explicit names in a graph, copies it into a
+        # new graph and checks all names in the copy are unique.
         graph: torch.fx.Graph = torch.fx.Graph()
         a: torch.fx.Node = graph.create_node("placeholder", "x")
         b: torch.fx.Node = graph.create_node(
@@ -977,8 +1243,12 @@ class TestFX(JitTestCase):
             seen_names.add(node.name)
 
     def test_unpack(self):
+        # [FUNCTION DOC] Checks tracing of a module that unpacks a tuple argument.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that unpacks its first argument into two parts and sums
+            # them with b.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: returns the two unpacked elements of a plus b.
                 c, d = a
                 return c + d + b
 
@@ -988,6 +1258,11 @@ class TestFX(JitTestCase):
         self.checkGraphModule(m, (a, b))
 
     def test_native_callable(self):
+        # [FUNCTION DOC] End-to-end test of lowering a traced module into the C++
+        # ElementwiseInterpreter torchbind class wrapped by a GraphModule; compares eager,
+        # lowered, TorchScript-compiled and exported/imported results. Skipped on FBCODE, Windows
+        # and macOS because it needs the non-portable test library. Raises inside the lowering for
+        # unsupported ops, kwargs or multiple output nodes.
         if IS_FBCODE or IS_WINDOWS or IS_MACOS:
             raise unittest.SkipTest("non-portable load_library call used in test")
         # This test exercises the case where we use FX to translate from Python
@@ -1009,7 +1284,9 @@ class TestFX(JitTestCase):
 
         # We use this simple Module as a reference computation
         class MySimpleMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: reference module computing three times x plus x.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns 3.0 times x plus x.
                 return 3.0 * x + x
 
         msm = MySimpleMod()
@@ -1021,6 +1298,12 @@ class TestFX(JitTestCase):
         def lower_to_elementwise_interpreter(
             orig_mod: torch.nn.Module,
         ) -> torch.nn.Module:
+            # [FUNCTION DOC] HELPER: symbolically traces the module, translates add and multiply
+            # call nodes into interpreter instructions (non-node arguments become named constant
+            # tensors), loads constants, input names, instructions and output name into an
+            # ElementwiseInterpreter, and returns a GraphModule that calls the interpreter. Raises
+            # AssertionError on kwargs or unsupported call targets, and RuntimeError on multiple
+            # outputs or unsupported opcodes.
             # ===== Stage 1: Symbolic trace the module =====
             mod = symbolic_trace(orig_mod)
 
@@ -1088,7 +1371,10 @@ class TestFX(JitTestCase):
 
             # ===== Stage 3: Create a wrapper GraphModule around the interpreter =====
             class WrapperModule(torch.nn.Module):
+                # [CLASS DOC] HELPER: empty module that only holds the interpreter object as
+                # an attribute.
                 def __init__(self, interpreter):
+                    # [FUNCTION DOC] HELPER: stores the interpreter as an attribute.
                     super().__init__()
                     self.interpreter = interpreter
 
@@ -1147,10 +1433,14 @@ class TestFX(JitTestCase):
         torch.testing.assert_close(imported_out, ref_out)
 
     def test_reserved_getattr(self):
+        # [FUNCTION DOC] Checks that no node in the traced graph of attribute-chain access on the
+        # input is given the name of a reserved builtin (getattr).
         """Ensure that we do not name any nodes with a reserved builtin like `getattr`"""
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning a chained attribute access on its input.
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: returns the attribute chain foo, bar, baz of a.
                 return a.foo.bar.baz
 
         m = M()
@@ -1162,10 +1452,17 @@ class TestFX(JitTestCase):
     @unittest.skip("https://github.com/pytorch/pytorch/issues/74208")
     @unittest.skip("Hotfix for SEV remediation")
     def test_trace_buffer_slice(self):
+        # [FUNCTION DOC] Skipped test (two unconditional skip decorators). When enabled it
+        # traces a module slicing a buffer by the input's shape and compares the traced and
+        # eager outputs.
         bs, d_hid = 10, 23
 
         class ExampleCode(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with two parameters, a Linear layer and a buffer, used to
+            # test slicing a buffer with a data-dependent bound.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates two square parameters, a linear layer and a
+                # buffer with more rows than the batch size.
                 super().__init__()
                 self.mm_param = torch.nn.Parameter(torch.randn(d_hid, d_hid))
                 self.mm_param2 = torch.nn.Parameter(torch.randn(d_hid, d_hid))
@@ -1173,6 +1470,9 @@ class TestFX(JitTestCase):
                 self.buffer = torch.nn.Buffer(torch.randn(bs + 100, d_hid))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: runs matmuls with the parameters, relus, a skip
+                # connection, a buffer slice addition and the linear layer twice; returns the
+                # final tensor.
                 x = torch.mm(x, self.mm_param)
                 skip_connection = x
                 x = torch.relu(x)
@@ -1192,7 +1492,11 @@ class TestFX(JitTestCase):
         torch.testing.assert_close(ec(x), traced(x))
 
     def test_node_tagging(self):
+        # [FUNCTION DOC] Uses a Tracer subclass that sets a tag attribute on every created node
+        # and checks all nodes of the traced graph carry the tag.
         class TaggingTracer(Tracer):
+            # [CLASS DOC] HELPER: Tracer whose create_node marks each created node with the
+            # tag foo.
             def create_node(
                 self,
                 kind: str,
@@ -1202,12 +1506,16 @@ class TestFX(JitTestCase):
                 name: str | None = None,
                 type_expr: Any | None = None,
             ) -> Node:
+                # [FUNCTION DOC] HELPER: delegates to the parent create_node, sets the tag
+                # attribute on the returned node, and returns it.
                 n = super().create_node(kind, target, args, kwargs, name)
                 n.tag = "foo"
                 return n
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning the sum of two inputs.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: returns a plus b.
                 return a + b
 
         m = M()
@@ -1218,12 +1526,18 @@ class TestFX(JitTestCase):
             self.assertEqual(n.tag, "foo")
 
     def test_tensor_attribute(self):
+        # [FUNCTION DOC] Checks tracing of modules that use a plain tensor attribute, directly and
+        # via a nested submodule path, runs the traced modules and lints the graph.
         class TensorAttribute(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding a 3 by 4 random tensor as a plain attribute.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the tensor attribute.
                 super().__init__()
                 self.tensor = torch.rand(3, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the functional linear of x with the tensor
+                # attribute as weight.
                 return torch.nn.functional.linear(x, self.tensor)
 
         ta = TensorAttribute()
@@ -1231,11 +1545,15 @@ class TestFX(JitTestCase):
         traced(torch.rand(4, 4))
 
         class WrapperForQualname(torch.nn.Module):
+            # [CLASS DOC] HELPER: module owning a TensorAttribute submodule and using its tensor.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the ta submodule.
                 super().__init__()
                 self.ta = TensorAttribute()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the functional linear of x with the
+                # submodule's tensor.
                 return torch.nn.functional.linear(x, self.ta.tensor)
 
         wfq = WrapperForQualname()
@@ -1244,7 +1562,15 @@ class TestFX(JitTestCase):
         traced2(torch.rand(4, 4))
 
     def test_tensor_attribute_coalseced(self):
+        # [FUNCTION DOC] Checks that a closed-over tensor used twice yields a single get_attr
+        # target, while a closed-over tensor plus a tensor created inside the function yields
+        # two targets.
         def count_attrs(fx_module):
+            # [FUNCTION DOC] HELPER: returns the number of distinct get_attr targets in the graph
+            # of the enclosing test's traced module (it reads that variable from the enclosing
+            # scope and ignores its own argument).
+            # KNOWN ISSUE: the parameter fx_module is unused; the closure variable traced is
+            # read instead.
             targets = set()
             for node in traced.graph.nodes:
                 if node.op == "get_attr":
@@ -1254,6 +1580,7 @@ class TestFX(JitTestCase):
         val = torch.tensor(5)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: returns x plus the captured tensor val twice.
             return x + val + val
 
         traced = symbolic_trace(f)
@@ -1263,6 +1590,8 @@ class TestFX(JitTestCase):
         val2 = torch.tensor(5)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: returns x plus a locally created tensor plus the captured
+            # tensor val2.
             val = torch.tensor(5)
             return x + val + val2
 
@@ -1271,8 +1600,12 @@ class TestFX(JitTestCase):
         self.assertEqual(count_attrs(traced), 2)
 
     def test_symbolic_trace_sequential(self):
+        # [FUNCTION DOC] Traces a Sequential of three simple modules and checks the traced module
+        # matches eager execution.
         class Simple(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that negates its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the negation of x.
                 return torch.neg(x)
 
         seq = torch.nn.Sequential(Simple(), Simple(), Simple())
@@ -1282,8 +1615,14 @@ class TestFX(JitTestCase):
         self.assertEqual(traced(x), seq(x))
 
     def test_tensor_constant(self):
+        # [FUNCTION DOC] Checks that a tensor constant created inside forward can be traced,
+        # linted and executed.
         class ConstTensor(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that applies a functional linear using a freshly created
+            # zeros tensor.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the functional linear of x with a 3 by 4
+                # zero weight.
                 return torch.nn.functional.linear(x, torch.zeros(3, 4))
 
         ct = ConstTensor()
@@ -1292,12 +1631,17 @@ class TestFX(JitTestCase):
         traced(torch.rand(4, 4))
 
     def test_pickle_graphmodule(self):
+        # [FUNCTION DOC] Pickles and unpickles a traced module containing a Linear submodule and
+        # checks the loaded module lints and gives the same output.
         class Nested(torch.nn.Module):
+            # [CLASS DOC] HELPER: module wrapping a 4 to 4 Linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the st linear layer.
                 super().__init__()
                 self.st = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the linear layer applied to x.
                 return self.st(x)
 
         n = Nested()
@@ -1310,6 +1654,8 @@ class TestFX(JitTestCase):
         self.assertEqual(loaded(x), traced(x))
 
     def test_pickle_custom_import(self):
+        # [FUNCTION DOC] Pickles and unpickles a GraphModule whose graph calls a module-level
+        # Python function and torch.sin, and checks the loaded module gives the same output.
         graph = torch.fx.Graph()
         a = graph.placeholder("x")
         b = graph.placeholder("y")
@@ -1324,6 +1670,9 @@ class TestFX(JitTestCase):
         self.assertEqual(loaded(x, y), gm(x, y))
 
     def test_all_input_nodes(self):
+        # [FUNCTION DOC] Checks all_input_nodes on nodes of a hand-built graph: a node with a
+        # single node arg, a node without node args, a node with two node args and a node whose
+        # first arg is a node.
         graph: torch.fx.Graph = torch.fx.Graph()
         a: torch.fx.Node = graph.placeholder("x")
         b: torch.fx.Node = graph.call_module("linear_mod", args=(a,))
@@ -1339,11 +1688,17 @@ class TestFX(JitTestCase):
         self.assertEqual(e.all_input_nodes, [d])
 
     def test_deepcopy_graphmodule_with_transform(self):
+        # [FUNCTION DOC] Traces SimpleTest, builds a new GraphModule whose graph appends a
+        # negation call method to the copied graph, deep copies it, and checks the copy has a
+        # distinct class but gives the same output.
         st = SimpleTest()
         traced = symbolic_trace(st)
         traced.graph.lint()
 
         def transform(traced):
+            # [FUNCTION DOC] HELPER: copies the graph of the given module into a new graph,
+            # appends a neg method call on the copied output, and returns a GraphModule over the
+            # old module and new graph.
             new_graph = torch.fx.Graph()
             val_map: dict[Node, Node] = {}
             output_value = new_graph.graph_copy(traced.graph, val_map)
@@ -1361,21 +1716,29 @@ class TestFX(JitTestCase):
         self.assertEqual(copied(x), transformed(x))
 
     def test_deepcopy_with_submods_params(self):
+        # [FUNCTION DOC] Deep copies a traced module that has nested submodules with parameters
+        # and lints the copy's graph.
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a parameter added to relu of the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 3 by 4 random parameter.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 4))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns relu of x plus the parameter.
                 return torch.relu(x) + self.param
 
         class Baz(torch.nn.Module):
+            # [CLASS DOC] HELPER: module owning a parameter and a Bar submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a parameter and the bar submodule.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 4))
                 self.bar = Bar()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns bar of x minus the parameter.
                 return self.bar(x) - self.param
 
         baz = Baz()
@@ -1385,8 +1748,11 @@ class TestFX(JitTestCase):
         copied.graph.lint()
 
     def test_deepcopy_graph_with_tracer_cls(self):
+        # [FUNCTION DOC] Checks that deep copying a Graph preserves its tracer class setting.
         class TestTracer(Tracer):
+            # [CLASS DOC] HELPER: Tracer treating every module as a leaf.
             def is_leaf_module(self, module, name):
+                # [FUNCTION DOC] HELPER: always returns True.
                 return True
 
         g = Graph(tracer_cls=TestTracer)
@@ -1398,16 +1764,25 @@ class TestFX(JitTestCase):
         self.assertTrue(g._tracer_cls == h._tracer_cls)
 
     def test_unpack_list_better_error(self):
+        # [FUNCTION DOC] Checks that tracing a module that star-expands a proxy list raises
+        # TraceError saying the proxy cannot be iterated.
         class SomeArgs(torch.nn.Module):
+            # [CLASS DOC] HELPER: module taking two arguments and returning a random tensor.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: ignores both arguments and returns a random 3 by
+                # 4 tensor.
                 return torch.rand(3, 4)
 
         class UnpacksList(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that star-expands its list input into a submodule call.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the sa submodule.
                 super().__init__()
                 self.sa = SomeArgs()
 
             def forward(self, x: list):
+                # [FUNCTION DOC] HELPER: calls sa with the elements of the list x expanded as
+                # positional args.
                 return self.sa(*x)
 
         ul = UnpacksList()
@@ -1415,16 +1790,26 @@ class TestFX(JitTestCase):
             symbolic_trace(ul)
 
     def test_unpack_dict_better_error(self):
+        # [FUNCTION DOC] Checks that tracing a module that double-star-expands a proxy dict raises
+        # TraceError saying the proxy cannot be iterated.
         class SomeKwargs(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with two defaulted arguments returning a random tensor.
             def forward(self, x=3, y=4):
+                # [FUNCTION DOC] HELPER: ignores both arguments and returns a random 3 by
+                # 4 tensor.
                 return torch.rand(3, 4)
 
         class UnpacksDict(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that double-star-expands its dict input into a
+            # submodule call.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the sk submodule.
                 super().__init__()
                 self.sk = SomeKwargs()
 
             def forward(self, x: dict):
+                # [FUNCTION DOC] HELPER: calls sk with the entries of the dict x expanded as
+                # keyword args.
                 return self.sk(**x)
 
         ud = UnpacksDict()
@@ -1432,11 +1817,16 @@ class TestFX(JitTestCase):
             symbolic_trace(ud)
 
     def test_pretty_print_targets(self):
+        # [FUNCTION DOC] Checks that printing a graph uses readable qualified names for targets
+        # from the operator, builtins and torch namespaces.
         # Test that Graph pretty-print prints friendly name for targets
         # in `operator` and `builtins`
 
         class SomeMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module using attribute access, addition and torch.add on
+            # its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns torch.add of two attribute values of x plus 3.0.
                 return torch.add(x.foo + x.bar, 3.0)
 
         traced = symbolic_trace(SomeMod())
@@ -1446,13 +1836,20 @@ class TestFX(JitTestCase):
         self.assertIn("torch.add", graph_str)
 
     def test_pretty_print_node(self):
+        # [FUNCTION DOC] Checks with FileCheck that formatting each node of a traced graph shows
+        # the expected op kinds and names in order (placeholders, getitem, get_attr, add, module
+        # call, clamp).
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a parameter and a Linear layer, indexing its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 3 by 4 parameter and a 4 to 5 linear layer.
                 super().__init__()
                 self.param: torch.nn.Parameter = torch.nn.Parameter(torch.rand(3, 4))
                 self.linear = torch.nn.Linear(4, 5)
 
             def forward(self, x: torch.Tensor, y: int = 2):
+                # [FUNCTION DOC] HELPER: indexes x by y, adds the parameter, applies linear and
+                # clamps to 0..1.
                 return self.linear(x[y] + self.param).clamp(min=0.0, max=1.0)
 
         traced = symbolic_trace(M())
@@ -1468,6 +1865,9 @@ class TestFX(JitTestCase):
         ).check("clamp").check("call_method").run(all_formatted)
 
     def test_print_graph(self):
+        # [FUNCTION DOC] Builds a graph calling an aten relu overload twice with a type expression
+        # and checks that print_readable output mentions the sanitized overload name exactly
+        # twice; raises AssertionError otherwise.
         op: torch._ops.OpOverload = torch.ops.aten.relu.default
         type_name: str = torch.typename(op)
 
@@ -1489,23 +1889,33 @@ class TestFX(JitTestCase):
             )
 
     def test_print_readable_no_trailing_whitespace_with_inner_graph(self):
+        # [FUNCTION DOC] Builds an outer GraphModule that calls an inner traced GraphModule and
+        # checks print_readable output has no line with trailing whitespace.
         # When a GraphModule has a child GraphModule (e.g., from invoke_subgraph),
         # print_readable() should not produce lines with trailing whitespace.
 
         # Create an inner GraphModule
         class InnerModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module adding one to its input, traced to become the
+            # inner GraphModule.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x plus one.
                 return x + 1
 
         inner_gm = torch.fx.symbolic_trace(InnerModule())
 
         # Create an outer module that has the inner GraphModule as a submodule
         class OuterModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding the traced inner GraphModule as the
+            # attribute subgraph_0.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: stores the inner GraphModule captured from the
+                # enclosing test.
                 super().__init__()
                 self.subgraph_0 = inner_gm
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x times two (not used by the hand-built graph).
                 return x * 2
 
         outer = OuterModule()
@@ -1535,24 +1945,39 @@ class TestFX(JitTestCase):
             )
 
     def test_script_tensor_constant(self):
+        # [FUNCTION DOC] Checks that a traced module with an anonymous tensor constant
+        # can be compiled by TorchScript (constants must not have names starting with a
+        # double underscore).
         # TorchScript seems to ignore attributes that start with `__`.
         # We used to call anonymous Tensor values `__tensor_constant*`, but
         # they were getting ignored by script. Now they're called
         # `_tensor_constant*`
         class IHaveATensorConstant(torch.nn.Module):
+            # [CLASS DOC] HELPER: module adding a freshly created random tensor to its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x plus a new random 3 by 4 tensor.
                 return x + torch.rand(3, 4)
 
         traced = torch.fx.symbolic_trace(IHaveATensorConstant())
         torch.jit.script(traced)
 
     def test_autowrap_functions(self):
+        # [FUNCTION DOC] Checks that Tracer with autowrap_functions lets global int-conversion
+        # helpers accept proxy arguments, traces a second module using two autowrapped functions,
+        # and that the first traced module is scriptable and returns 2 for a length-4 input.
         class AutowrapFnTest(torch.nn.Module):
+            # [CLASS DOC] HELPER: module applying fx_int to half of the first dimension of x.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns fx_int of the first dimension of x divided
+                # by two.
                 return fx_int(x.shape[0] / 2)
 
         class AutowrapFnTest2(torch.nn.Module):
+            # [CLASS DOC] HELPER: module using both fx_int and fx_int_x2 on half the
+            # first dimension.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the sum of fx_int and fx_int_x2 of the halved
+                # first dimension.
                 return fx_int(x.shape[0] / 2) + fx_int_x2(x.shape[0] / 2)
 
         # Check function(s) are wrapped
@@ -1568,7 +1993,11 @@ class TestFX(JitTestCase):
         self.assertEqual(traced_scripted(torch.rand(4)), 2)
 
     def test_tuple_no_subscript(self):
+        # [FUNCTION DOC] Traces a function with a bare tuple annotation that indexes its argument,
+        # checks the result, then saves and loads the traced module through torch.save and
+        # torch.load with weights_only disabled and checks the loaded module result.
         def foo(x: tuple):
+            # [FUNCTION DOC] HELPER: returns the first element of the tuple x.
             return x[0]
 
         traced = torch.fx.symbolic_trace(foo)
@@ -1588,8 +2017,13 @@ class TestFX(JitTestCase):
         torch.testing.assert_close(loaded(x), x[0])
 
     def test_torch_fx_len(self):
+        # [FUNCTION DOC] Checks that len on a proxy is traced, traced and eager modules are
+        # scriptable, len of a plain list attribute is evaluated eagerly, and the builtin len
+        # is restored.
         class FXLenTest(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning the length of its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns len of x.
                 return len(x)
 
         traced = symbolic_trace(FXLenTest())
@@ -1604,11 +2038,14 @@ class TestFX(JitTestCase):
 
         # Test non-proxy len
         class FXLenTest2(torch.nn.Module):
+            # [CLASS DOC] HELPER: module adding the length of a plain list attribute to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a list attribute with three entries.
                 super().__init__()
                 self.l = [3, 4, 5]
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x plus the length of the list attribute.
                 return x + len(self.l)
 
         traced2 = symbolic_trace(FXLenTest2())
@@ -1617,24 +2054,38 @@ class TestFX(JitTestCase):
         self.assertIs(len, builtins.len)
 
     def test_torch_fx_getattr(self):
+        # [FUNCTION DOC] Checks that the getattr builtin with a default on a proxy is traced and
+        # that the traced module returns the default tensor.
         class FXGetattrTest(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling getattr with a missing attribute name and a
+            # default tensor.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the default tensor for the missing attribute.
                 return getattr(x, "nonexistent_attr", torch.Tensor([2, 3]))
 
         traced = symbolic_trace(FXGetattrTest())
         self.assertEqual(traced(torch.rand(3, 4)), torch.Tensor([2, 3]))
 
     def test_sqrt(self):
+        # [FUNCTION DOC] Checks that modules using the bare sqrt, math.sqrt, and a constant sqrt
+        # trace correctly, and that the math module sqrt is left unpatched afterwards.
         class Sqrt1(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning sqrt (imported name) of the first
+            # dimension size.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the square root of the size of dimension 0.
                 return sqrt(x.size(0))
 
         class Sqrt2(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning math.sqrt of the first dimension size.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the square root of the size of dimension 0.
                 return math.sqrt(x.size(0))
 
         class Sqrt3(torch.nn.Module):
+            # [CLASS DOC] HELPER: module adding constant square roots to its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x plus two constant square roots of 2.
                 return x + math.sqrt(2) + sqrt(2)
 
         self.checkGraphModule(Sqrt1(), [torch.zeros(8)])
@@ -1644,8 +2095,13 @@ class TestFX(JitTestCase):
         self.assertIs(math.sqrt, _sqrt)
 
     def test_torch_custom_ops(self):
+        # [FUNCTION DOC] Checks that aten ops called through torch.ops (sigmoid, cat on list and
+        # tuple) trace and give the eager result.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module composed of aten sigmoid and cat calls.
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: concatenates a with its sigmoid, then concatenates the
+                # result with itself.
                 b = torch.ops.aten.sigmoid(a)
                 c = torch.ops.aten.cat([a, b])
                 return torch.ops.aten.cat((c, c))
@@ -1659,8 +2115,13 @@ class TestFX(JitTestCase):
         self.assertEqual(out, ref_out)
 
     def test_torch_op_overloads(self):
+        # [FUNCTION DOC] Traces a module calling an aten overload and checks that every
+        # call_function node target is an OpOverload named add.Tensor; raises
+        # AssertionError otherwise.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling the aten add Tensor overload.
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: returns a added to itself via the aten overload.
                 b = torch.ops.aten.add.Tensor(a, a)
                 return b
 
@@ -1685,8 +2146,13 @@ class TestFX(JitTestCase):
                     )
 
     def test_pickle_torch_custom_ops(self):
+        # [FUNCTION DOC] Pickles and unpickles a traced module that calls aten ops through
+        # torch.ops and checks the loaded module output matches.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module composed of aten sigmoid and cat calls.
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: concatenates a with its sigmoid, then concatenates the
+                # result with itself.
                 b = torch.ops.aten.sigmoid(a)
                 c = torch.ops.aten.cat([a, b])
                 return torch.ops.aten.cat((c, c))
@@ -1701,6 +2167,8 @@ class TestFX(JitTestCase):
         self.assertEqual(loaded(input), gm(input))
 
     def test_pretty_print(self):
+        # [FUNCTION DOC] Checks that the string form of a traced module contains the class name
+        # and the call to relu; raises AssertionError otherwise.
         st = SimpleTest()
         traced = symbolic_trace(st)
         traced.graph.lint()
@@ -1711,8 +2179,12 @@ class TestFX(JitTestCase):
             raise AssertionError(f"Expected 'torch.relu' in printed, got {printed}")
 
     def test_pretty_print_graph(self):
+        # [FUNCTION DOC] Checks the string form of a graph includes the args, kwargs and num_users
+        # fields for a call using a keyword argument.
         class KwargPrintTest(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling squeeze with a keyword dim on a shifted input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns squeeze of x plus 3.0 along dim 2.
                 return torch.squeeze(x + 3.0, dim=2)
 
         st = KwargPrintTest()
@@ -1724,21 +2196,28 @@ class TestFX(JitTestCase):
                 raise AssertionError(f"Expected '{s}' in stringed graph output")
 
     def test_custom_proxy_type(self):
+        # [FUNCTION DOC] Traces a function over a plain Python class (no proxy metaclass) holding
+        # two tensors, and checks the traced output attributes equal the eager results.
         class TensorPair:
+            # [CLASS DOC] HELPER: plain pair of tensors with elementwise add and mul methods.
             def __init__(self, left, right):
+                # [FUNCTION DOC] HELPER: stores the two tensors in left and right attributes.
                 self.left, self.right = left, right
 
             def add(self, other):
+                # [FUNCTION DOC] HELPER: returns a new pair with left and right sums.
                 l = self.left + other.left
                 r = self.right + other.right
                 return TensorPair(l, r)
 
             def mul(self, other):
+                # [FUNCTION DOC] HELPER: returns a new pair with left and right products.
                 l = self.left * other.left
                 r = self.right * other.right
                 return TensorPair(l, r)
 
         def use_tensor_pair(x: TensorPair, y: TensorPair):
+            # [FUNCTION DOC] HELPER: adds the two pairs and multiplies the result by the first.
             s = x.add(y)
             return s.mul(x)
 
@@ -1754,21 +2233,30 @@ class TestFX(JitTestCase):
         self.assertEqual(traced_out.right, ref_out.right)
 
     def test_custom_proxy_type_literal(self):
+        # [FUNCTION DOC] Same as the plain-class test but the pair class uses the
+        # ProxyableClassMeta metaclass and the function constructs a pair literal from zero
+        # tensors inside traced code.
         class TensorPair(metaclass=torch.fx.ProxyableClassMeta):
+            # [CLASS DOC] HELPER: pair of tensors with ProxyableClassMeta so it can be created
+            # while tracing.
             def __init__(self, left, right):
+                # [FUNCTION DOC] HELPER: stores the two tensors in left and right attributes.
                 self.left, self.right = left, right
 
             def add(self, other):
+                # [FUNCTION DOC] HELPER: returns a new pair with left and right sums.
                 l = self.left + other.left
                 r = self.right + other.right
                 return TensorPair(l, r)
 
             def mul(self, other):
+                # [FUNCTION DOC] HELPER: returns a new pair with left and right products.
                 l = self.left * other.left
                 r = self.right * other.right
                 return TensorPair(l, r)
 
         def use_tensor_pair_literal(x: TensorPair):
+            # [FUNCTION DOC] HELPER: adds a zero-filled pair literal to x and multiplies by x.
             s = x.add(TensorPair(torch.zeros(5, 3), torch.zeros(5, 3)))
             return s.mul(x)
 
@@ -1783,21 +2271,30 @@ class TestFX(JitTestCase):
         self.assertEqual(traced_out.right, ref_out.right)
 
     def test_custom_proxy_dynamic_value(self):
+        # [FUNCTION DOC] Same as the metaclass test, but the pair constructed inside traced code
+        # is built from an input tensor (a dynamic value) rather than a literal.
         class TensorPair(metaclass=torch.fx.ProxyableClassMeta):
+            # [CLASS DOC] HELPER: pair of tensors with ProxyableClassMeta so it can be created
+            # while tracing.
             def __init__(self, left, right):
+                # [FUNCTION DOC] HELPER: stores the two tensors in left and right attributes.
                 self.left, self.right = left, right
 
             def add(self, other):
+                # [FUNCTION DOC] HELPER: returns a new pair with left and right sums.
                 l = self.left + other.left
                 r = self.right + other.right
                 return TensorPair(l, r)
 
             def mul(self, other):
+                # [FUNCTION DOC] HELPER: returns a new pair with left and right products.
                 l = self.left * other.left
                 r = self.right * other.right
                 return TensorPair(l, r)
 
         def use_tensor_pair_ctor(x: TensorPair, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: adds a pair built from y twice to x and multiplies the result
+            # by x.
             s = x.add(TensorPair(y, y))
             return s.mul(x)
 
@@ -1812,8 +2309,15 @@ class TestFX(JitTestCase):
         self.assertEqual(traced_out.right, ref_out.right)
 
     def test_custom_proxy_input_dependent_control_flow(self):
+        # [FUNCTION DOC] Traces a function building a proxyable class whose constructor branches
+        # on the tensor sum being zero, and checks the traced output's is_zero flag and tensor
+        # equal eager.
         class ZeroTensor(metaclass=torch.fx.ProxyableClassMeta):
+            # [CLASS DOC] HELPER: proxyable class wrapping a tensor with a flag marking an
+            # all-zero input; the constructor branches on the input sum.
             def __init__(self, inp):
+                # [FUNCTION DOC] HELPER: sets is_zero true with an empty tensor if the sum is
+                # zero, otherwise stores false and the input tensor.
                 if inp.sum() == 0:
                     self.is_zero = True
                     self.tensor = torch.tensor([])
@@ -1822,12 +2326,15 @@ class TestFX(JitTestCase):
                     self.tensor = inp
 
             def add(self, other):
+                # [FUNCTION DOC] HELPER: returns a new instance from other's tensor if self is
+                # zero, returns self if other is zero, otherwise falls through returning None.
                 if self.is_zero:
                     return ZeroTensor(other.tensor)
                 elif other.is_zero:
                     return self
 
         def use_zero_tensor(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: returns a ZeroTensor constructed from x plus y.
             return ZeroTensor(x + y)
 
         x, y = torch.randn(5, 3), torch.randn(5, 3)
@@ -1842,6 +2349,9 @@ class TestFX(JitTestCase):
         self.assertEqual(traced_out.tensor, ref_out.tensor)
 
     def test_graph_fns(self):
+        # [FUNCTION DOC] Builds a graph by hand using placeholder, call_module, get_attr,
+        # call_method and call_function, builds a GraphModule over a Linear and a bias, and checks
+        # the output equals the eager computation.
         g = Graph()
         a = g.placeholder("a")
         b = g.call_module("linear", (a,))
@@ -1860,6 +2370,8 @@ class TestFX(JitTestCase):
         self.assertEqual(r, ref)
 
     def test_remove_uses(self):
+        # [FUNCTION DOC] Replaces all uses of a node with another node, erases the node, and
+        # checks the erased node is no longer in the other node's users.
         g: torch.fx.Graph = Graph()
         x: torch.fx.Node = g.placeholder("x")
         relu: torch.fx.Node = g.call_function(torch.relu, (x,))
@@ -1873,6 +2385,9 @@ class TestFX(JitTestCase):
 
     @skipIfTorchDynamo("Dynamo does not free right away")
     def test_prepend_does_not_leak(self):
+        # [FUNCTION DOC] Skipped under Dynamo. Inserts a node before another via prepend, erases
+        # it, deletes all strong references and collects garbage, then checks a weak reference to
+        # the erased node is dead (no leak).
         g = Graph()
         x = g.placeholder("x")
         relu = g.call_function(torch.relu, (x,))
@@ -1891,6 +2406,8 @@ class TestFX(JitTestCase):
         self.assertIsNone(ref())
 
     def test_remove_uses_with_custom_filter(self):
+        # [FUNCTION DOC] Replaces uses of a node with another using a filter that excludes the
+        # node itself from replacement, and checks the node is still a user.
         g: torch.fx.Graph = Graph()
         x: torch.fx.Node = g.placeholder("x")
         relu: torch.fx.Node = g.call_function(torch.relu, (x,))
@@ -1902,10 +2419,14 @@ class TestFX(JitTestCase):
         self.assertTrue(neg in relu.users)
 
     def test_nonetype_annotation(self):
+        # [FUNCTION DOC] Checks that an EmbeddingBag module (with None-typed annotations) can
+        # be traced.
         eb = torch.nn.EmbeddingBag(3, 4)
         symbolic_trace(eb)
 
     def test_pickle_nonetype_annotation(self):
+        # [FUNCTION DOC] Pickles and unpickles a traced EmbeddingBag and checks the loaded module
+        # gives the same output for index and offset inputs.
         eb = torch.nn.EmbeddingBag(10, 3, mode="sum")
         traced = symbolic_trace(eb)
         pickled = pickle.dumps(traced)
@@ -1916,7 +2437,12 @@ class TestFX(JitTestCase):
         self.assertEqual(loaded(input, offsets), traced(input, offsets))
 
     def test_save_string_type_annotation(self):
+        # [FUNCTION DOC] Traces a function with string annotations, checks the serialized import
+        # block and code via the reduce protocol against an expected golden string, saves and
+        # loads the module, and checks the output and the string-valued annotations are preserved.
         def f(x: "torch.Tensor") -> "torch.Tensor":
+            # [FUNCTION DOC] HELPER: identity function annotated with string forward references
+            # to Tensor.
             return x
 
         traced = symbolic_trace(f)
@@ -1952,8 +2478,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         )
 
     def test_return_tuple(self):
+        # [FUNCTION DOC] Checks that a traced module returning a tuple behaves like the original.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning the input and the input doubled as a
+            # typed tuple.
             def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                # [FUNCTION DOC] HELPER: returns the tuple of x and x plus x.
                 return (x, x + x)
 
         original = M()
@@ -1961,6 +2491,10 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(traced(torch.ones(1)), original.forward(torch.ones(1)))
 
     def test_construct_root_dict(self):
+        # [FUNCTION DOC] Builds a GraphModule whose root is a mapping from qualified names to a
+        # Linear module and a tensor, checks lint, that generated code references the nested
+        # attribute path, and that the output equals the eager computation; raises AssertionError
+        # if the path is absent.
         graph: torch.fx.Graph = torch.fx.Graph()
         a: torch.fx.Node = graph.create_node("placeholder", "x")
         b: torch.fx.Node = graph.create_node("call_module", "foo.bar.baz", args=(a,))
@@ -1986,8 +2520,15 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(out, ref_out)
 
     def test_symbolic_trace_assert(self):
+        # [FUNCTION DOC] Traces a module containing a tensor-shape assertion; checks the traced
+        # module raises AssertionError with the message when the shape condition fails, and
+        # that the eager module scripted with TorchScript raises a torch.jit.Error with the
+        # same message.
         class AssertsTensorShape(torch.nn.Module):
+            # [CLASS DOC] HELPER: module asserting its input has more than four columns.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: asserts the size of dim 1 of x exceeds 4 (message
+                # assert_foobar), returns x.
                 torch._assert(x.shape[1] > 4, "assert_foobar")
                 return x
 
@@ -2004,12 +2545,20 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             ms(torch.rand(4, 3))
 
     def test_fx_create_arg(self):
+        # [FUNCTION DOC] Checks the __fx_create_arg__ protocol: a leaf submodule receives an
+        # object that knows how to create its own graph node, and the generated code constructs
+        # that object. Raises AssertionError if the constructor call is missing from the code.
         class CustomArgObject:
+            # [CLASS DOC] HELPER: object holding x and y that implements the FX create-arg hook to
+            # become a call_function node constructing itself from its fields.
             def __init__(self, x, y):
+                # [FUNCTION DOC] HELPER: stores x and y.
                 self.x = x
                 self.y = y
 
             def __fx_create_arg__(self, tracer: torch.fx.Tracer):
+                # [FUNCTION DOC] HELPER: creates a call_function node targeting the class with the
+                # tracer-created args for x and y and returns the node.
                 return tracer.create_node(
                     "call_function",
                     CustomArgObject,
@@ -2021,7 +2570,11 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 )
 
         class HasCustomArgObjectWhenLeaf(torch.nn.Module):
+            # [CLASS DOC] HELPER: leaf module that loops over the custom object's x and
+            # accumulates into y; untraceable on purpose, so it must be a leaf.
             def forward(self, o: CustomArgObject):
+                # [FUNCTION DOC] HELPER: adds each element of o.x into o.y in place and
+                # returns o.y.
                 # Not normally traceable; good reason to make
                 # this module a leaf.
                 for x in o.x:
@@ -2029,16 +2582,25 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 return o.y
 
         class Root(torch.nn.Module):
+            # [CLASS DOC] HELPER: root module building a CustomArgObject and passing it to the
+            # inner leaf.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the inner submodule.
                 super().__init__()
                 self.inner = HasCustomArgObjectWhenLeaf()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: builds a custom object from x and y and returns inner
+                # of it.
                 o = CustomArgObject(x, y)
                 return self.inner(o)
 
         class CreateArgTracer(torch.fx.Tracer):
+            # [CLASS DOC] HELPER: Tracer treating only HasCustomArgObjectWhenLeaf instances as
+            # leaf modules.
             def is_leaf_module(self, m, module_qualified_name):
+                # [FUNCTION DOC] HELPER: returns whether the module's exact type
+                # is HasCustomArgObjectWhenLeaf.
                 return type(m) is HasCustomArgObjectWhenLeaf
 
         m = Root()
@@ -2050,9 +2612,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             )
 
     def test_trace_fn_constant(self):
+        # [FUNCTION DOC] Checks a function closing over a tensor constant traces and
+        # matches eager.
         some_constant = torch.rand(3, 4)
 
         def add_const(x):
+            # [FUNCTION DOC] HELPER: returns the closed-over tensor plus x.
             return some_constant + x
 
         traced = symbolic_trace(add_const)
@@ -2061,6 +2626,9 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(traced(input), add_const(input))
 
     def test_copy_no_remap(self):
+        # [FUNCTION DOC] Copies every node of a graph with node_copy without a value remapping
+        # function and checks lint raises RuntimeError because copied nodes still reference
+        # original nodes.
         traced = symbolic_trace(SimpleTest())
         g = traced.graph
         copied = torch.fx.Graph()
@@ -2070,6 +2638,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             copied.lint()
 
     def test_wrong_topo(self):
+        # [FUNCTION DOC] Moves a node ahead of its dependency by appending one node after another,
+        # and checks lint raises RuntimeError saying a value was used before being defined.
         graph: torch.fx.Graph = torch.fx.Graph()
         a: torch.fx.Node = graph.create_node("placeholder", "x")
         b: torch.fx.Node = graph.create_node("call_module", "foo.bar.baz", args=(a,))
@@ -2084,6 +2654,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             graph.lint()
 
     def test_wrong_target_type(self):
+        # [FUNCTION DOC] Checks that constructing a Node with a string target for the
+        # call_function op raises ValueError.
         graph: torch.fx.Graph = torch.fx.Graph()
         with self.assertRaises(ValueError):
             n = torch.fx.Node(
@@ -2096,13 +2668,21 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             )
 
     def test_example_shape_prop(self):
+        # [FUNCTION DOC] Runs ShapeProp on a traced module using every opcode, checks that all
+        # opcodes appear, and that the output node's recorded tensor_meta shape and stride match
+        # eager output.
         class TestCase(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a tensor attribute and a Linear submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the random 3 by 4 attribute and a 4 to 4
+                # linear layer.
                 super().__init__()
                 self.attr = torch.randn(3, 4)
                 self.submod = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the negation of the linear layer applied to relu
+                # of x plus the attribute.
                 return torch.neg(self.submod(x.relu() + self.attr))
 
         tc = TestCase()
@@ -2136,12 +2716,18 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(output_stride, ref_out.stride())
 
     def test_shape_prop_layout(self):
+        # [FUNCTION DOC] Checks ShapeProp records contiguous memory format for all nodes of a conv
+        # model and, after converting the module to channels-last with a channels-last input, that
+        # the placeholder node records the channels-last format.
         class ConvTest(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a single 2D convolution.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 5 to 5 channel conv with kernel size 3.
                 super().__init__()
                 self.conv_mod = torch.nn.Conv2d(5, 5, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the conv applied to x.
                 return self.conv_mod(x)
 
         # contiguous layout
@@ -2171,22 +2757,32 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 )
 
     def test_shape_prop_aggregate(self):
+        # [FUNCTION DOC] Checks ShapeProp on a leaf module returning a tuple of an int and a
+        # scalar tensor: the node's tensor_meta holds the int and a metadata entry with an
+        # empty shape.
         class ReturnTwo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning a constant 3 and the sum of its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the pair of 3 and the sum of x.
                 return (3, torch.sum(x))
 
         class UnderTest(torch.nn.Module):
+            # [CLASS DOC] HELPER: module wrapping a ReturnTwo submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the rt submodule.
                 super().__init__()
                 self.rt = ReturnTwo()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns rt applied to x.
                 return self.rt(x)
 
         ut = UnderTest()
 
         class RTTracer(torch.fx.Tracer):
+            # [CLASS DOC] HELPER: Tracer treating ReturnTwo as a leaf module.
             def is_leaf_module(self, m, module_qualified_name):
+                # [FUNCTION DOC] HELPER: returns whether the module's exact type is ReturnTwo.
                 return type(m) is ReturnTwo
 
         graph = RTTracer().trace(ut)
@@ -2211,12 +2807,17 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
 
     @xfailIf(IS_ARM64 and IS_LINUX) # RuntimeError: label is too far
     def test_shape_prop_layout_3d(self):
+        # [FUNCTION DOC] Expected-failure on ARM64 Linux (label too far error). Same as the 2D
+        # layout test but with a 3D convolution and channels-last-3d memory format.
         class ConvTest3d(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a single 3D convolution.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 5 to 5 channel 3D conv with kernel size 3.
                 super().__init__()
                 self.conv_mod = torch.nn.Conv3d(5, 5, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the conv applied to x.
                 return self.conv_mod(x)
 
         test_mod_3d = ConvTest3d()
@@ -2244,10 +2845,15 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 )
 
     def test_shape_prop_unbacked_sym(self):
+        # [FUNCTION DOC] Exports a module returning nonzero indices, runs ShapeProp with fake
+        # inputs and the detected fake mode, and checks no pending fresh unbacked symbols remain
+        # in the shape env.
         from torch._dynamo.utils import detect_fake_mode
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning the indices of nonzero elements of its input.
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns the nonzero index tensor of x.
                 return torch.nonzero(x)
 
         inp = (torch.tensor([1, 0, 1, 0]),)
@@ -2261,20 +2867,28 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(len(fake_mode.shape_env.pending_fresh_unbacked_symbols), 0)
 
     def test_nn_module_stack(self):
+        # [FUNCTION DOC] Checks that the first node with an nn_module_stack in the traced graph
+        # has the expected ordered entries for the submodule and nested conv.
         class SubModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module wrapping a bias-free 3 by 3 Conv2d with 64 channels.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the conv_mod layer.
                 super().__init__()
                 self.conv_mod = torch.nn.Conv2d(64, 64, (3, 3), padding=1, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the conv applied to x.
                 return self.conv_mod(x)
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module wrapping a SubModule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the sub_mod submodule.
                 super().__init__()
                 self.sub_mod = SubModule()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns sub_mod applied to x.
                 return self.sub_mod(x)
 
         m = MyModule()
@@ -2293,12 +2907,18 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(stack_list, expected_stack)
 
     def test_transformer_preserves_nn_module_stack_for_get_attr(self):
+        # [FUNCTION DOC] Sets nn_module_stack, stack_trace and source_fn_stack metadata on
+        # get_attr nodes, runs a Transformer, and checks those metadata values are preserved on
+        # get_attr nodes.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with one parameter added to the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 1 by 1 ones parameter.
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.ones(1, 1))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the parameter plus x.
                 return self.weight + x
 
         tracer = torch.fx.Tracer()
@@ -2317,13 +2937,19 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 self.assertEqual(node.meta["source_fn_stack"], "source_fn_stack")
 
     def test_interpreter(self):
+        # [FUNCTION DOC] Checks that an Interpreter over a traced module gives the same output as
+        # the traced and original modules.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a parameter, a Linear layer and a clamp.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 3 by 4 parameter and a 4 to 5 linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 4))
                 self.linear = torch.nn.Linear(4, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: adds the parameter to x, applies linear and clamps to the
+                # 0..1 range.
                 return self.linear(x + self.param).clamp(min=0.0, max=1.0)
 
         m = MyModule()
@@ -2335,8 +2961,13 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(interpreter.run(input), m(input))
 
     def test_interpreter_boxed_run_argument_validation(self):
+        # [FUNCTION DOC] Checks boxed_run: with exactly the needed args it returns the result and
+        # empties the input list; with extra or missing args it raises RuntimeError mentioning
+        # extra or missing arguments and leaves the list unmodified.
         class AddModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module adding two inputs.
             def forward(self, lhs, rhs):
+                # [FUNCTION DOC] HELPER: returns lhs plus rhs.
                 return lhs + rhs
 
         gm = torch.fx.symbolic_trace(AddModule())
@@ -2360,13 +2991,19 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(len(missing_args), 1)
 
     def test_interpreter_other_graph(self):
+        # [FUNCTION DOC] Checks that an Interpreter built with an explicit graph argument runs and
+        # matches the module output.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a parameter, a Linear layer and a clamp.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 3 by 4 parameter and a 4 to 5 linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 4))
                 self.linear = torch.nn.Linear(4, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: adds the parameter to x, applies linear and clamps to the
+                # 0..1 range.
                 return self.linear(x + self.param).clamp(min=0.0, max=1.0)
 
         m = MyModule()
@@ -2378,23 +3015,35 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(interpreter.run(input), m(input))
 
     def test_interpreter_run_node_override(self):
+        # [FUNCTION DOC] Subclasses Interpreter to override run_node, caching each node's result
+        # on the node, and checks every node got the cached attribute after a run.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a parameter, a Linear layer and a clamp.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 3 by 4 parameter and a 4 to 5 linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 4))
                 self.linear = torch.nn.Linear(4, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: adds the parameter to x, applies linear and clamps to the
+                # 0..1 range.
                 return self.linear(x + self.param).clamp(min=0.0, max=1.0)
 
         m = MyModule()
         gm = torch.fx.symbolic_trace(m)
 
         class RunNodeInterpreter(Interpreter):
+            # [CLASS DOC] HELPER: Interpreter that stores the result of every executed node as an
+            # attribute of that node.
             def __init__(self, module):
+                # [FUNCTION DOC] HELPER: initializes the parent Interpreter with the module.
                 super().__init__(module)
 
             def run_node(self, n: Node) -> Any:
+                # [FUNCTION DOC] HELPER: runs the node via the parent, saves the result on
+                # the node as a cached value attribute (side effect on the node), and returns
+                # the result.
                 result = super().run_node(n)
                 n.cached_value = result
                 return result
@@ -2408,18 +3057,31 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 )
 
     def test_interpreter_onthefly_swap(self):
+        # [FUNCTION DOC] Uses an Interpreter that swaps sigmoid and negation at execution time and
+        # checks the swapped result equals negation followed by sigmoid.
         def fn(x):
+            # [FUNCTION DOC] HELPER: returns the negation of sigmoid of x.
             return torch.sigmoid(x).neg()
 
         gm = torch.fx.symbolic_trace(fn)
 
         class NegSigmSwapInterpreter(Interpreter):
+            # [CLASS DOC] HELPER: Interpreter that executes sigmoid function calls as neg and neg
+            # method calls as sigmoid.
             def call_function(self, target: Target, args: tuple, kwargs: dict) -> Any:
+                # [FUNCTION DOC] HELPER: executes negation instead of sigmoid for the sigmoid
+                # target; for any other target intends to defer to the parent.
+                # KNOWN ISSUE: the fall-through passes the undefined name n (lint suppressed), so
+                # it would raise NameError; the test never reaches that branch.
                 if target == torch.sigmoid:
                     return torch.neg(*args, **kwargs)
                 return super().call_function(n)  # noqa: F821
 
             def call_method(self, target: Target, args: tuple, kwargs: dict) -> Any:
+                # [FUNCTION DOC] HELPER: executes sigmoid on the receiver instead of neg for the
+                # neg method; for other methods intends to defer to the parent.
+                # KNOWN ISSUE: the fall-through passes the undefined name n (lint suppressed), so
+                # it would raise NameError; the test never reaches that branch.
                 if target == "neg":
                     call_self, *args_tail = args
                     return call_self.sigmoid(*args_tail, **kwargs)
@@ -2430,13 +3092,20 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(result, torch.neg(input).sigmoid())
 
     def test_interpreter_partial_eval(self):
+        # [FUNCTION DOC] Runs an Interpreter with an initial environment pre-binding the linear
+        # module node to a constant tensor and checks the remaining nodes compute from it
+        # (clamped output).
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a parameter, a Linear layer and a clamp.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 3 by 4 parameter and a 4 to 5 linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 4))
                 self.linear = torch.nn.Linear(4, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: adds the parameter to x, applies linear and clamps to the
+                # 0..1 range.
                 return self.linear(x + self.param).clamp(min=0.0, max=1.0)
 
         gm = torch.fx.symbolic_trace(MyModule())
@@ -2455,7 +3124,10 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         )
 
     def test_interpreter_star_args(self):
+        # [FUNCTION DOC] Checks an Interpreter handles a traced function taking varargs, using the
+        # first extra arg.
         def with_star_args(x, *args):
+            # [FUNCTION DOC] HELPER: returns x plus the first extra positional argument.
             return x + args[0]
 
         gm = torch.fx.symbolic_trace(with_star_args)
@@ -2465,6 +3137,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
 
     @skipIfNoTorchVision
     def test_interpreter_noop_resnet18(self):
+        # [FUNCTION DOC] Skipped without torchvision. Applies a no-op Transformer to a traced
+        # resnet18 and checks outputs equal the original model.
         rn18 = torchvision_models.resnet18()
         transformed = torch.fx.Transformer(symbolic_trace(rn18)).transform()
         inp = torch.randn(5, 3, 224, 224)
@@ -2472,6 +3146,9 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
 
     @skipIfNoTorchVision
     def test_interpreter_gc_values(self):
+        # [FUNCTION DOC] Skipped without torchvision. Runs an Interpreter over resnet18 and checks
+        # that after the run only the output node remains in the interpreter environment (values
+        # were freed).
         rn18 = torchvision_models.resnet18()
         interp = Interpreter(symbolic_trace(rn18))
         inp = torch.rand(5, 3, 224, 224)
@@ -2480,8 +3157,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(env_key_names, {"output"})
 
     def test_interpreter_default_args(self):
+        # [FUNCTION DOC] Checks an Interpreter uses a parameter's default value when the argument
+        # is not passed.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a defaulted second argument.
             def forward(self, x, y=3.14159):
+                # [FUNCTION DOC] HELPER: returns x plus y, where y defaults to 3.14159.
                 return x + y
 
         model = Model()
@@ -2493,8 +3174,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         torch.testing.assert_close(out, x + 3.14159)
 
     def test_interpreter_not_enough_args(self):
+        # [FUNCTION DOC] Checks that running an Interpreter with a missing required argument
+        # raises RuntimeError saying a positional argument for the parameter was not passed in.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: module adding two required inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: returns x plus y.
                 return x + y
 
         model = Model()
@@ -2509,13 +3194,18 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             out = interp.run(x)
 
     def test_transformer_noop(self):
+        # [FUNCTION DOC] Checks that a default Transformer reproduces the module's behavior.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a parameter, a Linear layer and a clamp.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 3 by 4 parameter and a 4 to 5 linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 4))
                 self.linear = torch.nn.Linear(4, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: adds the parameter to x, applies linear and clamps to the
+                # 0..1 range.
                 return self.linear(x + self.param).clamp(min=0.0, max=1.0)
 
         m = MyModule()
@@ -2527,18 +3217,31 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(new_gm(input), gm(input))
 
     def test_transformer_op_swap(self):
+        # [FUNCTION DOC] Uses a Transformer that swaps sigmoid and negation and checks the
+        # transformed module computes negation followed by sigmoid.
         def fn(x):
+            # [FUNCTION DOC] HELPER: returns the negation of sigmoid of x.
             return torch.sigmoid(x).neg()
 
         gm = torch.fx.symbolic_trace(fn)
 
         class NegSigmSwapXformer(Transformer):
+            # [CLASS DOC] HELPER: Transformer that rewrites sigmoid function calls into neg and
+            # neg method calls into sigmoid.
             def call_function(self, target: Target, args: tuple, kwargs: dict) -> Any:
+                # [FUNCTION DOC] HELPER: replaces the sigmoid target with a negation call; other
+                # targets would defer to the parent.
+                # KNOWN ISSUE: the fall-through passes the undefined name n (lint suppressed), so
+                # it would raise NameError; the test never reaches that branch.
                 if target == torch.sigmoid:
                     return torch.neg(*args, **kwargs)
                 return super().call_function(n)  # noqa: F821
 
             def call_method(self, target: Target, args: tuple, kwargs: dict) -> Any:
+                # [FUNCTION DOC] HELPER: replaces the neg method with a sigmoid call on the
+                # receiver; other methods would defer to the parent.
+                # KNOWN ISSUE: the fall-through passes the undefined name n (lint suppressed), so
+                # it would raise NameError; the test never reaches that branch.
                 if target == "neg":
                     call_self, *args_tail = args
                     return call_self.sigmoid(*args_tail, **kwargs)
@@ -2549,13 +3252,20 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(transformed(input), torch.neg(input).sigmoid())
 
     def test_transformer_multi_outputs(self):
+        # [FUNCTION DOC] Checks that a Transformer keeps a module that returns multiple
+        # outputs working.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a parameter and a Linear layer returning
+            # two tensors.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 3 by 4 parameter and a 4 to 5 linear layer.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 4))
                 self.linear = torch.nn.Linear(4, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the input plus the parameter and the linear of
+                # that sum.
                 x = x + self.param
                 out = self.linear(x)
                 return x, out
@@ -2569,10 +3279,17 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(new_gm(input), gm(input))
 
     def test_fn_type_annotations(self):
+        # [FUNCTION DOC] Scripts both an eager module and its symbolically traced version, each
+        # having a forward with NamedTuple, tensor and int parameters and a dict return
+        # annotation, and calls both.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward takes a Pair, a tensor and an int, returns
+            # a dict.
             def forward(
                 self, p: Pair, z: torch.Tensor, i: int
             ) -> dict[str, torch.Tensor]:
+                # [FUNCTION DOC] HELPER: returns a mapping with key a for the sum of the pair
+                # fields, z and i.
                 return {"a": p.x + p.y + z + i}
 
         foo_scripted = torch.jit.script(Foo())
@@ -2583,13 +3300,21 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         fxed_scripted(Pair(torch.rand(5), torch.rand(5)), torch.rand(5), 3)
 
     def test_fn_type_annotation_empty(self):
+        # [FUNCTION DOC] Scripts a traced function annotated with a list of tensors to check the
+        # empty generics annotation survives codegen.
         def forward(a: list[torch.Tensor]):
+            # [FUNCTION DOC] HELPER: returns the first element of the list a.
             return a[0]
 
         torch.jit.script(symbolic_trace(forward))
 
     def test_optional_typing_dict_placeholder_annotation_python314(self):
+        # [FUNCTION DOC] Traces a module with an Optional/Dict/Tuple annotation using typing
+        # aliases, checks generated code includes the expected annotation fragments (via
+        # FileCheck), and that the traced module is TorchScript-compatible.
         class OptionalTypingDictModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward takes an optional dict of int to tensor
+            # pairs and calls the wrapped helper.
             def forward(
                 self,
                 value: typing.Optional[  # noqa: UP045
@@ -2598,6 +3323,7 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                     ]
                 ],
             ):
+                # [FUNCTION DOC] HELPER: returns the wrapped helper applied to value.
                 return wrapped_optional_typing_dict(value)
 
         traced = symbolic_trace(OptionalTypingDictModule())
@@ -2608,16 +3334,26 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         torch.jit.script(traced)
 
     def test_wrapped_method(self):
+        # [FUNCTION DOC] Traces a module whose forward is replaced by a functools-wrapped function
+        # adding relu, and checks the traced graph contains a relu node.
         def wrap_with_relu(fn):
+            # [FUNCTION DOC] HELPER: decorator wrapping a function in a version that applies relu
+            # to the result, preserving metadata.
             @functools.wraps(fn)
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: calls the wrapped function and returns relu of
+                # its result.
                 return torch.relu(fn(*args, **kwargs))
 
             return wrapper
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward (a matmul) is decorated with the
+            # relu wrapper.
             @wrap_with_relu
             def forward(self, x, w):
+                # [FUNCTION DOC] HELPER: returns the matmul of x and w (then relu through
+                # the decorator).
                 return torch.matmul(x, w)
 
         f = Foo()
@@ -2626,11 +3362,17 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertTrue(any(n.target == torch.relu for n in traced.graph.nodes))
 
     def test_empty_graph_codegen(self):
+        # [FUNCTION DOC] Checks a GraphModule built from an empty graph can be called and
+        # returns None.
         graph = torch.fx.Graph()
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
         self.assertEqual(gm(), None)
 
     def test_complex_constant_codegen_preserves_signed_zero(self):
+        # [FUNCTION DOC] Builds a graph that creates a complex64 tensor from a list of complex
+        # constants including negative zero parts, and checks the result equals the eager tensor
+        # including sign bits of real and imag parts and that generated code prints the first
+        # constant exactly.
         values = [
             complex(-0.0, -1e-28),
             complex(-0.0, 1e-28),
@@ -2654,24 +3396,34 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertIn("complex(-0.0, -1e-28)", gm.code)
 
     def test_sequential(self):
+        # [FUNCTION DOC] Traces a Sequential with one conv layer and deep copies the result;
+        # passes if no exception is raised.
         m = torch.nn.Sequential(torch.nn.Conv2d(1, 1, 1))
         gm = torch.fx.symbolic_trace(m)
         gm_copy = copy.deepcopy(gm)
 
     def test_ctx_mgr(self):
+        # [FUNCTION DOC] Checks that a forward method wrapped by a context manager decorator is
+        # traced correctly and matches eager output.
         @contextlib.contextmanager
         def do_nothing():
+            # [FUNCTION DOC] HELPER: context manager that yields once and does nothing.
             yield
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward is decorated with the do-nothing
+            # context manager.
             @do_nothing()
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns relu of x.
                 return torch.relu(x)
 
         m = M()
         self.checkGraphModule(m, (torch.rand(3, 4),))
 
     def test_typename_print(self):
+        # [FUNCTION DOC] Checks the printed graph contains the builtin generic form of a node type
+        # expression given as a list of float.
         graph: torch.fx.Graph = torch.fx.Graph()
         x: torch.fx.Node = graph.create_node("placeholder", "x")
         b: torch.fx.Node = graph.create_node(
@@ -2682,6 +3434,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertTrue('list[float]' in str(graph))
 
     def test_typename_print_pre_pep585(self):
+        # [FUNCTION DOC] Checks the printed graph shows the typing-module form of a list-of-float
+        # type expression.
         graph : torch.fx.Graph = torch.fx.Graph()
         x : torch.fx.Node = graph.create_node('placeholder', 'x')
         b : torch.fx.Node = graph.create_node('call_function', target=torch.relu, args=(x,),
@@ -2691,6 +3445,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertTrue("typing.List[float]" in str(graph))
 
     def test_typename_print_union(self):
+        # [FUNCTION DOC] Checks the printed graph shows a union type expression with float, Tensor
+        # and None in pipe-separated form.
         graph: torch.fx.Graph = torch.fx.Graph()
         x: torch.fx.Node = graph.create_node("placeholder", "x")
         b: torch.fx.Node = graph.create_node(
@@ -2701,8 +3457,14 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertTrue('float | torch.Tensor | None' in str(graph))
 
     def test_layout(self):
+        # [FUNCTION DOC] Traces a module calling empty_like with layout and pin_memory keywords
+        # followed by fill, and checks the result is zeros of the input's shape.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module producing a zero tensor like its input via empty_like
+            # and fill.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns an empty strided tensor like x filled in place
+                # with zero.
                 return torch.empty_like(
                     x, layout=torch.strided, pin_memory=False
                 ).fill_(0)
@@ -2712,8 +3474,13 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(traced(x), torch.zeros_like(x))
 
     def test_ellipsis(self):
+        # [FUNCTION DOC] Checks that slicing with an Ellipsis constant is traced and gives the
+        # same result as eager.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module adding a sliced and ellipsis-indexed y to x.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: returns x plus the slice of y on dim 1 from 1 to 10
+                # with ellipsis.
                 return x + y[:, 1:10, ...]
 
         traced = symbolic_trace(M())
@@ -2721,14 +3488,23 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(traced(x, y), x + y[:, 1:10, ...])
 
     def test_inf_nan(self):
+        # [FUNCTION DOC] Checks codegen of infinity and NaN float constants through a
+        # traced module.
         class FooMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module adding positive infinity, negative infinity and NaN to
+            # its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the three tensors x plus inf, x plus negative inf
+                # and x plus nan.
                 return x + float("inf"), x + float("-inf"), x + float("nan")
 
         fm = FooMod()
         self.checkGraphModule(fm, (torch.rand(3, 4),))
 
     def test_inf_nan_kwds(self):
+        # [FUNCTION DOC] Hand-builds a graph with add nodes named inf and nan (names that could
+        # clash with float constants) using infinite and NaN arguments, and checks the
+        # GraphModule output.
         graph: torch.fx.Graph = torch.fx.Graph()
         x: torch.fx.Node = graph.create_node("placeholder", "x")
         b: torch.fx.Node = graph.create_node(
@@ -2744,6 +3520,9 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(gm(x), (x + float("inf"), x + float("nan")))
 
     def test_deepcopy_recursion_depth(self):
+        # [FUNCTION DOC] Builds a long chain of relu calls deeper than the recursion limit, deep
+        # copies the graph, and checks every copied node's users correspond one-to-one to the
+        # originals' users (copy must not recurse per node).
         depth = sys.getrecursionlimit() + 20
 
         g = torch.fx.Graph()
@@ -2764,10 +3543,17 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
 
     @skipIfNoTorchVision
     def test_replace_uses(self):
+        # [FUNCTION DOC] Skipped without torchvision. Traces resnet18 with a tracer that traces
+        # through ReLU modules, then replaces each relu call_function node by a neg call inserted
+        # before it, redirecting its uses and erasing the originals.
         rn18 = torchvision_models.resnet18()
 
         class LowerReluTracer(torch.fx.Tracer):
+            # [CLASS DOC] HELPER: Tracer that does not treat ReLU modules as leaves,
+            # otherwise default.
             def is_leaf_module(self, m: torch.nn.Module, qualname: str):
+                # [FUNCTION DOC] HELPER: returns False for ReLU modules and the parent decision
+                # for others.
                 if isinstance(m, torch.nn.ReLU):
                     return False
                 return super().is_leaf_module(m, qualname)
@@ -2794,6 +3580,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             rn18_traced.graph.erase_node(node)
 
     def test_replace_input(self):
+        # [FUNCTION DOC] Redirects a node's input from one placeholder to another via
+        # replace_input_with and checks the GraphModule applies relu to the second input.
         graph: torch.fx.Graph = torch.fx.Graph()
         x: torch.fx.Node = graph.create_node("placeholder", "x")
         y: torch.fx.Node = graph.create_node("placeholder", "y")
@@ -2811,6 +3599,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(gm(input_x, input_y), torch.relu(input_y))
 
     def test_insertion_point(self):
+        # [FUNCTION DOC] Inserts a neg call before a relu using the inserting_before context and
+        # rewires the relu argument to it; checks the result equals relu of the negated input.
         graph: torch.fx.Graph = torch.fx.Graph()
         x: torch.fx.Node = graph.create_node("placeholder", "x")
         b: torch.fx.Node = graph.create_node(
@@ -2829,6 +3619,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(gm(input), torch.relu(torch.neg(input)))
 
     def test_update_args_api(self):
+        # [FUNCTION DOC] Checks Node.update_arg replaces a positional argument: output changes
+        # from relu of the first input to relu of the second.
         graph: torch.fx.Graph = torch.fx.Graph()
         x: torch.fx.Node = graph.create_node("placeholder", "x")
         y: torch.fx.Node = graph.create_node("placeholder", "y")
@@ -2846,6 +3638,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(new_gm(inp_x, inp_y), torch.relu(inp_y))
 
     def test_update_kwargs_api(self):
+        # [FUNCTION DOC] Checks Node.update_kwarg replaces a keyword argument: output changes from
+        # relu of the first input to relu of the second.
         graph: torch.fx.Graph = torch.fx.Graph()
         x: torch.fx.Node = graph.create_node("placeholder", "x")
         y: torch.fx.Node = graph.create_node("placeholder", "y")
@@ -2863,6 +3657,9 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(new_gm(inp_x, inp_y), torch.relu(inp_y))
 
     def test_immutable_list_pytree_ops(self):
+        # [FUNCTION DOC] Checks pytree flatten and unflatten on an immutable list with nested
+        # content: leaves are flattened in order and unflatten returns an equal immutable list.
+        # Raises AssertionError on mismatches.
         rand_tensor = torch.randn(5, 3)
         l = immutable_list([3, [rand_tensor, 42]])
 
@@ -2881,6 +3678,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             )
 
     def test_immutable_dict_pytree_ops(self):
+        # [FUNCTION DOC] Checks pytree flatten and unflatten on an immutable dict with nested
+        # content: leaves are flattened in order and unflatten returns an equal immutable dict.
         rand_tensor = torch.randn(5, 3)
         d = immutable_dict({"a": 3, "b": [rand_tensor, 42]})
 
@@ -2897,6 +3696,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             )
 
     def test_move_before(self):
+        # [FUNCTION DOC] Creates a neg node at the graph end, rewires relu to use it, moves it
+        # before relu with prepend, and checks the graph computes relu of the negated input.
         graph: torch.fx.Graph = torch.fx.Graph()
         x: torch.fx.Node = graph.create_node("placeholder", "x")
         b: torch.fx.Node = graph.create_node(
@@ -2915,6 +3716,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(gm(input), torch.relu(torch.neg(input)))
 
     def test_prepend_self(self):
+        # [FUNCTION DOC] Checks that prepending a node to itself is a no-op and that the graph
+        # still has three nodes after appending it after the placeholder.
         graph: torch.fx.Graph = torch.fx.Graph()
         x: torch.fx.Node = graph.create_node("placeholder", "x")
         b: torch.fx.Node = graph.create_node(
@@ -2927,6 +3730,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(len(graph.nodes), 3)
 
     def test_erase_node_error(self):
+        # [FUNCTION DOC] Checks erase_node raises RuntimeError saying the node still has users
+        # when erasing add or relu nodes that are used by another node or the output.
         st = SimpleTest()
         traced = symbolic_trace(st)
 
@@ -2939,6 +3744,7 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                     traced.graph.erase_node(node)
 
     def test_copy_it(self):
+        # [FUNCTION DOC] Checks deep copies of an immutable dict and list equal the originals.
         d = immutable_dict([(3, 4), (5, 6)])
         l = immutable_list([(3, 4), (5, 6)])
 
@@ -2946,12 +3752,16 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(l, deepcopy(l))
 
     def test_get_torch_func_signature(self):
+        # [FUNCTION DOC] Smoke test: calls the schema signature helper for every callable in the
+        # torch namespace and expects no exception; the result is not checked.
         for key in dir(torch):
             obj = getattr(torch, key)
             if callable(obj):
                 schemas = get_signature_for_torch_op(obj)
 
     def test_find_uses(self):
+        # [FUNCTION DOC] Builds a graph via proxies where one input has three users and checks the
+        # users of the placeholder have names starting with relu, add or neg.
         graph = torch.fx.Graph()
         x = torch.fx.Proxy(graph.placeholder("x"))
 
@@ -2972,12 +3782,19 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 )
 
     def test_inline_graph(self):
+        # [FUNCTION DOC] Copies one traced graph into a new graph and uses its output as the input
+        # mapping when copying a second graph, producing a combined relu-then-neg module; checks
+        # the combined output.
         class InlineInto(torch.nn.Module):
+            # [CLASS DOC] HELPER: module applying relu.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns relu of x.
                 return torch.relu(x)
 
         class ToInline(torch.nn.Module):
+            # [CLASS DOC] HELPER: module applying negation.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the negation of x.
                 return torch.neg(x)
 
         inline_into = symbolic_trace(InlineInto())
@@ -3003,6 +3820,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(combined_module(input), input.relu().neg())
 
     def test_multi_insert_point(self):
+        # [FUNCTION DOC] Inserts two nodes (neg then tanh) before a relu node using the
+        # inserting_before context, and checks the node order is x, neg, tanh, relu.
         graph = torch.fx.Graph()
         x = torch.fx.Proxy(graph.placeholder("x"))
         relu = torch.relu(x)
@@ -3022,6 +3841,9 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 )
 
     def test_reassign_args_kwargs_uses(self):
+        # [FUNCTION DOC] Reassigns node args and checks the users mapping of the input node
+        # is updated: first losing one use, then losing another when another node's args
+        # are replaced.
         graph = torch.fx.Graph()
         x, y = Proxy(graph.placeholder("x")), Proxy(graph.placeholder("y"))
         z = x + y
@@ -3038,13 +3860,18 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(list(x.node.users.keys()), [zed.node])
 
     def test_trace_function(self):
+        # [FUNCTION DOC] Checks symbolic tracing of a plain function via the shared
+        # graph-module helper.
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: returns relu of x plus y.
             return torch.relu(x) + y
 
         x, y = torch.randn(3, 4), torch.randn(3, 4)
         self.checkGraphModule(foo, (x, y))
 
     def test_trace_return_dataclass(self):
+        # [FUNCTION DOC] Traces a module returning a dataclass instance, prints the graph and
+        # checks the graph module returns an equal value.
         """
         Test case for Module that return dataclass
         """
@@ -3052,11 +3879,15 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
 
         @dataclass
         class MyOutput:
+            # [CLASS DOC] HELPER: dataclass with two tensor fields foo and bar.
             foo: torch.Tensor
             bar: torch.Tensor
 
         class ModuleReturnDataclass(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning a MyOutput built from its input.
             def forward(self, d: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns a MyOutput with foo as d plus d and bar as d
+                # times 3.
                 return MyOutput(foo=d + d, bar=d * 3)
 
         module = ModuleReturnDataclass()
@@ -3069,6 +3900,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(module(x), gm(x))
 
     def test_trace_return_dataclass_nested(self):
+        # [FUNCTION DOC] Same as the dataclass-return test, with a parent module calling a child
+        # module that returns the dataclass and then re-wrapping the fields into a new dataclass.
         """
         Test case for Module that return dataclass
         """
@@ -3076,19 +3909,28 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
 
         @dataclass
         class MyOutput:
+            # [CLASS DOC] HELPER: dataclass with two tensor fields foo and bar.
             foo: torch.Tensor
             bar: torch.Tensor
 
         class ModuleReturnDataclass(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning a MyOutput built from its input.
             def forward(self, d: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns a MyOutput with foo as d plus d and bar as d
+                # times 3.
                 return MyOutput(foo=d + d, bar=d * 3)
 
         class CallsModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling the child module and rebuilding its
+            # dataclass result.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the child module m.
                 super().__init__()
                 self.m = ModuleReturnDataclass()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: calls m, then returns a MyOutput made from foo and bar of
+                # the result.
                 tmp = self.m(x)
                 return MyOutput(foo=tmp.foo, bar=tmp.bar)
 
@@ -3102,16 +3944,21 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(module(x), gm(x))
 
     def test_trace_return_namedtuple(self):
+        # [FUNCTION DOC] Traces a module returning a NamedTuple, prints the graph and checks the
+        # graph module returns an equal value.
         """
         Test case for Module that return namedtuple
         """
 
         class MyOutput(NamedTuple):
+            # [CLASS DOC] HELPER: NamedTuple with two tensor fields foo and bar.
             foo: torch.Tensor
             bar: torch.Tensor
 
         class ModuleReturnNamedTuple(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning a MyOutput with the same tensor in both fields.
             def forward(self, d: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns a MyOutput with foo and bar both set to d.
                 return MyOutput(foo=d, bar=d)
 
         module = ModuleReturnNamedTuple()
@@ -3125,51 +3972,75 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(module(x), gm(x))
 
     def test_trace_dict_int_keys(self):
+        # [FUNCTION DOC] Checks that a leaf submodule may be passed a dict with integer keys
+        # literal during tracing; passes if tracing does not raise.
         class ModWithDictArg(torch.nn.Module):
+            # [CLASS DOC] HELPER: module taking a dict keyed by int and indexing key 42.
             def forward(self, d: dict[int, torch.Tensor]):
+                # [FUNCTION DOC] HELPER: returns the entry at key 42.
                 return d[42]
 
         class CallsModWithDict(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling a ModWithDictArg with a dict of int to input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the child module m.
                 super().__init__()
                 self.m = ModWithDictArg()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the child module applied to a dict from 42 to x.
                 return self.m({42: x})
 
         class MyTracer(torch.fx.Tracer):
+            # [CLASS DOC] HELPER: Tracer treating ModWithDictArg as a leaf module.
             def is_leaf_module(
                 self, m: torch.nn.Module, module_qualified_name: str
             ) -> bool:
+                # [FUNCTION DOC] HELPER: returns whether the module is a ModWithDictArg instance.
                 return isinstance(m, ModWithDictArg)
 
         traced_graph = MyTracer().trace(CallsModWithDict())
 
     def test_trace_dict_proxy_keys(self):
+        # [FUNCTION DOC] Checks tracing a leaf call with a dict whose key is a proxy raises
+        # RuntimeError saying a dict cannot contain a Node as key.
         class ModWithDictArg(torch.nn.Module):
+            # [CLASS DOC] HELPER: module taking a dict keyed by tensor and indexing key 42.
             def forward(self, d: dict[torch.Tensor, torch.Tensor]):
+                # [FUNCTION DOC] HELPER: returns the entry at key 42.
                 return d[42]
 
         class CallsModWithDict(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling a ModWithDictArg with a dict whose key is
+            # its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the child module m.
                 super().__init__()
                 self.m = ModWithDictArg()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the child module applied to a dict from x to x.
                 return self.m({x: x})
 
         class MyTracer(torch.fx.Tracer):
+            # [CLASS DOC] HELPER: Tracer treating ModWithDictArg as a leaf module.
             def is_leaf_module(
                 self, m: torch.nn.Module, module_qualified_name: str
             ) -> bool:
+                # [FUNCTION DOC] HELPER: returns whether the module is a ModWithDictArg instance.
                 return isinstance(m, ModWithDictArg)
 
         with self.assertRaisesRegex(RuntimeError, "cannot contain a Node"):
             traced_graph = MyTracer().trace(CallsModWithDict())
 
     def test_module_deepcopy_edit_nodes(self):
+        # [FUNCTION DOC] Deep copies a traced module, retargets relu to neg in the copy only,
+        # recompiles both, and checks the original still computes relu while the copy
+        # computes neg.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module applying relu.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns relu of x.
                 return torch.relu(x)
 
         traced1 = symbolic_trace(Foo())
@@ -3187,20 +4058,29 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         torch.testing.assert_close(copied(x), torch.neg(x))
 
     def test_direct_param_use(self):
+        # [FUNCTION DOC] Checks that a parameter accessed directly through a submodule path is
+        # traced as a plain attribute access and no node target name contains the word constant.
         class TransposeTest(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a 4 by 3 parameter b.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the parameter.
                 super().__init__()
                 self.b = torch.nn.Parameter(torch.rand(4, 3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the parameter, ignoring x.
                 return self.b
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding a TransposeTest and using its parameter directly.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the submodule a.
                 super().__init__()
                 self.a = TransposeTest()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the parameter, its transpose and a flattened view
+                # of it.
                 return self.a.b, self.a.b.t(), self.a.b.view(12)
 
         traced = torch.fx.symbolic_trace(Foo())
@@ -3210,8 +4090,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             )
 
     def test_single_default_arg(self):
+        # [FUNCTION DOC] Checks tracing a forward with one defaulted arg, called with and without
+        # a value.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with one defaulted argument.
             def forward(self, y=1):
+                # [FUNCTION DOC] HELPER: returns y, which defaults to 1.
                 return y
 
         m = M()
@@ -3219,8 +4103,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.checkGraphModule(m, (3,))
 
     def test_multiple_default_args(self):
+        # [FUNCTION DOC] Checks tracing with two defaulted args, called with zero, one and
+        # two values.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with two defaulted arguments.
             def forward(self, y=1, z=2):
+                # [FUNCTION DOC] HELPER: returns y plus z, which default to 1 and 2.
                 return y + z
 
         m = M()
@@ -3229,8 +4117,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.checkGraphModule(m, (3, 4))
 
     def test_regular_and_default_args(self):
+        # [FUNCTION DOC] Checks tracing with one regular and one defaulted arg, called with one
+        # and two values.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with one required and one defaulted argument.
             def forward(self, x, y=1):
+                # [FUNCTION DOC] HELPER: returns x plus y, where y defaults to 1.
                 return x + y
 
         m = M()
@@ -3238,16 +4130,23 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.checkGraphModule(m, (2, 3))
 
     def test_string_literal_return(self):
+        # [FUNCTION DOC] Checks a forward returning a string literal is traced and matches eager.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with no inputs returning a string.
             def forward(self):
+                # [FUNCTION DOC] HELPER: returns the string foo.
                 return "foo"
 
         m = M()
         self.checkGraphModule(m, ())
 
     def test_namedtuple_return_qualname(self):
+        # [FUNCTION DOC] Checks a module returning a NamedTuple imported from another test module
+        # traces and gives an equal result.
         class NamedTupReturn(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning a MyNamedTup of x twice.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns a MyNamedTup with x in both fields.
                 return MyNamedTup(x, x)
 
         traced = symbolic_trace(NamedTupReturn())
@@ -3255,40 +4154,55 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(traced(input), MyNamedTup(input, input))
 
     def test_update_args_kwargs_yells_at_you(self):
+        # [FUNCTION DOC] Checks that calling the private args-and-kwargs update method on a
+        # node raises AttributeError mentioning its name (it is name-mangled and not
+        # directly callable).
         symtraced = symbolic_trace(SimpleTest())
         node = next(iter(symtraced.graph.nodes))
         with self.assertRaisesRegex(AttributeError, "__update_args_kwargs"):
             node.__update_args_kwargs((), {})
 
     def test_torchbind_class_attribute_in_fx(self):
+        # [FUNCTION DOC] Skipped on FBCODE, Windows and macOS. Traces a module holding a torchbind
+        # StackString object attribute whose method is called, comparing against eager.
         if IS_FBCODE or IS_WINDOWS or IS_MACOS:
             self.skipTest(
                 "torch.classes._TorchScriptTesting._StackString is registered, skipping"
             )
 
         class FooBar1234(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding a torchbind StackString object created from
+            # two strings.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the torchbind object attribute f.
                 super().__init__()
                 self.f = torch.classes._TorchScriptTesting._StackString(["3", "4"])
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: returns the top of the torchbind stack object.
                 return self.f.top()
 
         m = FooBar1234()
         self.checkGraphModule(m, ())
 
     def test_torchbind_class_attribute_in_fx_tensor_arg(self):
+        # [FUNCTION DOC] Skipped on FBCODE, Windows and macOS. Traces a module with a torchbind
+        # ReLUClass attribute that takes a tensor; checks output equality and that a call_method
+        # node exists.
         if IS_FBCODE or IS_WINDOWS or IS_MACOS:
             self.skipTest(
                 "torch.classes._TorchScriptTesting._ReLUClass is registered, skipping"
             )
 
         class FooBar2341(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding a torchbind ReLUClass object.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the torchbind object attribute f.
                 super().__init__()
                 self.f = torch.classes._TorchScriptTesting._ReLUClass()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the torchbind object's run applied to x.
                 return self.f.run(x)
 
         m = FooBar2341()
@@ -3300,16 +4214,23 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertTrue(any(n.op == "call_method" for n in traced.graph.nodes))
 
     def test_script_method_trace(self):
+        # [FUNCTION DOC] Traces a module holding a TorchScript-compiled submodule and checks
+        # output equality and that the scripted module call appears as a call_method node.
         class Scripted(torch.nn.Module):
+            # [CLASS DOC] HELPER: module applying relu, compiled with TorchScript by the test.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns relu of x.
                 return torch.relu(x)
 
         class Holder(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding a TorchScript-compiled Scripted instance.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the scripted submodule s.
                 super().__init__()
                 self.s = torch.jit.script(Scripted())
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the scripted module applied to x.
                 return self.s(x)
 
         h = Holder()
@@ -3320,8 +4241,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertTrue(any(n.op == "call_method" for n in traced.graph.nodes))
 
     def test_namedtuple_return_trace(self):
+        # [FUNCTION DOC] Checks a module returning a NamedTuple defined in this file traces and
+        # returns an equal value.
         class NamedTupReturn(torch.nn.Module):
+            # [CLASS DOC] HELPER: module returning a Pair of x twice.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns a Pair with x in both fields.
                 return Pair(x, x)
 
         traced = symbolic_trace(NamedTupReturn())
@@ -3329,8 +4254,16 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(traced(input), Pair(input, input))
 
     def test_named_tuple_inlined(self):
+        # [FUNCTION DOC] Traces a module that calls a wrapped function with NamedTuple args, then
+        # edits the call node to embed NamedTuples containing graph nodes (positional and
+        # keyword), checks the formatted argument text shows node references, then removes dead
+        # code, recompiles and checks the output still matches the eager result.
         class NamedTupMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling the wrapped named-tuple function with
+            # Pair arguments.
             def forward(self, inp):
+                # [FUNCTION DOC] HELPER: returns the wrapped function applied to a Pair of the
+                # input and 1.2 and a keyword-only Pair of 3.4 and the input.
                 return wrapped_named_tup(Pair(inp, 1.2), p2=Pair(3.4, inp))
 
         m = NamedTupMod()
@@ -3363,11 +4296,17 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(ref, res)
 
     def test_return_type_exists(self):
+        # [FUNCTION DOC] Checks that the generated code and TorchScript output of a traced
+        # module keep the list-of-str return annotation (builtin generic form in Python, List
+        # in TorchScript).
         class ReturnTypeModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with an annotated helper method and forward.
             def other(self, x: list[str]) -> list[str]:
+                # [FUNCTION DOC] HELPER: returns the list unchanged.
                 return x
 
             def forward(self, x: list[str]) -> list[str]:
+                # [FUNCTION DOC] HELPER: returns the result of the helper method on x.
                 return self.other(x)
 
         traced = symbolic_trace(ReturnTypeModule())
@@ -3376,11 +4315,17 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertIn("-> List[str]", scripted.code)
 
     def test_return_type_exists_pre_pep585(self):
+        # [FUNCTION DOC] Same as the previous test but with typing module List annotations; the
+        # generated code uses the typing alias and TorchScript still shows List.
         class ReturnTypeModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with an annotated helper method and forward using
+            # typing List.
             def other(self, x: typing.List[str]) -> typing.List[str]:  # noqa: UP006
+                # [FUNCTION DOC] HELPER: returns the list unchanged.
                 return x
 
             def forward(self, x: typing.List[str]) -> typing.List[str]:  # noqa: UP006
+                # [FUNCTION DOC] HELPER: returns the result of the helper method on x.
                 return self.other(x)
 
         traced = symbolic_trace(ReturnTypeModule())
@@ -3389,21 +4334,34 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertIn("-> List[str]", scripted.code)
 
     def getitem_inner(self):
+        # [FUNCTION DOC] HELPER: shared body of the getitem test (not collected as a test itself).
+        # Defines modules slicing or indexing a buffer with slices, a proxy size and a constant,
+        # and checks each traces correctly via the graph-module helper.
         class GetItemBase(torch.nn.Module):
+            # [CLASS DOC] HELPER: base module owning a random 8 by 8 buffer named pe.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the buffer.
                 super().__init__()
                 self.pe = torch.nn.Buffer(torch.randn(8, 8))
 
         class GetItem1(GetItemBase):
+            # [CLASS DOC] HELPER: module slicing the buffer's second dim up to the input's size.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the buffer sliced on dim 1 up to the first dim
+                # size of x.
                 return self.pe[:, : x.size(0)]
 
         class GetItem2(GetItemBase):
+            # [CLASS DOC] HELPER: module indexing the buffer with the input's size.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the buffer row at the first dim size of x.
                 return self.pe[x.size(0)]
 
         class GetItem3(GetItemBase):
+            # [CLASS DOC] HELPER: module indexing the buffer with a constant, which creates a
+            # tensor constant.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the buffer row at index 4.
                 return self.pe[4]  # fx creates `self._tensor_constant0` here
 
         self.checkGraphModule(GetItem1(), [torch.zeros(4)])
@@ -3415,9 +4373,13 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         "Will be checked in test_getitem_subproc",
     )
     def test_getitem(self):
+        # [FUNCTION DOC] Only runs when the environment variable FX_PATCH_GETITEM is 1, which the
+        # subprocess test sets. Runs the shared getitem checks.
         self.getitem_inner()
 
     def test_getitem_subproc(self):
+        # [FUNCTION DOC] Runs the getitem target in a separate process (to work around a patching
+        # issue) and checks the process exit code is zero.
         # need to run this test in a subproc to work around:
         #   https://github.com/pytorch/pytorch/issues/50710
         proc = Process(target=run_getitem_target)
@@ -3426,7 +4388,11 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(proc.exitcode, 0)
 
     def test_user_friendly_call_provenance_with_function(self):
+        # [FUNCTION DOC] Traces a function calling a wrapped function whose body is not scriptable
+        # and checks TorchScript compilation raises RuntimeError naming the wrapped function and
+        # the calling traced forward.
         def fn(x):
+            # [FUNCTION DOC] HELPER: returns the wrapped function applied to x.
             return wrapper_fn(x)
 
         traced = torch.fx.symbolic_trace(fn)
@@ -3440,8 +4406,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             scripted = torch.jit.script(traced)
 
     def test_user_friendly_call_provenance_with_module(self):
+        # [FUNCTION DOC] Same as the function variant but with a module whose forward calls the
+        # wrapped function; the error message names the module's forward.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling the wrapped function.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the wrapped function applied to x.
                 return wrapper_fn(x)
 
         traced = torch.fx.symbolic_trace(M())
@@ -3453,8 +4423,15 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             scripted = torch.jit.script(traced)
 
     def test_snake_case(self):
+        # [FUNCTION DOC] Checks that node names for submodules in a ModuleDict with snake, Pascal
+        # and upper-case keys are normalized to snake case while targets keep the original key,
+        # in order.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a ModuleDict of three activation modules keyed by
+            # names in different cases.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the activations dict with ReLU, LeakyReLU
+                # and PReLU.
                 super().__init__()
                 self.activations = torch.nn.ModuleDict(
                     [
@@ -3465,6 +4442,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: applies the three activations by key and returns the
+                # three results.
                 a = self.activations["snake_case"](x)
                 b = self.activations["PascalCase"](x)
                 c = self.activations["ALL_CAPS"](x)
@@ -3490,6 +4469,8 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(i, 3)
 
     def test_no_mutation(self):
+        # [FUNCTION DOC] Checks that assigning into an immutable list raises TypeError mentioning
+        # the new_args replacement mechanism.
         from torch.fx.immutable_collections import immutable_list
 
         x = immutable_list([3, 4])
@@ -3497,8 +4478,13 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             x[0] = 4
 
     def test_partial_trace(self):
+        # [FUNCTION DOC] Traces a branching function with concrete args specializing the flag to
+        # True and False; checks results, that assertions are inserted so a mismatched flag raises
+        # AssertionError, and that a callable concrete argument is accepted.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module branching on the Python truth value of y.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: returns x doubled if y is truthy, otherwise x.
                 if y:
                     return 2 * x
                 else:
@@ -3520,18 +4506,25 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             mod_false(3, True)
 
         def f_higher(a, f):
+            # [FUNCTION DOC] HELPER: returns the function f applied to a.
             return f(a)
 
         nf = symbolic_trace(f_higher, concrete_args={"f": lambda x: x * 2})
         self.assertEqual(nf(3, lambda x: x * 2), 6)
 
     def test_custom_traceback_raised_when_exception_source_is_graphmodule(self):
+        # [FUNCTION DOC] Inserts a bad method call (relu on a scalar result) into a traced module,
+        # recompiles, runs it capturing stderr, and checks TypeError is raised and the captured
+        # output contains the custom message pointing at the generated forward function line.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a vector parameter computing a dot product.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a random parameter of size 5.
                 super().__init__()
                 self.W = torch.nn.Parameter(torch.randn(5))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the dot product of the parameter and x.
                 return torch.dot(self.W, x)
 
         traced = torch.fx.symbolic_trace(M())
@@ -3554,12 +4547,18 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         )
 
     def test_custom_traceback_not_raised_when_exception_source_is_submodule(self):
+        # [FUNCTION DOC] Runs a traced module whose submodule fails on bad input and checks that
+        # the formatted traceback does not contain the custom generated-forward message. Note the
+        # captured variable is only defined if a RuntimeError occurs.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a Linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates a 3 to 4 linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the linear layer applied to x.
                 return self.linear(x)
 
         traced = torch.fx.symbolic_trace(M())
@@ -3578,8 +4577,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         )
 
     def test_graph_module_replicate_for_dp(self):
+        # [FUNCTION DOC] Replicates a traced module for data parallel use and checks the replica
+        # produces the same output.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module applying relu.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns relu of x.
                 return torch.relu(x)
 
         gm = torch.fx.symbolic_trace(Foo())
@@ -3593,8 +4596,13 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         torch.testing.assert_close(out_replica, out)
 
     def test_ast_rewriter_rewrites_assert(self):
+        # [FUNCTION DOC] Traces a module containing an assert using the AST-rewriting tracer,
+        # builds a GraphModule and lints; the rewriter must convert the assert statement into a
+        # traceable check.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module asserting two integer inputs are equal.
             def forward(self, x: torch.Tensor, y: int, z: int):
+                # [FUNCTION DOC] HELPER: asserts y equals z and returns x doubled via add.
                 assert y == z  # noqa: S101
                 return torch.add(x, x)
 
@@ -3605,8 +4613,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         traced.graph.lint()
 
     def test_ast_rewriter_rewrites_assert_with_message(self):
+        # [FUNCTION DOC] Same as the assert-rewriting test but the assert carries a message.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module asserting two integer inputs are equal, with a message.
             def forward(self, x: torch.Tensor, y: int, z: int):
+                # [FUNCTION DOC] HELPER: asserts y equals z with a message and returns x doubled
+                # via add.
                 assert y == z, "msg"  # noqa: S101
                 return torch.add(x, x)
 
@@ -3617,12 +4629,19 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         traced.graph.lint()
 
     def test_throw_out_variant(self):
+        # [FUNCTION DOC] Checks a Tracer with mutable-operation checking enabled raises
+        # RuntimeError naming the out-variant sigmoid op when tracing a function that passes an
+        # out tensor.
         def foo(x):
+            # [FUNCTION DOC] HELPER: creates a random tensor like x, writes sigmoid of x into it
+            # via an out argument, and returns it.
             y = torch.rand_like(x)
             torch.sigmoid(x, out=y)
             return y
 
         class MyTracer(torch.fx.Tracer):
+            # [CLASS DOC] HELPER: Tracer with mutable-operation checking turned on as a
+            # class attribute.
             check_mutable_operations = True
 
         tracer = MyTracer()
@@ -3632,12 +4651,18 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             traced_graph = tracer.trace(foo)
 
     def test_ast_rewriter_reassigns_submodules(self):
+        # [FUNCTION DOC] Traces a module with a BatchNorm2d submodule that is not used in
+        # forward using the AST-rewriting tracer and lints the graph; checks submodules are
+        # reassigned properly.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with an unused BatchNorm2d submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the bn submodule with 100 features.
                 super().__init__()
                 self.bn = torch.nn.BatchNorm2d(100)
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns x added to itself.
                 return torch.add(x, x)
 
         ast_rewriter = RewritingTracer()
@@ -3647,9 +4672,13 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         traced.graph.lint()
 
     def test_ast_rewriter_wrap(self):
+        # [FUNCTION DOC] Same as the wrap-by-name test but using the AST-rewriting tracer;
+        # checks the wrapped call appears in code, output is correct and the function is
+        # unpatched afterwards.
         self.assertEqual(3 + 4 + 5, a_lifted_leaf((3, 4), 5))
 
         def to_trace(y):
+            # [FUNCTION DOC] HELPER: sums three calls of a_lifted_leaf mixing y into tuples.
             return (
                 a_lifted_leaf((4, y), 3)
                 + a_lifted_leaf((3, 4), 5)
@@ -3665,9 +4694,11 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertIs(a_lifted_leaf, real_a_lifed_leaf)
 
     def test_ast_rewriter_wrap_fn_directly(self):
+        # [FUNCTION DOC] Same as the previous test but for the function registered by object.
         self.assertEqual(3 + 4 + 5, a_lifted_leaf2((3, 4), 5))
 
         def to_trace(y):
+            # [FUNCTION DOC] HELPER: sums three calls of a_lifted_leaf2 mixing y into tuples.
             return (
                 a_lifted_leaf2((4, y), 3)
                 + a_lifted_leaf2((3, 4), 5)
@@ -3683,6 +4714,9 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertIs(a_lifted_leaf2, real_a_lifed_leaf2)
 
     def test_profiler_ranges_side_effect(self):
+        # [FUNCTION DOC] Builds a graph calling profiler range enter and exit ops and checks
+        # both targets are retained before and after dead-code elimination, because they have
+        # side effects.
         g = torch.fx.Graph()
         handle = g.call_function(
             torch.ops.profiler._record_function_enter_new, ("test_range",)
@@ -3716,8 +4750,13 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         )
 
     def test_ast_rewriter_wrapped_via_decorator(self):
+        # [FUNCTION DOC] Traces a module calling a decorator-wrapped function with the
+        # AST-rewriting tracer; checks the call is in the code, the result is 1, and the global
+        # is unpatched.
         class F(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling the decorator-wrapped function.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the wrapped function applied to x.
                 return wrapped_via_decorator(x)
 
         ast_rewriter = RewritingTracer()
@@ -3730,9 +4769,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertFalse(hasattr(wrapped_via_decorator, "__fx_already_patched"))
 
     def test_ast_rewriter_wrapped_via_decorator_and_transformed(self):
+        # [FUNCTION DOC] Same as the previous test using a function, then additionally runs a
+        # Transformer on the traced module and checks the wrapped call survives.
         self.assertEqual(wrapped_via_decorator(0), 1)
 
         def to_trace(y):
+            # [FUNCTION DOC] HELPER: returns the decorator-wrapped function applied to y.
             return wrapped_via_decorator(y)
 
         ast_rewriter = RewritingTracer()
@@ -3751,12 +4793,19 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertFalse(hasattr(wrapped_via_decorator, "__fx_already_patched"))
 
     def test_ast_rewriter_wrap_with_submodule(self):
+        # [FUNCTION DOC] AST-rewriting variant of the wrapped-function-with-submodule test: output
+        # equals a fresh affine-free BatchNorm1d on the same input.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module owning a BatchNorm1d and calling the wrapped function.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the batchnorm1d submodule with 2 features and no
+                # affine params.
                 super().__init__()
                 self.batchnorm1d = torch.nn.BatchNorm1d(2, affine=False)
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns the wrapped function applied to x and
+                # the submodule.
                 return wrapped_with_submodule(x, self.batchnorm1d)
 
         ast_rewriter = RewritingTracer()
@@ -3770,32 +4819,49 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(ref_batchnorm1d(input), traced(input))
 
     def test_submodule_manipulation_API(self):
+        # [FUNCTION DOC] Exercises GraphModule submodule APIs on a nested module: add_submodule,
+        # get_submodule, call_module without warnings, replacing and erasing a node,
+        # delete_submodule, get_attr warning for missing references, get_parameter and get_buffer
+        # errors for wrong kinds or missing names, and delete_all_unused_submodules; checks
+        # parameters and buffers survive.
         class C(torch.nn.Module):
+            # [CLASS DOC] HELPER: innermost module with a convolution and a parameter concatenated
+            # with x.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates conv and param.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(16, 33, 3, stride=2)
                 self.param = torch.nn.Parameter(torch.rand(2, 3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns conv applied to the concatenation of param and x.
                 return self.conv(torch.cat([self.param, x]))
 
         class B(torch.nn.Module):
+            # [CLASS DOC] HELPER: middle module with a Linear layer, a buffer and a nested
+            # C submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates linear, buf and net_c.
                 super().__init__()
                 self.linear = torch.nn.Linear(100, 200)
                 self.buf = torch.nn.Buffer(torch.randn(2, 3))
                 self.net_c = C()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns linear applied to the concatenation of buf and
+                # net_c of x.
                 return self.linear(torch.cat([self.buf, self.net_c(x)]))
 
         class A(torch.nn.Module):
+            # [CLASS DOC] HELPER: outer module with a nested B submodule and a parameter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates net_b and param.
                 super().__init__()
                 self.net_b = B()
                 self.param = torch.nn.Parameter(torch.rand(2, 3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns net_b of x plus param.
                 return self.net_b(x) + self.param
 
         a = symbolic_trace(A())
@@ -3815,14 +4881,20 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         a.recompile()
 
         def module_exists(gm: GraphModule, path: str) -> bool:
+            # [FUNCTION DOC] HELPER: returns whether a submodule with the dotted path exists
+            # in named_modules.
             return any(path == name for name, _ in gm.named_modules())
 
         def parameter_exists(gm: GraphModule, path: str) -> bool:
+            # [FUNCTION DOC] HELPER: returns whether the dotted path is both a named parameter and
+            # a state dict key.
             return any(path == name for name, _ in gm.named_parameters()) and any(
                 path == name for name in gm.state_dict()
             )
 
         def buffer_exists(gm: GraphModule, path: str) -> bool:
+            # [FUNCTION DOC] HELPER: returns whether the dotted path is both a named buffer and a
+            # state dict key.
             return any(path == name for name, _ in gm.named_buffers()) and any(
                 path == name for name in gm.state_dict()
             )
@@ -3916,32 +4988,44 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         a.graph.lint()
 
     def test_delete_unused_submodules_leaf(self):
+        # [FUNCTION DOC] Traces with a tracer that treats a named submodule as a leaf, then
+        # deletes unused submodules and checks that leaf's children are kept so the output still
+        # matches eager.
         class SubModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a Linear layer followed by ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates linear and relu layers.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns relu of linear of x.
                 x = self.linear(x)
                 x = self.relu(x)
                 return x
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: module wrapping a SubModule named submod.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the submod submodule.
                 super().__init__()
                 self.submod = SubModule()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns submod applied to x.
                 x = self.submod(x)
                 return x
 
         model = Model()
 
         class MyCustomTracer(torch.fx.Tracer):
+            # [CLASS DOC] HELPER: Tracer treating only the submodule with qualified name submod as
+            # a leaf.
             def is_leaf_module(
                 self, m: torch.nn.Module, module_qualified_name: str
             ) -> bool:
+                # [FUNCTION DOC] HELPER: returns whether the qualified module name equals submod.
                 return module_qualified_name == "submod"
 
         inputs = torch.randn(1, 10)
@@ -3951,13 +5035,20 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         torch.testing.assert_close(gm2(inputs), model(inputs))
 
     def test_fx_stateless(self):
+        # [FUNCTION DOC] Calls a traced module with functional_call using substitute parameters
+        # and buffer, runs backward, and checks gradients exist for substituted weight and bias,
+        # none for the substituted buffer, and none for the module's own parameters.
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a 1 to 1 Linear layer and a ones buffer,
+            # adding both.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates l1 and the buffer.
                 super().__init__()
                 self.l1 = torch.nn.Linear(1, 1)
                 self.buffer = torch.nn.Buffer(torch.ones(1))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns l1 of x plus the buffer.
                 return self.l1(x) + self.buffer
 
         module = MockModule()
@@ -3978,45 +5069,72 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertIsNone(module.buffer.grad)
 
     def test_tracing_graphmodules_as_leaf_submodules(self):
+        # [FUNCTION DOC] Checks how nested GraphModules and custom __call__ methods interact
+        # with leaf decisions: a traced submodule stays a call_module node; a non-leaf custom
+        # module is traced through so its __call__ override is honored (a subtraction appears);
+        # as an ordinary leaf its own __call__ runs; as a traced GraphModule leaf the __call__
+        # is not honored.
         class A(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that doubles its input by self-addition.
             def forward(self, t):
+                # [FUNCTION DOC] HELPER: returns t plus t.
                 return t + t
 
         class B(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with calling and called flags whose __call__ override
+            # records the call; forward subtracts while the calling flag is set, otherwise adds.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: initializes the parent through the instance type and sets
+                # the calling and called flags to false.
                 super(type(self), self).__init__()
                 self.calling = False
                 self.called = False
 
             def forward(self, t):
+                # [FUNCTION DOC] HELPER: returns t minus t if the calling flag is set, otherwise t
+                # plus t.
                 if self.calling:
                     return t - t
                 else:
                     return t + t
 
             def __call__(self, *args):
+                # [FUNCTION DOC] HELPER: sets the called and calling flags, then returns the
+                # parent __call__ result. The final statement that resets the calling flag
+                # is unreachable.
+                # KNOWN ISSUE: the statement after the return is dead code, so the calling flag is
+                # never reset.
                 self.called = True
                 self.calling = True
                 return super(type(self), self).__call__(*args)
                 self.calling = False
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module holding two child modules a and b and returning the sum
+            # of their outputs.
             def __init__(self, a, b):
+                # [FUNCTION DOC] HELPER: stores the two child modules as attributes a and b.
                 super().__init__()
                 self.a = a
                 self.b = b
 
             def forward(self, t):
+                # [FUNCTION DOC] HELPER: returns a of t plus b of t.
                 x = self.a(t)
                 y = self.b(t)
                 return x + y
 
         class LeafTracer(Tracer):
+            # [CLASS DOC] HELPER: Tracer treating every module as a leaf.
             def is_leaf_module(self, module, name):
+                # [FUNCTION DOC] HELPER: always returns True.
                 return True
 
         class LeafTracerNotB(Tracer):
+            # [CLASS DOC] HELPER: Tracer treating every module whose qualified name lacks the
+            # letter b as a leaf.
             def is_leaf_module(self, module, name):
+                # [FUNCTION DOC] HELPER: returns True unless the name contains b.
                 return "b" not in name
 
         # Recompile calls added "for fun", since they
@@ -4097,8 +5215,15 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertTrue(len(match) == 1)
 
     def _test_graph_module_init_buffer_param_copied(self, use_dict_init: bool):
+        # [FUNCTION DOC] HELPER: shared body for the init-copy tests. Traces a module with a
+        # buffer and a parameter, builds a new GraphModule either from a mapping of those tensors
+        # or from the module itself (selected by the flag), and checks the buffer and parameter
+        # are found, equal to the originals, and produce the same output.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with one buffer and one parameter, both added to
+            # the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates my_buff and registers my_param.
                 super().__init__()
                 self.my_buff = torch.nn.Buffer(torch.rand(3, 4))
                 self.register_parameter(
@@ -4106,6 +5231,7 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x plus the buffer plus the parameter.
                 return x + self.my_buff + self.my_param
 
         mod = MyModule()
@@ -4139,24 +5265,35 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(orig_out, submodules_out)
 
     def test_graph_module_init_buffer_param_copied_dict_init(self):
+        # [FUNCTION DOC] Runs the shared init-copy check with a dict root.
         self._test_graph_module_init_buffer_param_copied(use_dict_init=True)
 
     def test_graph_module_init_buffer_param_copied_mod_init(self):
+        # [FUNCTION DOC] Runs the shared init-copy check with a module root.
         self._test_graph_module_init_buffer_param_copied(use_dict_init=False)
 
     def test_graph_module_init_preserves_non_persistent_buffers(self):
+        # [FUNCTION DOC] Checks that building a GraphModule preserves non-persistent buffers at
+        # the top level and in a child (they appear in named_buffers and in the non-persistent
+        # sets) while the state dict stays empty.
         class Child(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a non-persistent buffer named nested.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: registers the non-persistent buffer.
                 super().__init__()
                 self.register_buffer("nested", torch.ones(1), persistent=False)
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a non-persistent buffer and a Child submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: registers the non-persistent buffer top_level and
+                # the child.
                 super().__init__()
                 self.register_buffer("top_level", torch.ones(1), persistent=False)
                 self.child = Child()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x plus both buffers.
                 return x + self.top_level + self.child.nested
 
         module = MyModule()
@@ -4176,23 +5313,35 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual({}, graph_module.state_dict())
 
     def test_annotations_with_no_forward_references(self):
+        # [FUNCTION DOC] Checks tracing a forward with a custom class annotation (no string
+        # forward references) via the graph-module helper.
         class A:
+            # [CLASS DOC] HELPER: callable class that doubles a tensor by addition.
             def __call__(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns x plus x.
                 return torch.add(x, x)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling its callable argument.
             def forward(self, x: torch.Tensor, a: A) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: returns a applied to x.
                 return a(x)
 
         self.checkGraphModule(M(), (torch.rand(2, 3), A()), kwargs=None)
 
     def test_annotations_with_forward_references(self):
+        # [FUNCTION DOC] Same as the previous test but all annotations are string
+        # forward references.
         class A:
+            # [CLASS DOC] HELPER: callable class that doubles a tensor by addition.
             def __call__(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns x plus x.
                 return torch.add(x, x)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling its callable argument, annotated with strings.
             def forward(self, x: "torch.Tensor", a: "A") -> "torch.Tensor":
+                # [FUNCTION DOC] HELPER: returns a applied to x.
                 return a(x)
 
         self.checkGraphModule(M(), (torch.rand(2, 3), A()), kwargs=None)
@@ -4200,28 +5349,44 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
     def test_annotations_with_non_torch_reference_and_no_internal_forward_references(
         self,
     ):
+        # [FUNCTION DOC] Tracing check with a list-of-tensor annotation and a non-torch class
+        # annotation, without forward references inside the list.
         class A:
+            # [CLASS DOC] HELPER: callable class that doubles a tensor by addition.
             def __call__(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns x plus x.
                 return torch.add(x, x)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling its callable argument on the first list element.
             def forward(self, x: list[torch.Tensor], a: A) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: returns a applied to the first element of x.
                 return a(x[0])
 
         self.checkGraphModule(M(), (torch.rand(2, 3), A()), kwargs=None)
 
     def test_annotations_with_non_torch_reference_and_internal_forward_references(self):
+        # [FUNCTION DOC] Tracing check with a list annotation containing a string forward
+        # reference and a non-torch class annotation.
         class A:
+            # [CLASS DOC] HELPER: callable class that doubles a tensor by addition.
             def __call__(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns x plus x.
                 return torch.add(x, x)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling its callable argument on x and indexing
+            # the result.
             def forward(self, x: list["torch.Tensor"], a: A) -> "torch.Tensor":
+                # [FUNCTION DOC] HELPER: returns the first element of a applied to x.
                 return a(x)[0]
 
         self.checkGraphModule(M(), (torch.rand(2, 3), A()), kwargs=None)
 
     def test_annotation_with_future(self):
+        # [FUNCTION DOC] Imports the test module that uses postponed annotation evaluation
+        # and always removes the future module entry from sys.modules afterwards (side effect
+        # on sys.modules).
         try:
             import fx.test_future  # noqa: F401
         finally:
@@ -4229,8 +5394,13 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
 
     @unittest.skipIf(sys.version_info > (3, 11), "Does not work in 3.11")
     def test_annotations_empty_tuple(self):
+        # [FUNCTION DOC] Skipped on Python newer than 3.11. Traces a forward annotated with
+        # empty tuple types, runs it, checks generated code and scripted code mention the
+        # tuple annotations.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward takes empty-tuple-annotated arguments.
             def forward(self, x: typing.Tuple[()], y: typing.Tuple[str, typing.Tuple[()]]):  # noqa: UP006
+                # [FUNCTION DOC] HELPER: ignores its arguments and returns the string foo.
                 return "foo"
 
         traced = torch.fx.symbolic_trace(Foo())
@@ -4251,29 +5421,41 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         FileCheck().check("Tuple[()]").check("Tuple[str, Tuple[()]]").run(scripted.code)
 
     def test_pytree(self):
+        # [FUNCTION DOC] Table-driven test of pytree handling with concrete args: registers Foo as
+        # a pytree node and flatten spec, defines functions over lists, dicts, custom nodes and
+        # namedtuples with placeholder inputs, and for each verifies results, codegen, placeholder
+        # counts, retracing and pickling via a nested verification helper.
         # Used to test that you can use your own placeholder class
         class PHTest(PHBase):
+            # [CLASS DOC] HELPER: custom placeholder subclass used to check user-defined
+            # placeholders work.
             pass
 
         def f_sum(x):
+            # [FUNCTION DOC] HELPER: returns the sum of the items of x.
             return sum(x)
 
         def f_sum_dict(x):
+            # [FUNCTION DOC] HELPER: returns the sum of the values of the mapping x.
             out = 0
             for v in x.values():
                 out += v
             return out
 
         def f_dict_list_map(x):
+            # [FUNCTION DOC] HELPER: returns a new mapping with the same keys whose list values
+            # have one added to each element.
             new_dict = {}
             for k, v in x.items():
                 new_dict[k] = [i + 1 for i in v]
             return new_dict
 
         def f_dict_add(x):
+            # [FUNCTION DOC] HELPER: returns x at key a plus the sum of the sequence at key z.
             return x["a"] + sum(x["z"])
 
         def f_namedtuple_add(x):
+            # [FUNCTION DOC] HELPER: returns the x field plus the y field of a namedtuple.
             return x.x + x.y
 
         pytree.register_pytree_node(
@@ -4284,12 +5466,17 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         fx_pytree.register_pytree_flatten_spec(Foo, lambda x, _: [x.a, x.b])
 
         def f_custom(x):
+            # [FUNCTION DOC] HELPER: returns the a attribute plus the b attribute of a Foo.
             return x.a + x.b
 
         def f_custom_dict(x):
+            # [FUNCTION DOC] HELPER: returns the sum of the values of the dict at attribute a plus
+            # attribute b.
             return f_sum_dict(x.a) + x.b
 
         def f_return_custom(x):
+            # [FUNCTION DOC] HELPER: returns a Foo with the fields swapped (not used; output
+            # pytrees are unsupported).
             return Foo(x.b, x.a)
 
         tests = [
@@ -4309,6 +5496,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         ]
 
         def verify_pytree(f, inp):
+            # [FUNCTION DOC] HELPER: replaces placeholders in the input structure by random
+            # tensors, then checks the function traced with the structure as a concrete arg
+            # matches eager; the graph can be rerun with codegen processing disabled, has the
+            # right flattening call and one placeholder per leaf; retracing without and with
+            # concrete args and pickling round trips keep results. Raises AssertionError on any
+            # structural mismatch.
             val = pytree.tree_map(
                 lambda x: torch.randn(3) if isinstance(x, PHBase) else x, inp
             )
@@ -4365,7 +5558,11 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             verify_pytree(f, inp)
 
     def test_pytree_concrete(self):
+        # [FUNCTION DOC] Traces a function with a dict concrete arg that mixes placeholders and
+        # a plain boolean, runs with keyword args, then retraces the result and checks both
+        # match eager.
         def f(b, a):
+            # [FUNCTION DOC] HELPER: returns entry a or entry z of the mapping a depending on b.
             if b:
                 return a["a"]
             else:
@@ -4380,7 +5577,12 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         self.assertEqual(nf(**val), f(**val))
 
     def test_metadata_on_ph(self):
+        # [FUNCTION DOC] Checks placeholder metadata: traces with placeholders carrying keys for
+        # two ints and for a dict, checks the placeholder names and the stored key attribute, then
+        # checks a node tag set by a tracer is not overwritten by a placeholder attribute of the
+        # same name.
         def f_sum(a: int, b: int) -> int:
+            # [FUNCTION DOC] HELPER: returns a plus b.
             return a + b
 
         # Due to unflattening of dict, the batch argument
@@ -4388,9 +5590,13 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
         # "batch_1" and "batch_2", referring to the keys
         # "f1" and "f2" respectively in the dict.
         def f_dict(a: dict[str, str]) -> bool:
+            # [FUNCTION DOC] HELPER: returns whether the entries f1 and f2 of the mapping
+            # are equal.
             return a["f1"] == a["f2"]
 
         def verify_metadata(gm: GraphModule, arg_names: list[str], metadata: list[str]):
+            # [FUNCTION DOC] HELPER: asserts each placeholder node's name is in the allowed names
+            # and its stored placeholder key is in the allowed metadata list.
             for node in gm.graph.nodes:
                 if node.op == "placeholder":
                     self.assertTrue(node.name in arg_names)
@@ -4420,6 +5626,7 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
 
         # Ensures that tags on nodes are NOT overwritten by PH attributes with same attr name (tag)
         class TaggingTracer(Tracer):
+            # [CLASS DOC] HELPER: Tracer that tags every created node with the tag foo.
             def create_node(
                 self,
                 kind: str,
@@ -4429,12 +5636,16 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
                 name: str | None = None,
                 type_expr: Any | None = None,
             ) -> Node:
+                # [FUNCTION DOC] HELPER: delegates node creation to the parent, sets the tag
+                # attribute to foo on the returned node and returns it.
                 n = super().create_node(kind, target, args, kwargs, name)
                 n.tag = "foo"
                 return n
 
         class PHWithTag(PHBase):
+            # [CLASS DOC] HELPER: placeholder base subclass carrying a tag attribute.
             def __init__(self, tag: str):
+                # [FUNCTION DOC] HELPER: initializes the base placeholder and stores the tag.
                 super().__init__()
 
                 self.tag = tag
@@ -4448,17 +5659,29 @@ def forward(self, x : _torch_Tensor_) -> _torch_Tensor_:
             self.assertEqual(n.tag, "foo")
 
     def test_custom_codegen(self):
+        # [FUNCTION DOC] Sets a custom CodeGen taking a single list argument on a traced function,
+        # recompiles, and checks results with list input, with a plain default-codegen copy using
+        # the processed inputs, and after TorchScript compilation.
         class ListCodeGen(CodeGen):
+            # [CLASS DOC] HELPER: CodeGen producing a forward that takes one list of tensors and
+            # unpacks it into the free variables.
             def gen_fn_def(self, free_vars, maybe_return_annotation):
+                # [FUNCTION DOC] HELPER: returns the source text of a forward definition taking
+                # a list argument that is unpacked into the free variables, followed by the
+                # return annotation.
                 lst_unpack = f"""
 def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
     {', '.join(free_vars)} = args_list"""
                 return lst_unpack
 
             def additional_globals(self):
+                # [FUNCTION DOC] HELPER: returns the extra globals for the generated code: the
+                # name List mapped to the builtin list type.
                 return [("List", list)]
 
             def process_inputs(self, *inputs):
+                # [FUNCTION DOC] HELPER: checks exactly one input was passed (raises
+                # AssertionError otherwise) and returns it, the list.
                 if len(inputs) != 1:
                     raise AssertionError(
                         f"Expected len(inputs) == 1, got {len(inputs)}"
@@ -4466,6 +5689,7 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
                 return inputs[0]
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: returns a plus b.
             return a + b
 
         nf = symbolic_trace(f)
@@ -4488,17 +5712,28 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         self.assertEqual(nf(vals), ts_f(vals))
 
     def test_custom_codegen_with_transformer(self):
+        # [FUNCTION DOC] Checks a Transformer can transform a module with a custom
+        # list-taking CodeGen.
         class ListCodeGen(CodeGen):
+            # [CLASS DOC] HELPER: CodeGen producing a forward that takes one list of tensors and
+            # unpacks it into the free variables.
             def gen_fn_def(self, free_vars, maybe_return_annotation):
+                # [FUNCTION DOC] HELPER: returns the source text of a forward definition taking
+                # a list argument that is unpacked into the free variables, followed by the
+                # return annotation.
                 lst_unpack = f"""
 def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
     {', '.join(free_vars)} = args_list"""
                 return lst_unpack
 
             def additional_globals(self):
+                # [FUNCTION DOC] HELPER: returns the extra globals for the generated code: the
+                # name List mapped to the builtin list type.
                 return [("List", list)]
 
             def process_inputs(self, *inputs):
+                # [FUNCTION DOC] HELPER: checks exactly one input was passed (raises
+                # AssertionError otherwise) and returns it, the list.
                 if len(inputs) != 1:
                     raise AssertionError(
                         f"Expected len(inputs) == 1, got {len(inputs)}"
@@ -4506,6 +5741,7 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
                 return inputs[0]
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: returns a plus b.
             return a + b
 
         nf = symbolic_trace(f)
@@ -4520,17 +5756,28 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         self.assertEqual(nf(vals), transformed_gm(vals))
 
     def test_interpreter_with_codegen(self):
+        # [FUNCTION DOC] Checks Interpreter results match the module's own output when a custom
+        # CodeGen with list input and list output is installed.
         class ListCodeGen(CodeGen):
+            # [CLASS DOC] HELPER: CodeGen taking a list input and returning a list output of
+            # the results.
             def gen_fn_def(self, free_vars, maybe_return_annotation):
+                # [FUNCTION DOC] HELPER: returns the source text of a forward definition taking
+                # a list argument that is unpacked into the free variables, followed by the
+                # return annotation.
                 lst_unpack = f"""
 def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
     {', '.join(free_vars)} = args_list"""
                 return lst_unpack
 
             def additional_globals(self):
+                # [FUNCTION DOC] HELPER: returns the extra globals for the generated code: the
+                # name List mapped to the builtin list type.
                 return [("List", list)]
 
             def process_inputs(self, *inputs):
+                # [FUNCTION DOC] HELPER: checks exactly one input was passed (raises
+                # AssertionError otherwise) and returns it, the list.
                 if len(inputs) != 1:
                     raise AssertionError(
                         f"Expected len(inputs) == 1, got {len(inputs)}"
@@ -4538,12 +5785,16 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
                 return inputs[0]
 
             def generate_output(self, output_args):
+                # [FUNCTION DOC] HELPER: returns the source of a return statement building a list
+                # from the output arguments.
                 return f"return list({repr(output_args)})"
 
             def process_outputs(self, outputs):
+                # [FUNCTION DOC] HELPER: converts the outputs to a list and returns it.
                 return list(outputs)
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: reassigns a and b in sequence and returns both as a pair.
             a = a + b
             b = a + b
             return a, b
@@ -4555,6 +5806,9 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         self.assertEqual(Interpreter(nf).run(vals), nf(vals))
 
     def test_imul_code_print(self):
+        # [FUNCTION DOC] Builds a graph calling the in-place multiply operator and checks
+        # generated code uses the augmented assignment form and that the module returns 6 for
+        # inputs 2 and 3.
         graph = torch.fx.Graph()
         a = graph.placeholder("a")
         b = graph.placeholder("b")
@@ -4566,7 +5820,11 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         self.assertIn("a *= b", gm.code)
 
     def test_deepcopy_tracer(self):
+        # [FUNCTION DOC] Checks deep copying a Tracer before and after tracing: the copy taken
+        # after has the same graph text as the original; the copy taken before has no graph or a
+        # different one.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: returns sin of relu of x plus y.
             return (x + y).relu().sin()
 
         tracer = Tracer()
@@ -4581,30 +5839,39 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         )
 
     def test_deepcopy_graphmodule(self):
+        # [FUNCTION DOC] Checks deep copying a GraphModule preserves its meta dictionary.
         m = symbolic_trace(SimpleTest())
         m.meta["hello"] = "world"
         copy_m = copy.deepcopy(m)
         self.assertEqual(copy_m.meta["hello"], "world")
 
     def test_deepcopy_no_recursion(self):
+        # [FUNCTION DOC] Checks that deep copying a GraphModule whose meta refers back to itself
+        # terminates and the copy's meta refers to the copy.
         m = symbolic_trace(SimpleTest())
         m.meta["hello"] = m  # circular reference
         copy_m = copy.deepcopy(m)  # finishes
         self.assertEqual(id(copy_m), id(copy_m.meta["hello"]))
 
     def test_enum(self):
+        # [FUNCTION DOC] Checks that tracing a function that passes an Enum member into a helper
+        # that appends it to a list works and gives the same result.
         from enum import Enum
 
         class Foo(Enum):
+            # [CLASS DOC] HELPER: Enum with members A and B.
             A = 1
             B = 2
 
         def leaf_fn(arr, enum_val):
+            # [FUNCTION DOC] HELPER: appends the enum value to the list and returns the value of
+            # the last item.
             # Use the raw enum.
             arr.append(enum_val)
             return arr[-1].value
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: returns the helper applied to x and Foo.A.
             # Pass the enum as argument.
             return leaf_fn(x, Foo.A)
 
@@ -4612,6 +5879,9 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         self.assertEqual(foo([]), traced([]))
 
     def test_insert_arg(self):
+        # [FUNCTION DOC] Adds a buffer attribute node before the output and inserts it as an
+        # argument at two positions with Node.insert_arg, checking args length, users bookkeeping
+        # and lint.
         m = symbolic_trace(SimpleTest())
         m.buf = torch.nn.Buffer(torch.tensor(0))
         output_node = next(iter(reversed(m.graph.nodes)))
@@ -4631,6 +5901,11 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         m.graph.lint()
 
     def test_delete_unused_values(self):
+        # [FUNCTION DOC] Temporarily disables the tracer mutable-operation check, traces a
+        # function with a copy_ into a fake mode graph via make_fx, runs dead-code elimination and
+        # checks the in-place copy call is kept and its result cleared in the generated source.
+        # Restores the flag at the end (not in a finally block, so a failure leaves it disabled
+        # until tearDown).
         from torch.fx.experimental.proxy_tensor import make_fx
 
         # disable mutable checking temporarily
@@ -4638,6 +5913,8 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         torch.fx.proxy.TracerBase.check_mutable_operations = False
 
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: adds a and b, copies the sum into the sum of c and d in
+            # place, and returns relu of the first sum.
             x = a + b
             y = c + d
             y.copy_(x)
@@ -4661,6 +5938,12 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
     @torch.fx.experimental._config.patch("enrich_profiler_metadata", True)
     @blas_library_context("cublaslt")
     def test_profiler_stack_trace_augmentation(self):
+        # [FUNCTION DOC] CUDA-only test (the decorators skip it without CUDA, enable profiler
+        # metadata enrichment and select the cublaslt BLAS library). Compiles a three-layer model
+        # with the eager-AOT backend, warms it up, profiles one call on CPU and CUDA, enriches the
+        # events with FX stack traces, and compares them to the expected text (HIP/CUDA kernel
+        # names substituted; on Windows only checks that node names map to stack traces containing
+        # given substrings).
         """
         Test that map_recorded_events_to_aten_ops_with_stack_trace correctly
         augments profiler events with stack traces from FX metadata registry.
@@ -4668,13 +5951,17 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
 
         # Simple test model
         class TestModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with two linear layers separated by a ReLU.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the linear1, relu and linear2 submodules.
                 super().__init__()
                 self.linear1 = torch.nn.Linear(10, 16)
                 self.relu = torch.nn.ReLU()
                 self.linear2 = torch.nn.Linear(16, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: applies linear1, relu and linear2 in order and returns
+                # the result.
                 x = self.linear1(x)
                 x = self.relu(x)
                 x = self.linear2(x)
@@ -4737,17 +6024,24 @@ event={kernel_event} node=addmm_1 stack_trace=x = self.linear2(x)"""
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     @torch.fx.experimental._config.patch("enrich_profiler_metadata", True)
     def test_profiler_multiple_modules(self):
+        # [FUNCTION DOC] CUDA-only. Compiles two separate small modules, profiles a call of each
+        # in one profiler session and checks the enriched events carry each module's own source
+        # line for the add and subtract operations.
         """
         Test that multiple compiled modules under the same profiler session
         have their events correctly augmented with stack traces.
         """
 
         class ModelA(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that adds one to its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x plus one.
                 return x + 1
 
         class ModelB(torch.nn.Module):
+            # [CLASS DOC] HELPER: module that subtracts one from its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x minus one.
                 return x - 1
 
         model_a = ModelA().cuda()
@@ -4781,6 +6075,9 @@ event={kernel_event} node=sub stack_trace=return x - 1"""
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     @torch.fx.experimental._config.patch("enrich_profiler_metadata", True)
     def test_profiler_nested_graph_modules(self):
+        # [FUNCTION DOC] CUDA-only. Compiles a module whose forward is a nested compile region,
+        # profiles a call, and checks the enriched events map the multiply, sine and add kernels
+        # to their source lines.
         """
         Test that nested graph modules (e.g., graph modules calling subgraphs)
         have their events correctly augmented with stack traces.
@@ -4788,12 +6085,17 @@ event={kernel_event} node=sub stack_trace=return x - 1"""
 
         # Model with nested structure
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with an integer attribute whose forward (a nested compile
+            # region) multiplies, takes sine and adds the attribute.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: stores the integer attribute c as 5.
                 super().__init__()
                 self.c = 5
 
             @torch.compiler.nested_compile_region
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: returns sine of the product of x and y plus the
+                # attribute c.
                 m = torch.mul(x, y)
                 s = m.sin()
                 a = s + self.c
@@ -4828,6 +6130,11 @@ event={kernel_event} node=add stack_trace=a = s + self.c"""
     @xfailIfNoAcceleratorTriton
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     def test_graph_module_with_hop_serialization(self):
+        # [FUNCTION DOC] Expected to fail without an accelerator Triton and skipped without CUDA.
+        # Builds a fake-tensor graph via make_fx containing a functional triton kernel wrapper
+        # higher-order op, checks it is present, serializes the GraphModule with
+        # SerializedGraphModule, deserializes it, and checks the result is a GraphModule that
+        # still contains that op.
         """
         Test that a GraphModule containing HigherOrderOperators that don't take
         callable arguments can be serialized and deserialized via __reduce__.
@@ -4848,6 +6155,9 @@ event={kernel_event} node=add stack_trace=a = s + self.c"""
         kernel_side_table.reset_table()
 
         def f(x, output):
+            # [FUNCTION DOC] HELPER: calls the functional triton wrapper (multiply by two kernel)
+            # over the input and output buffers, registering kernel and constant args in the
+            # kernel side table, and returns the cloned output pointer tensor.
             out = triton_kernel_wrapper_functional(
                 kernel_idx=kernel_side_table.add_kernel(mul2_kernel),
                 constant_args_idx=kernel_side_table.add_constant_args(
@@ -4898,6 +6208,9 @@ event={kernel_event} node=add stack_trace=a = s + self.c"""
 
     @staticmethod
     def _capture_gm(fn, *example_inputs):
+        # [FUNCTION DOC] HELPER: static method that compiles a function with dynamic shapes
+        # using a graph-recording backend on the example inputs and returns the last
+        # captured GraphModule.
         """Compile ``fn`` with dynamic shapes, return the captured GraphModule."""
         from torch._dynamo.testing import EagerAndRecordGraphs
 
@@ -4907,6 +6220,9 @@ event={kernel_event} node=add stack_trace=a = s + self.c"""
 
     @staticmethod
     def _find_placeholder(gm, example_value_type):
+        # [FUNCTION DOC] HELPER: static method returning the first placeholder node whose
+        # recorded example_value metadata is an instance of the given type; raises StopIteration
+        # if none exists.
         """Return the first placeholder whose ``meta['example_value']`` is an
         instance of ``example_value_type``."""
         return next(
@@ -4917,7 +6233,14 @@ event={kernel_event} node=add stack_trace=a = s + self.c"""
         )
 
     def test_create_tensor_metadata_nodes(self):
+        # [FUNCTION DOC] Checks Graph.create_size_node, create_stride_node and
+        # create_storage_offset_node produce nodes with the matching sym ops, the tensor node as
+        # first arg, and metadata values taken from a meta-device strided tensor stored under
+        # either the val key or the example_value key.
         def check(meta_key):
+            # [FUNCTION DOC] HELPER: builds a graph with a placeholder carrying a strided meta
+            # tensor under the given metadata key, creates size, stride and storage-offset nodes
+            # and asserts their targets, args and metadata match the tensor.
             graph = torch.fx.Graph()
             tensor_node = graph.placeholder("x")
             fake = torch.empty_strided((2, 3), (5, 2), device="meta")
@@ -4946,6 +6269,11 @@ event={kernel_event} node=add stack_trace=a = s + self.c"""
 
     @unittest.skipIf(TEST_WITH_CROSSREF, "expectedInline graph differs under TorchFunctionMode")
     def test_materialize_symints_basic(self):
+        # [FUNCTION DOC] Skipped under crossref mode. Captures a dynamic-shape graph, materializes
+        # four symbolic expressions (three composed from the first dim symbol, one plain int)
+        # before the output node, checks the int passes through and others become nodes, and
+        # compares the full graph text with the expected golden string, showing shared
+        # sub-expressions are reused.
         """``Graph.materialize_symints`` lowers each SymInt input into an FX
         subgraph rooted at existing symbol producers."""
         gm = self._capture_gm(lambda x: x + 1, torch.randn(8, 4))
@@ -4991,6 +6319,8 @@ graph():
         )
 
     def test_materialize_symints_constant_symint(self):
+        # [FUNCTION DOC] Checks materialize_symints returns plain int zero (and creates no nodes)
+        # for a symbolic int expression that folds to a constant.
         """A SymInt whose expression has folded to a constant is unwrapped
         to a plain ``int`` rather than emitting any FX nodes."""
         gm = self._capture_gm(lambda x: x + 1, torch.randn(8, 4))
@@ -5004,6 +6334,8 @@ graph():
         self.assertIsInstance(result[0], int)
 
     def test_materialize_symints_missing_symbol_rejects(self):
+        # [FUNCTION DOC] Checks materialize_symints raises AssertionError saying there is no
+        # producer when the symbol of an unbacked symbolic int is absent from an empty graph.
         """Materializing a SymInt whose symbol has no producer in the graph
         raises ``AssertionError`` rather than producing a dangling node."""
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -5020,6 +6352,9 @@ graph():
 
     @unittest.skipIf(TEST_WITH_CROSSREF, "expectedInline graph differs under TorchFunctionMode")
     def test_materialize_symints_symint_placeholder(self):
+        # [FUNCTION DOC] Skipped under crossref mode. For a graph with a symbolic int top-level
+        # placeholder, materializes expressions of it and checks via the golden graph text that
+        # the placeholder itself is used with no size-query node emitted.
         """When the symbol is produced by a top-level SymInt placeholder, the
         placeholder itself is used as the symbol's producer — no
         `sym_size.int` node is emitted."""
@@ -5052,6 +6387,9 @@ graph():
         )
 
     def test_materialize_symints_unbacked_via_unbacked_bindings(self):
+        # [FUNCTION DOC] Uses make_fx with symbolic tracing on a nonzero function, reads the
+        # unbacked bindings from the nonzero node, materializes an expression of that unbacked
+        # size and checks exactly one sym_size node over the nonzero output, dim 0, was emitted.
         """When an unbacked SymInt's producer is described by
         ``node.meta['unbacked_bindings']`` with a non-trivial keypath (e.g.
         ``nonzero()`` → ``.size(0)``), ``materialize_symints`` follows the
@@ -5059,6 +6397,7 @@ graph():
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def f(x):
+            # [FUNCTION DOC] HELPER: returns the indices of nonzero elements of x.
             return torch.nonzero(x)
 
         gm = make_fx(f, tracing_mode="symbolic")(torch.randn(10))
@@ -5091,6 +6430,10 @@ graph():
         self.assertEqual(sym_size_nodes[0].args[1], 0)
 
     def test_materialize_symints_unbacked_via_divide_by_key(self):
+        # [FUNCTION DOC] Rewrites the unbacked binding of a nonzero node so its path ends in a
+        # divide-by key referencing a backed size symbol, materializes an expression and checks
+        # the golden graph text: a floor division whose divisor is a lowered sym_size node of the
+        # 2D input placeholder, not a raw symbolic value.
         """When an unbacked-binding keypath ends in ``DivideByKey(s_backed)``,
         ``materialize_symints`` emits ``producer // s_backed_node`` -- where
         ``s_backed_node`` is the lowered backed shape symbol, not a raw SymInt.
@@ -5103,6 +6446,7 @@ graph():
         # the keypath includes a ``DivideByKey(s_backed)`` component, where
         # ``s_backed`` is a backed shape symbol of the input tensor.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: returns the nonzero indices of y, ignoring x.
             return torch.nonzero(y)
 
         gm = make_fx(f, tracing_mode="symbolic")(
@@ -5166,6 +6510,10 @@ graph():
         self.assertIs(divisor_arg.args[0], tensor_ph)
 
 def run_getitem_target():
+    # [FUNCTION DOC] HELPER: executed in a child process by the getitem subprocess test.
+    # Temporarily registers Tensor.__getitem__ in the list of methods the tracer patches, runs
+    # the shared getitem checks on a fresh test instance, and removes the registration in a
+    # finally block.
     from torch.fx._symbolic_trace import _wrapped_methods_to_patch
 
     _wrapped_methods_to_patch.append((torch.Tensor, "__getitem__"))
@@ -5176,7 +6524,13 @@ def run_getitem_target():
 
 
 class TestOperatorSignatures(JitTestCase):
+    # [CLASS DOC] Parametrized (OpInfo-based) check that torch op schemas can bind sample
+    # inputs. The base JitTestCase setUp is intentionally skipped to avoid JIT emit hooks that
+    # crash at exit.
     def setUp(self):
+        # [FUNCTION DOC] Records the torch function mode stack length and function state baselines
+        # (never checked in this class's tearDown), and enables the tracer mutable-operation check
+        # after saving the previous flag. Does not call the parent setUp.
         # Don't call super().setUp() — JitTestCase.setUp installs JIT emit
         # hooks that cause segfaults during process cleanup. Record state
         # baselines that tearDown checks for.
@@ -5190,6 +6544,8 @@ class TestOperatorSignatures(JitTestCase):
         torch.fx.proxy.TracerBase.check_mutable_operations = True
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the saved tracer mutable-operation flag; does not call the
+        # parent tearDown.
         torch.fx.proxy.TracerBase.check_mutable_operations = (
             self.orig_tracer_mutable_flag
         )
@@ -5197,6 +6553,10 @@ class TestOperatorSignatures(JitTestCase):
     @onlyCPU
     @ops(op_db, allowed_dtypes=(torch.float,))
     def test_get_torch_func_signature_exhaustive(self, device, dtype, op):
+        # [FUNCTION DOC] CPU-only test generated per OpInfo with float dtype. Skips ops that are
+        # not builtin functions. Gets the operator's schemas (raises RuntimeError if none) and for
+        # each sample input finds a schema that binds the sample and runs the op with the bound
+        # arguments; raises RuntimeError when no schema matches a sample.
         if not isinstance(op.op, types.BuiltinFunctionType):
             raise unittest.SkipTest("This path doesn't work on Python functions")
         sample_inputs_itr = op.sample_inputs(device, dtype, requires_grad=False)
@@ -5221,7 +6581,12 @@ class TestOperatorSignatures(JitTestCase):
 
 
 class TestFXAPIBackwardCompatibility(JitTestCase):
+    # [CLASS DOC] Tests that guard the stability of the public FX API: signatures of functions and
+    # classes marked as backward compatible are serialized to text and compared against an
+    # expected list, and non-compatible public objects are checked for being documented as such.
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp, removes the diff size limit for failures, and
+        # saves and enables the tracer mutable-operation check flag.
         super().setUp()
         self.maxDiff = None
 
@@ -5233,12 +6598,19 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
         torch.fx.proxy.TracerBase.check_mutable_operations = True
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown and restores the saved tracer
+        # mutable-operation flag.
         super().tearDown()
         torch.fx.proxy.TracerBase.check_mutable_operations = (
             self.orig_tracer_mutable_flag
         )
 
     def _fn_to_stable_annotation_str(self, obj):
+        # [FUNCTION DOC] HELPER: builds a stable text form of a function or class signature (the
+        # native signature repr is not stable across Python versions). Includes the qualified
+        # name, each parameter with star markers, a stable annotation string and default values
+        # (modules and callables replaced with address-free placeholders, strings quoted), and the
+        # return annotation.
         """
         Unfortunately we have to serialize function signatures manually since
         serialization for `inspect.Signature` objects is not stable across
@@ -5259,6 +6631,10 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
             )
 
             def default_val_str(val):
+                # [FUNCTION DOC] HELPER: renders a default value as text; tuples and lists
+                # recurse elementwise (single-element tuples get a trailing comma), modules
+                # show their name, callables show their function name, anything else uses the
+                # string conversion.
                 if isinstance(val, (tuple, list)):
                     str_pieces = ["(" if isinstance(val, tuple) else "["]
                     str_pieces.append(", ".join(default_val_str(v) for v in val))
@@ -5345,6 +6721,16 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
     }
 
     def _annotation_type_to_stable_str(self, t, sig_str, recursive: bool = False):
+        # [FUNCTION DOC] HELPER: converts a type annotation into a stable text form used in the
+        # backward-compatibility signature listing. Returns an empty string for an empty
+        # annotation, quotes string annotations (normalizing a trailing pipe-None into Optional),
+        # unwraps forward references, uses the trivial-mapping table for simple types, and
+        # recurses into contained types for tuples, unions (detecting Optional), dicts, lists,
+        # types, and callables. The flag marks nested calls, in which strings are not quoted.
+        # Raises RuntimeError if the type is unrecognized.
+        # KNOWN ISSUE: the second raise statement at the end is unreachable because the first
+        # raise already ends the function; set-membership tests that list the same type twice
+        # are redundant.
         if t is inspect.Signature.empty:
             return ""
 
@@ -5431,6 +6817,10 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
         )
 
     def test_function_back_compat(self):
+        # [FUNCTION DOC] Builds sorted stable signature text for every back-compat-marked
+        # non-class object and compares it with the stored expected file for function signatures;
+        # on a mismatch raises AssertionError with a message telling the developer to revert or
+        # get FX team approval.
         """
         Test backward compatibility for function signatures with
         @compatibility(is_backward_compatible=True). Currently this checks for
@@ -5463,6 +6853,10 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
             raise AssertionError(msg)  # noqa: B904
 
     def test_class_member_back_compat(self):
+        # [FUNCTION DOC] For every back-compat-marked class, collects the sorted public
+        # (non-underscore) names in its own namespace, and compares the sorted listing with the
+        # stored expected file for class members; on mismatch raises AssertionError with a
+        # guidance message.
         """
         Test backward compatibility for members of classes with
         @compatibility(is_backward_compatible=True). Currently this checks for
@@ -5497,9 +6891,18 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
             raise AssertionError(msg) from e
 
     def test_public_api_surface(self):
+        # [FUNCTION DOC] Walks the torch.fx and torch.fx.passes module trees (skipping
+        # experimental and private names, and not revisiting modules) to find public classes and
+        # functions that are not marked with the compatibility decorator; raises AssertionError
+        # listing those found in public non-experimental torch.fx namespaces.
         non_back_compat_objects = {}
 
         def check_symbols_have_bc_designation(m, seen):
+            # [FUNCTION DOC] HELPER: recursive walker that records, in the enclosing mapping,
+            # public classes and functions in torch.fx module m that are not in the
+            # compatibility-marked set. It ignores modules outside torch.fx and in
+            # experimental, tracks visited module names in the given set, and skips private
+            # names and self references.
             if not m.__name__.startswith("torch.fx"):
                 return
             if m.__name__.startswith("torch.fx.experimental"):
@@ -5549,8 +6952,13 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
             )
 
     def test_adding_side_effect_function(self):
+        # [FUNCTION DOC] Traces a module calling a function marked as having side effects and
+        # checks the graph keeps three nodes through dead-code elimination and recompilation and
+        # still contains the call node.
         class TestModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module calling the side-effect function and returning its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: calls the side-effect function on x and returns x.
                 side_effect_func(x)
                 return x
 
@@ -5566,6 +6974,9 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
         self.assertTrue(found)
 
     def test_preserve_unused_attr_after_unpickle(self):
+        # [FUNCTION DOC] Adds an unused submodule, a buffer and a parameter to a traced module,
+        # saves and reloads it (weights_only disabled), and checks all three attributes are
+        # still present.
         gm = torch.fx.symbolic_trace(Add())
         gm.add_submodule("foo", Add())
         gm.dummy_buffer = torch.nn.Buffer(torch.empty(1))
@@ -5584,7 +6995,15 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
 # This is failing on Python 3.12 : https://github.com/pytorch/pytorch/issues/119454
 @unittest.skipIf(sys.version_info >= (3, 12), "Failing on python 3.12+")
 class TestFunctionalTracing(JitTestCase):
+    # [CLASS DOC] Tests tracing of every function in torch.nn.functional that takes a tensor
+    # argument. Test methods are generated at import time by generate_tests: each traces the
+    # function and either expects success or a specific error recorded in the UNTRACEABLE
+    # tables. Skipped on Python 3.12 and newer. setUpClass temporarily replaces torch-function
+    # checks in the functional namespace with a function always returning False, and
+    # tearDownClass restores them.
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and enables the tracer mutable-operation check
+        # after saving the previous flag.
         super().setUp()
         # Checking for mutable operations while tracing is feature flagged
         # Enable it in testing but not by default
@@ -5594,6 +7013,8 @@ class TestFunctionalTracing(JitTestCase):
         torch.fx.proxy.TracerBase.check_mutable_operations = True
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent tearDown and restores the saved tracer
+        # mutable-operation flag.
         super().tearDown()
         torch.fx.proxy.TracerBase.check_mutable_operations = (
             self.orig_tracer_mutable_flag
@@ -5777,6 +7198,10 @@ class TestFunctionalTracing(JitTestCase):
 
     @classmethod
     def _get_functional(cls):
+        # [FUNCTION DOC] HELPER: class method returning a list of (name, function) pairs for the
+        # public lowercase callables in torch.nn.functional, excluding private names, names in the
+        # ignore list, non-callables, and functions that have a signature but no tensor-annotated
+        # parameter (unless listed as lacking annotations, or the signature cannot be obtained).
         functional_list = []
         for f in dir(torch.nn.functional):
             if not f.islower():
@@ -5810,7 +7235,13 @@ class TestFunctionalTracing(JitTestCase):
 
     @classmethod
     def generate_test_func(cls, func_name, fn):
+        # [FUNCTION DOC] HELPER: class method returning a test function for one functional. The
+        # test expects symbolic tracing to raise the recorded exception type and message
+        # (older-Python override table first when below 3.12, else the main table) or to succeed
+        # when none is recorded.
         def functional_test(self):
+            # [FUNCTION DOC] HELPER: generated test body; looks up the expected error for the
+            # function and asserts tracing raises it, or just traces if no error is expected.
             if (
                 func_name in self.UNTRACEABLE_FUNCTIONALS_PY38
                 and sys.version_info < (3, 12)
@@ -5829,6 +7260,8 @@ class TestFunctionalTracing(JitTestCase):
 
     @classmethod
     def generate_tests(cls):
+        # [FUNCTION DOC] HELPER: class method that attaches one generated test method per
+        # functional to the class, named with the nn_functional prefix. Mutates the class.
         functional_list = cls._get_functional()
         for func_name, fn in functional_list:
             test_name = "test_nn_functional_" + func_name
@@ -5837,7 +7270,11 @@ class TestFunctionalTracing(JitTestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Replaces the torch-function check helpers in torch.nn.functional with a
+        # stub that returns False, saving the originals in the class patch table (global side
+        # effect restored in tearDownClass).
         def no(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: stub accepting any arguments and returning False.
             return False
 
         for name in cls.TO_PATCH:
@@ -5846,6 +7283,8 @@ class TestFunctionalTracing(JitTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Restores the original torch-function check helpers in torch.nn.functional
+        # from the saved patch table.
         for name in cls.TO_PATCH:
             setattr(torch.nn.functional, name, cls.TO_PATCH[name])
 
@@ -5859,7 +7298,15 @@ instantiate_device_type_tests(TestOperatorSignatures, globals())
 @skipIfTorchDynamo("too slow")
 @skipIfNoTorchVision
 class TestVisionTracing(JitTestCase):
+    # [CLASS DOC] Tests symbolic tracing, running and TorchScript compilation of torchvision
+    # models (classification, segmentation, detection, video). Skipped under Dynamo and without
+    # torchvision. Test methods are generated at import time when torchvision is available; some
+    # models are expected to fail tracing or scripting with specific errors. Like the operator
+    # signature tests, setUp deliberately does not call the parent setUp.
     def setUp(self):
+        # [FUNCTION DOC] Records torch function mode stack length and function state baselines and
+        # enables the tracer mutable-operation check after saving the previous flag. Does not call
+        # the parent setUp.
         # Don't call super().setUp() — JitTestCase.setUp installs JIT emit
         # hooks that cause segfaults during process cleanup. Record state
         # baselines that tearDown checks for.
@@ -5873,6 +7320,8 @@ class TestVisionTracing(JitTestCase):
         torch.fx.proxy.TracerBase.check_mutable_operations = True
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the saved tracer mutable-operation flag; does not call the
+        # parent tearDown.
         torch.fx.proxy.TracerBase.check_mutable_operations = (
             self.orig_tracer_mutable_flag
         )
@@ -5919,7 +7368,14 @@ class TestVisionTracing(JitTestCase):
 
     @classmethod
     def generate_test_fn(cls, name, x, kwargs):
+        # [FUNCTION DOC] HELPER: class method returning a test function for one torchvision model
+        # name with sample input and construction kwargs.
         def run_test(self):
+            # [FUNCTION DOC] HELPER: generated test body; builds the model in eval mode, expects
+            # tracing to fail with the recorded error for known untraceable models, otherwise
+            # traces, compares the output (after an optional per-model output transform) with the
+            # original, and scripts the traced module, expecting a recorded error for known
+            # unscriptable models, else comparing the scripted output.
             model = torchvision_models.get_model(name, **kwargs)
             model = model.eval()
             if name in self.UNTRACEABLE_MODELS:
@@ -5946,6 +7402,9 @@ class TestVisionTracing(JitTestCase):
 
     @classmethod
     def generate_classification_tests(cls):
+        # [FUNCTION DOC] HELPER: class method generating one test per classification model, using
+        # a larger input for inception_v3 and a 50-class setting, and skipping on ROCm; attaches
+        # the tests to the class.
         for k in torchvision_models.list_models(module=torchvision_models):
             test_name = "test_torchvision_models_" + k
             x = (
@@ -5962,6 +7421,8 @@ class TestVisionTracing(JitTestCase):
 
     @classmethod
     def generate_segmentation_tests(cls):
+        # [FUNCTION DOC] HELPER: class method generating one test per segmentation model with a
+        # small input, 10 classes and no pretrained backbone; attaches the tests to the class.
         for k in torchvision_models.list_models(module=torchvision_models.segmentation):
             test_name = "test_torchvision_models_segmentation_" + k
             x = torch.rand(1, 3, 32, 32)
@@ -5971,6 +7432,8 @@ class TestVisionTracing(JitTestCase):
 
     @classmethod
     def generate_detection_tests(cls):
+        # [FUNCTION DOC] HELPER: class method generating one test per detection model with a list
+        # of one image, 10 classes and no pretrained backbone; attaches the tests to the class.
         for k in torchvision_models.list_models(module=torchvision_models.detection):
             test_name = "test_torchvision_models_detection_" + k
             x = [torch.rand(3, 300, 300)]
@@ -5980,6 +7443,8 @@ class TestVisionTracing(JitTestCase):
 
     @classmethod
     def generate_video_tests(cls):
+        # [FUNCTION DOC] HELPER: class method generating one test per video model with a
+        # model-dependent clip size and 50 classes; attaches the tests to the class.
         for k in torchvision_models.list_models(module=torchvision_models.video):
             test_name = "test_torchvision_models_video_" + k
             x = (
@@ -5993,6 +7458,8 @@ class TestVisionTracing(JitTestCase):
 
     @classmethod
     def generate_tests(cls):
+        # [FUNCTION DOC] HELPER: class method generating the classification, detection,
+        # segmentation and video test groups.
         cls.generate_classification_tests()
         cls.generate_detection_tests()
         cls.generate_segmentation_tests()
