@@ -1,4 +1,7 @@
 # flake8: noqa
+# [MODULE DOC] Negative typing test. Type-checker input expecting errors when a string is
+# passed as the dtype to the tensor, ones and zeros creation functions instead of a dtype
+# object. Expected messages are given in the trailing error markers on each flagged line.
 import torch
 
 

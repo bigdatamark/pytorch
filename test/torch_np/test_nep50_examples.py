@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests of NEP 50 (weak scalar promotion) behavior in torch._numpy. It first
+# defines a table of example expressions with their old and new expected results, then
+# compares torch._numpy against real NumPy running in weak promotion mode over combinations of
+# Python scalars and typed values. Import side effects: detects whether NumPy is new enough
+# (at least 1.24) and sets a flag used to skip all tests, and builds module-level tables of
+# examples, scalar kinds, array kinds, dtypes and per-ufunc corner cases.
 
 """Test examples for NEP 50."""
 
@@ -91,8 +97,17 @@ examples = {
 @skipif(not HAVE_NUMPY, reason="NumPy not found")
 @instantiate_parametrized_tests
 class TestNEP50Table(TestCase):
+    # [CLASS DOC] Evaluates each text expression of the NEP 50 examples table with
+    # torch._numpy types and compares to the expected new-behavior result. Skipped if NumPy is
+    # unavailable or too old.
     @parametrize("example", examples)
     def test_nep50_exceptions(self, example):
+        # [FUNCTION DOC] Looks up the old and new results of the example, evaluates the
+        # expression text with eval in the module namespace (where array constructors and
+        # scalar types are imported), and checks the outcome. If the new result is the
+        # exception marker it expects an OverflowError; otherwise a result equal to the old
+        # one is used when the new entry is the unchanged marker, the values must be close
+        # (tolerance 1e-16) and the dtypes equal.
         old, new = examples[example]
 
         if new is Exception:
@@ -159,8 +174,18 @@ corners = {
 @skipif(not HAVE_NUMPY, reason="NumPy not found")
 @instantiate_parametrized_tests
 class TestCompareToNumpy(TestCase):
+    # [CLASS DOC] Compares torch._numpy scalar-with-array promotion against real NumPy under
+    # the weak promotion state, across the module-level tables of scalars, arrays and dtypes.
+    # Skipped if NumPy is unavailable or too old.
     @parametrize("scalar, array, dtype", itertools.product(weaks, non_weaks, dtypes))
     def test_direct_compare(self, scalar, array, dtype):
+        # [FUNCTION DOC] Adds a Python scalar to a torch._numpy value in both libraries,
+        # optionally with an explicit output dtype, and asserts that the result dtype and
+        # value agree. The NumPy promotion state is switched to weak and restored afterwards.
+        # If the NumPy call raises, the case returns without checking.
+        # KNOWN ISSUE: when dtype is None the keyword mapping is never assigned before the
+        # NumPy call, so a NameError is raised, caught by the broad exception handler, and the
+        # test returns early; the no-dtype cases therefore check nothing.
         # compare to NumPy w/ NEP 50.
         try:
             state = _np._get_promotion_state()
@@ -190,6 +215,13 @@ class TestCompareToNumpy(TestCase):
     @parametrize("name", tnp._ufuncs._binary)
     @parametrize("scalar, array", itertools.product(weaks, non_weaks))
     def test_compare_ufuncs(self, name, scalar, array):
+        # [FUNCTION DOC] For one binary ufunc name from the torch._numpy list, applies it to a
+        # scalar and a typed value in both libraries under the weak promotion state (restored
+        # afterwards) and asserts the result dtypes match. Raises SkipTest for names and
+        # dtypes listed in the corner-case table; silently returns for matmul, modf, divmod
+        # and ldexp. A RuntimeError from torch._numpy or a TypeError from NumPy marks that
+        # result as missing and skips the comparison. On Windows the dtype comparison is
+        # relaxed for boolean arrays; a mismatch raises AssertionError reporting both dtypes.
         if name in corners and (
             array.dtype.name in corners[name]
             or tnp.asarray(scalar).dtype.name in corners[name]

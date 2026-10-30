@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] NumPy-compatibility tests for advanced indexing in torch._numpy (separated
+# advanced indices, broadcast index arrays, booleans, tuples, ellipsis, newaxis, zero-dim
+# tensors). Each case is a shape plus an index; the same index is applied to an arange array
+# in torch._numpy and in real NumPy, and both getitem shape and values and setitem results are
+# compared. Uses real NumPy in place of torch._numpy under TorchDynamo.
 
 import numpy
 
@@ -21,9 +26,19 @@ else:
 
 @instantiate_parametrized_tests
 class TestAdvancedIndexing(TestCase):
+    # [CLASS DOC] Collects the advanced-indexing comparison tests. A shared runner method
+    # takes a list of case mappings (shape, index, optional name) and checks each in its own
+    # subtest; helper methods generate standard and broadcast index patterns per
+    # dimensionality.
     """Test advanced indexing for NumPy compatibility (separated advanced indices)."""
 
     def _test_cases(self, test_cases, description=""):
+        # [FUNCTION DOC] HELPER: Runs every case mapping in the list as a subtest. For each
+        # case it builds an arange array of the given shape in both torch._numpy and NumPy,
+        # indexes both, asserts equal result shape and values (converting to NumPy when
+        # needed), then copies both arrays, assigns 999 ones of the result shape through the
+        # index, and asserts the arrays are equal afterwards. The description is used only in
+        # default case names.
         """Unified test runner for multiple test cases."""
         for case in test_cases:
             shape, index = case["shape"], case["index"]
@@ -57,6 +72,9 @@ class TestAdvancedIndexing(TestCase):
                 )
 
     def _generate_standard_indices(self, shape):
+        # [FUNCTION DOC] HELPER: Returns a list of index tuples for the given shape, mixing
+        # lists of integers, slices and scalars, with distinct patterns for one to four
+        # dimensions; returns an empty list for any other dimensionality.
         """Generate standard index patterns for given shape."""
         if len(shape) == 1:
             return [([0, 2, 4],), ([1, 3, 5, 7],), ([0, 0, 1, 1],)]
@@ -94,6 +112,10 @@ class TestAdvancedIndexing(TestCase):
         return []
 
     def _generate_broadcast_indices(self, shape):
+        # [FUNCTION DOC] HELPER: For shapes with at least two dimensions returns index tuples
+        # made of two integer-list indices (a two-dimensional broadcast pair and an
+        # element-selection pair), each only included when the shape is large enough for its
+        # largest index; otherwise an empty list.
         """Generate broadcast-style index patterns."""
         if len(shape) >= 2:
             # Only generate patterns that fit within the shape bounds
@@ -106,6 +128,9 @@ class TestAdvancedIndexing(TestCase):
         return []
 
     def test_comprehensive_indexing(self):
+        # [FUNCTION DOC] Builds cases for shapes of one to five dimensions from the standard
+        # and broadcast generators, separated and adjacent advanced indices for three or more
+        # dimensions, and negative-index cases, then runs them all through the shared runner.
         """Test comprehensive indexing patterns across multiple dimensions."""
         test_shapes = [(10,), (4, 6), (3, 4, 5), (2, 3, 4, 5), (5, 6, 7, 8, 9)]
 
@@ -151,6 +176,9 @@ class TestAdvancedIndexing(TestCase):
         self._test_cases(all_cases, "Comprehensive indexing")
 
     def test_advanced_separation_patterns(self):
+        # [FUNCTION DOC] Runs fixed cases on six- and eight-dimensional shapes with several
+        # separated advanced indices, mixes of scalars with advanced indices, and single
+        # advanced indices at the start, middle and end of a five-dimensional shape.
         """Test advanced separation patterns and edge cases."""
         cases = [
             # Complex multi-dimensional separations
@@ -221,6 +249,9 @@ class TestAdvancedIndexing(TestCase):
         self._test_cases(cases, "Advanced separation patterns")
 
     def test_broadcast_and_numpy_compatibility(self):
+        # [FUNCTION DOC] Runs cases with multidimensional index arrays that broadcast
+        # together, adjacent and separated by slices on a five-dimensional shape (producing
+        # outputs of up to nine dimensions), plus examples from the NumPy documentation.
         """Test broadcasting patterns and NumPy documentation examples."""
         base_shape = (10, 20, 30, 40, 50)
 
@@ -294,6 +325,11 @@ class TestAdvancedIndexing(TestCase):
         self._test_cases(cases, "Broadcast and NumPy compatibility")
 
     def test_special_index_types(self):
+        # [FUNCTION DOC] Runs cases with ellipsis, newaxis, mixed integer/advanced/slice
+        # indices, boolean scalars, and tuples as indices, then cases that use
+        # zero-dimensional torch tensors as indices. For the tensor cases the tensors are
+        # converted to Python numbers before the comparison, so the tensors themselves are not
+        # passed to the indexing code.
         """Test special index types including tensors, ellipsis, and newaxis."""
         cases = [
             # Ellipsis handling
@@ -417,6 +453,10 @@ class TestAdvancedIndexing(TestCase):
         self._test_cases(cases + numpy_torch_cases, "Special index types")
 
     def test_ellipsis(self):
+        # [FUNCTION DOC] Runs cases where an ellipsis combines with advanced indices, covering
+        # empty and non-empty ellipsis, separated advanced indices, nested integer sequences
+        # and boolean masks; one case with two-dimensional boolean masks is left commented out
+        # pending a known issue.
         """Tests containing ellipsis."""
         cases = [
             # Ellipsis + Basic indexing
