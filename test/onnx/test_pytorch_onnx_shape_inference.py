@@ -1,4 +1,9 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] Tests for ONNX shape and type inference in the TorchScript exporter. Defines small
+# graph-building helpers (a type checker factory, a graph context builder and an op inserter) and
+# two test classes: one builds tiny graphs by hand, runs the shape/type inference pass and checks
+# the inferred output type of single nodes; the other exports small models with custom operator
+# symbolics and checks the shape info saved in the exported model.
 
 import io
 
@@ -16,7 +21,13 @@ from torch.testing._internal import common_utils
 
 
 def expect_tensor(scalar_type, shape=None):
+    # [FUNCTION DOC] HELPER: Returns a checker function for a node output type. The checker
+    # asserts (numpy equality) that the type scalar type equals the given scalar type name; when a
+    # shape is given it also asserts that the varying sizes equal the shape, where unknown
+    # dimensions are None.
     def verify(actual_type):
+        # [FUNCTION DOC] HELPER: The returned checker. Compares scalar type, and varying sizes
+        # when a shape was requested; raises an assertion error on any difference.
         np.testing.assert_equal(actual_type.scalarType(), scalar_type)
         # if shape is not None:
         #     np.testing.assert_equal(actual_type.sizes(), shape)
@@ -27,6 +38,9 @@ def expect_tensor(scalar_type, shape=None):
 
 
 def as_graphcontext(graph: torch.Graph) -> jit_utils.GraphContext:
+    # [FUNCTION DOC] HELPER: Wraps a graph into a graph context object using the graph main block,
+    # the maximum supported TorchScript exporter opset, no original node, and empty parameter
+    # dictionary, environment and tracked-values set.
     return jit_utils.GraphContext(
         graph=graph,
         block=graph.block(),
@@ -39,15 +53,26 @@ def as_graphcontext(graph: torch.Graph) -> jit_utils.GraphContext:
 
 
 def g_op(graph: torch.Graph, op_name: str, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Inserts an operator into the graph, through a fresh graph context,
+    # and returns the resulting value. Extra positional arguments are the inputs and keyword
+    # arguments are the node attributes.
     return as_graphcontext(graph).op(op_name, *args, **kwargs)
 
 
 class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
+    # [CLASS DOC] Tests that the C++ ONNX graph shape/type inference pass computes the right
+    # scalar type and dimensions for individual ONNX operators. Each test builds a graph of
+    # constants and inputs, adds the operator under test, runs inference and checks the output.
     def setUp(self):
+        # [FUNCTION DOC] Records the maximum supported opset as the test opset and sets it as the
+        # global export opset version. Does not call the base setup.
         self.opset_version = _constants.ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET
         GLOBALS.export_onnx_opset_version = self.opset_version
 
     def run_test(self, g, n, type_assertion_funcs):
+        # [FUNCTION DOC] HELPER: Runs the shape/type inference pass over graph g with the test
+        # opset and then applies each type check function, in order, to the matching output type
+        # of node n. A single function is accepted in place of a list.
         if not isinstance(type_assertion_funcs, list):
             type_assertion_funcs = [type_assertion_funcs]
 
@@ -56,15 +81,21 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
             type_assertion_func(out.type())
 
     def create_empty_graph(self):
+        # [FUNCTION DOC] HELPER: Returns a new empty graph, after running the inference pass once
+        # on it so that the constant-value map is initialized.
         g = torch._C.Graph()
         # kick off initialization for ConstantMap.
         torch._C._jit_pass_onnx_graph_shape_type_inference(g, {}, self.opset_version)
         return g
 
     def insert_tensor_constant(self, g, tensor):
+        # [FUNCTION DOC] HELPER: Adds a Constant node holding the given tensor to graph g and
+        # returns its output value.
         return g_op(g, "Constant", value_t=tensor)
 
     def test_cast(self):
+        # [FUNCTION DOC] Casts an input of unknown type to float (target type code 1) and expects
+        # a Float output scalar type without shape information.
         # Test cast with input of unknown scalar type.
         g = self.create_empty_graph()
         input = g.addInput()
@@ -72,6 +103,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, cast_out.node(), expect_tensor("Float"))
 
     def test_constant_of_shape(self):
+        # [FUNCTION DOC] Builds a ConstantOfShape fed by the Shape of a 1x2x3x4 constant and
+        # expects a Float output of shape 1x2x3x4.
         # Test ConstantOfShape with input of onnx::Shape node.
         g = self.create_empty_graph()
         constant = self.insert_tensor_constant(g, torch.ones(1, 2, 3, 4))
@@ -84,6 +117,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         )
 
     def test_constant_of_shape_static(self):
+        # [FUNCTION DOC] Builds ConstantOfShape fed by a list construct of four constant scalars
+        # with values 1 to 4, typed as an int list, and expects a Float output of shape 1x2x3x4.
         # Test ConstantOfShape with input of prim::ListConstruct of static tensor
         rank = 4
         g = self.create_empty_graph()
@@ -100,6 +135,9 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         )
 
     def test_constant_of_shape_dynamic(self):
+        # [FUNCTION DOC] Builds ConstantOfShape fed by a list construct of four graph inputs
+        # (values unknown), typed as an int list, and expects a Float output of rank 4 with
+        # all dimensions unknown.
         # Test ConstantOfShape with input of prim::ListConstruct of dynamic tensor
         rank = 4
         g = self.create_empty_graph()
@@ -116,6 +154,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         )
 
     def test_gather_dynamic_index(self):
+        # [FUNCTION DOC] Gather along axis 1 of a float input of sizes unknown, 3, 16, 16 with a
+        # dynamic 1-D index input; expects Float output of unknown, unknown, 16, 16.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(
@@ -129,6 +169,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         )
 
     def test_gather_scalar_index(self):
+        # [FUNCTION DOC] Gather along axis 1 of a float input of sizes unknown, 3, 16, 16 with a
+        # scalar constant index; expects the indexed axis removed, giving unknown, 16, 16.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(
@@ -139,6 +181,9 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, output.node(), expect_tensor("Float", shape=([None, 16, 16])))
 
     def test_reshape(self):
+        # [FUNCTION DOC] Reshape of constant tensors with target shapes using the zero (copy
+        # this dimension) and minus one (infer) entries; expects 2x16x25, 10x16x4 and 8x16x5 for
+        # three separate graphs.
         g = self.create_empty_graph()
         constant = self.insert_tensor_constant(g, torch.ones(2, 16, 5, 5))
         constant_2 = self.insert_tensor_constant(g, torch.tensor([2, 0, -1]))
@@ -158,6 +203,9 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, shape.node(), expect_tensor("Float", shape=(8, 16, 5)))
 
     def test_reshape_symbolic(self):
+        # [FUNCTION DOC] Reshape of an input of sizes unknown, unknown, 2, 8 to a constant target
+        # with two copy entries and one inferred entry; expects unknown, unknown, 16 with no
+        # scalar type assertion.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_sizes([None, None, 2, 8]))
@@ -167,6 +215,9 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
 
     @skipIfUnsupportedMinOpsetVersion(14)
     def test_reshape_allowzero(self):
+        # [FUNCTION DOC] Reshape with the allow-zero attribute set, of an input with sizes 3, 4, 0
+        # to a target containing a zero that is taken literally; expects output sizes 0, 4, 3.
+        # Needs opset 14 or newer.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_sizes([3, 4, 0]))
@@ -175,6 +226,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, output.node(), expect_tensor(None, shape=(0, 4, 3)))
 
     def test_slice(self):
+        # [FUNCTION DOC] Slice of a 2-D input with unknown sizes using a dynamic start input and
+        # constant end, axes and steps; expects a 2-D output with both dimensions unknown.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_sizes([None, None]))
@@ -187,6 +240,9 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, slice.node(), expect_tensor(None, shape=(None, None)))
 
     def test_slice_with_dynamic_start_index(self):
+        # [FUNCTION DOC] Slice of a constant 2x3x4x5 tensor with a dynamic two-element start input
+        # and constant ends and axes (axis one and the last axis); expects output sizes 2,
+        # unknown, 4, unknown.
         g = self.create_empty_graph()
         input = self.insert_tensor_constant(g, torch.ones(2, 3, 4, 5))
         start_input = g.addInput()
@@ -197,6 +253,9 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, slice.node(), expect_tensor(None, shape=(2, None, 4, None)))
 
     def test_broadcast_matmul(self):
+        # [FUNCTION DOC] MatMul broadcasting on constants in four graphs: batched 5x1x2 by 3x1x2x1
+        # gives 3x5x1x1; rank-1 first operand gives 3x1x1; rank-1 second operand gives 5x1; two
+        # rank-1 operands give a scalar shape (empty). All expect Float.
         g = self.create_empty_graph()
         constant = self.insert_tensor_constant(g, torch.ones(5, 1, 2))
         constant_2 = self.insert_tensor_constant(g, torch.ones(3, 1, 2, 1))
@@ -225,6 +284,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, shape.node(), expect_tensor("Float", shape=()))
 
     def test_expand(self):
+        # [FUNCTION DOC] Expand a constant 2x4 tensor to the Shape of a 2-D input with unknown
+        # sizes; expects Float output with two unknown dimensions.
         g = self.create_empty_graph()
         input = g.addInput()
         constant = self.insert_tensor_constant(g, torch.ones(2, 4))
@@ -234,6 +295,9 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, expand.node(), expect_tensor("Float", shape=(None, None)))
 
     def test_pad(self):
+        # [FUNCTION DOC] Pad in constant mode on a float 3x320x100 input with a constant
+        # pad list of six ones (one before and one after per dimension) and a none
+        # value; expects 5x322x102.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_dtype(torch.float).with_sizes([3, 320, 100]))
@@ -243,6 +307,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, pad.node(), expect_tensor("Float", shape=(5, 322, 102)))
 
     def test_pad_with_dynamic_input_shape(self):
+        # [FUNCTION DOC] Same constant-mode Pad with an input of sizes 3, unknown, unknown;
+        # expects 5, unknown, unknown (known dimension is padded, unknown stay unknown).
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_dtype(torch.float).with_sizes([3, None, None]))
@@ -252,6 +318,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, pad.node(), expect_tensor("Float", shape=(5, None, None)))
 
     def test_pad_with_dynamic_pad_size(self):
+        # [FUNCTION DOC] Constant-mode Pad where the pad amounts are a graph input of length six
+        # (values unknown); expects a rank-3 Float output with all dimensions unknown.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_dtype(torch.float).with_sizes([3, 320, 100]))
@@ -262,6 +330,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, pad.node(), expect_tensor("Float", shape=(None, None, None)))
 
     def test_resize(self):
+        # [FUNCTION DOC] Resize in linear mode on a float 4x32x64x64 input using constant scales
+        # of 1, 1, 2, 2 and no size input; expects Float output 4x32x128x128.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_dtype(torch.float).with_sizes([4, 32, 64, 64]))
@@ -283,6 +353,9 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, resize.node(), expect_tensor("Float", shape=(4, 32, 128, 128)))
 
     def test_resize_after_concat(self):
+        # [FUNCTION DOC] Same Resize as the previous test but the scales come from concatenating
+        # two constant tensors, relying on constant folding in the inference pass to know the
+        # values; expects Float output 4x32x128x128.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_dtype(torch.float).with_sizes([4, 32, 64, 64]))
@@ -309,6 +382,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, resize.node(), expect_tensor("Float", shape=(4, 32, 128, 128)))
 
     def test_reduce_prod_with_axes(self):
+        # [FUNCTION DOC] ReduceProd with the axes attribute on a Long input of size 2; expects
+        # Long output of shape one (kept dimension).
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_dtype(torch.long).with_sizes([2]))
@@ -316,6 +391,8 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, reduce_prod.node(), expect_tensor("Long", shape=(1,)))
 
     def test_reduce_prod_without_axes(self):
+        # [FUNCTION DOC] ReduceProd without axes on a Long input of size 2; expects Long output of
+        # shape one (all axes reduced, dimension kept).
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_dtype(torch.long).with_sizes([2]))
@@ -323,6 +400,9 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, reduce_prod.node(), expect_tensor("Long", shape=(1,)))
 
     def test_proceeding_nodes_use_prim_pack_padded_output_dtype_correctly(self):
+        # [FUNCTION DOC] Builds a two-output PackPadded node (as produced when tracing) with
+        # output types set manually, then a Gather on its second output (batch sizes). Expects the
+        # Gather result to use the Long type of that output with a single unknown dimension.
         g = self.create_empty_graph()
         input = g.addInput()
         input.setType(input.type().with_dtype(torch.float).with_sizes([4, 16]))
@@ -339,6 +419,11 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
         self.run_test(g, gather.node(), expect_tensor("Long", shape=(None,)))
 
     def test_squeeze_after_dynamic_if(self):
+        # [FUNCTION DOC] Builds an If node with two blocks (one adds the input to itself, the
+        # other is identity) on an int32 condition, runs fixup and node inference, then calls the
+        # opset 11 squeeze symbolic on dimension zero. Raises an assertion error unless a plain
+        # Squeeze node was emitted (meaning the size-one dimension was known); then expects Float
+        # output of sizes unknown, 5.
         from torch.onnx.symbolic_opset11 import squeeze as squeeze11
 
         g = self.create_empty_graph()
@@ -375,18 +460,31 @@ class TestONNXShapeInference(pytorch_test_common.ExportTestCase):
 
 
 class TestONNXCustomOpShapeInference(pytorch_test_common.ExportTestCase):
+    # [CLASS DOC] Tests exported-model shape info for custom operators registered with symbolic
+    # functions that do or do not set the output type. Exports use the legacy exporter at the
+    # maximum opset with a custom opset domain, then read value info from the saved graph.
     def setUp(self):
+        # [FUNCTION DOC] Calls the base setup and records the maximum supported opset
+        # for the tests.
         super().setUp()
         self.opset_version = _constants.ONNX_TORCHSCRIPT_EXPORTER_MAX_OPSET
 
     def test_setType_maintains_output_shape_for_single_custom_op(self):
+        # [FUNCTION DOC] Registers a custom symbolic for the inverse op whose result copies the
+        # input type, exports a module computing inverse plus input for a 2x3x3 input, and checks
+        # that the first value info of the saved graph has only fixed dimensions equal to the
+        # input sizes. The symbolic is unregistered by cleanup.
         self.addCleanup(torch.onnx.unregister_custom_op_symbolic, "::linalg_inv", 9)
 
         class CustomInverse(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds the input to its matrix inverse.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the matrix inverse of the input plus the input.
                 return torch.inverse(x) + x
 
         def linalg_inv_settype(g, self):
+            # [FUNCTION DOC] HELPER: Custom symbolic emitting a custom-domain Inverse node and
+            # giving its output the type of the input.
             return g.op("com.microsoft::Inverse", self).setType(self.type())
 
         torch.onnx.register_custom_op_symbolic("::linalg_inv", linalg_inv_settype, 9)
@@ -416,13 +514,21 @@ class TestONNXCustomOpShapeInference(pytorch_test_common.ExportTestCase):
             self.assertEqual(dim.dim_value, rank)
 
     def test_no_setType_for_single_custom_op(self):
+        # [FUNCTION DOC] Registers a custom symbolic that emits the custom Inverse node
+        # without setting its type, exports, and checks that dimensions of the first value
+        # info are all symbolic (dim param), i.e. shape was not inferred. The symbolic is
+        # unregistered by cleanup.
         self.addCleanup(torch.onnx.unregister_custom_op_symbolic, "::linalg_inv", 9)
 
         class CustomInverse(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds the input to its matrix inverse.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the matrix inverse of the input plus the input.
                 return torch.inverse(x) + x
 
         def linalg_inv_no_settype(g, self):
+            # [FUNCTION DOC] HELPER: Custom symbolic emitting a custom-domain Inverse node without
+            # setting any output type.
             return g.op("com.microsoft::Inverse", self)
 
         torch.onnx.register_custom_op_symbolic("::linalg_inv", linalg_inv_no_settype, 9)
@@ -452,13 +558,21 @@ class TestONNXCustomOpShapeInference(pytorch_test_common.ExportTestCase):
     def test_setType_maintains_output_shape_for_single_custom_op_with_dynamic_axes(
         self,
     ):
+        # [FUNCTION DOC] Custom symbolic sets the output type to float with sizes unknown, 3, 3;
+        # export uses a named input with the first axis dynamic (batch). Checks the first value
+        # info has a symbolic first dimension and fixed remaining dimensions equal to the input
+        # sizes. The symbolic is unregistered by cleanup.
         self.addCleanup(torch.onnx.unregister_custom_op_symbolic, "::linalg_inv", 9)
 
         class CustomInverse(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds the input to its matrix inverse.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the matrix inverse of the input plus the input.
                 return torch.inverse(x) + x
 
         def linalg_inv_settype(g, self):
+            # [FUNCTION DOC] HELPER: Custom symbolic emitting a custom-domain Inverse node whose
+            # output type is float with sizes unknown, 3, 3.
             return g.op("com.microsoft::Inverse", self).setType(
                 self.type().with_dtype(torch.float).with_sizes([None, 3, 3])
             )
@@ -493,14 +607,24 @@ class TestONNXCustomOpShapeInference(pytorch_test_common.ExportTestCase):
             self.assertEqual(dims[i].dim_value, x.size()[i])
 
     def test_setType_maintains_output_shape_for_single_custom_op_with_onnx_ops(self):
+        # [FUNCTION DOC] Exports a module computing the inverse of the first input plus the other
+        # two (all 2x3x10x10) with a custom symbolic setting a fixed float output type. Finds the
+        # Inverse node output name in the saved graph, then checks that the matching value info
+        # has fixed dimensions equal to the input sizes. Raises assertion errors if the node, the
+        # value info or a name is missing. The symbolic is unregistered by cleanup.
         self.addCleanup(torch.onnx.unregister_custom_op_symbolic, "::linalg_inv", 9)
 
         class CustomInverse(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward takes three inputs and returns the inverse
+            # of the first plus the second plus the third.
             def forward(self, x, y, z):
+                # [FUNCTION DOC] HELPER: Returns the inverse of x added to y and z.
                 x = torch.inverse(x)
                 return x + y + z
 
         def linalg_inv_settype(g, self):
+            # [FUNCTION DOC] HELPER: Custom symbolic emitting a custom-domain Inverse node whose
+            # output type is float with fixed sizes 2, 3, 10, 10.
             return g.op("com.microsoft::Inverse", self).setType(
                 self.type().with_dtype(torch.float).with_sizes([2, 3, 10, 10])
             )

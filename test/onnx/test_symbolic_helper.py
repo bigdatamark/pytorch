@@ -1,4 +1,7 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] Unit tests for the TorchScript exporter symbolic helper check on training mode
+# consistency. Tests set the global export training mode and verify whether a warning is emitted.
+# Import-time effect: the parametrized tests are instantiated at module level.
 """Unit tests on `torch.onnx.symbolic_helper`."""
 
 import torch
@@ -8,11 +11,17 @@ from torch.testing._internal import common_utils
 
 
 class TestHelperFunctions(common_utils.TestCase):
+    # [CLASS DOC] Tests for the training-mode check helper. The setup saves the global export
+    # training mode and the teardown restores it, so each test may freely override it.
     def setUp(self):
+        # [FUNCTION DOC] Saves the current global training mode on the instance
+        # for later restoration.
         super().setUp()
         self._initial_training_mode = GLOBALS.training_mode
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the global training mode saved by setUp; does not call
+        # the base teardown.
         GLOBALS.training_mode = self._initial_training_mode
 
     @common_utils.parametrize(
@@ -34,6 +43,10 @@ class TestHelperFunctions(common_utils.TestCase):
     def test_check_training_mode_does_not_warn_when(
         self, op_train_mode: int, export_mode: torch.onnx.TrainingMode
     ):
+        # [FUNCTION DOC] Parametrized over three (operator train flag, export mode)
+        # combinations: preserve mode with a train operator, eval mode with a non-train
+        # operator, training mode with a train operator. Sets the global mode and asserts that
+        # the check raises no warning.
         GLOBALS.training_mode = export_mode
         self.assertNotWarn(
             lambda: symbolic_helper.check_training_mode(op_train_mode, "testop")
@@ -57,6 +70,9 @@ class TestHelperFunctions(common_utils.TestCase):
         op_train_mode: int,
         export_mode: torch.onnx.TrainingMode,
     ):
+        # [FUNCTION DOC] Parametrized over two mismatching combinations (non-train operator in
+        # training export mode, train operator in eval export mode). Asserts the check emits a
+        # user warning whose message starts with the export mode text.
         with self.assertWarnsRegex(
             UserWarning, f"ONNX export mode is set to {export_mode}"
         ):

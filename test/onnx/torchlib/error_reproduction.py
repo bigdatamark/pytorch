@@ -1,4 +1,9 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] Helpers for writing markdown error reports from ONNX op consistency tests:
+# one report for an ONNX Runtime failure with a runnable reproduction script, another for
+# output mismatches between ONNX Runtime and PyTorch. Defines the report text templates as
+# module constants; reports are saved as files in an error_reports directory relative to
+# the working directory.
 """Error reproduction utilities for op consistency tests."""
 
 from __future__ import annotations
@@ -189,6 +194,13 @@ def create_reproduction_report(
     error: Exception,
     test_file_path: str,
 ) -> None:
+    # [FUNCTION DOC] Writes a markdown issue report for an ONNX Runtime failure. Args: test name,
+    # the ONNX model, mapping of ORT input names to arrays, the raised error, and the test file
+    # path. Builds the reproduction script template (model text plus inputs printed in full), an
+    # error stack from the error text and traceback, and an environment summary (OS, Python,
+    # library versions), then saves the filled issue template to a timestamped file named from the
+    # short test name (text after the last dot, with slash and colon replaced by dashes), and
+    # prints the saved path. Returns nothing.
     # NOTE: We choose to embed the ONNX model as a string in the report instead of
     # saving it to a file because it is easier to share the report with others.
     onnx_model_text = str(onnx_model)
@@ -241,6 +253,13 @@ def create_mismatch_report(
     error: Exception,
     test_file_path: str,
 ) -> None:
+    # [FUNCTION DOC] Writes a markdown report for a mismatch between ONNX Runtime output (actual)
+    # and PyTorch output (expected) for one test sample. Args: test name, sample number, ONNX
+    # model, inputs, keyword arguments, actual, expected, the error, and the test file path. Side
+    # effect: sets the global torch print options so tensors print in full. The report holds input
+    # shapes (tensors shown by shape and dtype), actual and expected values with shapes (none for
+    # non-tensors), a unified diff of their text, the model text, the error stack and environment
+    # info. Saves it to a timestamped file with a mismatch prefix and prints the path.
     torch.set_printoptions(threshold=sys.maxsize)
 
     error_text = str(error)
@@ -294,6 +313,9 @@ torch=={torch.__version__}"""
 
 
 def save_error_report(file_name: str, text: str):
+    # [FUNCTION DOC] Saves report text to a file with the given name inside the error_reports
+    # directory in the current working directory, creating the directory (and parents) if needed,
+    # writing UTF-8 text and overwriting any existing file. Returns the path of the file.
     reports_dir = pathlib.Path("error_reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
     file_path = reports_dir / file_name
