@@ -1,5 +1,9 @@
 # Owner(s): ["oncall: jit"]
 # ruff: noqa: F841
+# [MODULE DOC] TorchScript autodiff tests: gradient functions for lists containing undefined
+# tensors, and consistency of requires_grad on scripted outputs with eager outputs when values are
+# profiled twice, pass through ignored Python calls, or are computed under no-grad mode. Raises an
+# error if run directly; run via the main jit test file.
 
 from typing import List
 
@@ -78,8 +82,16 @@ class TestAutodiffJit(JitTestCase):
         # So during autodiff graph formation the profile nodes are unmerged because
         # they are aliasing. Then the DifferentiableGraph doesn't have a profile
         # node on the output. The requires_grad info should then be added onto the
+        # [CLASS DOC] JIT test case for autodiff behavior, skipped under Dynamo.
         # output value (otherwise autodiff will make the output require_grad).
+        # [FUNCTION DOC] Scripts a function that concatenates a list of tensors, adds a tensor and
+        # applies sine; runs it with grad-requiring inputs and backpropagates a few times so
+        # autodiff is applied. Takes the backward function of the last result and checks it
+        # returns three gradients for a defined output gradient, and that with an undefined output
+        # gradient every returned gradient is either absent or all zeros.
         # Note: this relies on gammaln and entr not having autodiff implementations.
+        # [FUNCTION DOC] HELPER: Concatenates the tensors in the list along dimension one, adds
+        # the second argument and returns the sine.
         def fn(a, b, c):
             r = a.relu().relu()
             return torch.special.gammaln(r), torch.special.entr(r), c.cos().relu()
@@ -123,8 +135,13 @@ class TestAutodiffJit(JitTestCase):
             self.assertEqual(y_s.requires_grad, y.requires_grad)
             self.assertEqual(z_s.requires_grad, z.requires_grad)
 
+    # [FUNCTION DOC] Runs a scripted function repeatedly on two non-grad inputs and one grad
+    # input. Checks that the first output (from the non-grad inputs) does not require grad and the
+    # second does, matching eager semantics.
     def test_autodiff_requires_grad_nograd(self):
         @torch.jit.ignore
+        # [FUNCTION DOC] HELPER: Returns the sum of relu applied to the first two arguments, and
+        # relu of the third.
         def python_fn(x):
             return x.relu()
 
@@ -139,6 +156,11 @@ class TestAutodiffJit(JitTestCase):
 
         a = torch.rand((10, 10), requires_grad=True)
         b = torch.rand((10, 10), requires_grad=True)
+        # [FUNCTION DOC] Checks requires_grad of scripted outputs against eager outputs, over four
+        # runs, for a function where an intermediate value is used by two operations that lack
+        # autodiff formulas, so it is profiled twice. The comment in the test explains that the
+        # differentiable graph then lacks a profile node on the output and requires_grad must be
+        # added to the value.
         c = torch.rand((10, 10), requires_grad=True)
 
         for _ in range(4):
@@ -146,9 +168,24 @@ class TestAutodiffJit(JitTestCase):
             x, y, z = fn(a, b, c)
 
             self.assertEqual(x_s.requires_grad, x.requires_grad)
+            # [FUNCTION DOC] HELPER: Applies relu twice, returns the log-gamma and the entropy of
+            # that result, and a cosine followed by relu of the third argument.
             self.assertEqual(y_s.requires_grad, y.requires_grad)
             self.assertEqual(z_s.requires_grad, z.requires_grad)
 
 
 if __name__ == "__main__":
     raise_on_run_directly("test/test_jit.py")
+# [FUNCTION DOC] HELPER: Returns sine-relu of the first argument, the ignored function applied to
+# the second, and the first result plus the third computed under no-grad mode.
+# [FUNCTION DOC] HELPER: Python function, excluded from scripting, returning relu of x.
+# [FUNCTION DOC] Compares requires_grad of scripted and eager outputs over four runs, for a
+# function with an ignored Python call and a computation done under no-grad mode, with all three
+# inputs requiring grad.
+# [FUNCTION DOC] HELPER: Calls the ignored Python function on an intermediate value and discards
+# the result; returns relu of that intermediate, a gelu of it and a cosine plus relu of the third
+# argument.
+# [FUNCTION DOC] HELPER: Python function, excluded from scripting, returning relu of x.
+# [FUNCTION DOC] Same comparison as the profiled-twice test but with a call to an ignored Python
+# function in the middle of the graph. Compares requires_grad of each scripted output with eager
+# over four runs.

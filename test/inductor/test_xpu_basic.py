@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Temporary smoke tests for the first Intel GPU inductor integration: elementwise
+# add, sub, mul and div on random float tensors, run through the shared inductor model checker on
+# the xpu device. Import-time side effects: requires the filelock package (import fails otherwise)
+# and appends the test directory to the module search path. The main block runs the tests only
+# when XPU and Triton are available. The file carries a TODO to remove it.
 import importlib
 import os
 import sys
@@ -23,29 +28,41 @@ from inductor.test_torchinductor import (  # @manual=fbcode//caffe2/test/inducto
 
 
 class XpuBasicTests(TestCase):
+    # [CLASS DOC] Test case using the shared GPU model-check helper as its common runner with the
+    # device set to xpu. Each test defines a small binary function and compares compiled and
+    # eager.
     common = check_model_gpu
     device = "xpu"
 
     def test_add(self):
+        # [FUNCTION DOC] Checks addition of two random 4-D float tensors via the common runner.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Returns the sum of the two arguments.
             return a + b
 
         self.common(fn, (torch.rand(2, 3, 16, 16), torch.rand(2, 3, 16, 16)))
 
     def test_sub(self):
+        # [FUNCTION DOC] Checks subtraction of two random 4-D float tensors via the common runner.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Returns the difference of the two arguments.
             return a - b
 
         self.common(fn, (torch.rand(2, 3, 16, 16), torch.rand(2, 3, 16, 16)))
 
     def test_mul(self):
+        # [FUNCTION DOC] Checks multiplication of two random 4-D float tensors via the common
+        # runner.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Returns the product of the two arguments.
             return a * b
 
         self.common(fn, (torch.rand(2, 3, 16, 16), torch.rand(2, 3, 16, 16)))
 
     def test_div(self):
+        # [FUNCTION DOC] Checks division of two random 4-D float tensors via the common runner.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Returns the quotient of the two arguments.
             return a / b
 
         self.common(fn, (torch.rand(2, 3, 16, 16), torch.rand(2, 3, 16, 16)))

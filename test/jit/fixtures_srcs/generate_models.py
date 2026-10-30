@@ -1,3 +1,9 @@
+# [MODULE DOC] Script that generates old-format lite-interpreter model files for operator upgrader
+# tests. It holds a table mapping fixture module instances (star-imported from fixtures_src) to
+# the operator each must contain, and helpers that find existing fixtures, read a saved model's
+# version and operator list, and export missing models. Import-time side effects: configures root
+# logging to standard output and sets this module's logger to debug. Running as a script calls
+# main, which writes model files under the fixtures directory.
 import io
 import logging
 import sys
@@ -111,6 +117,8 @@ Get the path to `test/jit/fixtures`, where all test models for operator changes
 
 
 def get_fixtures_path() -> Path:
+    # [FUNCTION DOC] Returns the path of the fixtures directory (test/jit/fixtures), computed as
+    # three directory levels above this file's directory, joined with the test and jit parts.
     pytorch_dir = Path(__file__).resolve().parents[3]
     fixtures_path = pytorch_dir / "test" / "jit" / "fixtures"
     return fixtures_path
@@ -122,6 +130,8 @@ Get all models' name in `test/jit/fixtures`
 
 
 def get_all_models(model_directory_path: Path) -> Set[str]:
+    # [FUNCTION DOC] Recursively globs every entry under the given directory and returns the set
+    # of file stems (names without extension) of the regular files. Reads only.
     files_in_fixtures = model_directory_path.glob("**/*")
     all_models_from_fixtures = [
         fixture.stem for fixture in files_in_fixtures if fixture.is_file()
@@ -135,6 +145,7 @@ Check if a given model already exist in `test/jit/fixtures`
 
 
 def model_exist(model_file_name: str, all_models: Set[str]) -> bool:
+    # [FUNCTION DOC] Returns whether the given model name is a member of the given set of names.
     return model_file_name in all_models
 
 
@@ -144,6 +155,8 @@ Get the operator list given a module
 
 
 def get_operator_list(script_module: torch) -> Set[str]:
+    # [FUNCTION DOC] Serializes the scripted module for the lite interpreter into an in-memory
+    # buffer, reloads it as a mobile module and returns the exported set of operator names.
     buffer = io.BytesIO(script_module._save_to_buffer_for_lite_interpreter())
     buffer.seek(0)
     mobile_module = _load_for_lite_interpreter(buffer)
@@ -157,6 +170,9 @@ Get the output model operator version, given a module
 
 
 def get_output_model_version(script_module: torch.nn.Module) -> int:
+    # [FUNCTION DOC] Saves the scripted module into an in-memory archive and returns the integer
+    # model version read from the version entry. If that entry is absent from the archive root,
+    # falls back to the version entry under the data subdirectory.
     buffer = io.BytesIO()
     torch.jit.save(script_module, buffer)
     buffer.seek(0)
@@ -188,6 +204,15 @@ likely this script is running with the commit to make the change.
 
 
 def generate_models(model_directory_path: Path):
+    # [FUNCTION DOC] For each registered test module, derives the model file name by converting
+    # the class name to lower snake case, and skips it if a fixture with that name already exists.
+    # Otherwise scripts the module and checks the model version against the runtime maximum
+    # operator version (skipping with an error log if it is not below that maximum plus one), and
+    # checks the expected operator appears in the module's operator list (skipping with an error
+    # log otherwise). Passing models are saved for the lite interpreter into the given directory
+    # with the lite-model extension and logged.
+    # KNOWN ISSUE: a table key that is not a torch module is only logged as an error; the loop
+    # does not skip it, so the following scripting step then fails for it.
     all_models = get_all_models(model_directory_path)
     for a_module, expect_operator in ALL_MODULES.items():
         # For example: TestVersionedDivTensorExampleV7
@@ -250,6 +275,8 @@ def generate_models(model_directory_path: Path):
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: resolves the fixtures directory and generates any missing
+    # models.
     model_directory_path = get_fixtures_path()
     generate_models(model_directory_path)
 

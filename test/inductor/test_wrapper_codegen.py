@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Unit tests for how the inductor Python and C++ wrapper code generators bind
+# symbolic input shapes: symbol inputs, size and stride symbols of tensor inputs, replacement
+# aliases from the shape environment, and recording of symbolic input sources during lowering.
+# Wrappers and graphs are lightweight fakes built without running a real compile.
 
 from types import SimpleNamespace
 
@@ -16,12 +20,20 @@ from torch.utils._ordered_set import OrderedSet
 
 
 class TestPythonWrapperCodegen(TestCase):
+    # [CLASS DOC] Tests of wrapper input-symbol code generation. Fixture methods build a bare
+    # wrapper whose prefix buffer collects generated lines, and a fake graph with identity
+    # simplification; each test installs the fake graph as the current graph handler.
     def _new_wrapper(self):
+        # [FUNCTION DOC] HELPER: Creates a Python wrapper object without running its constructor
+        # and gives it an empty indented buffer as its prefix. Returns it.
         wrapper = PythonWrapperCodegen.__new__(PythonWrapperCodegen)
         wrapper.prefix = IndentedBuffer()
         return wrapper
 
     def _graph_with_sizevars(self, **kwargs):
+        # [FUNCTION DOC] HELPER: Builds a fake graph object whose size variable helper has an
+        # identity simplify function and a free-symbols function returning an empty ordered set.
+        # Extra keyword arguments become further attributes of the fake graph.
         return SimpleNamespace(
             sizevars=SimpleNamespace(
                 simplify=lambda x: x,
@@ -31,11 +43,16 @@ class TestPythonWrapperCodegen(TestCase):
         )
 
     def _new_cpp_wrapper(self):
+        # [FUNCTION DOC] HELPER: Creates a C++ CPU wrapper object without running its constructor
+        # and gives it an empty indented buffer as its prefix. Returns it.
         wrapper = CppWrapperCpu.__new__(CppWrapperCpu)
         wrapper.prefix = IndentedBuffer()
         return wrapper
 
     def test_explicit_symbol_input_assignment_uses_canonical_symbol(self):
+        # [FUNCTION DOC] Makes simplification map symbol s0 to s1, then generates the assignment
+        # for an input holding s0. Expects the canonical symbol s1 to be assigned first, then the
+        # raw s0, both from the input name, and the bound set to list s1 then s0.
         wrapper = self._new_wrapper()
         bound_vars = OrderedSet()
         s0 = sympy.Symbol("s0")
@@ -55,6 +72,10 @@ s0 = arg0_1""",
         self.assertEqual(list(bound_vars), [s1, s0])
 
     def test_explicit_symbol_input_assignment_preserves_raw_symbol(self):
+        # [FUNCTION DOC] With simplification mapping s0 to s1, assigns s1 from one input and s0
+        # from another. Expects the raw symbol s0 to still get its own assignment from the second
+        # input even though its canonical form is already bound, and the bound set to list s1 then
+        # s0.
         wrapper = self._new_wrapper()
         bound_vars = OrderedSet()
         s0 = sympy.Symbol("s0")
@@ -75,6 +96,9 @@ s0 = arg1_1""",
         self.assertEqual(list(bound_vars), [s1, s0])
 
     def test_tensor_input_does_not_bind_size_or_stride_symbols(self):
+        # [FUNCTION DOC] Passes a tensor input with symbolic sizes and strides to the assignment
+        # code generator. Expects nothing to be written to the prefix and no variables to be
+        # bound.
         wrapper = self._new_wrapper()
         bound_vars = OrderedSet()
         s0 = sympy.Symbol("s0")
@@ -97,6 +121,9 @@ s0 = arg1_1""",
         self.assertEqual(list(bound_vars), [])
 
     def test_record_symbolic_input_source_ignores_non_input_tensorbox(self):
+        # [FUNCTION DOC] Records a symbolic source for a pointwise result (not a graph input
+        # buffer) under a fake graph. Expects the graph's recorded symbolic input sources to
+        # remain empty.
         s0 = sympy.Symbol("s0")
         tensor = ir.Pointwise.create(
             device=torch.device("cpu"),
@@ -112,6 +139,9 @@ s0 = arg1_1""",
         self.assertEqual(graph.symbolic_input_sources, {})
 
     def test_record_symbolic_input_source_ignores_input_view(self):
+        # [FUNCTION DOC] Records a symbolic source for a reinterpreted view of an input buffer,
+        # even though the base is registered as a graph input. Expects nothing recorded since a
+        # view is not a direct input.
         s0 = sympy.Symbol("s0")
         base = ir.TensorBox.create(
             ir.InputBuffer(
@@ -145,6 +175,8 @@ s0 = arg1_1""",
         self.assertEqual(graph.symbolic_input_sources, {})
 
     def test_record_symbolic_input_source_records_direct_input(self):
+        # [FUNCTION DOC] Records a symbolic source for a tensor that is itself a registered graph
+        # input. Expects the symbol to map to the input name, the size kind and dimension zero.
         s0 = sympy.Symbol("s0")
         tensor = ir.TensorBox.create(
             ir.InputBuffer(
@@ -167,6 +199,10 @@ s0 = arg1_1""",
         self.assertEqual(graph.symbolic_input_sources, {s0: ("arg0_1", "size", 0)})
 
     def test_codegen_inputs_binds_canonical_recorded_symbolic_input_source(self):
+        # [FUNCTION DOC] With size asserts off, a recorded source for the raw symbol and a
+        # simplifier mapping it to a canonical symbol, runs input code generation. Expects the
+        # canonical symbol to be read from the input's size and the raw symbol to be aliased to
+        # it.
         wrapper = self._new_wrapper()
         raw = sympy.Symbol("s0")
         canonical = sympy.Symbol("s1")
@@ -205,6 +241,9 @@ s0 = s1""",
         )
 
     def test_codegen_inputs_binds_size_assert_symbols(self):
+        # [FUNCTION DOC] With size asserts on and a tensor with one symbolic size and one symbolic
+        # stride, runs input code generation. Expects saved size and stride variables for the
+        # input and the symbols assigned from their first entries.
         wrapper = self._new_wrapper()
         s0 = sympy.Symbol("s0")
         s1 = sympy.Symbol("s1")
@@ -241,6 +280,8 @@ s1 = arg0_1_stride[0]""",
         )
 
     def test_codegen_inputs_ignores_unused_compound_input_symbols(self):
+        # [FUNCTION DOC] With size asserts off and a stride that is a compound expression of a
+        # symbol, runs input code generation. Expects no lines to be generated.
         wrapper = self._new_wrapper()
         s0 = sympy.Symbol("s0")
         tensor = ir.TensorBox.create(
@@ -269,6 +310,9 @@ s1 = arg0_1_stride[0]""",
         self.assertEqual(wrapper.prefix.getvalue().strip(), "")
 
     def test_codegen_inputs_ignores_zero_size_compound_input_symbols(self):
+        # [FUNCTION DOC] With size asserts on and a tensor having a zero-sized dimension and a
+        # compound size expression, runs input code generation. Expects no lines and no error,
+        # because zero-size inputs are skipped.
         wrapper = self._new_wrapper()
         s0 = sympy.Symbol("s0")
         tensor = ir.TensorBox.create(
@@ -297,6 +341,9 @@ s1 = arg0_1_stride[0]""",
         self.assertEqual(wrapper.prefix.getvalue().strip(), "")
 
     def test_codegen_inputs_binds_canonical_size_assert_symbol(self):
+        # [FUNCTION DOC] With size asserts on, a raw symbol replaced by a canonical one, runs
+        # input code generation. Expects the raw symbol to be read from the saved size variable
+        # and the canonical symbol to be aliased to it.
         wrapper = self._new_wrapper()
         raw = sympy.Symbol("s0")
         canonical = sympy.Symbol("s1")
@@ -336,6 +383,9 @@ s1 = s0""",
         )
 
     def test_codegen_inputs_rejects_unbound_input_symbol(self):
+        # [FUNCTION DOC] With size asserts on and a size that is a sum of two unbound symbols,
+        # runs input code generation. Expects an assertion error whose message says the symbol was
+        # expected to have been generated.
         wrapper = self._new_wrapper()
         s0 = sympy.Symbol("s0")
         s1 = sympy.Symbol("s1")
@@ -364,6 +414,10 @@ s1 = s0""",
                 wrapper.codegen_inputs()
 
     def test_cpp_bind_input_symbol_emits_raw_replacement_alias(self):
+        # [FUNCTION DOC] Uses the C++ wrapper to bind a canonical symbol to the size of an input
+        # at dimension zero, with a replacement from raw to canonical in the shape environment.
+        # Expects a 64-bit integer declaration read from the input's sizes plus an alias for the
+        # raw symbol, and both symbols tracked as bound.
         wrapper = self._new_cpp_wrapper()
         bound_vars = OrderedSet()
         raw = sympy.Symbol("s0")

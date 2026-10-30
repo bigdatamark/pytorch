@@ -1,4 +1,7 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests that compiling with inductor and running the attention fusion pass do not
+# emit Python user warnings for the float32 matmul precision advisory; the advisory must go to the
+# perf_hints log instead. Tests need a CUDA (non-ROCm) device of compute capability 8.0+.
 
 import unittest
 import warnings
@@ -18,6 +21,8 @@ TF32_ADVISORY = "TensorFloat32 tensor cores for float32 matrix multiplication av
 
 
 def _has_cuda_sm80() -> bool:
+    # [FUNCTION DOC] HELPER: Returns true when CUDA is available, the build is not ROCm, and the
+    # current device capability is at least 8.0.
     return (
         torch.cuda.is_available()
         and torch.version.hip is None
@@ -26,9 +31,16 @@ def _has_cuda_sm80() -> bool:
 
 
 class InductorWarningTests(TestCase):
+    # [CLASS DOC] Test case for warning behavior of the float32 TF32 advisory in inductor.
     @unittest.skipIf(not _has_cuda_sm80(), "requires CUDA SM80")
     @recover_orig_fp32_precision
     def test_trivial_matmul_compile_no_user_warning(self):
+        # [FUNCTION DOC] Sets highest float32 matmul precision, clears the compile_fx advisory
+        # cache and resets dynamo, then compiles a square matmul on an identity matrix with the
+        # inductor backend while capturing user warnings and the compile_fx perf_hints log.
+        # Asserts the result equals the input, that no warnings were captured, and that the log
+        # contains the TF32 advisory text. A finally block restores the previous matmul precision
+        # and resets dynamo again. Skipped without CUDA SM80.
         # recover_orig_fp32_precision restores the per-backend flags; the
         # legacy enum still needs the set_float32_matmul_precision below.
         orig_matmul_precision = torch.get_float32_matmul_precision()
@@ -57,6 +69,11 @@ class InductorWarningTests(TestCase):
     @unittest.skipIf(not _has_cuda_sm80(), "requires CUDA SM80")
     @recover_orig_fp32_precision
     def test_fuse_attention_tf32_advisory_no_user_warning(self):
+        # [FUNCTION DOC] Sets highest float32 matmul precision and clears the fuse_attention
+        # advisory cache, then calls the advisory function directly while capturing user warnings
+        # and the fuse_attention perf_hints log. Asserts no warnings were captured and the log
+        # holds the TF32 advisory text. The previous matmul precision is restored in a finally
+        # block. Skipped without CUDA SM80.
         orig_matmul_precision = torch.get_float32_matmul_precision()
         try:
             torch.set_float32_matmul_precision("highest")
