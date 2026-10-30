@@ -1,5 +1,13 @@
 # Owner(s): ["module: inductor"]
 # ruff: noqa: F841
+# [MODULE DOC] Large device-generic Inductor end-to-end test suite. Defines shared helpers
+# (check_model, check_model_gpu, custom-op registration helpers, backend skip/xfail decorators,
+# generated-kernel-count assertions), a base TestCase that patches Inductor debug configs, and the
+# CommonTemplate mixin holding the bulk of numerics/codegen tests. Concrete
+# CPU/GPU/MPS/Halide/Pallas test classes later in the file combine the mixin with device-specific
+# setup. Import time side effects: imports functorch and filelock, creates a torch.library fragment
+# named test and a global id registry, sets ROCm layout/NHWC env settings when running on ROCm, and
+# builds the list of dtypes tested by default.
 import contextlib
 import contextvars
 import copy
@@ -226,6 +234,12 @@ if SM80OrLater or MACOS_VERSION >= 14.0 or GPU_TYPE == "xpu":
 
 
 def _large_cumprod_input(shape, dim, dtype, device):
+    # [FUNCTION DOC] HELPER: Build a cumprod test input of the given shape that cannot overflow or
+    # underflow. Integer dtypes get random plus/minus one values. Float dtypes get batches of
+    # random magnitudes with power-of-two exponents, each batch concatenated with its reciprocals
+    # along the dim so partial products stay near one, then sliced to the requested length along
+    # dim and given random signs. Low precision dtypes use a smaller batch size derived from the
+    # dtype maximum. Returns a tensor of the requested dtype on the device.
     # Construct a cumprod input which guarantees not to overflow or underflow
     if is_integer_dtype(dtype):
         # Large products don't fit in integers, the best we can do
@@ -264,6 +278,10 @@ def _large_cumprod_input(shape, dim, dtype, device):
 
 
 def define_custom_op_for_test(id_, fn, fn_meta, tags=()):
+    # [FUNCTION DOC] HELPER: Define a custom op named id_ in the global test library taking one
+    # tensor and returning one tensor, with fn as the CPU/CUDA/XPU/MPS kernel and fn_meta as the
+    # Meta kernel. Registration happens only once per id (tracked in the global ids set), so
+    # repeated calls with the same id are no-ops. Optional tags are attached to the schema.
     global libtest
     global ids
     if id_ not in ids:
@@ -277,6 +295,9 @@ def define_custom_op_for_test(id_, fn, fn_meta, tags=()):
 
 
 def define_custom_op_2_for_test(id_, fn, fn_meta, tags=()):
+    # [FUNCTION DOC] HELPER: Same as the first custom-op helper but the schema takes a tensor and a
+    # float scale and returns a pair of tensors. Registers fn for CPU/CUDA/XPU/MPS and fn_meta for
+    # Meta, only if id_ was not already registered; records the id afterwards.
     global libtest
     global ids
     if id_ not in ids:
@@ -292,6 +313,9 @@ def define_custom_op_2_for_test(id_, fn, fn_meta, tags=()):
 
 
 def define_custom_op_3_for_test(id_, fn, fn_meta, tags=()):
+    # [FUNCTION DOC] HELPER: Same pattern as the other custom-op helpers but the schema takes a
+    # list of tensors and returns one tensor. Registers fn for CPU/CUDA/XPU/MPS and fn_meta for
+    # Meta, only if id_ is new, then records the id in the global set.
     global libtest
     global ids
     if id_ not in ids:
@@ -308,6 +332,11 @@ f32 = torch.float32
 
 
 def register_ops_with_aoti_compile(ns, op_set, dispatch_key, torch_compile_op_lib_impl):
+    # [FUNCTION DOC] HELPER: For every op name in op_set under namespace ns, look up all its
+    # overloads through the JIT operation registry and register an AOTI-compiled eager
+    # implementation for the given dispatch key on the supplied library object, using the
+    # overload-qualified name when the schema has an overload name. Any exception while registering
+    # one overload is swallowed and that overload is skipped.
     for _op_name in op_set:
         qualified_op_name = f"{ns}::{_op_name}"
         _, overload_names = torch._C._jit_get_operation(qualified_op_name)
@@ -325,6 +354,11 @@ def register_ops_with_aoti_compile(ns, op_set, dispatch_key, torch_compile_op_li
 
 
 def get_divisible_by_16(cfg):
+    # [FUNCTION DOC] HELPER: Return the argument indices that triton marks as divisible by 16 from
+    # a triton attribute config object. Handles the renamed attribute (divisibility_16 or
+    # divisible_by_16) by using whichever exists; otherwise it parses a mapping of index tuples to
+    # attribute lists and returns the first index of every single-element key whose first attribute
+    # is the divisibility-16 entry.
     # attribute was renamed between triton versions, from "divisible_by_16" to "divisibility_16"
     if hasattr(cfg, "divisibility_16"):
         return cfg.divisibility_16
@@ -340,6 +374,9 @@ def get_divisible_by_16(cfg):
 
 
 def get_post_grad_graph(f, inputs):
+    # [FUNCTION DOC] HELPER: Run f on inputs while capturing the post_grad_graphs log of
+    # torch._inductor.compile_fx, and return the logged graph text with the first three log lines
+    # dropped and whitespace stripped. Used by tests that compare printed post-grad FX graphs.
     log_stream, ctx = logs_to_string("torch._inductor.compile_fx", "post_grad_graphs")
     with ctx():
         f(*inputs)
@@ -348,8 +385,15 @@ def get_post_grad_graph(f, inputs):
 
 
 class TestCase(InductorTestCase):
+    # [CLASS DOC] Base TestCase for the Inductor tests in this file (derived from
+    # InductorTestCase). For the whole class it patches Inductor config with debug mode, index
+    # asserts, minimal CPU chunk size, no pointwise autotuning, no implicit fallbacks, intermediate
+    # hooks, and runtime triton dtype/shape asserts; the patch is undone in class teardown. Each
+    # test resets dynamo and Inductor metrics and is timed.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class-level setup: calls the parent setup, then enters (on an ExitStack
+        # kept on the class) a config patch enabling debug checks and test-only runtime assertions.
         super().setUpClass()
         cls._stack = contextlib.ExitStack()
         cls._stack.enter_context(
@@ -369,16 +413,23 @@ class TestCase(InductorTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class-level teardown: closes the saved ExitStack so the config patch is
+        # undone, then calls the parent teardown.
         cls._stack.close()
         super().tearDownClass()
 
     def setUp(self):
+        # [FUNCTION DOC] Per-test setup: resets dynamo and Inductor metrics, calls the parent
+        # setup, and records the start time with a performance counter.
         torch._dynamo.reset()
         torch._inductor.metrics.reset()
         super().setUp()
         self._start = time.perf_counter()
 
     def tearDown(self):
+        # [FUNCTION DOC] Per-test teardown: calls the parent teardown, resets dynamo, and when the
+        # environment variable ERROR_ON_SLOW equals 1 raises AssertionError if the test took 120
+        # seconds or longer.
         super().tearDown()
         torch._dynamo.reset()
         if os.environ.get("ERROR_ON_SLOW") == "1":
@@ -388,46 +439,68 @@ class TestCase(InductorTestCase):
 
 
 class ToTuple(torch.nn.Module):
+    # [CLASS DOC] HELPER: Trivial module whose forward wraps its input in a one-element tuple.
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Return a one-element tuple containing x.
         return (x,)
 
 
 @dataclasses.dataclass
 class InputGen:
+    # [CLASS DOC] HELPER: Dataclass producing sample tensors for a device with edge size n. Each
+    # method builds a different layout (dense, transposed, strided slice, broadcast shapes, double,
+    # or int32 arange) used to sweep input kinds in pairwise tests.
     n: int
     device: str
 
     def dense(self):
+        # [FUNCTION DOC] HELPER: Random contiguous float tensor of shape n by n on the device.
         return torch.randn((self.n, self.n), device=self.device)
 
     def transposed(self):
+        # [FUNCTION DOC] HELPER: The dense n by n tensor transposed, so it is non-contiguous.
         return self.dense().transpose(0, 1)
 
     def strided(self):
+        # [FUNCTION DOC] HELPER: Non-contiguous view obtained by slicing a larger random tensor
+        # (starting at offset n on both dims, with step 2 on the second), shape n by roughly n*3/2.
         return torch.randn((self.n * 2, self.n * 3), device=self.device)[
             self.n :, self.n :: 2
         ]
 
     def broadcast1(self):
+        # [FUNCTION DOC] HELPER: Random 1-D float tensor of length n.
         return torch.randn((self.n,), device=self.device)
 
     def broadcast2(self):
+        # [FUNCTION DOC] HELPER: Random float tensor of shape 1 by n by 1, broadcastable on dims 0,
+        # 2.
         return torch.randn((1, self.n, 1), device=self.device)
 
     def broadcast3(self):
+        # [FUNCTION DOC] HELPER: Random float tensor with a single element, shape 1.
         return torch.randn((1,), device=self.device)
 
     def double(self):
+        # [FUNCTION DOC] HELPER: Random n by n float64 tensor. Raises unittest.SkipTest on MPS
+        # since that backend does not support float64.
         if self.device == "mps":
             raise unittest.SkipTest("MPS does not support torch.float64")
         return torch.randn((self.n, self.n), device=self.device, dtype=torch.double)
 
     def int(self):
+        # [FUNCTION DOC] HELPER: Integer arange tensor of length n with dtype int32 on the device.
         return torch.arange(self.n, device=self.device, dtype=torch.int32)
 
 
 def compute_grads(args, kwrags, results, grads):
+    # [FUNCTION DOC] HELPER: Compute gradients of the differentiable tensors in results with
+    # respect to the leaf tensors needing grad found in args and kwargs, using the given upstream
+    # grads, allowing unused inputs and retaining the graph. Raises AssertionError if no result
+    # requires grad or no input leaf requires grad. Returns the gradient tuple.
     def gather_leaf_tensors(args, kwargs):
+        # [FUNCTION DOC] HELPER: Flatten args and kwargs with pytree and return the list of those
+        # leaves that are tensors requiring grad.
         args = pytree.arg_tree_leaves(*args, **kwargs)
         leaf_tensors = [
             arg for arg in args if isinstance(arg, torch.Tensor) and arg.requires_grad
@@ -456,6 +529,10 @@ def compute_grads(args, kwrags, results, grads):
 
 
 def _assert_same_significant_strides(self: TestCase, actual, expected):
+    # [FUNCTION DOC] HELPER: Flatten both pytrees and verify equal leaf counts; for each pair of
+    # strided tensors check that their strides agree on significant dimensions (via
+    # check_significant_strides, which ignores size-one dims). Raises AssertionError with the leaf
+    # index, dim and strides on any mismatch; non-tensor or non-strided leaves are skipped.
     actual_flat = pytree.tree_leaves(actual)
     expected_flat = pytree.tree_leaves(expected)
     if len(actual_flat) != len(expected_flat):
@@ -495,6 +572,10 @@ def _assert_equal_with_significant_stride_check(
     exact_dtype,
     exact_stride,
 ):
+    # [FUNCTION DOC] HELPER: Compare actual and expected with the supplied equality function using
+    # the given tolerances, equal_nan and dtype checking but never its own exact-stride check,
+    # then, if exact_stride is requested, separately verify that significant strides match. This
+    # avoids false failures from strides of size-one or broadcast dimensions.
     assert_equal_fn(
         actual,
         expected,
@@ -518,10 +599,21 @@ def assert_expected_dynamic_dims(
     *,
     require_matching_aot_inputs: bool = True,
 ):
+    # [FUNCTION DOC] HELPER: Verify that the graph module placeholders for selected user tensor
+    # inputs have symbolic (dynamic) sizes in the requested dims. Returns an empty mapping when
+    # assert_dynamic_dims is None. Without dynamic_dim_targets (the Dynamo graph case) it maps each
+    # user input index to the placeholders whose recorded graph argument example is that very
+    # tensor, checks each, and returns a mapping from flattened placeholder index to the list of
+    # (user index, dims) pairs; with targets (the AOT graph case) it looks up placeholders by their
+    # plain AOT input index and checks them, and optionally requires every target be found. Raises
+    # AssertionError for bad indices, missing/unused inputs, non-tensor placeholders, out-of-range
+    # dims or statically sized dims.
     if assert_dynamic_dims is None:
         return {}
 
     def placeholder_value(node):
+        # [FUNCTION DOC] HELPER: Return the fake example value stored in a node's metadata, trying
+        # the example_value key first and the val key as fallback.
         return node.meta.get("example_value", node.meta.get("val"))
 
     def assert_dynamic_dims_on_node(
@@ -529,6 +621,10 @@ def assert_expected_dynamic_dims(
         user_input_idx: int,
         expected_dims: Sequence[int],
     ) -> None:
+        # [FUNCTION DOC] HELPER: For the given placeholder node, resolve negative dims against the
+        # fake value rank and assert every listed dim is in range and has a symbolic size. Raises
+        # AssertionError if the placeholder value is not a tensor or a dim is out of range; fails
+        # the test via assertTrue when a dim is static.
         fake_value = placeholder_value(node)
         if not isinstance(fake_value, torch.Tensor):
             raise AssertionError(
@@ -628,6 +724,12 @@ def make_compile_fx_wrapper_with_dynamic_dim_assertions(
     kwargs,
     on_compile: Callable[[], None] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Build a compile backend that wraps compile_fx with optional dynamic
+    # dimension assertions. First collects the user tensor inputs from the example inputs and
+    # kwargs (only when assertions are requested). The returned function calls on_compile if given,
+    # checks the Dynamo graph, and then runs compile_fx with an inner compile that re-checks the
+    # AOT graphs (not requiring all inputs for backward graphs) before calling compile_fx_inner.
+    # When assertions are on, cache use is forcibly disabled during compile.
     user_tensor_inputs = (
         None
         if assert_dynamic_dims is None
@@ -639,6 +741,9 @@ def make_compile_fx_wrapper_with_dynamic_dim_assertions(
     )
 
     def compile_fx_wrapper(model_, example_inputs_):
+        # [FUNCTION DOC] HELPER: Backend used by torch.compile. Invokes the on_compile callback if
+        # supplied, asserts dynamic dims on the incoming Dynamo graph, then compiles through
+        # compile_fx with the asserting inner compile; returns the compiled callable.
         if on_compile is not None:
             on_compile()
         dynamic_dim_targets = assert_expected_dynamic_dims(
@@ -649,6 +754,10 @@ def make_compile_fx_wrapper_with_dynamic_dim_assertions(
         )
 
         def inner_compile_with_dynamic_dim_assertions(gm, inputs, **kwargs):
+            # [FUNCTION DOC] HELPER: Inner compile hook that re-asserts the dynamic dims on each
+            # AOT graph (relaxed for backward graphs, where tangent inputs have no direct user
+            # input) and then delegates to compile_fx_inner with the same graph, inputs and keyword
+            # arguments.
             assert_expected_dynamic_dims(
                 self,
                 gm,
@@ -699,6 +808,17 @@ def check_model(
     exact_stride=False,
     assert_dynamic_dims: Mapping[int, Sequence[int]] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Core numerical check used by most tests. Computes a reference by
+    # running the model eagerly (optionally in float32 after upcasting low precision inputs and a
+    # deep copy of the model), compiles a wrapper with torch.compile using a compile_fx backend,
+    # runs it, and then verifies that compile_fx was invoked (if requested), result types and
+    # lengths match, output dtypes equal the eager dtypes, and values compare equal (via
+    # assertEqual or a custom callable) with optional significant-stride checking; inputs must also
+    # be unchanged versus the reference after any mutation. Without assert_equal it only checks
+    # device, size, strides, layout and dtype. With check_gradient it also builds random unit-norm
+    # upstream grads and compares backward results, with the special case where all reference grads
+    # are None and no output requires grad. Resets dynamo before and after and seeds the RNG before
+    # each run. Raises AssertionError on any mismatch.
     kwargs = kwargs or {}
     torch._dynamo.reset()
 
@@ -726,6 +846,9 @@ def check_model(
     if reference_in_float:
         # check_lowp is ignored here, it's kept just to be able to call `common` with extra arg
         def upcast_fn(x):
+            # [FUNCTION DOC] HELPER: Return a float32 copy (preserving strides) of a
+            # float16/bfloat16 tensor and record via an enclosing flag that low precision args were
+            # seen; any other value is returned unchanged.
             nonlocal has_lowp_args
             if isinstance(x, torch.Tensor) and (
                 x.dtype == torch.float16 or x.dtype == torch.bfloat16
@@ -757,6 +880,8 @@ def check_model(
     called = False
 
     def mark_called():
+        # [FUNCTION DOC] HELPER: Callback passed to the compile wrapper; sets the enclosing flag
+        # showing that compile_fx was actually invoked.
         nonlocal called
         called = True
 
@@ -769,6 +894,8 @@ def check_model(
     )
 
     def run(*ex, **kwargs):
+        # [FUNCTION DOC] HELPER: Function handed to torch.compile; forwards its arguments to the
+        # model and returns the result.
         return model(*ex, **kwargs)
 
     run = torch.compile(run, backend=compile_fx_wrapper, fullgraph=nopython)
@@ -801,6 +928,10 @@ def check_model(
     actual_flat = pytree.tree_leaves(actual)
 
     def to_dtype_preserve_strides(src, dtype):
+        # [FUNCTION DOC] HELPER: Convert src to the given dtype while preserving its strides: dims
+        # that are expanded (stride zero, size over one) are selected away first, the sliced tensor
+        # is copied into an empty_strided tensor of the target dtype, and the expanded dims are
+        # restored by unsqueeze and expand to the original size.
         expanded_dims = []
         src_slice = src
 
@@ -826,6 +957,9 @@ def check_model(
         return result
 
     def reference_to_expect(actual_flat, correct_flat):
+        # [FUNCTION DOC] HELPER: Build a tuple converting the reference values so they match the
+        # actual results: floating-point tensors are cast to the dtype of the corresponding actual
+        # value preserving strides; all other values pass through unchanged.
         return tuple(
             (
                 to_dtype_preserve_strides(y, x.dtype)
@@ -848,6 +982,8 @@ def check_model(
         correct = tree_unflatten(correct_flat, correct_spec)
 
     def has_zero_dim(x):
+        # [FUNCTION DOC] HELPER: Return whether the value (or any element if it is a tuple) is a
+        # tensor with a zero-sized dimension.
         if not isinstance(x, tuple):
             x = (x,)
         return any(isinstance(t, torch.Tensor) and 0 in t.size() for t in x)
@@ -858,6 +994,9 @@ def check_model(
         if callable(assert_equal):
 
             def custom_assert_with_self(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Adapter that calls the user supplied assert_equal callable
+                # with the test case as its first argument followed by the given positional and
+                # keyword arguments.
                 assert_equal(self, *args, **kwargs)
 
             assert_equal_fn = custom_assert_with_self
@@ -1004,6 +1143,11 @@ def check_model_gpu(
     exact_stride=False,
     assert_dynamic_dims: Mapping[int, Sequence[int]] | None = None,
 ):
+    # [FUNCTION DOC] GPU variant of check_model (decorated to disable triton cudagraphs). Moves the
+    # model to the GPU device and, if copy_to_gpu, clones inputs to it preserving strides, then
+    # runs check_model. If check_lowp it then downcasts float32 inputs and the model to half,
+    # loosens rtol to at least 2e-3 when set, and runs check_model again. Arguments mirror
+    # check_model; raises AssertionError on mismatches.
     kwargs = kwargs or {}
     if hasattr(model, "to"):
         model = model.to(device=GPU_TYPE)
@@ -1036,6 +1180,8 @@ def check_model_gpu(
     if check_lowp:
 
         def downcast_fn(x):
+            # [FUNCTION DOC] HELPER: Return a half precision strided copy on the GPU of a float32
+            # tensor; other values are returned unchanged.
             if not isinstance(x, torch.Tensor) or x.dtype != torch.float:
                 return x
             return torch.empty_strided(
@@ -1074,6 +1220,13 @@ check_model_cuda = check_model_gpu
 def _run_and_assert_no_indirect_indexing(
     test_case, func, *args, has_wrapping=None, has_assert=False, **kwargs
 ):
+    # [FUNCTION DOC] HELPER: Run func with args through run_and_get_code, then inspect each
+    # generated source line that loads or stores memory (triton load/store, C++ index brackets) and
+    # assert the index expression contains no tmp variable, i.e. no indirect indexing. Lines using
+    # block pointers or TMA/tensor descriptors are skipped. If has_wrapping is not None, also
+    # asserts that a where or ternary form appears in the code exactly when has_wrapping is true.
+    # Finally asserts that at least one generated code string has an assert (device_assert or
+    # non-AOTI TORCH_CHECK) matching has_assert. Returns the function result.
     result, source_codes = run_and_get_code(func, *args, **kwargs)
 
     for code in source_codes:
@@ -1116,6 +1269,9 @@ def _run_and_assert_no_indirect_indexing(
             )
 
     def has_assert_in_code(code):
+        # [FUNCTION DOC] HELPER: Return True if the code string contains device_assert or a line
+        # with TORCH_CHECK that is not AOTI_TORCH_CHECK (the latter is lazy triton compile
+        # machinery, not a bounds check); otherwise False.
         # Check for device_assert, or TORCH_CHECK that isn't AOTI_TORCH_CHECK
         # AOTI_TORCH_CHECK is for lazy Triton compile infrastructure, not bounds checking
         if "device_assert" in code:
@@ -1132,6 +1288,9 @@ def _run_and_assert_no_indirect_indexing(
 
 
 def assertGeneratedKernelCountEqual(self: TestCase, expected: int):
+    # [FUNCTION DOC] HELPER: Assert that Inductor metrics report exactly the expected number of
+    # generated kernels. Skipped silently when triton multi_kernel is on because that mode emits
+    # extra kernels for the same schedule node.
     if config.triton.multi_kernel:
         # when multi_kernel is enabled, we generated both persistent reduction
         # and non-persistent reduction kernels for the same node schedule.
@@ -1141,12 +1300,19 @@ def assertGeneratedKernelCountEqual(self: TestCase, expected: int):
 
 
 def assertGeneratedKernelCountGreater(self: TestCase, expected: int):
+    # [FUNCTION DOC] HELPER: Assert that the generated kernel count in Inductor metrics is greater
+    # than expected; no check is done when triton multi_kernel is enabled.
     if config.triton.multi_kernel:
         return
     self.assertGreater(torch._inductor.metrics.generated_kernel_count, expected)
 
 
 class SweepInputs2:
+    # [CLASS DOC] HELPER: Mixin that generates pairwise input-layout tests. Class attributes list
+    # the input generator method names (dense, transposed, strided, broadcasts, double, int) for
+    # first and second operand, the InputGen instance in gen, and a set of generator names
+    # unsupported by a backend. populate creates one test method per pair and attaches it to the
+    # class.
     input_gen_types1 = [
         "dense",
         "transposed",
@@ -1162,6 +1328,8 @@ class SweepInputs2:
 
     @staticmethod
     def kernel(a, b):
+        # [FUNCTION DOC] HELPER: Kernel under test; returns a one-element tuple with the sum of a
+        # and b.
         return (a + b,)
 
     # Input gen types unsupported by specific backends. Subclasses or wrapper
@@ -1170,7 +1338,13 @@ class SweepInputs2:
 
     @classmethod
     def gen_template(cls, name1, name2):
+        # [FUNCTION DOC] HELPER: Class method that builds a test method for the pair of generator
+        # names, names it by device and the two names, and attaches it to the class with setattr.
+        # Does not return anything.
         def test(self):
+            # [FUNCTION DOC] HELPER: Generated test body. Skips the test if either input generator
+            # name is in the backend's unsupported set; otherwise builds both inputs from the
+            # shared InputGen and runs check_model on the class kernel.
             unsupported = type(self)._unsupported_input_gen_types
             for name in (name1, name2):
                 if name in unsupported:
@@ -1189,18 +1363,26 @@ class SweepInputs2:
 
     @classmethod
     def populate(cls):
+        # [FUNCTION DOC] HELPER: Class method that creates a test for every combination of the
+        # first and second lists of input generator names.
         for name1 in cls.input_gen_types1:
             for name2 in cls.input_gen_types2:
                 cls.gen_template(name1, name2)
 
 
 def is_cpp_backend(device):
+    # [FUNCTION DOC] HELPER: True if the device (object with type, or a string) is cpu and the
+    # configured CPU backend is the C++ one.
     return getattr(device, "type", device) == "cpu" and config.cpu_backend == "cpp"
 
 
 def skip_if_cpu(fn):
+    # [FUNCTION DOC] HELPER: Decorator that makes the test raise unittest.SkipTest when the test
+    # instance device is cpu; otherwise it runs the original test.
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper that skips (SkipTest) on cpu devices and otherwise calls
+        # the wrapped test with the same arguments.
         if self.device == "cpu":
             raise unittest.SkipTest("cpu not supported")
         return fn(self, *args, **kwargs)
@@ -1209,8 +1391,12 @@ def skip_if_cpu(fn):
 
 
 def skip_if_halide(fn):
+    # [FUNCTION DOC] HELPER: Decorator that skips the test with SkipTest when the device uses the
+    # Halide backend.
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper raising SkipTest on a Halide backend, else running the
+        # test.
         if is_halide_backend(self.device):
             raise unittest.SkipTest("halide not supported")
         return fn(self, *args, **kwargs)
@@ -1219,8 +1405,12 @@ def skip_if_halide(fn):
 
 
 def skip_if_pallas(fn):
+    # [FUNCTION DOC] HELPER: Decorator that skips the test with SkipTest when the device uses the
+    # Pallas backend.
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper raising SkipTest on a Pallas backend, else running the
+        # test.
         if is_pallas_backend(self.device):
             raise unittest.SkipTest("pallas not supported")
         return fn(self, *args, **kwargs)
@@ -1229,8 +1419,12 @@ def skip_if_pallas(fn):
 
 
 def xfail_if_mps(fn):
+    # [FUNCTION DOC] HELPER: Decorator that expects failure on MPS: on non-MPS devices the test
+    # runs normally; on MPS it must raise some exception, which is asserted and swallowed.
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper implementing the MPS expected-failure logic: runs the test
+        # directly off MPS, and on MPS wraps it in an assertRaises for any exception.
         if not is_mps_backend(self.device):
             return fn(self, *args, **kwargs)
         with self.assertRaises(Exception):
@@ -1244,8 +1438,12 @@ xfail_if_mps_unimplemented = xfail_if_mps
 
 
 def skip_if_triton(fn):
+    # [FUNCTION DOC] HELPER: Decorator that skips the test with SkipTest when the device uses the
+    # triton backend.
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper raising SkipTest on a triton backend, else running the
+        # test.
         if is_triton_backend(self.device):
             raise unittest.SkipTest("triton not supported")
         return fn(self, *args, **kwargs)
@@ -1254,8 +1452,12 @@ def skip_if_triton(fn):
 
 
 def skip_if_not_triton(fn):
+    # [FUNCTION DOC] HELPER: Decorator that skips the test with SkipTest unless the device uses the
+    # triton backend.
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper raising SkipTest (naming the device) when the backend is
+        # not triton, else running the test.
         if not is_triton_backend(self.device):
             raise unittest.SkipTest(f"triton backend is required for {self.device}")
         return fn(self, *args, **kwargs)
@@ -1264,8 +1466,13 @@ def skip_if_not_triton(fn):
 
 
 def skip_if_dynamic(fn):
+    # [FUNCTION DOC] HELPER: Decorator that skips the test when dynamic shapes are the default (the
+    # dynamic-versus-static selector chooses the dynamic value); the skip reason says that
+    # associative scan does not support lifted SymInts.
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper raising SkipTest under dynamic-shape default, else running
+        # the test.
         if ifdynstaticdefault(True, False):
             raise unittest.SkipTest("associtaive_scan doesn's support lifted SymInts.")
         return fn(self, *args, **kwargs)
@@ -1274,16 +1481,22 @@ def skip_if_dynamic(fn):
 
 
 def is_halide_backend(device):
+    # [FUNCTION DOC] HELPER: True if the configured backend for the device is Halide, using the CPU
+    # backend setting for cpu devices and the CUDA backend setting for any other device.
     if getattr(device, "type", device) == "cpu":
         return config.cpu_backend == "halide"
     return config.cuda_backend == "halide"
 
 
 def is_mps_backend(device):
+    # [FUNCTION DOC] HELPER: True if the device type is mps.
     return getattr(device, "type", device) == "mps"
 
 
 def is_triton_backend(device):
+    # [FUNCTION DOC] HELPER: True if the triton backend is configured for the device: checks the
+    # CPU backend setting for cpu, always False for mps, and the CUDA backend setting for
+    # everything else.
     device_type = getattr(device, "type", device)
     if device_type == "cpu":
         return config.cpu_backend == "triton"
@@ -1293,23 +1506,34 @@ def is_triton_backend(device):
 
 
 def is_triton_cpu_backend(device):
+    # [FUNCTION DOC] HELPER: True if the device is cpu and the CPU backend is triton.
     return getattr(device, "type", device) == "cpu" and config.cpu_backend == "triton"
 
 
 def is_pallas_backend(device):
+    # [FUNCTION DOC] HELPER: True if the Pallas backend is configured for the device (CPU backend
+    # setting for cpu, otherwise the CUDA backend setting).
     if getattr(device, "type", device) == "cpu":
         return config.cpu_backend == "pallas"
     return config.cuda_backend == "pallas"
 
 
 def skip_if_triton_cpu(fn):
+    # [FUNCTION DOC] HELPER: Skip decorator for Triton-CPU that works both bare and with a reason
+    # argument. If given a function it directly returns the decorated function; if given a string
+    # it records it as the skip reason and returns the decorator. The decorated test raises
+    # SkipTest when the device uses the triton CPU backend.
     import types
 
     reason = "Triton CPU not supported"
 
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Inner decorator that wraps the test to skip when the triton CPU
+        # backend is used.
         @functools.wraps(fn)
         def wrapper(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper raising SkipTest with the stored reason on triton CPU,
+            # else running the test.
             if is_triton_cpu_backend(self.device):
                 raise unittest.SkipTest(reason)
             return fn(self, *args, **kwargs)
@@ -1324,11 +1548,16 @@ def skip_if_triton_cpu(fn):
 
 
 def xfail_if_triton_cpu(fn):
+    # [FUNCTION DOC] HELPER: Decorator that marks the function with an attribute flagging an
+    # expected failure on the triton CPU backend (consumed by the test harness) and returns it
+    # unchanged.
     fn._expected_failure_triton_cpu = True
     return fn
 
 
 def xfail_if_triton_cpu_no_avx512_bf16(fn):
+    # [FUNCTION DOC] HELPER: Like xfail_if_triton_cpu but only flags the function as an expected
+    # triton CPU failure when the CPU lacks AVX512 bf16 support; returns the function.
     # Triton CPU codegen for some BF16 kernels matches eager numerics only
     # when avx512_bf16 is available; on older Intel CPUs the result drifts.
     if not torch.cpu._is_avx512_bf16_supported():
@@ -1337,13 +1566,19 @@ def xfail_if_triton_cpu_no_avx512_bf16(fn):
 
 
 def xfail_if_pallas(fn):
+    # [FUNCTION DOC] HELPER: Decorator that flags the function as an expected failure on the Pallas
+    # backend via an attribute and returns it unchanged.
     fn._expected_failure_pallas = True
     return fn
 
 
 def skip_if_gpu_halide(fn):
+    # [FUNCTION DOC] HELPER: Decorator that skips the test with SkipTest when the Halide backend is
+    # used on a CUDA device (Halide on CPU still runs).
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper raising SkipTest for Halide on CUDA, else running the
+        # test.
         if (
             is_halide_backend(self.device)
             and getattr(self.device, "type", self.device) == "cuda"
@@ -1355,12 +1590,21 @@ def skip_if_gpu_halide(fn):
 
 
 class skip_if_cpp_wrapper:
+    # [CLASS DOC] HELPER: Decorator factory used as a class so it can be applied with or without a
+    # reason string. Calling an instance on a test function returns a wrapper that raises SkipTest
+    # (mentioning the reason) when the C++ wrapper config is enabled.
     def __init__(self, reason: str = "") -> None:
+        # [FUNCTION DOC] HELPER: Store the human readable skip reason.
         self.reason = reason
 
     def __call__(self, fn, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Decorate fn: returns a wrapper taking only the test instance that
+        # skips under cpp_wrapper mode and otherwise calls fn with the instance plus the extra
+        # arguments captured here.
         @functools.wraps(fn)
         def wrapper(test_self):
+            # [FUNCTION DOC] HELPER: Wrapper that raises SkipTest with the stored reason if
+            # cpp_wrapper is enabled, else calls the decorated test.
             if config.cpp_wrapper:
                 raise unittest.SkipTest(f"cpp wrapper bug to be fixed: {self.reason}")
             return fn(test_self, *args, **kwargs)
@@ -1369,14 +1613,20 @@ class skip_if_cpp_wrapper:
 
 
 def is_dynamic_shape_enabled():
+    # [FUNCTION DOC] HELPER: True when dynamo is not configured to assume static shapes by default,
+    # i.e. dynamic shapes are in use.
     # What's the best way to decide this?
     return not torch._dynamo.config.assume_static_by_default
 
 
 def cpp_int_array_str(values):
+    # [FUNCTION DOC] HELPER: Format a list of values as a C++ brace initializer string. Integer
+    # values get the L suffix (LL on macOS and Windows), other values are converted to strings.
     suffix = "LL" if sys.platform in ["darwin", "win32"] else "L"
 
     def fmt(v):
+        # [FUNCTION DOC] HELPER: Format one value with the platform integer suffix if it is an int,
+        # else its string form.
         return f"{v}{suffix}" if isinstance(v, int) else str(v)
 
     return "{" + ", ".join(fmt(v) for v in values) + "}"
@@ -1385,6 +1635,12 @@ def cpp_int_array_str(values):
 def target_assert_size_stride_str(
     name, sizes, strides, dynamic_sizes=None, dynamic_strides=None, dtype=None
 ):
+    # [FUNCTION DOC] HELPER: Build the substring that generated code is expected to contain for a
+    # tensor metadata check. With dynamic shapes enabled and dynamic sizes given, those replace the
+    # static sizes and strides. Under cpp_wrapper the sizes and strides become C++ brace lists,
+    # else Python tuples. With a name and dtype (Python wrapper only) it returns the
+    # assert_tensor_metadata call text prefix; with only a name the assert_size_stride prefix; with
+    # no name just the size and stride pair text.
     """Build expected tensor metadata check string for generated code.
 
     Handles cpp_wrapper ({}/L or LL suffix) vs Python wrapper (()). When dynamic_sizes
@@ -1414,12 +1670,22 @@ def target_assert_size_stride_str(
 
 @instantiate_parametrized_tests
 class CommonTemplate:
+    # [CLASS DOC] Big mixin of device-generic Inductor tests (decorated so parametrized tests are
+    # instantiated). It does not subclass TestCase; concrete test classes mix it in and provide
+    # device, common and the checker helpers it relies on. Covers pointwise, reduction, indexing,
+    # dtype, decomposition, AOTI eager and many other codegen behaviors.
     def is_dtype_supported(self, dtype: torch.dtype) -> bool:
+        # [FUNCTION DOC] HELPER: Return whether the device interface for self.device supports the
+        # given dtype.
         device_interface = get_interface_for_device(self.device)
         return device_interface.is_dtype_supported(dtype)
 
     def test_bool(self):
+        # [FUNCTION DOC] Check boolean tensor arithmetic and logic ops (add, mul, and, or, xor,
+        # logical ops, sign) compile to results equal to eager for small boolean inputs.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Test function returning a tuple of boolean arithmetic and
+            # logical results of the two inputs.
             return (
                 a + b,
                 a * b,
@@ -1446,6 +1712,9 @@ class CommonTemplate:
     @skip_if_triton_cpu  # aoti
     @skipIfWindows(msg="aoti not support on Windows")
     def test_aoti_eager_dtype_device_layout(self):
+        # [FUNCTION DOC] AOTI eager test for the tril_indices factory op with dtype, device and
+        # layout arguments: computes the eager reference, registers an AOTI compiled implementation
+        # for the CPU or CUDA dispatch key, and checks the result is equal. Requires sm80 on CUDA.
         ns = "aten"
         op_name = "tril_indices"
         dispatch_key = "CPU"
@@ -1490,6 +1759,9 @@ class CommonTemplate:
     @skip_if_triton_cpu  # aoti
     @skipIfWindows(msg="aoti not support on Windows")
     def test_aoti_eager_support_out(self):
+        # [FUNCTION DOC] AOTI eager test for the clamp op with an out tensor, with keyword
+        # arguments given in two different orders: compares both the return value and the filled
+        # out tensor between eager and the AOTI registered implementation.
         ns = "aten"
         op_name = "clamp"
         dispatch_key = "CPU"
@@ -1546,6 +1818,9 @@ class CommonTemplate:
     @skip_if_triton_cpu  # aoti
     @skipIfWindows(msg="aoti not support on Windows")
     def test_aoti_eager_support_str(self):
+        # [FUNCTION DOC] AOTI eager test for the div op with string rounding_mode arguments (trunc
+        # and floor): compares results from the eager op with those after registering the AOTI
+        # implementation.
         ns = "aten"
         op_name = "div"
         dispatch_key = "CPU"
@@ -1587,6 +1862,10 @@ class CommonTemplate:
     @skip_if_triton_cpu  # aoti
     @skipIfWindows(msg="aoti not support on Windows")
     def test_aoti_eager_cache_hit(self):
+        # [FUNCTION DOC] AOTI eager test that a persistent cache entry is reused: first compiles an
+        # abs kernel into the persistent cache and checks the library file exists, then patches the
+        # compile function to None so any recompilation would fail, registers the AOTI eager
+        # implementation and checks results equal eager.
         ns = "aten"
         op_name = "abs"
         dispatch_key = "CPU"
@@ -1632,7 +1911,12 @@ class CommonTemplate:
     @skip_if_triton_cpu  # aoti
     @skipIfWindows(msg="aoti not support on Windows")
     def test_aoti_eager_with_persistent_cache(self):
+        # [FUNCTION DOC] AOTI eager test of the persistent cache: compiles an abs kernel, checks
+        # the returned path is non-empty, a JSON config file for the op exists in the cache dir,
+        # the loaded JSON is a non-empty list whose first entry is a dict with meta_info and
+        # kernel_path, and that the returned kernel library path is among the cached kernel paths.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Function computing the absolute value of its input.
             return torch.abs(a)
 
         ns = "aten"
@@ -1680,6 +1964,11 @@ class CommonTemplate:
     @skip_if_triton_cpu  # aoti
     @skipIfWindows(msg="aoti not support on Windows")
     def test_aoti_eager_with_scalar(self):
+        # [FUNCTION DOC] AOTI eager test with scalar arguments: compiles the add op (Tensor
+        # overload) with two scalar tensors and an alpha scalar and verifies the cache entry
+        # metadata: three meta_info entries, two scalar tensors with empty sizes and strides and no
+        # scalar value, and one scalar entry with a value and no size or stride. Then registers the
+        # implementation and checks several alpha values give the same results as eager.
         namespace_name = "aten"
         op_name = "add"
         op_overload_name = "Tensor"
@@ -1754,6 +2043,11 @@ class CommonTemplate:
     @skip_if_triton_cpu  # aoti
     @skipIfWindows(msg="aoti not support on Windows")
     def test_aoti_eager_override_registration(self):
+        # [FUNCTION DOC] AOTI eager test that registering AOTI implementations overrides eager ops.
+        # First gets reference results for abs and acos through torch.compile, then registers AOTI
+        # versions for those ops and checks eager calls give equal results. Then registers an AOTI
+        # clamp and checks the tensor-min form and the tensor-min-and-max form against eager
+        # references computed before registration.
         namespace_name = "aten"
         dispatch_key = "CPU"
         device = torch.device("cpu")
@@ -1764,6 +2058,7 @@ class CommonTemplate:
         unary_op_set = ["abs", "acos"]
 
         def fn(x, op_name=""):
+            # [FUNCTION DOC] HELPER: Apply the torch function named by op_name to x.
             return getattr(torch, op_name)(x)
 
         # Invoke torch.compile directly to get referent results
@@ -1804,20 +2099,29 @@ class CommonTemplate:
             self.assertEqual(ref_with_min_max, res_with_min_max)
 
     def test_add_const_int(self):
+        # [FUNCTION DOC] Compiled addition of an int constant, and add with an alpha multiplier, on
+        # float32, int32 and int64 aranges matches eager.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a tuple of the input plus one and the input added to
+            # one with alpha two.
             return (a + 1, torch.add(a, 1, alpha=2))
 
         for dtype in [torch.float32, torch.int32, torch.int64]:
             self.common(fn, (torch.arange(32, dtype=dtype),))
 
     def test_add_const_float(self):
+        # [FUNCTION DOC] Compiled addition of a float constant to a random float tensor.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple of the input plus 1.5.
             return (a + 1.5,)
 
         self.common(fn, (torch.randn(32),))
 
     def test_add_inplace_permuted(self):
+        # [FUNCTION DOC] In-place add of a broadcastable tensor into a permuted (transposed, thus
+        # non-contiguous) tensor; checks compiled result and mutated input match eager.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Add y into x in place and return x.
             return x.add_(y)
 
         x = torch.ones([2, 12, 13, 17]).transpose(1, 2)
@@ -1826,7 +2130,10 @@ class CommonTemplate:
         self.common(fn, (x, y))
 
     def test_add_complex(self):
+        # [FUNCTION DOC] Complex tensor addition with an alpha scalar of 2 for same-shape complex
+        # inputs, compared against eager.
         def fn(a, b, alpha):
+            # [FUNCTION DOC] HELPER: Return add of a and b scaled by alpha.
             return torch.add(a, b, alpha=alpha)
 
         x = torch.tensor([1 + 1j, -1 + 1j, -2 + 2j, 3 - 3j, 0, 1j, 1, -1])
@@ -1835,9 +2142,13 @@ class CommonTemplate:
         self.common(fn, (x, y, 2))
 
     def test_add_complex3(self):
+        # [FUNCTION DOC] Regression test for issue 115071: the compiled function negates and adds a
+        # complex tensor; after the call the input must be unchanged (no in-place write to it).
         # fix https://github.com/pytorch/pytorch/issues/115071
         @torch.compile
         def fn(*args):
+            # [FUNCTION DOC] HELPER: Compiled function returning the negation of the first argument
+            # and the first argument added to itself.
             a = torch.neg(args[0])
             b = torch.add(args[0], args[0])
             return (a, b)
@@ -1849,8 +2160,14 @@ class CommonTemplate:
         self.assertEqual(x, y)
 
     def test_add_complex4(self):
+        # [FUNCTION DOC] Complex add for complex32, complex64 and complex128 (supported ones only):
+        # compiles a function computing a sum of two identical additions, takes the generated code,
+        # drops lines with size/stride or alignment assertions, and checks the code contains at
+        # least three view-as-dtype operations (named differently under cpp wrapper).
         @torch.compile
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Compiled function adding a and b twice and returning the sum
+            # of the two results.
             c = a + b
             d = a + b
             return c + d
@@ -1882,8 +2199,13 @@ class CommonTemplate:
             )
 
     def test_add_complex_strided_fallback(self):
+        # [FUNCTION DOC] Complex64 add of two transposed (non-contiguous) tensors should fall back
+        # to an extern kernel: resets metrics, compiles and runs, asserts zero generated kernels
+        # and that the code contains an extern add or aten add marker (or AOTI add shims in cpp
+        # wrapper mode). Skips if complex64 is unsupported on the device.
         @torch.compile
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Compiled function returning a plus b.
             return a + b
 
         if not self.is_dtype_supported(torch.complex64):
@@ -1915,7 +2237,9 @@ class CommonTemplate:
         )
 
     def test_add_complex5(self):
+        # [FUNCTION DOC] Complex add with alpha for 2x2 complex tensors compared against eager.
         def fn(a, b, alpha):
+            # [FUNCTION DOC] HELPER: Return add of a and b scaled by alpha.
             return torch.add(a, b, alpha=alpha)
 
         x = torch.tensor([[1 + 1j, -1 + 1j], [-2 + 2j, 3 - 3j]])
@@ -1924,9 +2248,12 @@ class CommonTemplate:
         self.common(fn, (x, y, 2))
 
     def test_add_complex6(self):
+        # [FUNCTION DOC] Regression for issue 125745: complex add with alpha where the second
+        # operand must broadcast.
         # Fix https://github.com/pytorch/pytorch/issues/125745.
         # Add complex tensors with broadcasting.
         def fn(a, b, alpha):
+            # [FUNCTION DOC] HELPER: Return add of a and b scaled by alpha.
             return torch.add(a, b, alpha=alpha)
 
         x = torch.tensor([[1 + 1j, -1 + 1j, -2 + 2j, 3 - 3j]])
@@ -1935,9 +2262,12 @@ class CommonTemplate:
         self.common(fn, (x, y, 2))
 
     def test_add_complex7(self):
+        # [FUNCTION DOC] Regression for issue 160495: add of two zero-dimensional complex64 tensors
+        # with alpha.
         # Fix https://github.com/pytorch/pytorch/issues/160495
         # Test scalar (0-dimensional) complex tensor addition: 0D + 0D
         def fn(a, b, alpha):
+            # [FUNCTION DOC] HELPER: Return add of a and b scaled by alpha.
             return torch.add(a, b, alpha=alpha)
 
         x = torch.rand((), dtype=torch.complex64, device=self.device)
@@ -1946,9 +2276,12 @@ class CommonTemplate:
         self.common(fn, (x, y, 2))
 
     def test_add_complex8(self):
+        # [FUNCTION DOC] Regression for issue 160495: complex64 add of a one-element 1-D tensor and
+        # a zero-dimensional tensor with alpha.
         # Fix https://github.com/pytorch/pytorch/issues/160495
         # Test scalar complex addition: 1D + 0D
         def fn(a, b, alpha):
+            # [FUNCTION DOC] HELPER: Return add of a and b scaled by alpha.
             return torch.add(a, b, alpha=alpha)
 
         x = torch.rand(1, dtype=torch.complex64, device=self.device)
@@ -1957,9 +2290,12 @@ class CommonTemplate:
         self.common(fn, (x, y, 2))
 
     def test_add_complex9(self):
+        # [FUNCTION DOC] Regression for issue 160495: complex64 add of a zero-dimensional tensor
+        # and a one-element 1-D tensor with alpha.
         # Fix https://github.com/pytorch/pytorch/issues/160495
         # Test scalar complex addition: 0D + 1D
         def fn(a, b, alpha):
+            # [FUNCTION DOC] HELPER: Return add of a and b scaled by alpha.
             return torch.add(a, b, alpha=alpha)
 
         x = torch.rand((), dtype=torch.complex64, device=self.device)
@@ -1968,9 +2304,12 @@ class CommonTemplate:
         self.common(fn, (x, y, 2))
 
     def test_add_complex10(self):
+        # [FUNCTION DOC] Regression for issue 160495: complex64 add where a zero-dimensional tensor
+        # is broadcast against a 2 by 3 tensor.
         # Fix https://github.com/pytorch/pytorch/issues/160495
         # Test scalar complex broadcasting
         def fn(a, b, alpha):
+            # [FUNCTION DOC] HELPER: Return add of a and b scaled by alpha.
             return torch.add(a, b, alpha=alpha)
 
         x = torch.randn(2, 3, dtype=torch.complex64, device=self.device)
@@ -1978,7 +2317,10 @@ class CommonTemplate:
         self.common(fn, (x, y, 2))
 
     def test_concat_add_inplace(self):
+        # [FUNCTION DOC] Concatenate two tensors along dim 1 then add a third in place; compared to
+        # eager.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Concatenate x and y on dim 1 and add z to the result in place.
             return torch.cat([x, y], dim=1).add_(z)
 
         x = torch.randn([2, 12, 14, 14])
@@ -1988,14 +2330,19 @@ class CommonTemplate:
         self.common(fn, (x, y, z))
 
     def test_abs(self):
+        # [FUNCTION DOC] Pointwise absolute value test on a random tensor.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple of a divided by abs of a plus one.
             return (a / (torch.abs(a) + 1),)
 
         self.common(fn, (torch.randn(17),))
 
     @xfail_if_triton_cpu
     def test_angle(self):
+        # [FUNCTION DOC] torch.angle on complex, real (with NaN) and integer inputs; compared to
+        # eager. Expected to fail on the triton CPU backend.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return the angle of each of three inputs as a tuple.
             return torch.angle(a), torch.angle(b), torch.angle(c)
 
         complex_input = torch.tensor(
@@ -2006,14 +2353,19 @@ class CommonTemplate:
         self.common(fn, (complex_input, real_input, interger_real_input))
 
     def test_sgn(self):
+        # [FUNCTION DOC] sgn on a linspace tensor, including sgn of values shifted by one.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return sgn of a and sgn of a plus one minus one.
             return torch.sgn(a), torch.sgn(a + 1) - 1
 
         self.common(fn, [torch.linspace(-10, 10, 41)])
 
     @skipCUDAIf(not SM80OrLater, "uses bfloat16 which requires SM >= 80")
     def test_scatter_bf16(self):
+        # [FUNCTION DOC] Scatter-add into zeros for int64, bool and bfloat16 (those the device
+        # supports) and compare with eager. CUDA requires sm80.
         def fn(inp, src, index):
+            # [FUNCTION DOC] HELPER: Scatter-add src into inp along dim 0 at the given index.
             return inp.scatter_add(0, index, src)
 
         for dtype in [torch.int64, torch.bool, torch.bfloat16]:
@@ -2029,7 +2381,13 @@ class CommonTemplate:
             )
 
     def test_randn_generator(self):
+        # [FUNCTION DOC] Random normal generation with a Generator argument. With a None generator
+        # the compiled output is only checked for shape/dtype style properties (values are not
+        # compared); passing a real Generator object must raise a dynamo Unsupported error
+        # mentioning Generator.
         def fn(a, generator):
+            # [FUNCTION DOC] HELPER: Return random normal 20 by 20 values on the input device using
+            # the given generator.
             return torch.randn([20, 20], generator=generator, device=a.device)
 
         self.common(fn, (torch.linspace(-10, 10, 41), None), assert_equal=False)
@@ -2039,13 +2397,18 @@ class CommonTemplate:
             self.common(fn, (torch.linspace(-10, 10, 41), torch.Generator(self.device)))
 
     def test_sgn_extremal(self):
+        # [FUNCTION DOC] sgn on NaN, infinity, negative infinity and zero from numpy constants.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple with sgn of a.
             return (torch.sgn(a),)
 
         self.common(fn, [torch.tensor([np.nan, np.inf, -np.inf, 0])])
 
     def test_max_min(self):
+        # [FUNCTION DOC] Elementwise maximum and minimum, including inputs containing NaN so NaN
+        # propagation is compared with eager.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the elementwise maximum and minimum of a and b.
             return (torch.maximum(a, b), torch.minimum(a, b))
 
         self.common(fn, (torch.randn(8), torch.randn(8)))
@@ -2056,8 +2419,11 @@ class CommonTemplate:
         self.common(fn, (t1, t2))
 
     def test_neg_max_uint8(self):
+        # [FUNCTION DOC] Regression for issue 93380: maximum of a uint8 tensor and the negation
+        # (wrapping) of a one-element uint8 tensor over a large vector.
         # https://github.com/pytorch/pytorch/issues/93380
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return maximum of b and the negation of a.
             c = torch.neg(a)
             return torch.maximum(b, c)
 
@@ -2066,14 +2432,20 @@ class CommonTemplate:
         self.common(fn, (a, b))
 
     def test_compar(self):
+        # [FUNCTION DOC] Comparison ops gt, ge, eq, le, lt and ne against float constants on an
+        # integer tensor.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the six comparison results of x against 3.5 or 2.5.
             return x.gt(3.5), x.ge(3.5), x.eq(3.5), x.le(2.5), x.lt(3.5), x.ne(3.5)
 
         a = torch.tensor([3])
         self.common(fn, (a,))
 
     def test_horizonal_fusion1(self):
+        # [FUNCTION DOC] Horizontal fusion: three pointwise ops sharing inputs of different
+        # broadcast shapes.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return sum, difference and product of the inputs.
             return (a + b, a - c, b * c)
 
         self.common(
@@ -2081,13 +2453,20 @@ class CommonTemplate:
         )
 
     def test_horizonal_fusion2(self):
+        # [FUNCTION DOC] Horizontal fusion of three independent adds of constants on tensors with
+        # different shapes.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return a plus 1, b plus 2 and c plus 3.
             return a + 1, b + 2, c + 3
 
         self.common(fn, (torch.randn(8, 16, 8), torch.randn(8, 16), torch.randn(16, 8)))
 
     def test_vertical_fusion1(self):
+        # [FUNCTION DOC] Vertical fusion of a long pointwise chain taken from the pyhpc equation of
+        # state benchmark; checks numerics and that exactly one kernel is generated.
         def fn(sa, ct, p):
+            # [FUNCTION DOC] HELPER: Evaluate the equation-of-state style polynomial of sa, ct and
+            # p and return reciprocal plus product terms.
             # From torchbench.pyhpc_equation_of_state
             v17 = -3.087032500374211e-7
             v18 = -1.988366587925593e-8
@@ -2112,8 +2491,11 @@ class CommonTemplate:
     @config.patch({"fx_graph_cache": False})
     @skipIfWindows(msg="torch._dynamo.exc.Unsupported")
     def test_forced_buffer_realize(self):
+        # [FUNCTION DOC] Checks the test operator realize forces a buffer to be materialized: after
+        # running, the pre-fusion IR node count is two. FX graph cache is disabled for the test.
         # Test torch._test_inductor_realize forces a buffer to be realized
         def fn(a):
+            # [FUNCTION DOC] HELPER: Realize a times two and then multiply by two again.
             b = test_operators.realize(a * 2)
             return (b * 2,)
 
@@ -2123,9 +2505,14 @@ class CommonTemplate:
     @config.patch({"fx_graph_cache": False})
     @skipIfWindows(msg="torch._dynamo.exc.Unsupported")
     def test_scheduler_vertical_fusion1(self):
+        # [FUNCTION DOC] Scheduler vertical fusion: the same equation-of-state chain as above but
+        # with realize forced at each step, so five IR nodes exist before fusion, which must still
+        # fuse into one kernel (two on the C++ backend). FX graph cache disabled.
         realize = test_operators.realize
 
         def fn(sa, ct, p):
+            # [FUNCTION DOC] HELPER: Equation-of-state chain with realization forced after each
+            # intermediate result.
             # From torchbench.pyhpc_equation_of_state
             v17 = -3.087032500374211e-7
             v18 = -1.988366587925593e-8
@@ -2151,7 +2538,11 @@ class CommonTemplate:
         )
 
     def test_index_propagation(self):
+        # [FUNCTION DOC] Index propagation: indexing with an arange of the same length should be
+        # optimized to direct indexing; asserts no indirect indexing in generated code and equal
+        # output to eager.
         def copy(x):
+            # [FUNCTION DOC] HELPER: Build an arange over the first dim and index x with it.
             i = torch.arange(x.size(0), device=x.device)
             return x[i]
 
@@ -2168,7 +2559,13 @@ class CommonTemplate:
     @config.patch("halide.scheduler_cuda", "Li2018")
     @config.patch(implicit_fallbacks=True)
     def test_index_propagation_nested_indirect_indexing(self):
+        # [FUNCTION DOC] Nested indirect indexing: a dynamic-shape repeat_interleave of an arange
+        # feeding index_select, with the repeats tensor marked dynamic; compares compiled and
+        # eager. Dynamo captures dynamic output shape ops and implicit fallbacks are allowed;
+        # Halide schedulers are overridden.
         def nested(x, repeats):
+            # [FUNCTION DOC] HELPER: Repeat arange of the repeats length by repeats and select
+            # those rows of x.
             rank = torch.arange(repeats.numel(), device=x.device)
             index = rank.repeat_interleave(repeats, dim=0)
             return torch.index_select(x, index=index, dim=0)
@@ -2186,7 +2583,10 @@ class CommonTemplate:
         self.assertEqual(expect, actual)
 
     def test_index_propagation_flip(self):
+        # [FUNCTION DOC] Index propagation of a flipped arange index: checks no indirect indexing
+        # in generated code and result equals eager.
         def flip(x):
+            # [FUNCTION DOC] HELPER: Index x with a descending arange, i.e. reverse it along dim 0.
             i = torch.arange(x.size(0) - 1, -1, -1, device=x.device)
             return x[i]
 
@@ -2199,7 +2599,12 @@ class CommonTemplate:
 
     @unittest.skipIf(TEST_WITH_ASAN, "inf to int cast is UB under sanitizers")
     def test_index_propagation_to_dtype_inf(self):
+        # [FUNCTION DOC] Log of zeros gives -inf; summing with an int32 dtype and converting back
+        # to float must compile and match eager. Skipped under ASAN because the infinity to integer
+        # cast is undefined behavior.
         def fn():
+            # [FUNCTION DOC] HELPER: Take the log of a zeros tensor and sum in int32, returning
+            # float.
             x = torch.full((2,), 0.0, device=self.device)
             y = torch.log(x)
             return torch.sum(y, dtype=torch.int32).float()
@@ -2207,7 +2612,12 @@ class CommonTemplate:
         self.common(fn, ())
 
     def test_index_propagation_floordiv(self):
+        # [FUNCTION DOC] Index propagation through integer floor division (a repeat-interleave
+        # pattern): code must have no indirect indexing; an assert is expected only under dynamic
+        # shapes; compared with the repeat_interleave op and eager.
         def repeat_interleave(x, n):
+            # [FUNCTION DOC] HELPER: Gather rows of x using an arange divided by n, i.e. repeat
+            # each row n times.
             # e.g. x=[1, 2, 3], n=2 => returns [1, 1, 2, 2, 3, 3]
             i = torch.arange(x.shape[0] * n, device=x.device)
             return x[i // n]
@@ -2225,7 +2635,12 @@ class CommonTemplate:
         self.assertEqual(actual, repeat_interleave(x, 3))
 
     def test_index_propagation_remainder(self):
+        # [FUNCTION DOC] Index propagation through remainder (repeat tiling pattern): asserts no
+        # indirect indexing, no wrapping code, and an assert only for dynamic shapes; compares with
+        # repeat on x and eager.
         def repeat(x, n):
+            # [FUNCTION DOC] HELPER: Gather rows of x using an arange modulo the row count, tiling
+            # x n times.
             # e.g. x=[1, 2, 3], n=2 => returns [1, 2, 3, 1, 2, 3]
             i = torch.arange(x.shape[0] * n, device=x.device)
             return x[i % x.shape[0]]
@@ -2244,7 +2659,11 @@ class CommonTemplate:
         self.assertEqual(actual, repeat(x, 3))
 
     def test_index_propagation_abs(self):
+        # [FUNCTION DOC] Index propagation through abs (reflection pad pattern): asserts direct
+        # indexing with no wrapping and an assert only for dynamic shapes; compares with eager.
         def reflection_pad_left(x, n):
+            # [FUNCTION DOC] HELPER: Index x with the absolute value of an arange minus n, giving a
+            # left reflection pad.
             # e.g. x=[1, 2, 3], n=2 => returns [3, 2, 1, 2, 3]
             i = torch.arange(x.shape[0] + n, device=x.device)
             return x[(i - n).abs()]
@@ -2262,7 +2681,12 @@ class CommonTemplate:
         self.assertEqual(expect, actual)
 
     def test_index_propagation_device_assert_masked(self):
+        # [FUNCTION DOC] Indexing with an index tensor built from an arange padded with 1050 zeros
+        # on the left and passed through a where that keeps it unchanged; compares numerics with
+        # eager (exercises the device assert on masked index computations).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Pad an arange of indices with zeros on the left, select with a
+            # where on non-negative values, and index a with them.
             idx = torch.arange(a.size(0), device=a.device)
             padded_idx = torch.constant_pad_nd(idx, (1050, 0))
             padded_idx = torch.where(padded_idx >= 0, padded_idx, padded_idx)
@@ -2271,7 +2695,9 @@ class CommonTemplate:
         self.common(fn, (torch.randn(1024),))
 
     def test_index_remainder(self):
+        # [FUNCTION DOC] Indexing with a random integer index taken modulo 12.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return x indexed by y modulo 12.
             return x[y % 12]
 
         self.common(fn, (torch.rand(1024), torch.randint(50, (50,))))
@@ -2280,9 +2706,19 @@ class CommonTemplate:
     @config.patch(debug_index_asserts=False)
     @config.patch("cpp.enable_tiling_heuristics", False)
     def test_neg_index(self):
+        # [FUNCTION DOC] Checks negative index handling across backends. For several index patterns
+        # it compiles and inspects generated code for whether an index bounds assert and a negative
+        # wrapping (ternary or where) are present, and whether the CPU kernel is vectorized. Halide
+        # and Pallas are not checked; MPS checks error reporting and ternary; cpu uses C++ code;
+        # other devices use triton code. Runs with index asserts disabled and CPU tiling heuristics
+        # disabled. Not run on s390x.
         def test(
             fn, inps, has_assert: bool, has_wrapping: bool, vectorize: bool = True
         ):
+            # [FUNCTION DOC] HELPER: Compile fn, generate code for the active backend and assert
+            # that the presence of a bounds check and of negative wrapping match has_assert and
+            # has_wrapping, and (CPU vector case) that vector loads appear exactly when vectorize
+            # is set.
             fn_opt = torch.compile(fn)
             if is_halide_backend(self.device):
                 pass  # no device asserts in halide
@@ -2314,6 +2750,7 @@ class CommonTemplate:
                 self.assertTrue(("device_assert" in code) is has_assert)
 
         def indirect(a, b):
+            # [FUNCTION DOC] HELPER: Index a with b minus one.
             return a[b - 1]
 
         a = torch.rand(1024, device=self.device)
@@ -2321,6 +2758,7 @@ class CommonTemplate:
         test(indirect, (a, b), has_assert=True, has_wrapping=True)
 
         def direct(x):
+            # [FUNCTION DOC] HELPER: Take the last column via a negative constant slice index.
             return x[:, -1]
 
         a = torch.rand(1, 64, 32, device=self.device)
@@ -2328,6 +2766,7 @@ class CommonTemplate:
         test(direct, (a,), has_assert=False, has_wrapping=False, vectorize=False)
 
         def flip(a, b):
+            # [FUNCTION DOC] HELPER: Index a by index tensor b.
             return a[b]
 
         a = torch.rand(1024, device=self.device)
@@ -2336,6 +2775,8 @@ class CommonTemplate:
 
         # Constant propagate a constant that's negative
         def flip_with_index_constant(a):
+            # [FUNCTION DOC] HELPER: Build a descending negative arange inside the function and
+            # index a with it.
             b = torch.arange(start=-1, end=-a.numel() - 1, step=-1, device=a.device)
             return a[b]
 
@@ -2344,6 +2785,8 @@ class CommonTemplate:
 
         # Operation where we can't prove that the index is always positive or negative
         def pos_and_neg(a):
+            # [FUNCTION DOC] HELPER: Index a with an arange that goes from positive to negative
+            # values.
             b = torch.arange(start=1, end=-a.numel() - 1, step=-1, device=a.device)
             return a[b]
 
@@ -2353,6 +2796,8 @@ class CommonTemplate:
         # After removing mul(1.0) no-op and replacing with convert_element_type,
         # constant propagation now works correctly, so no bounds check is needed
         def flip_with_index(a):
+            # [FUNCTION DOC] HELPER: Build a descending negative float arange, convert to int and
+            # index a with it.
             b = 1.0 * torch.arange(
                 start=-1, end=-a.numel() - 1, step=-1, device=a.device
             )
@@ -2368,11 +2813,13 @@ class CommonTemplate:
         )
 
         def unsafe_index(a, b):
+            # [FUNCTION DOC] HELPER: Index a through the unchecked unsafe index op with tensor b.
             return aten._unsafe_index(a, (b,))
 
         test(unsafe_index, (a, b), has_assert=False, has_wrapping=True)
 
         def constant_propagation(a):
+            # [FUNCTION DOC] HELPER: Index a with a constant positive index tensor.
             b = torch.tensor([2], device=a.device)
             return a[b]
 
@@ -2385,6 +2832,7 @@ class CommonTemplate:
         )
 
         def constant_propagation_neg(a):
+            # [FUNCTION DOC] HELPER: Index a with a constant negative index tensor.
             b = torch.tensor([-2], device=a.device)
             return a[b]
 
@@ -2398,7 +2846,12 @@ class CommonTemplate:
         )
 
     def test_computed_buffer_inlining(self):
+        # [FUNCTION DOC] Checks that a computed index buffer used both for an indexing op and as a
+        # returned value can still be inlined: no indirect indexing in the code and result equals
+        # eager.
         def flip(x):
+            # [FUNCTION DOC] HELPER: Build a descending arange, return x indexed by it together
+            # with the index tensor.
             idx = torch.arange(x.size(0) - 1, -1, -1, device=x.device)
             return x[idx], idx
 
@@ -2410,7 +2863,10 @@ class CommonTemplate:
         self.assertEqual(expect, actual)
 
     def test__unsafe_masked_index(self):
+        # [FUNCTION DOC] Unsafe masked index op on an 8-element tensor with a boolean mask whose
+        # False entry hides an out-of-range index, compared with eager.
         def fn(a, mask, idx):
+            # [FUNCTION DOC] HELPER: Call the unsafe masked index op with fill value one.
             return aten._unsafe_masked_index(a, mask, idx, 1)
 
         self.common(
@@ -2423,7 +2879,9 @@ class CommonTemplate:
         )
 
     def test__unsafe_masked_index_put_accumulate(self):
+        # [FUNCTION DOC] Unsafe masked index_put with accumulate: tensor, mask, indices and values.
         def fn(a, mask, idx, values):
+            # [FUNCTION DOC] HELPER: Call the unsafe masked index_put accumulate op.
             return aten._unsafe_masked_index_put_accumulate(a, mask, idx, values)
 
         self.common(
@@ -2437,19 +2895,30 @@ class CommonTemplate:
         )
 
     def test_sum1(self):
+        # [FUNCTION DOC] Pointwise add followed by a sum over the last dim of 8 by 8 inputs.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the sum of a plus b over the last dim as a one-element
+            # tuple.
             return ((a + b).sum(-1),)
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
     def test_sum2(self):
+        # [FUNCTION DOC] Sum reductions of an add result over dims 1 and 2 and over the last dim of
+        # four-dimensional inputs.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the add result summed over dims 1 and 2 and over the
+            # last dim.
             return ((a + b).sum([1, 2]), (a + b).sum(-1))
 
         self.common(fn, (torch.randn(8, 9, 3, 21), torch.randn(8, 9, 3, 21)))
 
     def test_sum3(self):
+        # [FUNCTION DOC] Add, last-dim sum, and a squeezed broadcast operand plus ten, returned
+        # together; uses looser tolerances because of known mismatches in a few elements.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the add result, its last-dim sum, and squeezed b plus
+            # ten.
             r1 = a + b
             r2 = r1.sum(-1)
             r3 = torch.squeeze(b) + 10
@@ -2461,7 +2930,11 @@ class CommonTemplate:
         self.common(fn, (torch.randn(10, 10), torch.randn(1, 10)), atol=1e-5, rtol=2e-3)
 
     def test_sum4(self):
+        # [FUNCTION DOC] Chain of pointwise ops and two successive last-dim sums on a four
+        # dimensional input, returning all intermediates.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compute b as input plus one, c its sum, d plus three, e its
+            # sum, f plus five, and return all five.
             b = a + 1
             c = b.sum(-1)
             d = c + 3
@@ -2472,7 +2945,11 @@ class CommonTemplate:
         self.common(fn, (torch.randn(1, 16, 8, 8),))
 
     def test_sum5(self):
+        # [FUNCTION DOC] Like the previous chain test but only the final result is returned, using
+        # odd-sized dimensions.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Same chain of adds and two sums, returning only the final
+            # value.
             b = a + 1
             c = b.sum(-1)
             d = c + 3
@@ -2483,14 +2960,20 @@ class CommonTemplate:
         self.common(fn, (torch.randn(1, 17, 8, 9),))
 
     def test_reduction1(self):
+        # [FUNCTION DOC] Sum, max, min, argmax and argmin of a tensor with negative infinity, zero
+        # and infinity.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the five full reductions of a.
             return (a.sum(), a.max(), a.min(), a.argmax(), a.argmin())
 
         self.common(fn, (torch.tensor([float("-inf"), 0.0, float("inf")]),))
 
     @skip_if_x86_mac()
     def test_reduction2(self):
+        # [FUNCTION DOC] Reductions on an all-infinity tensor (argmax omitted, see in-test FIXME).
+        # Skipped on x86 macOS.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return sum, max, min and argmin of a.
             # FIXME: a.argmax
             return (a.sum(), a.max(), a.min(), a.argmin())
 
@@ -2498,17 +2981,23 @@ class CommonTemplate:
 
     @skip_if_x86_mac()
     def test_reduction3(self):
+        # [FUNCTION DOC] Reductions on an all negative-infinity tensor (argmin omitted). Skipped on
+        # x86 macOS.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return sum, max, min and argmax of a.
             # FIXME: a.argmin
             return (a.sum(), a.max(), a.min(), a.argmax())
 
         self.common(fn, (torch.full((4,), float("-inf")),))
 
     def test_reduction4(self):
+        # [FUNCTION DOC] Argmax and argmin along the last dim for all-ones inputs (ties). Skipped
+        # on CPU due to non-deterministic results; low precision checking is disabled for Halide.
         if self.device == "cpu":
             raise unittest.SkipTest("Non-deterministic CPU results")
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return last-dim argmax and argmin of a.
             return (a.argmax(-1), a.argmin(-1))
 
         inputs = (torch.ones(128), torch.ones(4, 4, 1))
@@ -2517,16 +3006,23 @@ class CommonTemplate:
 
     @config.patch(unroll_reductions_threshold=1)
     def test_reduction5(self):
+        # [FUNCTION DOC] Full reductions on an all negative-infinity tensor with the reduction
+        # unroll threshold set to 1. Skipped on CPU (non-deterministic).
         if self.device == "cpu":
             raise unittest.SkipTest("Non-deterministic CPU results")
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return sum, max, min and argmax of a.
             return (a.sum(), a.max(), a.min(), a.argmax())
 
         self.common(fn, (torch.full((4,), float("-inf")),))
 
     @skip_if_not_triton
     def test_reduction_config_limit(self):
+        # [FUNCTION DOC] Triton-only test that building reduction configs for very large size hints
+        # does not exceed the device maximum grid size: in a loop of four iterations it grows the x
+        # size hint to the next power of two and calls the reduction config builder with the device
+        # warp size. Passes if no exception is raised.
         """
         This unit-test tests whether we exceed cudaDeviceProperties.maxGridSize in
         triton reduction configs for large size hints. #128826 introduced a scaling XBLOCK
@@ -2543,14 +3039,22 @@ class CommonTemplate:
             triton_config_reduction(size_hints, 1, 2048, 1, 8, warp_size=warp_size)
 
     def test_prod(self):
+        # [FUNCTION DOC] Product reductions over dim 0, dim 1 and all elements, for a square input
+        # and a wide one-row input.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return products of a over dim 0, dim 1 and the whole tensor.
             return a.prod(0), a.prod(1), a.prod()
 
         self.common(fn, (torch.rand((10, 10)),))
         self.common(fn, (torch.rand((1, 2050)),))
 
     def test_unroll_small_reduction(self):
+        # [FUNCTION DOC] Small reductions (min, max with indices, sum, any, all, argmin, argmax,
+        # amin, amax, aminmax) are checked once with an unroll threshold of 8 (unrolled) and once
+        # with threshold 1 (not unrolled), resetting dynamo in between.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compute many last-dim reductions of x and return them as a
+            # tuple.
             val1, index1 = x.min(-1)
             val2, index2 = x.max(-1)
             return (
@@ -2577,17 +3081,23 @@ class CommonTemplate:
             self.common(fn, (torch.randn(8, 3),))
 
     def test_multilayer_sum_low_prec(self):
+        # [FUNCTION DOC] Mean of a large float16 tensor to exercise multilayer reductions in low
+        # precision. Skipped on CPU (fp16 not implemented there).
         # fp16 nyi for cpu
         if self.device == "cpu":
             raise unittest.SkipTest(f"requires {GPU_TYPE}")
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the mean of a.
             return torch.mean(a)
 
         self.common(fn, ((torch.rand((10, 3, 352, 352), dtype=torch.float16),)))
 
     def test_multilayer_prime_size(self):
+        # [FUNCTION DOC] Max and sum of a 3999971-element int64 vector (prime length, one non-zero
+        # element at the end), requiring masked loads in the intermediate reduction.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return max and sum of a.
             return torch.max(a), torch.sum(a)
 
         # Requires masked loading for the intermediate reduction
@@ -2598,7 +3108,10 @@ class CommonTemplate:
     @skip_if_gpu_halide
     @skipCPUIf(IS_MACOS, "fails on macos")
     def test_multilayer_var(self):
+        # [FUNCTION DOC] Variance of a large float32 tensor and of a prime-sized vector with
+        # relaxed tolerances. Skipped on GPU Halide and on CPU macOS.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the variance of a.
             return torch.var(a)
 
         self.common(
@@ -2617,7 +3130,10 @@ class CommonTemplate:
     @skipCPUIf(IS_MACOS, "fails on macos")
     @skip_if_halide  # accuracy 4.7% off
     def test_multilayer_var_lowp(self):
+        # [FUNCTION DOC] Variance of float16 inputs. Tolerances are loosened only on CPU with the
+        # default ATen CPU capability. Skipped on macOS CPU and Halide.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the variance of a.
             return torch.var(a)
 
         atol = None
@@ -2636,7 +3152,11 @@ class CommonTemplate:
         )
 
     def test_split_cumsum(self):
+        # [FUNCTION DOC] Cumulative sum over the last dim (split scan), flattened and 2-D views of
+        # a large non-negative tensor, for all supported non-complex, non-half dtypes including
+        # bool; relative errors are avoided by drawing values from zero upward.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return cumulative sum of a over the last dim.
             return torch.cumsum(a, -1)
 
         for dtype in get_all_dtypes(
@@ -2654,8 +3174,11 @@ class CommonTemplate:
             self.common(fn, (inp.view(10, -1),), rtol=1e-4, atol=1e-5, check_lowp=False)
 
     def test_split_cumsum_broadcast(self):
+        # [FUNCTION DOC] Regression test for issue 180221: cumsum along dim 1 of a sum of a
+        # non-negative tensor and a broadcast operand.
         # https://github.com/pytorch/pytorch/issues/180221
         def fn(x, b):
+            # [FUNCTION DOC] HELPER: Return cumsum along dim 1 of x plus b.
             return torch.cumsum(x + b, dim=1)
 
         x = make_tensor(1, 129, 64, low=0, dtype=torch.float32, device=self.device)
@@ -2665,10 +3188,13 @@ class CommonTemplate:
     @skipCUDAIf(not SM80OrLater, "Requires sm80")
     @skip_if_gpu_halide  # accuracy issue
     def test_split_cumsum_low_prec(self):
+        # [FUNCTION DOC] Cumulative sum of a flattened large float16 tensor with a float reference.
+        # Needs sm80 on CUDA; skipped on the C++ CPU backend and on GPU Halide.
         if is_cpp_backend(self.device):
             raise unittest.SkipTest("ir.Scan nyi on CPU")
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the flattened cumulative sum of a.
             return torch.cumsum(a.view(-1), 0)
 
         self.common(
@@ -2682,7 +3208,11 @@ class CommonTemplate:
     # not yet implemented in Triton CPU.
     @xfail_if_triton_cpu
     def test_consecutive_split_cumsum(self):
+        # [FUNCTION DOC] Two split cumulative sums of large flattened float32 and float64 tensors
+        # added together. If the device lacks either dtype, the test expects a TypeError. Expected
+        # to fail on Triton CPU (missing debug barrier).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Flatten a and b and return the sum of their cumulative sums.
             a = a.view(-1)
             b = b.view(-1)
             return torch.cumsum(a, 0) + torch.cumsum(b, 0)
@@ -2707,10 +3237,15 @@ class CommonTemplate:
     @xfail_if_triton_cpu
     @config.patch(max_autotune_pointwise=True)
     def test_split_cumsum_index(self):
+        # [FUNCTION DOC] Split scan workspace test: cumulative sum of 16384 lengths turned into
+        # offsets then used to index a data tensor; indirect indexing would reveal a workspace that
+        # was not zeroed. Autotuned pointwise enabled; expected to fail on Triton CPU.
         # Split scan uses a workspace that needs to be zeroed before use.
         # data[index] does indirect indexing that should catch issues if the
         # workspace is not zeroed.
         def fn(lengths, data):
+            # [FUNCTION DOC] HELPER: Compute offsets as cumulative sum of lengths and gather data
+            # at them.
             offsets = torch.cumsum(lengths, 0)
             return data[offsets]
 
@@ -2724,7 +3259,10 @@ class CommonTemplate:
     # implemented in the Triton CPU version pinned in CI.
     @xfail_if_triton_cpu
     def test_split_cumprod(self):
+        # [FUNCTION DOC] Cumulative product over the last dim of large safe inputs for float32,
+        # float64, int32 and int64. Expected to fail on Triton CPU.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return cumulative product of a over the last dim.
             return torch.cumprod(a, -1)
 
         for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
@@ -2738,10 +3276,13 @@ class CommonTemplate:
     @skipCUDAIf(not SM80OrLater, "Requires sm80")
     @skip_if_gpu_halide  # accuracy issue
     def test_split_cumprod_low_prec(self):
+        # [FUNCTION DOC] Cumulative product of large float16 and bfloat16 flattened inputs against
+        # a float reference. Needs sm80 on CUDA; skipped on the C++ CPU backend and GPU Halide.
         if is_cpp_backend(self.device):
             raise unittest.SkipTest("ir.Scan nyi on CPU")
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the flattened cumulative product of a.
             return torch.cumprod(a.view(-1), 0)
 
         for dtype in [torch.float16, torch.bfloat16]:
@@ -2761,7 +3302,10 @@ class CommonTemplate:
     # not yet implemented in Triton CPU.
     @xfail_if_triton_cpu
     def test_consecutive_split_cumprod(self):
+        # [FUNCTION DOC] Sum of two cumulative products of float32 and float64 vectors; expects a
+        # TypeError when the device lacks either dtype. Expected to fail on Triton CPU.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the cumulative product of a plus that of b along dim 0.
             return torch.cumprod(a, 0) + torch.cumprod(b, 0)
 
         dtype_a = torch.float32
@@ -2785,10 +3329,14 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op(self):
+        # [FUNCTION DOC] Custom associative scan with a sum combine function and with a log-cumsum
+        # combine function, compared with cumsum and logcumsumexp. GPU only; static shapes forced;
+        # skipped on Halide.
         if self.device != "cuda" and self.device != "xpu":
             raise unittest.SkipTest("associative_scan only supported on GPU")
 
         def sum_combine(a, b):
+            # [FUNCTION DOC] HELPER: Combine function adding two values.
             return a + b
 
         from torch._higher_order_ops.associative_scan import associative_scan
@@ -2799,6 +3347,8 @@ class CommonTemplate:
         self.assertEqual(expect, actual)
 
         def logcumsum_combine(a, b):
+            # [FUNCTION DOC] HELPER: Combine function implementing a numerically careful log of sum
+            # of exponentials of two values, treating equal infinities specially.
             min_v = torch.minimum(a, b)
             max_v = torch.maximum(a, b)
             mask = (min_v != max_v) | ~min_v.isinf()
@@ -2814,15 +3364,21 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op_compiled(self):
+        # [FUNCTION DOC] Compiles a function that sums an associative scan of the absolute
+        # difference of two inputs, compares with eager, and checks the generated code is a single
+        # triton kernel (a single call using the argument and output buffers). GPU only.
         if self.device != "cuda" and self.device != "xpu":
             raise unittest.SkipTest("associative_scan only supported on GPU")
 
         from torch._higher_order_ops.associative_scan import associative_scan
 
         def sum_combine(a, b):
+            # [FUNCTION DOC] HELPER: Combine function adding two values.
             return a + b
 
         def fn(a, b, dim):
+            # [FUNCTION DOC] HELPER: Take absolute difference of a and b, associative-scan it with
+            # sum along dim, and sum the result along dim.
             diff = (a - b).abs()
             sad = associative_scan(sum_combine, diff, dim)
             return sad.sum(dim)
@@ -2849,10 +3405,15 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_op_multi_input(self):
+        # [FUNCTION DOC] Associative scan over a pair of tensors (values and indices) with an
+        # argmax combine function, compared to cummax; the index tensor is an expanded arange. GPU
+        # only.
         if self.device != "cuda" and self.device != "xpu":
             raise unittest.SkipTest("associative_scan only supported on GPU")
 
         def argmax_combine(a, b):
+            # [FUNCTION DOC] HELPER: Combine two value-index pairs keeping the larger value,
+            # breaking ties by the larger index; returns the chosen pair.
             a_value, a_index = a
             b_value, b_index = b
             mask = (a_value > b_value) | ((a_value == b_value) & (a_index > b_index))
@@ -2876,10 +3437,16 @@ class CommonTemplate:
         {"dynamic_shapes": False, "assume_static_by_default": True}
     )
     def test_custom_scan_would_split(self):
+        # [FUNCTION DOC] Associative scan with a linear recurrence combine function on a tensor
+        # long enough (129 steps) that Inductor would split the scan; compiled result is compared
+        # with a float64 eager loop implementation. GPU only; static shapes forced; skipped on
+        # Halide.
         if self.device != "cuda" and self.device != "xpu":
             raise unittest.SkipTest("associative_scan only supported on GPU")
 
         def combine_linear_recurrence(left, right):
+            # [FUNCTION DOC] HELPER: Combine two (x, f) pairs of a linear recurrence: new x is the
+            # left x times right f plus right x, new f is the product of the two f values.
             xl, fl = left
             xr, fr = right
             x = xl * fr + xr
@@ -2887,6 +3454,8 @@ class CommonTemplate:
             return x, f
 
         def eager_scan(x, g):
+            # [FUNCTION DOC] HELPER: Reference sequential scan along dim 1 in float64, applying the
+            # combine function step by step; returns float32 results for both outputs.
             x, g = x.to(torch.float64), g.to(torch.float64)
             x_out = torch.empty_like(x)
             g_out = torch.empty_like(g)
@@ -2901,6 +3470,9 @@ class CommonTemplate:
 
         @torch.compile
         def compiled_scan(x, f):
+            # [FUNCTION DOC] HELPER: Compiled function running the associative scan with the
+            # recurrence combine function along dim 1 on the pair of inputs, returning both scanned
+            # tensors.
             from torch._higher_order_ops.associative_scan import associative_scan
 
             x, f = associative_scan(combine_linear_recurrence, (x, f), dim=1)
@@ -2913,10 +3485,13 @@ class CommonTemplate:
         self.assertEqual(expect, actual)
 
     def test_embedding_bag_byte_unpack(self):
+        # [FUNCTION DOC] Quantized embedding_bag_byte_unpack on a packed uint8 matrix (data bytes
+        # followed by byte views of random scales and offsets). CPU only; skipped on other devices.
         if self.device != "cpu":
             raise unittest.SkipTest(f"No {GPU_TYPE} implementation (it returns empty)")
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Call the quantized embedding bag byte unpack op on a.
             return torch.ops.quantized.embedding_bag_byte_unpack(a)
 
         M, N = 32, 64
@@ -2928,13 +3503,20 @@ class CommonTemplate:
 
     @xfail_if_mps_unimplemented
     def test_int8_weight_only_quant(self):
+        # [FUNCTION DOC] Weight-only int8 matmul: quantizes a random bfloat16 weight per channel,
+        # runs the int8 pack matmul with scales plus a bias and compares to eager. Expected failure
+        # on MPS.
         def convert_weight_to_int8pack(b):
+            # [FUNCTION DOC] HELPER: Dynamically quantize weight b per channel to int8 and return
+            # the packed weights and scales.
             b_int8pack, b_scales, _ = _dynamically_quantize_per_channel(
                 b, -128, 127, torch.int8
             )
             return b_int8pack, b_scales
 
         def fn(a, b_int8pack, b_scales, c):
+            # [FUNCTION DOC] HELPER: Run the weight int8 pack matmul of a with the quantized weight
+            # and scales and add c.
             res = torch._weight_int8pack_mm(a, b_int8pack, b_scales)
             res = res + c
             return res
@@ -2955,6 +3537,10 @@ class CommonTemplate:
     # Pallas codegen doesn't handle reduction axis after FloorDiv(ModularIndexing) simplification
     @xfail_if_pallas
     def test__dyn_quant_pack_4bit_weight_fp32(self):
+        # [FUNCTION DOC] Dynamic 4-bit quantization weight packing for a float32 weight with group
+        # size 32 (CPU op): packs symmetric group-quantized weights and compares packed bits to
+        # eager. Seeded; skipped on CUDA/XPU; expected failure on MPS, Pallas, and Triton CPU
+        # without AVX512 bf16.
         q_group = 32
         k = 128
         n = 128
@@ -2965,6 +3551,9 @@ class CommonTemplate:
         out_features = b.size(1)
 
         def dyn_quant_pack_4bit_weight(b, in_features, out_features):
+            # [FUNCTION DOC] HELPER: Group-quantize b to 4 bits symmetrically, cast scales and
+            # zeros to float if the group covers all input features else to bfloat16, pack with the
+            # dynamic quant pack op, and return packed weights and the scales.
             b_uint8, b_scales_and_zeros = _group_quantize_tensor_symmetric(
                 b, n_bit=4, groupsize=q_group
             )
@@ -2980,6 +3569,8 @@ class CommonTemplate:
             return b_int4pack, b_scales_and_zeros
 
         def fn(b, in_features, out_features):
+            # [FUNCTION DOC] HELPER: Return only the packed int4 weight produced by the packing
+            # helper.
             b_int4pack, _ = dyn_quant_pack_4bit_weight(b, in_features, out_features)
             return b_int4pack
 
@@ -2993,6 +3584,8 @@ class CommonTemplate:
     # Pallas codegen doesn't handle reduction axis after FloorDiv(ModularIndexing) simplification
     @xfail_if_pallas
     def test__dyn_quant_pack_4bit_weight_bf16(self):
+        # [FUNCTION DOC] Same dynamic 4-bit weight packing check as the float32 variant but with a
+        # bfloat16 weight; skipped if bfloat16 is unsupported on the device and on Halide.
         k = 128
         n = 128
         q_group = 32
@@ -3008,6 +3601,9 @@ class CommonTemplate:
         out_features = b.size(1)
 
         def dyn_quant_pack_4bit_weight(b, in_features, out_features):
+            # [FUNCTION DOC] HELPER: Group-quantize b to 4 bits, cast scales to float or bfloat16
+            # depending on whether the group equals the input features, and pack with the dynamic
+            # quant pack op; returns packed weights and scales.
             b_uint8, b_scales_and_zeros = _group_quantize_tensor_symmetric(
                 b, n_bit=4, groupsize=q_group
             )
@@ -3023,6 +3619,7 @@ class CommonTemplate:
             return b_int4pack, b_scales_and_zeros
 
         def fn(b, in_features, out_features):
+            # [FUNCTION DOC] HELPER: Return only the packed int4 weight from the packing helper.
             b_int4pack, _ = dyn_quant_pack_4bit_weight(b, in_features, out_features)
             return b_int4pack
 
@@ -3035,6 +3632,9 @@ class CommonTemplate:
     @skipCUDAIf(True, "No _dyn_quant_matmul_4bit implementation on CUDA")
     @skipIfXpu(msg="No _dyn_quant_matmul_4bit implementation on XPU")
     def test__dyn_quant_matmul_4bit_fp32_input(self):
+        # [FUNCTION DOC] Dynamic 4-bit quantized matmul with float32 activations: packs a float32
+        # weight with group size 32 and multiplies; compared to eager. Not run on CUDA/XPU;
+        # expected failure on MPS, Pallas and Triton CPU without AVX512 bf16.
         q_group = 32
         m = 32
         k = 128
@@ -3047,6 +3647,9 @@ class CommonTemplate:
         out_features = b.size(1)
 
         def dyn_quant_pack_4bit_weight(b, in_features, out_features):
+            # [FUNCTION DOC] HELPER: Group-quantize b to 4 bits and pack it with the dynamic quant
+            # pack op, casting scales to float or bfloat16 as needed; returns packed weights and
+            # scales.
             b_uint8, b_scales_and_zeros = _group_quantize_tensor_symmetric(
                 b, n_bit=4, groupsize=q_group
             )
@@ -3062,6 +3665,8 @@ class CommonTemplate:
             return b_int4pack, b_scales_and_zeros
 
         def fn(a, q_group, in_features, out_features):
+            # [FUNCTION DOC] HELPER: Pack the captured weight and run the dynamic 4-bit quantized
+            # matmul of activation a with it, returning the product.
             b_int4pack, _ = dyn_quant_pack_4bit_weight(b, in_features, out_features)
             res = torch._dyn_quant_matmul_4bit(
                 a,
@@ -3083,6 +3688,10 @@ class CommonTemplate:
     @skipIfXpu(msg="No _dyn_quant_matmul_4bit implementation on XPU")
     @skip_if_halide  # bf16
     def test__dyn_quant_matmul_4bit_bf16_input(self):
+        # [FUNCTION DOC] Dynamic 4-bit quantized matmul with bfloat16 activations, group size equal
+        # to k, with the activation's first dim and weight second dim marked dynamic; compared to
+        # eager with loose tolerances. Skipped without bfloat16 support, on macOS CPU, CUDA, XPU
+        # and Halide; expected failure on ARM64 without SVE.
         m = 32
         k = 128
         n = 128
@@ -3110,6 +3719,8 @@ class CommonTemplate:
             )
 
         def dyn_quant_pack_4bit_weight(b, in_features, out_features):
+            # [FUNCTION DOC] HELPER: Group-quantize b to 4 bits and pack it with the dynamic quant
+            # pack op; scales are float if the group equals the input features.
             b_uint8, b_scales_and_zeros = _group_quantize_tensor_symmetric(
                 b, n_bit=4, groupsize=q_group
             )
@@ -3125,6 +3736,8 @@ class CommonTemplate:
             return b_int4pack, b_scales_and_zeros
 
         def fn(a, q_group, in_features, out_features):
+            # [FUNCTION DOC] HELPER: Pack the captured weight, then run the aten dynamic 4-bit
+            # matmul of a with the packed weight and return it.
             b_int4pack, _ = dyn_quant_pack_4bit_weight(b, in_features, out_features)
             res = torch.ops.aten._dyn_quant_matmul_4bit(
                 a,
@@ -3138,7 +3751,10 @@ class CommonTemplate:
         self.common(fn, (a, q_group, in_features, out_features), atol=1, rtol=0.5)
 
     def test_expanded_reduction(self):
+        # [FUNCTION DOC] Reduction over the first two dims of a product of two inputs where one is
+        # expanded (broadcast) along dim 1.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the product of x and y summed over dims 0 and 1.
             z = x * y
             return z.sum((0, 1))
 
@@ -3150,7 +3766,11 @@ class CommonTemplate:
 
     @skip_if_gpu_halide
     def test_min_max_reduction(self):
+        # [FUNCTION DOC] Max, min and keepdim amax and amin reductions on float, float16 and (when
+        # supported) bfloat16 inputs. Skipped on GPU Halide.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return max and min of a plus b, and amax of a plus one and
+            # amin of b plus one with kept dims.
             return (
                 (a + b).max(),
                 (a + b).min(),
@@ -3166,7 +3786,10 @@ class CommonTemplate:
 
     @skip_if_halide  # bug in nan handling
     def test_min_max_reduction_nan(self):
+        # [FUNCTION DOC] Max and min over a vector containing NaN; NaN must propagate like eager.
+        # Skipped on Halide (NaN handling bug).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return max and min of a.
             return (torch.max(a), torch.min(a))
 
         t1 = torch.randn(32)
@@ -3175,7 +3798,11 @@ class CommonTemplate:
 
     @skip_if_halide  # bug in nan handling
     def test_fmin_fmax(self):
+        # [FUNCTION DOC] fmin and fmax on tensors with NaN in various positions, and fmax against a
+        # scalar tensor. Skipped on Halide (NaN handling bug).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return fmin and fmax of a and b, and fmax of a plus one with
+            # zero.
             return (
                 torch.fmin(a, b),
                 torch.fmax(a, b),
@@ -3195,7 +3822,10 @@ class CommonTemplate:
         )
 
     def test_sum_int(self):
+        # [FUNCTION DOC] Sum of bool, uint8 and int vectors reduced over the last dim and the whole
+        # tensor with an integer-promoting result, without low precision checking.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return twice the last-dim sum plus the full sum of x.
             return 2 * x.sum(-1) + x.sum()
 
         dtypes = torch.bool, torch.uint8, torch.int
@@ -3205,16 +3835,23 @@ class CommonTemplate:
             self.common(fn, (i,), check_lowp=False)
 
     def test_sum_dtype(self):
+        # [FUNCTION DOC] Sum with an explicit accumulation dtype (double, or bfloat16 on MPS) on a
+        # tensor of 70s, multiplied and added back.
         sum_dtype = torch.double if self.device != "mps" else torch.bfloat16
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x times the last-dim sum in the sum dtype plus the full
+            # sum in that dtype.
             return x * x.sum(-1, dtype=sum_dtype) + x.sum(dtype=sum_dtype)
 
         self.common(fn, (torch.ones(32, 32) * 70,))
 
     @skip_if_halide
     def test_cummin(self):
+        # [FUNCTION DOC] Cumulative minimum along dim 0 for a 16 by 32 matrix, a one-element vector
+        # and an empty tensor. Skipped on Halide.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the cumulative minimum of x along dim 0.
             return x.cummin(0)
 
         self.common(
@@ -3224,7 +3861,10 @@ class CommonTemplate:
         self.common(fn, (torch.rand(0),), check_lowp=not is_halide_backend(self.device))
 
     def test_cumsum(self):
+        # [FUNCTION DOC] Cumulative sums along dim 0 and 1 for sizes taking the persistent
+        # reduction path (small) and a non-persistent path (100 by 4000, with tight tolerances).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return cumulative sums of x along dim 0 and dim 1.
             return x.cumsum(0), x.cumsum(1)
 
         # Persistent reductions
@@ -3245,14 +3885,20 @@ class CommonTemplate:
         )
 
     def test_cumsum_zero_dim(self):
+        # [FUNCTION DOC] Cumulative sum of a zero-dimensional tensor along dim 0 and -1.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return cumsum of x along dim 0 and along the last dim.
             return x.cumsum(0), x.cumsum(-1)
 
         a = torch.rand(())
         self.common(fn, (a,))
 
     def test_cumsum_no_mask(self):
+        # [FUNCTION DOC] Cumulative sum over the last dim for rows of length 1024 (persistent) and
+        # 8192 (non-persistent), sizes where no mask is needed. Low precision check is skipped on
+        # ROCm and Halide.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the cumulative sum of x over the last dim.
             return x.cumsum(-1)
 
         # Persistent reduction
@@ -3272,14 +3918,20 @@ class CommonTemplate:
         )
 
     def test_cumprod_zero_dim(self):
+        # [FUNCTION DOC] Cumulative product of a zero-dimensional tensor along dim 0 and -1.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return cumprod of x along dim 0 and along the last dim.
             return x.cumprod(0), x.cumprod(-1)
 
         a = torch.rand(())
         self.common(fn, (a,))
 
     def test_flip_zero_dim(self):
+        # [FUNCTION DOC] Flip of a zero-dimensional tensor using many dim spellings (integer, list,
+        # negative, torch function, empty list).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return seven flipped variants of x with different dim
+            # arguments.
             return (
                 x.flip(0),
                 x.flip([0]),
@@ -3293,7 +3945,9 @@ class CommonTemplate:
         self.common(fn, (torch.rand(()),))
 
     def test_flip_zero_dim_backward(self):
+        # [FUNCTION DOC] Flip of a zero-dimensional tensor requiring grad, with gradient checking.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x flipped along dim 0.
             return x.flip(0)
 
         self.common(
@@ -3303,10 +3957,14 @@ class CommonTemplate:
         )
 
     def test_cumprod_backward(self):
+        # [FUNCTION DOC] Regression test for issue 136263 (cumprod backward was quadratic with
+        # tensor subclasses such as FakeTensor): for two dim sizes it compares the value and the
+        # input gradient of the compiled sum of a cumprod with eager.
         # Regression test for https://github.com/pytorch/pytorch/issues/136263
         # torch.compile used O(n^2) algorithm for cumprod backward with tensor
         # subclasses (like FakeTensor), making it extremely slow.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the sum of the cumulative product of x along dim 1.
             y = x.cumprod(dim=1)
             return y.sum()
 
@@ -3328,9 +3986,13 @@ class CommonTemplate:
             self.assertEqual(x.grad, x_ref.grad, atol=1e-4, rtol=1e-4)
 
     def test_cumprod_backward_with_zeros(self):
+        # [FUNCTION DOC] Cumprod backward when the input contains zeros (exercises the
+        # zero-handling algorithm path): zeros are written into a slice and compiled value and
+        # gradient are compared with eager for two dim sizes.
         # Test cumprod backward with zeros in the input
         # This exercises the more complex O(n) algorithm path
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the sum of the cumulative product of x along dim 1.
             y = x.cumprod(dim=1)
             return y.sum()
 
@@ -3355,6 +4017,10 @@ class CommonTemplate:
 
     @skip_if_gpu_halide
     def test_cumprod_backward_split_scan_reduction_fusion(self):
+        # [FUNCTION DOC] Cumprod backward fusion with a split scan (sequence length 8193) on GPU: a
+        # decay vector expanded to the input shape is cumprod-ed and multiplied with the input,
+        # summed; compiled forward value and gradients of both inputs are compared with eager.
+        # Skipped on non-GPU devices and on GPU Halide.
         if self.device not in ("cuda", "xpu"):
             raise unittest.SkipTest("split scan only supported on GPU")
 
@@ -3362,6 +4028,8 @@ class CommonTemplate:
         channels = 64
 
         def fn(x, gamma):
+            # [FUNCTION DOC] HELPER: Expand gamma to the shape of x, take cumprod along dim 1,
+            # multiply with x and sum everything.
             decay = gamma.view(1, 1, channels).expand_as(x)
             retention = torch.cumprod(decay, dim=1)
             return (x * retention).sum()
@@ -3383,9 +4051,13 @@ class CommonTemplate:
         self.assertEqual(gamma.grad, gamma_ref.grad, atol=1e-2, rtol=2e-3)
 
     def test_view_dtype_bool(self):
+        # [FUNCTION DOC] Regression test for bool handling in the view dtype lowering (integer type
+        # info does not support bool): compiles a masked where sum, compared with eager forward and
+        # backward.
         # Regression test for boolean dtype handling in view.dtype lowering
         # torch.iinfo doesn't support bool, so we need special handling
         def fn(x, mask):
+            # [FUNCTION DOC] HELPER: Return the sum of x where the mask is true else zero.
             # Create a computation that involves boolean tensors and where
             result = torch.where(mask, x, torch.zeros_like(x))
             return result.sum()
@@ -3408,12 +4080,19 @@ class CommonTemplate:
         self.assertEqual(x.grad, x_ref.grad)
 
     def test_cumsum_inf(self):
+        # [FUNCTION DOC] Cumulative sum of float64 tensors filled with infinity, with a fresh shape
+        # sequence of 100, 10 and 100 columns, checking the compiled function matches eager
+        # (infinite accumulations). If float64 is unsupported the code is expected to raise
+        # TypeError.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the cumulative sum over the last dim of x.
             return x.cumsum(-1)
 
         _dtype = torch.float64
 
         def make_tensor(shape):
+            # [FUNCTION DOC] HELPER: Build a float64 tensor of the given shape filled with positive
+            # infinity on the test device (local helper shadowing the testing make_tensor).
             return torch.full(shape, float("inf"), device=self.device, dtype=_dtype)
 
         ctx = (
@@ -3429,7 +4108,9 @@ class CommonTemplate:
                 self.assertEqual(cfn(inp), fn(inp))
 
     def test_cumsum_uint8(self):
+        # [FUNCTION DOC] Cumulative sum of a uint8 tensor compiled versus eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the last-dim cumulative sum of x.
             return x.cumsum(-1)
 
         cfn = torch.compile(fn)
@@ -3438,7 +4119,11 @@ class CommonTemplate:
 
     @xfail_if_triton_cpu
     def test_logcumsumexp(self):
+        # [FUNCTION DOC] Log-cumulative-sum-exp along dim 0 and 1 for persistent (small) and
+        # non-persistent (100 by 4000) shapes. Low precision check disabled on ROCm and Halide.
+        # Expected failure on Triton CPU.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return logcumsumexp of x along dim 0 and dim 1.
             return x.logcumsumexp(0), x.logcumsumexp(1)
 
         # Persistent reductions
@@ -3463,22 +4148,33 @@ class CommonTemplate:
         )
 
     def test_logcumsumexp_zero_dim(self):
+        # [FUNCTION DOC] Log-cumulative-sum-exp of a zero-dimensional tensor along dim 0 and -1.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return logcumsumexp of x along dim 0 and along the last dim.
             return x.logcumsumexp(0), x.logcumsumexp(-1)
 
         a = torch.rand(())
         self.common(fn, (a,))
 
     def test_clamp(self):
+        # [FUNCTION DOC] Clamp with float bounds, clamp with only a lower integer bound and the
+        # torch clamp function with only an upper bound.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return clamped values of a (-0.1 to 0.1), b (min 0) and of a
+            # plus b (max 0).
             return (a.clamp(-0.1, 0.1), b.clamp(0), torch.clamp(a + b, max=0))
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
     def test_clamp_type_promotion(self):
+        # [FUNCTION DOC] Clamp of an integer tensor with tensor bounds of other dtypes (a double
+        # or, on MPS, half scalar tensor as min and an int-filled tensor as max) to check type
+        # promotion.
         tgt_dtype = torch.double if self.device != "mps" else torch.half
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Clamp a between a scalar tensor minimum and a full tensor
+            # maximum.
             b = torch.tensor(1.0, dtype=tgt_dtype, device=self.device)
             c = torch.full((4,), 2, device=self.device)
             return a.clamp(min=b, max=c)
@@ -3486,18 +4182,24 @@ class CommonTemplate:
         self.common(fn, (torch.randint(4, (4,)),))
 
     def test_clamp_type_promotion_non_tensor(self):
+        # [FUNCTION DOC] Clamp of an integer tensor with Python float and int scalars as lower
+        # bounds to check type promotion.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return clamp of a with minimum 1.5 and with minimum 2.
             return a.clamp(min=1.5), a.clamp(min=2)
 
         self.common(fn, (torch.randint(4, (4,)),))
 
     def test_comparison_scalar_type_promotion_bf16(self):
+        # [FUNCTION DOC] Comparing a bfloat16 tensor with a Python float must upcast the constant
+        # consistently: compiled equality results match eager. Skipped on MPS.
         if self.device == "mps":
             raise unittest.SkipTest(
                 "MPS codegen doesn't upcast bf16 constants to float32"
             )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the elementwise equality of x with 3.14.
             return x == 3.14
 
         x = torch.tensor(
@@ -3508,8 +4210,13 @@ class CommonTemplate:
         self.assertEqual(actual, expected)
 
     def test_add_scalar_type_promotion_bf16(self):
+        # [FUNCTION DOC] Regression test for issue 185517: bfloat16 addition and subtraction of a
+        # float constant must match eager; also the backward of margin ranking loss with a margin
+        # of 1.7 in bfloat16 (where the clamp boundary is exactly hit in eager) must give the same
+        # gradients when compiled.
         # https://github.com/pytorch/pytorch/issues/185517
         def fwd(x):
+            # [FUNCTION DOC] HELPER: Return x plus 1.7 and x minus 1.7.
             return x + 1.7, x - 1.7
 
         x = torch.tensor(
@@ -3521,11 +4228,15 @@ class CommonTemplate:
         # margin_ranking_loss exactly 0.0, so the clamp_min backward passes
         # gradient at the boundary. The compiled backward must agree.
         def loss_fn(a, b, t):
+            # [FUNCTION DOC] HELPER: Margin ranking loss of a, b and targets t with margin 1.7 and
+            # mean reduction.
             return torch.nn.functional.margin_ranking_loss(
                 a, b, t, margin=1.7, reduction="mean"
             )
 
         def grads(f):
+            # [FUNCTION DOC] HELPER: Create bfloat16 inputs requiring grad, run the given loss
+            # function and backward, and return the gradients of the first two inputs.
             a = torch.tensor(
                 [1.703125] * 2,
                 dtype=torch.bfloat16,
@@ -3546,7 +4257,10 @@ class CommonTemplate:
     @skip_if_gpu_halide
     @xfail_if_triton_cpu
     def test_dist(self):
+        # [FUNCTION DOC] Distance between two tensors with default norm and with p equal to 1.2.
+        # Skipped on GPU Halide; expected failure on Triton CPU.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the distance of a and b for the default norm and p=1.2.
             return (
                 torch.dist(a, b),
                 torch.dist(a, b, p=1.2),
@@ -3556,7 +4270,10 @@ class CommonTemplate:
 
     @skip_if_halide  # different pow accuracies
     def test_norm_constant_overflow(self):
+        # [FUNCTION DOC] Vector norm with a large negative p (-41) along dims 1 and 0 to test
+        # constant overflow handling; skipped on Halide because of pow accuracy differences.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return norms with p=-41 along dim 1 and dim 0.
             return (
                 torch.norm(a, p=-41.0, dim=1),
                 torch.norm(a, p=-41.0, dim=0),
@@ -3567,7 +4284,10 @@ class CommonTemplate:
     @skipCUDAIf(not SM80OrLater, "Requires sm80")
     @skip_if_gpu_halide  # https://github.com/halide/Halide/issues/8311
     def test_dist_bf16(self):
+        # [FUNCTION DOC] Distance of two tensors after casting to bfloat16; skipped if bfloat16 is
+        # unsupported, on CUDA below sm80 and on GPU Halide.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Cast a and b to bfloat16 and return their distance.
             return torch.dist(a.to(torch.bfloat16), b.to(torch.bfloat16))
 
         if not self.is_dtype_supported(torch.bfloat16):
@@ -3577,7 +4297,11 @@ class CommonTemplate:
         self.common(fn, (torch.randn(4, 4), torch.randn(4, 4)))
 
     def test_arange1(self):
+        # [FUNCTION DOC] Arange (float32, reshaped) and a start-end integer arange used with
+        # pointwise multiply and add.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiply x by a float arange reshaped to 8 by 8 and add an
+            # integer arange from 10 to 17 to the product; return both.
             rng1 = torch.arange(8 * 8, dtype=torch.float32, device=x.device).view(8, 8)
             rng2 = torch.arange(10, 18, device=x.device)
             tmp = x * rng1
@@ -3586,14 +4310,19 @@ class CommonTemplate:
         self.common(fn, (torch.randn(8, 8),))
 
     def test_arange2(self):
+        # [FUNCTION DOC] Integer arange added to an integer tensor, without low precision checks.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x plus an integer arange of length 8.
             rng1 = torch.arange(8, device=x.device)
             return (x + rng1,)
 
         self.common(fn, (torch.randint(4, (8, 8)),), check_lowp=False)
 
     def test_arange3(self):
+        # [FUNCTION DOC] Aten arange start_step overload (0 to 53, step 4, int64) added to a float
+        # vector.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x plus the aten arange start_step result.
             return x + torch.ops.aten.arange.start_step(
                 0, 53, 4, dtype=torch.int64, device=x.device
             )
@@ -3601,13 +4330,21 @@ class CommonTemplate:
         self.common(fn, (torch.randn(14),))
 
     def test_arange4(self):
+        # [FUNCTION DOC] Float arange from 512 down to -512 with step -1.0 subtracted from a
+        # vector.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x minus a descending float arange.
             return x - torch.arange(512, -512, -1.0, device=x.device)
 
         self.common(fn, (torch.randn(1024),))
 
     def test_arange5(self):
+        # [FUNCTION DOC] Compiles a function building an arange from 512 to -512 with a step that
+        # is a runtime argument, with integer and float steps; compares results (including dtype)
+        # with eager using assertEqual.
         def fn(step, device):
+            # [FUNCTION DOC] HELPER: Return an arange from 512 to -512 with the given step on a
+            # device.
             return torch.arange(512, -512, step, device=device)
 
         compiled_fn = torch.compile(fn)
@@ -3620,7 +4357,11 @@ class CommonTemplate:
         self.assertEqual(expect, actual)
 
     def test_arange6(self):
+        # [FUNCTION DOC] Arange with float start and stop arguments but explicit dtype: float
+        # arguments must be truncated for an integer dtype; checked for float32 and int64 dtypes.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return an arange from 0.1 to 8.0001 with step 1 in the dtype
+            # of x.
             return torch.arange(0.1, 8.0001, 1, dtype=x.dtype, device=x.device)
 
         # Test that float arguments are truncated to int when dtype is set explicitly
@@ -3631,7 +4372,9 @@ class CommonTemplate:
         self.common(fn, (make_arg(1, dtype=torch.int64),))
 
     def test_arange7(self):
+        # [FUNCTION DOC] Aten arange start_step lowering with int64 added to an int64 tensor.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x plus an aten arange 0 to 10 with step 2.
             # Test aten.arange.start_step lowering with integer dtypes
             return x + torch.ops.aten.arange.start_step(
                 0, 10, 2, dtype=torch.int64, device=x.device
@@ -3640,41 +4383,55 @@ class CommonTemplate:
         self.common(fn, (torch.zeros(5, dtype=torch.int64),), check_lowp=False)
 
     def test_arange9(self):
+        # [FUNCTION DOC] An int64 arange used in a reduction: the sum of values scaled by ten
+        # million must accumulate in int64 even though each element fits in int32.
         # int64 arange used inside a reduction: reduction must accumulate
         # at int64 precision even though each per-element value fits int32.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the sum of an int64 arange of 100 values times 10
+            # million.
             idx = torch.arange(0, 100, device=x.device, dtype=torch.int64)
             return (idx * int(1e7)).sum()
 
         self.common(fn, (torch.zeros(1, device=self.device),))
 
     def test_linspace1(self):
+        # [FUNCTION DOC] Linspace with 7 points added to a broadcast row.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return a 7-point linspace from 0.125 to 0.875 plus x.
             return torch.linspace(0.125, 0.875, 7, device=x.device) + x
 
         self.common(fn, (torch.randn(1, 7),))
 
     def test_linspace2(self):
+        # [FUNCTION DOC] Linspace with a single point.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return a one-point linspace from 0 to 2 plus x.
             return torch.linspace(0, 2, 1, device=x.device) + x
 
         self.common(fn, (torch.randn(1, 1),))
 
     def test_linspace3(self):
+        # [FUNCTION DOC] Linspace with zero points on an empty input.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return an empty linspace on the device of x.
             return torch.linspace(0, 2, 0, device=x.device)
 
         self.common(fn, (torch.Tensor([]),))
 
     @requires_multigpu()
     def test_linspace4(self):
+        # [FUNCTION DOC] Empty linspace created on the second GPU device; requires multiple GPUs.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return an empty linspace on the device with index 1.
             return torch.linspace(0, 2, 0, device=f"{GPU_TYPE}:1")
 
         self.common(fn, (torch.Tensor([]),))
 
     def test_tensor1(self):
+        # [FUNCTION DOC] Tensor construction from a one-element list plus x, and from a scalar.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return tensor of one plus x, and a scalar tensor five.
             return torch.tensor([1], device=x.device) + x, torch.tensor(
                 5, device=x.device
             )
@@ -3682,13 +4439,19 @@ class CommonTemplate:
         self.common(fn, (torch.randn(10),))
 
     def test_tensor2(self):
+        # [FUNCTION DOC] Tensor construction from a list of even numbers added to a one-element x.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return tensor of the even numbers 2 to 38 plus x.
             return torch.tensor(list(range(2, 40, 2)), device=x.device) + x
 
         self.common(fn, (torch.randn(1),))
 
     def test_tensor3(self):
+        # [FUNCTION DOC] Tensor construction from empty and from small integer lists with constant
+        # adds and an add of x.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return an empty tensor and three small list tensors combined
+            # with constants and x.
             return (
                 torch.tensor([], device=x.device),
                 torch.tensor([1, 2], device=x.device) + 1,
@@ -3699,10 +4462,17 @@ class CommonTemplate:
         self.common(fn, [torch.randn(4)])
 
     def test_views1(self):
+        # [FUNCTION DOC] View reshape tests over several (input size, view size) pairs, then the
+        # reversed pairs; each pair is checked with a plain view plus operand and a view of x plus
+        # one.
         def fn1(x, y):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple of x viewed as the enclosing target
+            # size plus y.
             return (x.view(size2) + y,)
 
         def fn2(x, y):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple of (x plus one) viewed as the
+            # target size plus y.
             return ((x + 1).view(size2) + y,)
 
         views = [
@@ -3723,6 +4493,8 @@ class CommonTemplate:
             self.common(fn2, (torch.randn(size1), torch.randn(size2)))
 
     def test_views2(self):
+        # [FUNCTION DOC] View with an inferred (-1) dimension for three shape pairs, with a plain
+        # input and with an input multiplied by two.
         for size1, size2 in [
             ([2, 2, 2, 2], [4, -1]),
             ([10, 1, 10, 1, 10], [-1, 100]),
@@ -3730,17 +4502,24 @@ class CommonTemplate:
         ]:
 
             def fn1(x):
+                # [FUNCTION DOC] HELPER: Return x viewed with the loop's target size plus one.
                 return (x.view(size2) + 1,)
 
             def fn2(x):
+                # [FUNCTION DOC] HELPER: Return x times two viewed with the loop's target size plus
+                # one.
                 return ((x * 2).view(size2) + 1,)
 
             self.common(fn1, (torch.randn(size1),))
             self.common(fn2, (torch.randn(size1),))
 
     def test_views3(self):
+        # [FUNCTION DOC] Index followed by two views, taken from the hf_BigBird model, on strided
+        # float input and int64 indices.
         # example taken from hf_BigBird
         def forward(arg1, arg2):
+            # [FUNCTION DOC] HELPER: Index arg1 with arg2 via aten index, then view to 1 by 2232 by
+            # 64 and to 1 by 12 by 62 by 192.
             index = torch.ops.aten.index(arg1, [arg2])
             view_1 = torch.ops.aten.view(index, [1, 2232, 64])
             view_2 = torch.ops.aten.view(view_1, [1, 12, 62, 192])
@@ -3755,8 +4534,12 @@ class CommonTemplate:
         )
 
     def test_views4(self):
+        # [FUNCTION DOC] Index-select followed by two views with an inferred dim, taken from
+        # hf_BigBird.
         # example taken from hf_BigBird
         def forward(arg1, arg2):
+            # [FUNCTION DOC] HELPER: Select rows of arg1 by arg2, view as five dims, then view
+            # again with an inferred last dim.
             arg1 = arg1.index_select(0, arg2)
             arg1 = torch.ops.aten.view(arg1, [2, 3, 4, 5, 5])
             arg1 = torch.ops.aten.view(arg1, [2, 3, 2, 10, -1])
@@ -3771,8 +4554,11 @@ class CommonTemplate:
         )
 
     def test_views5(self):
+        # [FUNCTION DOC] View of a tensor whose slice has a zero-sized dimension.
         # tensor with shape 0 in any dimension
         def forward(x):
+            # [FUNCTION DOC] HELPER: Slice x from index 4 on dim 1, and view it with the first dim
+            # length, an inferred dim and a trailing dim of 4.
             y = x[:, 4:]
             return y.view(len(y), -1, 4)
 
@@ -3782,7 +4568,10 @@ class CommonTemplate:
         )
 
     def test_views6(self):
+        # [FUNCTION DOC] View of a relu-ed tensor after slices ending in an empty slice on dim 3.
         def forward(x):
+            # [FUNCTION DOC] HELPER: Apply relu, slice dims 0 and 1 fully and dim 3 to empty, then
+            # view as 4 by 2 by inferred.
             x = torch.ops.aten.relu(x)
             s = torch.ops.aten.slice(x, 0, 0, 9223372036854775807)
             s = torch.ops.aten.slice(s, 1, 0, 9223372036854775807)
@@ -3796,8 +4585,12 @@ class CommonTemplate:
         )
 
     def test_views7(self):
+        # [FUNCTION DOC] Dtype reinterpreting views: float32 data viewed as int32 and int32 data
+        # viewed as float32.
         # x.view(dtype)
         def forward(x, y):
+            # [FUNCTION DOC] HELPER: Convert x to float32 and y to int32 after adding one, then
+            # return x viewed as int32 and y viewed as float32.
             x = (x + 1).to(torch.float32)
             y = (y + 1).to(torch.int32)
             return x.view(torch.int32), y.view(torch.float32)
@@ -3811,14 +4604,19 @@ class CommonTemplate:
         )
 
     def test_view_copy_dtype_change(self):
+        # [FUNCTION DOC] Aten view_copy with a dtype change from int32 to int64.
         def fn(x, dtype):
+            # [FUNCTION DOC] HELPER: Call the aten view_copy op on x with the given dtype.
             return torch.ops.aten.view_copy(x, dtype=dtype)
 
         x = torch.randint(2, 32, (8, 16), dtype=torch.int32, device=self.device)
         self.common(fn, (x, torch.int64))
 
     def test_torch_device_split(self):
+        # [FUNCTION DOC] Splitting a tensor in chunks of two under a device context manager with an
+        # identity-like graph backend: outputs equal eager splits.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Split x into chunks of size 2.
             return x.split(2)
 
         x = torch.rand(10)
@@ -3830,11 +4628,14 @@ class CommonTemplate:
                 self.assertTrue(torch.allclose(a, b))
 
     def test_softshrink_reduced_float_lambd_type_promotion(self):
+        # [FUNCTION DOC] Softshrink of a bfloat16 and float16 tensor with a float lambda must match
+        # the eager result under type promotion, both eager-vs-reference and compiled-vs-reference.
         for dtype in [torch.bfloat16, torch.float16]:
             x = torch.tensor([-10.0625], dtype=dtype, device=self.device)
             lambd = 9.99
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Apply softshrink to x with the enclosing lambda value.
                 return torch.nn.functional.softshrink(x, lambd=lambd)
 
             self.assertEqual(fn(x), torch.nn.functional.softshrink(x, lambd=lambd))
@@ -3843,19 +4644,27 @@ class CommonTemplate:
             )
 
     def test_relu(self):
+        # [FUNCTION DOC] Relu of a and of a plus b divided by ten.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return relu of a and relu of a plus b divided by 10.
             return (torch.relu(a), torch.relu(a + b) / 10)
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
     def test_exp(self):
+        # [FUNCTION DOC] Exp of a and of a plus b.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return exp of a and of a plus b.
             return (torch.exp(a), torch.exp(a + b))
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
     def test_exp2(self):
+        # [FUNCTION DOC] Base-2 exponential of a, of a plus b, and power of two raised to a
+        # negative absolute difference.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return exp2 of a, exp2 of a plus b and 2 to the power of minus
+            # abs(a minus b).
             return (torch.exp2(a), torch.exp2(a + b), torch.pow(2, -torch.abs(a - b)))
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
@@ -3863,6 +4672,8 @@ class CommonTemplate:
     @skipIfXpu(msg="logaddexp_xpu not implemented for ComplexFloat")
     @skipCUDAIf(True, "Not implemented for CUDA")
     def test_logaddexp(self):
+        # [FUNCTION DOC] Complex64 logaddexp on CPU-supported devices. Skipped on XPU and CUDA
+        # where it is not implemented.
         self.common(
             torch.logaddexp,
             (
@@ -3872,14 +4683,21 @@ class CommonTemplate:
         )
 
     def test_sigmoid(self):
+        # [FUNCTION DOC] Sigmoid of a and of a plus b.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return sigmoid of a and sigmoid of a plus b.
             return (torch.sigmoid(a), torch.sigmoid(a + b))
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
     @xfail_if_triton_cpu
     def test_round(self):
+        # [FUNCTION DOC] Round and round with decimals=2 on scaled random inputs (values exactly at
+        # .5 times 100 stress half rounding); seeded to avoid a triton issue. Expected failure on
+        # Triton CPU.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return round of a, round of b plus one, and a rounded to 2
+            # decimals.
             return torch.round(a), torch.round(b + 1), torch.round(a, decimals=2)
 
         # without manual_seed, there is some chance this test fails due to:
@@ -3891,10 +4709,14 @@ class CommonTemplate:
 
     @xfail_if_triton_cpu
     def test_round_correctness(self):
+        # [FUNCTION DOC] Round correctness over a fine grid from -10 to 10 in the highest precision
+        # float dtype for the device, without low precision checks. Skipped on CUDA; expected
+        # failure on Triton CPU.
         if self.device == "cuda":
             raise unittest.SkipTest("need to debug tl.libdevice on A100/V100")
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return round of a.
             return torch.round(a)
 
         dtype = highest_precision_float(self.device)
@@ -3906,7 +4728,12 @@ class CommonTemplate:
 
     @xfail_if_triton_cpu
     def test_builtins_round(self):
+        # [FUNCTION DOC] Python builtin round of a symbolic integer under dynamic shapes, used to
+        # size a slice and as an added scalar; compiled with full graph for sizes 1 to 5 and
+        # compared with eager. Expected failure on Triton CPU.
         def fn(x, i):
+            # [FUNCTION DOC] HELPER: Slice x up to a rounded half of i plus one and add the rounded
+            # half of i.
             return x[: round(i / 2 + 1)] + round(i / 2)
 
         cfn = torch.compile(fullgraph=True, dynamic=True)(fn)
@@ -3918,7 +4745,10 @@ class CommonTemplate:
 
     @xfail_if_triton_cpu
     def test_builtins_round_float_ndigits_pos(self):
+        # [FUNCTION DOC] Builtin round with ndigits=1 applied to a dynamic float expression added
+        # to a tensor; compiled result equals eager. Expected failure on Triton CPU.
         def fn(x, i):
+            # [FUNCTION DOC] HELPER: Add to x the symbolic value i/2*123.4567 rounded to one digit.
             return x + round(i / 2 * 123.4567, 1)
 
         cfn = torch.compile(fullgraph=True, dynamic=True)(fn)
@@ -3931,7 +4761,10 @@ class CommonTemplate:
 
     @xfail_if_triton_cpu
     def test_builtins_round_float_ndigits_zero(self):
+        # [FUNCTION DOC] Builtin round with ndigits=0 on a dynamic float expression; compiled
+        # equals eager. Expected failure on Triton CPU.
         def fn(x, i):
+            # [FUNCTION DOC] HELPER: Add to x the value i/2*123.4567 rounded with zero digits.
             return x + round(i / 2 * 123.4567, 0)
 
         cfn = torch.compile(fullgraph=True, dynamic=True)(fn)
@@ -3944,7 +4777,10 @@ class CommonTemplate:
 
     @xfail_if_triton_cpu
     def test_builtins_round_float_ndigits_neg(self):
+        # [FUNCTION DOC] Builtin round with negative ndigits (-1) on a dynamic float expression;
+        # compiled equals eager. Expected failure on Triton CPU.
         def fn(x, i):
+            # [FUNCTION DOC] HELPER: Add to x the value i/2*123.4567 rounded to tens.
             return x + round(i / 2 * 123.4567, -1)
 
         cfn = torch.compile(fullgraph=True, dynamic=True)(fn)
@@ -3958,7 +4794,11 @@ class CommonTemplate:
     @skipCPUIf(True, "requires CUDA/Triton")
     @requires_cuda_and_triton
     def test_builtins_round_float_ndigits_neg_uses_value_expr(self):
+        # [FUNCTION DOC] Same negative-ndigits builtin round check but run through the inductor
+        # backend on a triton-capable GPU only (CPU skipped), verifying the generated code uses the
+        # value expression correctly.
         def fn(x, i):
+            # [FUNCTION DOC] HELPER: Add to x the value i/2*123.4567 rounded to tens.
             return x + round(i / 2 * 123.4567, -1)
 
         fn_opt = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=True)
@@ -3968,7 +4808,9 @@ class CommonTemplate:
             self.assertEqual(fn_opt(x, i), fn(x, i))
 
     def test_builtins_round_int_ndigits_pos(self):
+        # [FUNCTION DOC] Builtin round of a dynamic integer with ndigits=1 added to a tensor.
         def fn(x, i):
+            # [FUNCTION DOC] HELPER: Add to x the integer i rounded to one digit.
             return x + round(i, 1)
 
         cfn = torch.compile(fullgraph=True, dynamic=True)(fn)
@@ -3980,7 +4822,9 @@ class CommonTemplate:
             self.assertEqual(cfn(x, i), fn(x, i))
 
     def test_builtins_round_int_ndigits_zero(self):
+        # [FUNCTION DOC] Builtin round of a dynamic integer with ndigits=0 added to a tensor.
         def fn(x, i):
+            # [FUNCTION DOC] HELPER: Add to x the integer i rounded to zero digits.
             return x + round(i, 0)
 
         cfn = torch.compile(fullgraph=True, dynamic=True)(fn)
@@ -3992,16 +4836,22 @@ class CommonTemplate:
             self.assertEqual(cfn(x, i), fn(x, i))
 
     def test_silu(self):
+        # [FUNCTION DOC] SiLU activation on a random tensor.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple with silu of a.
             return (torch.nn.functional.silu(a),)
 
         self.common(fn, (torch.randn(8, 8),))
 
     @skip_if_halide  # halide has different precision characteristics
     def test_silu_exact_eager(self):
+        # [FUNCTION DOC] Checks compiled SiLU matches eager exactly: a random vector, then every
+        # possible bfloat16 bit pattern (built from int16 values viewed as bfloat16), compared with
+        # NaN treated as equal after resetting dynamo. Skipped on Halide.
         """Test that compiled SiLU matches eager exactly."""
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return silu of a.
             return torch.nn.functional.silu(a)
 
         # Test with normal random values
@@ -4021,7 +4871,12 @@ class CommonTemplate:
 
     @skip_if_halide  # halide has buggy nan handling
     def test_nan_to_num(self):
+        # [FUNCTION DOC] nan_to_num with default arguments and with explicit nan, posinf and neginf
+        # replacement options on a tensor with NaN and infinities. Low precision checks off.
+        # Skipped on Halide (NaN handling).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return six nan_to_num variants of a with different replacement
+            # values.
             return (
                 torch.nan_to_num(a),
                 torch.nan_to_num(a, nan=3.0),
@@ -4038,7 +4893,10 @@ class CommonTemplate:
         )
 
     def test_one_hot(self):
+        # [FUNCTION DOC] One-hot encoding with 8 classes plus one on a reshaped integer vector; the
+        # function carries an expected-failure flag for Halide.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return one-hot of a with 8 classes, plus one.
             return torch.nn.functional.one_hot(a, 8) + 1
 
         self.common(
@@ -4050,7 +4908,10 @@ class CommonTemplate:
     test_one_hot._expected_failure_halide = True
 
     def test_div1(self):
+        # [FUNCTION DOC] Division variants (true, floor and trunc rounding, slash and floor-divide
+        # operators) on large random float inputs.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the five division variants of a by b.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a, b, rounding_mode="floor"),
@@ -4062,7 +4923,9 @@ class CommonTemplate:
         self.common(fn, (torch.randn(8, 8) * 100, torch.randn(8, 8) * 100))
 
     def test_div2(self):
+        # [FUNCTION DOC] Same five division variants for an integer dividend and a float divisor.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the five division variants of a by b.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a, b, rounding_mode="floor"),
@@ -4074,7 +4937,9 @@ class CommonTemplate:
         self.common(fn, (torch.randint(-100, 100, [8, 8]), 100 * torch.randn(8, 8)))
 
     def test_div3(self):
+        # [FUNCTION DOC] Same division variants for integer inputs where a is exactly twice b.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the five division variants of a by b.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a, b, rounding_mode="floor"),
@@ -4087,7 +4952,10 @@ class CommonTemplate:
         self.common(fn, (a * 2, a))
 
     def test_div4(self):
+        # [FUNCTION DOC] Same division variants for negative integer dividends and positive integer
+        # divisors.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the five division variants of a by b.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a, b, rounding_mode="floor"),
@@ -4102,7 +4970,9 @@ class CommonTemplate:
         )
 
     def test_div5(self):
+        # [FUNCTION DOC] Same division variants where the divisor is the scalar 16.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the five division variants of a by b.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a, b, rounding_mode="floor"),
@@ -4115,7 +4985,10 @@ class CommonTemplate:
         self.common(fn, (torch.randint(-100, 0, [8, 8]), 16))
 
     def test_div6(self):
+        # [FUNCTION DOC] Same division variants with a boolean dividend (treated as integer) and a
+        # negative integer divisor.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the five division variants of a by b.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a, b, rounding_mode="floor"),
@@ -4132,7 +5005,10 @@ class CommonTemplate:
 
     @skip_if_triton_cpu  # divide by zero; cannot xfail because it crashes process
     def test_div7(self):
+        # [FUNCTION DOC] Same division variants for large int64 dividends and negative divisors.
+        # Skipped on Triton CPU (divide by zero would crash the process).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the five division variants of a by b.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a, b, rounding_mode="floor"),
@@ -4150,7 +5026,11 @@ class CommonTemplate:
         )
 
     def test_div8(self):
+        # [FUNCTION DOC] Division variants where the inputs are Python integers (1024 and 100),
+        # including variants dividing a half-scaled or float-scaled operand.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return seven division forms of a by b, with scaled operands
+            # and the different rounding modes.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a * 0.5, b, rounding_mode=None),
@@ -4164,16 +5044,25 @@ class CommonTemplate:
         self.common(fn, (1024, 100))
 
     def test_div9(self):
+        # [FUNCTION DOC] Division where the dividend is the Python scalar 42 and the divisor is a
+        # tensor, through div, true_divide and the Tensor overload.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return div, true_divide and aten div Tensor of the scalar 42
+            # by x.
             return (torch.div(42, x), aten.true_divide(42, x), aten.div.Tensor(42, x))
 
         self.common(fn, (torch.randn(8),))
 
     def test_div10(self):
+        # [FUNCTION DOC] Floor rounding division and floor_divide with a Python scalar dividend.
+        # The floor lowering seeds constants from the dtype of an operand, which used to fail for a
+        # scalar dividend.
         # A Python-scalar dividend with floor rounding: the floor-division
         # lowering seeds constants from an operand via get_dtype(), which fails
         # when the dividend is a scalar (no get_dtype()) rather than a tensor.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return floor division of the scalar 5.0 by x via div and
+            # floor_divide.
             return (
                 torch.div(5.0, x, rounding_mode="floor"),
                 torch.floor_divide(5.0, x),
@@ -4183,7 +5072,10 @@ class CommonTemplate:
 
     @skip_if_triton_cpu  # divide by zero; cannot xfail because it crashes process
     def test_div_zero_dim(self):
+        # [FUNCTION DOC] Division variants between a vector and a zero-dimensional tensor and the
+        # reverse, for float32 and int64; divisors exclude zero. Skipped on Triton CPU.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the five division variants of a by b.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a, b, rounding_mode="floor"),
@@ -4210,7 +5102,10 @@ class CommonTemplate:
 
     @skip_if_triton_cpu  # divide by zero; cannot xfail because it crashes process
     def test_div_prim(self):
+        # [FUNCTION DOC] The prims div op for float32 and int64 with divisors excluding zero.
+        # Skipped on Triton CPU.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the prims div of a by b in a tuple.
             return (torch.ops.prims.div(a, b),)
 
         for dtype in (torch.float32, torch.int64):
@@ -4225,7 +5120,11 @@ class CommonTemplate:
             )
 
     def test_floordiv(self):
+        # [FUNCTION DOC] Floor division of a Python integer symbol: one function computes a float
+        # expression floor-divided by a float and added to a tensor, another uses an integer floor
+        # division by 8; both compiled with an integer argument and compared with eager.
         def fn_floor_input(a, i):
+            # [FUNCTION DOC] HELPER: Add to a the value i times 1.234 floor-divided by 8.234.
             n = (i * 1.234) // 8.234
             return a + n
 
@@ -4235,6 +5134,7 @@ class CommonTemplate:
         )
 
         def fn_int_input(a, i):
+            # [FUNCTION DOC] HELPER: Add to a the integer i floor-divided by 8.
             n = i // 8
             return a + n
 
@@ -4243,10 +5143,14 @@ class CommonTemplate:
         )
 
     def test_floordiv_negative_int(self):
+        # [FUNCTION DOC] Regression test for issue 158212: signed int32 floor division with
+        # negative dividends must follow Python floor semantics for positive and negative divisors
+        # 2, 3 and 7.
         # Regression test for https://github.com/pytorch/pytorch/issues/158212
         # Signed integer floor division must handle negative dividends correctly.
         # The key case: (-1) // 2 should be -1 (Python floor), not 0 (C truncation).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return floor division of a by b.
             return a // b
 
         for divisor in [2, 3, 7]:
@@ -4257,11 +5161,15 @@ class CommonTemplate:
             self.common(fn, (a, b_neg))
 
     def test_floordiv_int_min_neg_one_cpu(self):
+        # [FUNCTION DOC] Regression test for issue 184406: floor_divide of the minimum
+        # representable integer by -1 for int32 and int64, both a one-element and a 128-element
+        # (vectorized) case. Only runs on the C++ CPU backend.
         # Regression test for https://github.com/pytorch/pytorch/issues/184406
         if not is_cpp_backend(self.device):
             raise unittest.SkipTest("cpp backend required")
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return floor_divide of a by b.
             return torch.floor_divide(a, b)
 
         for dtype in [torch.int32, torch.int64]:
@@ -4275,6 +5183,12 @@ class CommonTemplate:
             self.common(fn, (a, b))
 
     def test_floordiv_div_by_zero_int_cpu_inductor_raises_error(self):
+        # [FUNCTION DOC] On the C++ CPU backend, integer floor_divide with a zero divisor must
+        # raise an error mentioning ZeroDivisionError. Runs a script in a subprocess (with a
+        # working directory outside the source tree and header precompilation turned off in the
+        # environment) that compiles floor_divide for int32 and int64 with zero divisors and fails
+        # if no matching RuntimeError is raised; the test asserts the subprocess exit code is zero
+        # and shows stdout and stderr on failure.
         if not is_cpp_backend(self.device):
             raise unittest.SkipTest("cpp backend required")
 
@@ -4317,11 +5231,15 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_cpu
     def test_floordiv_div_by_zero_int(self):
+        # [FUNCTION DOC] On GPU (skipped on CPU), integer floor division by zero must give zero in
+        # both eager and compiled code, for int32 and int64 and several dividends with an all-zero
+        # divisor.
         # Integer floor division by zero is undefined behavior on CUDA/Triton.
         # On CPU, integer division by zero correctly raises ZeroDivisionError.
         # Eager (c10::div_floor_integer) and compiled (Triton floordiv) must
         # both return 0 for elements where the divisor is zero on GPU.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return floor_divide of a by b.
             return torch.floor_divide(a, b)
 
         for dtype in [torch.int32, torch.int64]:
@@ -4332,10 +5250,15 @@ for dtype in (torch.int32, torch.int64):
                 self.common(fn, (a, b))
 
     def test_floordiv_float_accuracy(self):
+        # [FUNCTION DOC] Floor division accuracy for floats: triton's approximate fp32 reciprocal
+        # can make a plain floor of a quotient wrong when the quotient is very close to an integer.
+        # Checks a float16 case whose exact quotient is 4, and mixed-sign cases for float16 and
+        # float32, against eager.
         # Triton uses an approximate reciprocal for fp32 division, so a naive
         # floor(a / b) can be off by one when the true quotient is very close
         # to an integer.  Verify the corrected lowering matches eager.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return floor_divide of a by b.
             return torch.floor_divide(a, b)
 
         # The original repro: fp16 values whose exact quotient is 4.0, but
@@ -4361,10 +5284,14 @@ for dtype in (torch.int32, torch.int64):
 
     @parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
     def test_div_floor_float_nonfinite(self, dtype):
+        # [FUNCTION DOC] Parametrized over float16, bfloat16, float32 and float64: floor-rounding
+        # division on NaN, infinities and zeros in many combinations. Only validated on cpu and
+        # cuda (other devices skipped).
         if self.device not in ("cpu", "cuda"):
             raise unittest.SkipTest("Only validated on CPU/CUDA")
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return floor-rounding division of a by b.
             return torch.div(a, b, rounding_mode="floor")
 
         a = torch.tensor(
@@ -4402,6 +5329,9 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (a, b))
 
     def test_minimum_signed_zero(self):
+        # [FUNCTION DOC] Regression test for issue 185610: the minimum of negative zero and
+        # positive zero in bfloat16 must be negative zero as per IEEE 754 (fix is specific to
+        # triton). Skipped on CPU.
         # Regression test for https://github.com/pytorch/pytorch/issues/185610
         # torch.minimum(-0.0, +0.0) must return -0.0 per IEEE 754.
         # The fix is Triton-specific (tl.minimum vs triton_helpers.minimum).
@@ -4409,6 +5339,7 @@ for dtype in (torch.int32, torch.int64):
             raise unittest.SkipTest("signed zero fix is Triton-specific")
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the elementwise minimum of a and b.
             return torch.minimum(a, b)
 
         a = torch.tensor([-0.0], dtype=torch.bfloat16, device=self.device)
@@ -4416,9 +5347,14 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (a, b))
 
     def test_div_precision(self):
+        # [FUNCTION DOC] Reproducer for issue 101039: divides attention-like scores by a tiny
+        # scalar (1e-6) and applies softmax, once with random matmul scores and once with a fixed
+        # 4D tensor squared by matmul and a tensor divisor; checks precision of division against
+        # eager.
         # Reproducer for https://github.com/pytorch/pytorch/issues/101039
 
         def forward(x, y):
+            # [FUNCTION DOC] HELPER: Divide x by y and apply softmax over the last dim.
             z = x.div(y)
             return F.softmax(z, dim=-1)
 
@@ -4488,7 +5424,11 @@ for dtype in (torch.int32, torch.int64):
         self.common(forward, (x, y))
 
     def test_div_softmax_symfloat(self):
+        # [FUNCTION DOC] Compiles with dynamic shapes a divide-by-(scalar times last dim size) plus
+        # softmax and calls it with two different float scalars (1e-5, 1e-6) to exercise symbolic
+        # float handling; only checks it runs.
         def forward(x, y):
+            # [FUNCTION DOC] HELPER: Divide x by y times the last dim size of x then apply softmax.
             z = x.div(y * x.shape[-1])
             return F.softmax(z, dim=-1)
 
@@ -4501,8 +5441,11 @@ for dtype in (torch.int32, torch.int64):
         cf(x, 1e-6)
 
     def test_div_presicion_accuracy(self):
+        # [FUNCTION DOC] Fix for issue 157959: division of a random tensor by the integer 101 then
+        # summed must match eager precisely.
         # fix https://github.com/pytorch/pytorch/issues/157959
         def forward(x, y):
+            # [FUNCTION DOC] HELPER: Return the sum of x divided by y.
             return (x / y).sum()
 
         x = torch.rand((5, 5))
@@ -4510,7 +5453,11 @@ for dtype in (torch.int32, torch.int64):
         self.common(forward, (x, y))
 
     def test_mul_softmax_symfloat(self):
+        # [FUNCTION DOC] Same as the div symfloat test but with multiplication: compiled with
+        # dynamic shapes and called with two float scalars; checks it runs.
         def forward(x, y):
+            # [FUNCTION DOC] HELPER: Multiply x by y times the last dim size of x then apply
+            # softmax.
             z = x.mul(y * x.shape[-1])
             return F.softmax(z, dim=-1)
 
@@ -4523,7 +5470,11 @@ for dtype in (torch.int32, torch.int64):
         cf(x, 1e-6)
 
     def test_div_by_zero(self):
+        # [FUNCTION DOC] Division by positive and negative zero constants, by a zero tensor and by
+        # runtime zero and negative-zero tensors, including zero over zero (NaN) and infinities.
         def fn(x, runtime_zero, runtime_neg_zero):
+            # [FUNCTION DOC] HELPER: Return nine quotients using zero constants, zero tensors and
+            # runtime zero inputs.
             zero = torch.zeros_like(x)
             return (
                 x / 0.0,
@@ -4543,7 +5494,10 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (a, zero, neg_zero))
 
     def test_both_scalars(self):
+        # [FUNCTION DOC] Arithmetic ops where both arguments are Python scalars (an int and a
+        # float), computed with the reference kept in the input precision.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return add, sub and mul of a and b in both orders.
             return (
                 aten.add(a, b),
                 aten.add(b, a),
@@ -4556,7 +5510,9 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (4, 3.3), reference_in_float=False)
 
     def test_sum_keepdims(self):
+        # [FUNCTION DOC] Sum with keepdim over the last dim of an add result.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the keepdim sum of a plus b over the last dim.
             return (torch.sum(a + b, -1, keepdim=True),)
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
@@ -4565,8 +5521,12 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_halide  # only 32-bit indexing
     @largeTensorTest("4GB", inductor=True)
     def test_large_tensor_reduction(self):
+        # [FUNCTION DOC] Max reduction over a 2 to the power of 32 element int8 tensor to check
+        # 64-bit indexing; the compiled result is compared without the usual input copy (which
+        # would run out of memory). Skipped on CPU and Halide; needs about 4GB.
         # Test 64-bit indexing works correctly
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the max of a.
             return torch.max(a)
 
         t = torch.ones(2**32, dtype=torch.int8, device=self.device)
@@ -4581,9 +5541,13 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_cpu
     @skip_if_gpu_halide  # only 32-bit indexing
     def test_large_broadcast_reduction(self):
+        # [FUNCTION DOC] Max of the sum of broadcast int8 inputs of size 1 by 65536 and 65536 by 1,
+        # where inputs fit in 32-bit indexing but the broadcast intermediate needs 64-bit indexing.
+        # Skipped on CPU and GPU Halide.
         # Test 64-bit indexing works correctly when inputs are less than 32-bit
         # but intermediate tensors require 64-bit indexing
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the max of a plus b.
             return torch.max(a + b)
 
         t1 = torch.ones(1, 2**16, dtype=torch.int8, device=self.device)
@@ -4602,7 +5566,11 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_pallas  # only 32-bit indexing
     @largeTensorTest("4GB", inductor=True)
     def test_large_pointwise(self):
+        # [FUNCTION DOC] Pointwise add of one to an int8 tensor with more than 2 to the power of 31
+        # elements, requiring 64-bit indexing; the result is compared on-device (copied to CPU on
+        # MPS) after freeing the input. Skipped on Halide and Pallas; needs about 4GB.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a plus one.
             return a + 1
 
         t = torch.ones(2**31 + 1, dtype=torch.int8, device=self.device)
@@ -4625,10 +5593,14 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_pallas  # only 32-bit indexing
     @largeTensorTest("3GB", inductor=True)
     def test_large_offset_pointwise(self):
+        # [FUNCTION DOC] 64-bit indexing needed because the storage offset of a view exceeds the
+        # 32-bit range: adds four to a view of the upper half of a huge int8 tensor and checks all
+        # elements equal four. Skipped on Halide and Pallas; needs about 3GB.
         # Test 64-bit indexing is used when input views a tensor that can be
         # indexed with 32-bit strides but the storage offset pushes it over
         # INT_MAX
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a plus four.
             return a + 4
 
         t = torch.ones(2**31 + 1, dtype=torch.int8, device=self.device)
@@ -4640,9 +5612,13 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_halide  # only 32-bit indexing
     @largeTensorTest("2GB", inductor=True)
     def test_large_strided_reduction(self):
+        # [FUNCTION DOC] 64-bit indexing needed because stride arithmetic exceeds the 32-bit range
+        # although the view's element count does not: max reduction over a view stepping by 32
+        # elements in a huge int8 tensor. Skipped on Halide; needs about 2GB.
         # Test 64-bit indexing is used when input numel is less than INT_MAX
         # but stride calculations go above INT_MAX
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the max of a.
             return torch.max(a)
 
         storage = torch.ones(2**31 + 1, dtype=torch.int8, device=self.device)
@@ -4655,16 +5631,28 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(actual, expect)
 
     def test_softmax(self):
+        # [FUNCTION DOC] Softmax over the last dim of a plus b and over dims 0 and 1 of single
+        # inputs.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return softmax of a plus b on the last dim, softmax of a on
+            # dim 0 and softmax of b on dim 1.
             return (torch.softmax(a + b, -1), torch.softmax(a, 0), torch.softmax(b, 1))
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
     def test_softmax_reused_expensive_pointwise_cpu(self):
+        # [FUNCTION DOC] C++ CPU codegen regression test: a T5 style relative position bias
+        # (bucketed log distances, embedding lookup) is added to scores in place before a softmax.
+        # Checks the result and that the input scores are mutated like eager, and that the
+        # expensive log computation appears only once in the generated C++ code (once or twice with
+        # dynamic shapes because of vector and scalar tail variants). Only on the C++ CPU backend.
         if not is_cpp_backend(self.device):
             raise unittest.SkipTest("C++ CPU codegen regression test")
 
         def fn(scores, table):
+            # [FUNCTION DOC] HELPER: Build relative position buckets from the sequence length, look
+            # up bias values in the table, add them in place to scores and return the float softmax
+            # over the last dim.
             n = scores.shape[-1]
             context_position = torch.arange(n, device=scores.device)[:, None]
             memory_position = torch.arange(n, device=scores.device)[None, :]
@@ -4718,13 +5706,18 @@ for dtype in (torch.int32, torch.int64):
             self.assertIn(log_count, (1, 2))
 
     def test_log_softmax(self):
+        # [FUNCTION DOC] Log softmax of a plus b over the last dim and of single inputs over dims
+        # 0, 1.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the three log softmax results.
             return (F.log_softmax(a + b, -1), F.log_softmax(a, 0), F.log_softmax(b, 1))
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
     def test_transpose(self):
+        # [FUNCTION DOC] Transposes via t and transpose combined with pointwise adds.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return t of a plus b, and b doubled transposed plus ten.
             return (
                 torch.t(a) + b,
                 torch.transpose(b * 2, 0, 1) + 10,
@@ -4733,7 +5726,9 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
     def test_permute1(self):
+        # [FUNCTION DOC] Permute of a five-dimensional tensor with and without a preceding add.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return permuted (a plus 1) plus 2 and permuted a plus 2.
             return (
                 torch.permute(a + 1, [2, 1, 4, 0, 3]) + 2,
                 torch.permute(a, [2, 1, 4, 0, 3]) + 2,
@@ -4742,7 +5737,13 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.randn(2, 2, 2, 2, 2),))
 
     def test_permute2(self):
+        # [FUNCTION DOC] Defines a function with unfold, unsqueeze and permute but never calls or
+        # compiles it, so the test checks nothing.
+        # KNOWN ISSUE: the test body only defines the inner function; it is never executed or
+        # compared, so this test has no effect.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Unfold dim 0 with size 2 step 1, unsqueeze dim 1 and permute;
+            # return it in a tuple (never called).
             a = a.unfold(0, 2, 1)
             a = torch.unsqueeze(a, 1)
             a = torch.permute(a, [0, 2, 3, -3])
@@ -4750,7 +5751,11 @@ for dtype in (torch.int32, torch.int64):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_permute_unbacked_slice(self):
+        # [FUNCTION DOC] Permute followed by a slice whose end comes from a tensor item (unbacked
+        # symbolic int, scalar output capture enabled); compiled result equals eager.
         def eager(a, end_t):
+            # [FUNCTION DOC] HELPER: Add one, permute dims 1 and 2, read end_t as a Python scalar
+            # and slice dim 1 up to it.
             b = a + 1
             c = torch.permute(b, [0, 2, 1])
             end = end_t.item()
@@ -4762,7 +5767,11 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(compiled(a, end_t), eager(a, end_t))
 
     def test_expand(self):
+        # [FUNCTION DOC] Expand of a small tensor to a larger rank, with and without a preceding
+        # add, and with negative one placeholders.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return nested expansions of a plus constants and an expand
+            # with negative one dims.
             return (
                 (a + 1).expand(3, 4, 2, 3, 2) + 2,
                 a.expand(2, 1, 2, 3, 2) + 2,
@@ -4771,17 +5780,25 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.randn(2, 1, 2),))
 
     def test_expand_implicit_kwarg(self):
+        # [FUNCTION DOC] The aten expand lowering must accept the implicit keyword argument
+        # (emitted by autograd for mean and broadcast backward), otherwise a TypeError occurs.
         # aten::expand's schema is `expand(Tensor self, SymInt[] size, *, bool
         # implicit=False)`. Autograd emits calls with `implicit=False` (e.g.
         # from mean_backward and broadcast backward). The Inductor lowering
         # must accept the kwarg or such graphs fail with
         # `TypeError: expand() got an unexpected keyword argument 'implicit'`.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Call aten expand with the implicit flag set to false and add
+            # one.
             return torch.ops.aten.expand.default(a, [3, 4], implicit=False) + 1
 
         self.common(fn, (torch.randn(1, 4),))
 
     def test_nested_reduction_broadcast_outer_product(self):
+        # [FUNCTION DOC] Regression test for nested reduction loops in a fused broadcast plus
+        # reduce (outer-product pattern with 1024 elements): a block pointer was not rewound after
+        # the inner loop, which broke loop-carried backends. Verifies sum and mean of a broadcast
+        # product with relaxed tolerance appropriate for summing a million float32 values.
         # Regression: for a fused broadcast+reduce whose broadcast
         # materializes [N, N] from [N] and [N, 1], the codegen used to emit
         # nested reduction loops that advanced a block_ptr through the entire
@@ -4793,6 +5810,7 @@ for dtype in (torch.int32, torch.int64):
         # sum/mean pattern at a size large enough to exercise multi-tile
         # reduction paths.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the sum of a times b and the mean of a times b.
             return (a * b).sum(), torch.mean(a * b)
 
         # Non-zero mean so a truncated reduction cannot hide behind noise.
@@ -4811,26 +5829,36 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_squeeze1(self):
+        # [FUNCTION DOC] Squeeze of all size-one dims with and without a preceding add.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return squeezed (a plus 1) plus 2 and squeezed a plus 2.
             return ((a + 1).squeeze() + 2, a.squeeze() + 2)
 
         self.common(fn, (torch.randn(1, 2, 1, 2, 2, 1, 1),))
 
     def test_squeeze2(self):
+        # [FUNCTION DOC] Squeeze of specific dims, chained, and of dim 0.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a plus one squeezed on dim -1 then dim 2, plus 2, and a
+            # squeezed on dim 0 plus 2.
             return ((a + 1).squeeze(-1).squeeze(2) + 2, a.squeeze(0) + 2)
 
         self.common(fn, (torch.randn(1, 2, 1, 2, 2, 2, 1),))
 
     def test_squeeze_varargs(self):
+        # [FUNCTION DOC] Squeeze with multiple dims given as separate arguments, followed by clone.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Squeeze dims 1 and 2 of x and clone.
             return x.squeeze(1, 2).clone()
 
         a = torch.randn(1024, 1, 1)
         self.common(fn, (a,))
 
     def test_simplify_loops(self):
+        # [FUNCTION DOC] Pointwise add where one operand is a permuted view, so loop simplification
+        # and merging of dimensions is exercised.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus b.
             return a + b
 
         self.common(
@@ -4842,7 +5870,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_unsqueeze(self):
+        # [FUNCTION DOC] Unsqueeze at several dims (negative and positive), with and without
+        # preceding adds.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return four unsqueezed results plus 2.
             return (
                 torch.unsqueeze(a + 1, -1) + 2,
                 torch.unsqueeze(a, 2) + 2,
@@ -4863,7 +5894,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_unsqueeze_inplace(self):
+        # [FUNCTION DOC] In-place unsqueeze on intermediates (aten unsqueeze_), checking both
+        # returned tensors including their changed shapes.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Unsqueeze a plus one in place at dim 2, another a plus one at
+            # dim 0 plus 2, and return both.
             tmp1 = a + 1
             aten.unsqueeze_(tmp1, 2)
             tmp2 = aten.unsqueeze_(a + 1, 0) + 2
@@ -4882,7 +5917,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_addmm(self):
+        # [FUNCTION DOC] addmm of three adjusted 8 by 8 inputs.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return addmm of a plus 1, b plus 2 and c plus 3, plus 4.
             return (torch.addmm(a + 1, b + 2, c + 3) + 4,)
 
         self.common(
@@ -4895,7 +5932,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_addmv(self):
+        # [FUNCTION DOC] addmv with an empty matrix and empty vector (int32) and a one-element
+        # input compiled with the inductor backend under no-grad; result equals eager.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return addmv of the three arguments.
             return torch.addmv(a, b, c)
 
         cfn = torch.compile(backend="inductor")(fn)
@@ -4906,7 +5946,10 @@ for dtype in (torch.int32, torch.int64):
             self.assertEqual(cfn(input, mat, vec), fn(input, mat, vec))
 
     def test_addmv_mixed_dtype_errors(self):
+        # [FUNCTION DOC] addmv with a float32 input but int32 matrix and vector must raise a
+        # RuntimeError mentioning that dtypes must be the same when compiled.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return addmv of the three arguments.
             return torch.addmv(a, b, c)
 
         cfn = torch.compile(backend="inductor")(fn)
@@ -4920,6 +5963,8 @@ for dtype in (torch.int32, torch.int64):
     @skipCUDAIf(True, "cuda failed for float64 linear")
     @skipIfXpu(msg="Double and complex datatype matmul is not supported in oneDNN")
     def test_linear_float64(self):
+        # [FUNCTION DOC] Linear layer in float64 under no-grad, checked via the common helper;
+        # expects a TypeError if float64 is unsupported. Skipped on CUDA and XPU (issue 98979).
         _dtype = torch.float64
         ctx = (
             contextlib.nullcontext()
@@ -4932,6 +5977,7 @@ for dtype in (torch.int32, torch.int64):
                 self.common(mod, (torch.randn(2, 8).to(_dtype),))
 
     def test_linear1(self):
+        # [FUNCTION DOC] Linear followed by sigmoid and a tuple wrapper module.
         mod = torch.nn.Sequential(
             torch.nn.Linear(8, 16),
             torch.nn.Sigmoid(),
@@ -4940,6 +5986,7 @@ for dtype in (torch.int32, torch.int64):
         self.common(mod, (torch.randn(2, 8),))
 
     def test_linear2(self):
+        # [FUNCTION DOC] Four stacked linear plus ReLU layers with relaxed tolerances.
         mod = torch.nn.Sequential(
             torch.nn.Linear(8, 8),
             torch.nn.ReLU(),
@@ -4958,7 +6005,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_bmm1(self):
+        # [FUNCTION DOC] Batched matmul with and without preceding adds, for two shape sets, with
+        # low precision checking disabled.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return bmm of a and b, and bmm of a plus 1 and b plus 2, plus
+            # 3.
             return (
                 torch.bmm(a, b),
                 torch.bmm(a + 1, b + 2) + 3,
@@ -4982,7 +6033,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_bmm2(self):
+        # [FUNCTION DOC] Batched matmul where the first operand is a permuted view.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return bmm of a with dims 1 and 2 swapped and b.
             return torch.bmm(a.permute(0, 2, 1), b)
 
         self.common(
@@ -4997,7 +6050,14 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_cpu
     @skip_if_not_triton
     def test_vmap_dot_decomposes_bmm(self):
+        # [FUNCTION DOC] For a vmapped dot product of two vectors over a batch of 64 (which becomes
+        # a batched matmul), checks for float16, bfloat16, float32 and float64 (supported ones) and
+        # inner sizes 3 and 32 that the compiled result equals eager and that the generated code
+        # contains neither an extern bmm call nor an aten bmm fallback, i.e. the bmm is decomposed
+        # into pointwise and reduction code. On ROCm older than 7.13 with some gfx11 archs bfloat16
+        # uses looser tolerances because eager is inaccurate there. Triton GPU only.
         def dot_based(a, b):
+            # [FUNCTION DOC] HELPER: Return two times the dot product of a and b (added twice).
             return torch.dot(a, b) + torch.dot(a, b)
 
         fn = torch.vmap(dot_based)
@@ -5052,7 +6112,12 @@ for dtype in (torch.int32, torch.int64):
     @skipIfXpu(msg="CUDA codegen check")
     @skip_if_not_triton
     def test_bmm_dot_shape_decompose_threshold(self):
+        # [FUNCTION DOC] Threshold on the inner size for decomposing a batched matmul with unit
+        # outer dims: for inner size 32 the code must not use an extern bmm; for 33 under static
+        # shapes it must use the extern bmm call (under dynamic shapes it must still not). Triton
+        # GPU only; CUDA codegen check.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return bmm of a and b.
             return torch.bmm(a, b)
 
         bmm_codegen_call = (
@@ -5085,7 +6150,11 @@ for dtype in (torch.int32, torch.int64):
     @skipIfXpu(msg="CUDA codegen check")
     @skip_if_not_triton
     def test_bmm_dot_shape_dynamic_k_range_spans_decompose_threshold(self):
+        # [FUNCTION DOC] With the inner dimension marked dynamic over a range (1 to 64) that spans
+        # the decomposition threshold, a unit-outer-dim batched matmul must still be decomposed: no
+        # extern bmm call and no aten bmm fallback in the generated code. Triton GPU only.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return bmm of a and b.
             return torch.bmm(a, b)
 
         bmm_codegen_call = (
@@ -5114,7 +6183,11 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_cpp_wrapper("cpp wrapper reports AOTI API call failures")
     @skip_if_not_triton
     def test_bmm_dot_shape_int_preserves_eager_error(self):
+        # [FUNCTION DOC] Integer batched matmul is not implemented on CUDA; checks that eager and
+        # compiled both raise NotImplementedError with the same message (error preserved by the
+        # decomposition logic). Skipped on CPU, XPU, cpp wrapper and non-triton backends.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return bmm of a and b.
             return torch.bmm(a, b)
 
         a = torch.ones(4, 1, 3, device=self.device, dtype=torch.int64)
@@ -5129,7 +6202,11 @@ for dtype in (torch.int32, torch.int64):
     @skipIfPy312  # segfaults
     @skipCUDAIf(not SM80OrLater, "Requires sm80")
     def test_mixed_mm(self):
+        # [FUNCTION DOC] Mixed-dtype matmul of a float matrix with an int8 matrix converted to the
+        # float dtype; low precision checking on. Skipped on Python 3.12 (segfaults) and CUDA below
+        # sm80.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return mm of a and b converted to the dtype of a.
             return torch.mm(a, b.to(a.dtype))
 
         self.common(
@@ -5144,7 +6221,10 @@ for dtype in (torch.int32, torch.int64):
     @skipIfPy312  # segfaults
     @skipCUDAIf(not SM80OrLater, "Requires sm80")
     def test_mixed_mm2(self):
+        # [FUNCTION DOC] Mixed matmul with an int8 operand followed by a per-column scale multiply
+        # and bias add. Skipped on Python 3.12 and CUDA below sm80.
         def fn(a, b, scale, bias):
+            # [FUNCTION DOC] HELPER: Return mm of a and b cast to a dtype, times scale plus bias.
             return torch.mm(a, b.to(a.dtype)) * scale + bias
 
         self.common(
@@ -5161,7 +6241,10 @@ for dtype in (torch.int32, torch.int64):
     @skipIfPy312  # segfaults
     @skipCUDAIf(not SM80OrLater, "Requires sm80")
     def test_mixed_mm3(self):
+        # [FUNCTION DOC] Mixed matmul with 256 by 256 operands so that multiple block sizes are
+        # tried during autotuning; looser tolerances. Skipped on Python 3.12 and CUDA below sm80.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return mm of a and b converted to the dtype of a.
             return torch.mm(a, b.to(a.dtype))
 
         # (256, 256) @ (256, 256) so different block sizes are tried out during autotuning
@@ -5177,7 +6260,12 @@ for dtype in (torch.int32, torch.int64):
 
     @with_tf32_off
     def test_uint4x2_mixed_mm(self):
+        # [FUNCTION DOC] Matmul where the second operand is a packed uint4x2 tensor (two nibbles
+        # per byte) unpacked via bit operations, concatenated, reshaped, converted and shifted by
+        # 8; TF32 disabled.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Unpack the low and high nibbles of b along dim 1, reshape to
+            # rows, convert to the dtype of a, subtract 8 and matmul with a.
             return torch.mm(
                 a,
                 torch.cat((b & 0xF, b >> 4), 1)
@@ -5196,7 +6284,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_mm_mixed_dtype(self):
+        # [FUNCTION DOC] Matmul of a float and an int64 matrix must raise a RuntimeError about
+        # mismatched dtypes in both eager and compiled modes (a different message pattern is used
+        # under cpp wrapper).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return mm of a and b.
             return torch.mm(a, b)
 
         t1 = torch.arange(6, dtype=torch.float, device=self.device).view(2, 3)
@@ -5212,12 +6304,21 @@ for dtype in (torch.int32, torch.int64):
 
     @xfail_if_mps_unimplemented  # linear for non-float inputs
     def test_linear_mixed_dtype(self):
+        # [FUNCTION DOC] Linear layer applied to an integer input: eager raises a dtype mismatch
+        # RuntimeError; compiled under no-grad raises the same (or an AOTI API failure under cpp
+        # wrapper); compiled with grad raises an Autograd unsupported dtype error. Expected failure
+        # on MPS.
         class Net(nn.Module):
+            # [CLASS DOC] HELPER: Small module with a single linear layer from 3 to 3 features
+            # whose forward permutes its input before applying it.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Construct the module and create the linear layer.
                 super(Net, self).__init__()  # noqa: UP008
                 self.fc1 = nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Permute the input dims to (1, 2, 0) and apply the linear
+                # layer.
                 x = self.fc1(x.permute(1, 2, 0))
                 return x
 
@@ -5245,16 +6346,23 @@ for dtype in (torch.int32, torch.int64):
         }
     )
     def test_linear_dynamic_maxautotune(self):
+        # [FUNCTION DOC] A dynamic-shape compiled module with a one-in one-out linear layer and a
+        # dynamic batch dimension, with max-autotune restricted to the Triton GEMM backend. Skipped
+        # on CPU and on GPUs that are not big enough.
         if self.device == "cpu":
             raise unittest.SkipTest("using triton backend only is not supported on CPU")
 
         @torch.compile(dynamic=True)
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a one-feature linear layer, compiled with dynamic
+            # shapes via a class decorator.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the linear layer to x.
                 return self.linear(x)
 
         x = torch.randn(10, 1)
@@ -5262,7 +6370,9 @@ for dtype in (torch.int32, torch.int64):
         self.common(Model(), (x,))
 
     def test_scalar_input(self):
+        # [FUNCTION DOC] Floor division of an integer tensor by a Python scalar input of 5400.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return floor-rounded division of x by y.
             a = torch.div(x, y, rounding_mode="floor")
             return a
 
@@ -5271,7 +6381,13 @@ for dtype in (torch.int32, torch.int64):
     @torch._dynamo.config.patch(dynamic_shapes=True)
     @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_scalar_output(self):
+        # [FUNCTION DOC] A graph returning a symbolic integer (the size of a dim) along with
+        # tensors, produced from view, embedding and full ops, with dynamic shapes forced and
+        # compared with eager on CPU.
         def fn(arg0_1, arg2_1):
+            # [FUNCTION DOC] HELPER: Read the second dim size of arg2_1, view arg2_1 flat to that
+            # width, embed it with arg0_1, create a ones tensor of matching width, and return the
+            # ones tensor, the size, and the embedding.
             arg1_1 = arg2_1.size(1)
             view = torch.ops.aten.view.default(arg2_1, [-1, arg1_1])
             embedding = torch.ops.aten.embedding.default(arg0_1, view)
@@ -5283,8 +6399,13 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, [arg0_1, arg2_1])
 
     def test_shape_prop_torch_ones(self):
+        # [FUNCTION DOC] Shape propagation for a freshly created ones tensor added to the input:
+        # compiles the module under no-grad and compares with eager.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds an 8 by 1 by 1 by 512 ones tensor
+            # created on the input device to the attention scores.
             def forward(self, attention_scores):
+                # [FUNCTION DOC] HELPER: Return the scores plus the broadcast ones mask.
                 extended_attention_mask = torch.ones(
                     8, 1, 1, 512, device=attention_scores.device
                 )
@@ -5303,6 +6424,10 @@ for dtype in (torch.int32, torch.int64):
     @expectedFailureCodegenDynamic
     @config.patch({"freezing": True})
     def test_conv_bn_fuse(self):
+        # [FUNCTION DOC] Convolution plus batch norm fusion in inference with freezing, on CPU
+        # only, over combinations of 1/2/3 spatial dims, bias, kernel size, dilation and groups,
+        # and for 2D/3D also the channels_last memory format when no GPU is present. Marked slow;
+        # expected to fail the dynamic codegen check since the batch norm is fused.
         # For gpu path, there is an accuracy issue
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("only support cpu conv bn test")
@@ -5362,12 +6487,17 @@ for dtype in (torch.int32, torch.int64):
                     )
 
     def test_conv_functional_bn_fuse(self):
+        # [FUNCTION DOC] Convolution followed by a batch norm subclass that uses the functional
+        # batch norm call, on CPU only under no-grad, compared with eager.
         # For gpu path, there is an accuracy issue
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("only support cpu conv bn test")
 
         # Define a BatchNorm using functional BN.
         class BatchNorm(torch.nn.BatchNorm2d):
+            # [CLASS DOC] HELPER: BatchNorm2d subclass whose forward replicates the standard batch
+            # norm logic (momentum or cumulative average, tracked batch count, running stats usage)
+            # and calls the functional batch norm op directly.
             def __init__(
                 self,
                 num_features,
@@ -5378,6 +6508,8 @@ for dtype in (torch.int32, torch.int64):
                 device=None,
                 dtype=None,
             ):
+                # [FUNCTION DOC] HELPER: Pass the arguments (with device and dtype factory kwargs)
+                # to the parent constructor.
                 factory_kwargs = {"device": device, "dtype": dtype}
                 super().__init__(
                     num_features,
@@ -5389,6 +6521,10 @@ for dtype in (torch.int32, torch.int64):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Compute the exponential average factor (incrementing the
+                # batch counter in training), decide whether to use batch statistics, and return
+                # the functional batch norm of x with running stats only when they are tracked or
+                # in eval mode.
                 if self.momentum is None:
                     exponential_average_factor = 0.0
                 else:
@@ -5451,6 +6587,11 @@ for dtype in (torch.int32, torch.int64):
 
     @xfail_if_mps  # Expected to find .run(
     def test_conv_inference_heuristics(self):
+        # [FUNCTION DOC] Checks convolution layout heuristics at inference on a GPU: a grouped
+        # convolution should call the convolution kernel without a channels-last permute kernel
+        # first, while an ordinary convolution should permute to channels last before the kernel.
+        # Verifies this by pattern checking the generated code (differently for Halide, cpp wrapper
+        # and plain). Skipped when device is not the GPU type; expected failure on MPS.
         if self.device != GPU_TYPE:
             raise unittest.SkipTest(f"{GPU_TYPE} only test")
 
@@ -5468,6 +6609,7 @@ for dtype in (torch.int32, torch.int64):
         # Perform the forward pass
         @torch.compile()
         def foo(m, inp):
+            # [FUNCTION DOC] HELPER: Compiled function applying module m to input inp.
             return m(inp)
 
         if self.device != "xpu":
@@ -5506,14 +6648,19 @@ for dtype in (torch.int32, torch.int64):
                     FileCheck().check("convolution(").check(".run(").run(code[0])
 
     def test_upsample_cat_conv(self):
+        # [FUNCTION DOC] Nearest-neighbor upsample, concatenation with a second input along
+        # channels and a 1x1 convolution, on CPU only (skipped on GPU), under no-grad.
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("only support cpu upsample_cat_conv test")
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 2x nearest upsample and a pointwise convolution (8
+            # to 5 channels); extra keyword arguments are forwarded to the convolution constructor.
             def __init__(
                 self,
                 **kwargs,
             ):
+                # [FUNCTION DOC] HELPER: Create the upsampling and convolution submodules.
                 super().__init__()
                 self.upsample = torch.nn.UpsamplingNearest2d(scale_factor=2)
                 self.conv = torch.nn.Conv2d(
@@ -5527,6 +6674,8 @@ for dtype in (torch.int32, torch.int64):
                 )
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Upsample x, concatenate with y on dim 1, apply the
+                # convolution.
                 x = self.upsample(x)
                 z = torch.cat([x, y], dim=1)
                 z = self.conv(z)
@@ -5542,7 +6691,11 @@ for dtype in (torch.int32, torch.int64):
             )
 
     def test_aliased_buffer_reuse(self):
+        # [FUNCTION DOC] Buffer reuse with aliased buffers: doubles inputs, concatenates, adds one,
+        # matrix-multiplies the result with itself and adds a slice of x. Low precision checks off.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the sliced mm of one plus the concatenation of doubled
+            # inputs, plus x.
             x = 2 * x
             y = 2 * y
             c = torch.cat([x, y], dim=-1)
@@ -5553,7 +6706,13 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.randn(4, 2), torch.randn(4, 2)), check_lowp=False)
 
     def test_slice_view_with_graph_break(self):
+        # [FUNCTION DOC] A function that creates a tensor, takes a slice and a squeezed view,
+        # mutates through the original, has a data dependent branch (graph break) and mutates
+        # again; the compiled function returns the view and must equal the eager result after both
+        # mutations.
         def fn():
+            # [FUNCTION DOC] HELPER: Create a one-element tensor, view it via slice and squeeze,
+            # write 0, branch on its value, write 2 and return the view.
             a = torch.tensor([1], device=self.device)
             a = a[0:1]
             b = a.squeeze()
@@ -5569,7 +6728,9 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(expect, actual)
 
     def test_view_detach(self):
+        # [FUNCTION DOC] Detach of an indexed view of a tensor requiring grad.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the detached first row of a.
             return a[0].detach()
 
         self.common(
@@ -5578,7 +6739,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_gather1(self):
+        # [FUNCTION DOC] Gather along the last dim of an expanded tensor using an index tensor plus
+        # one, with positive and negative dim spellings.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return two gathers of the expanded a with index b plus one.
             return (
                 torch.gather(a.expand([4, 5, 10, 6]), 3, b + 1),
                 torch.gather(a.expand([4, 5, 10, 6]), -1, b + 1),
@@ -5593,8 +6757,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_gather2(self):
+        # [FUNCTION DOC] Gather on a zero-dimensional tensor checked in eager only: result must
+        # equal twice the scalar.
         # 0d tensor
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return gather of a with index b along dim 0 plus along dim -1.
             return torch.gather(a, 0, b) + torch.gather(a, -1, b)
 
         x = torch.tensor(123)
@@ -5602,7 +6769,10 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(fn(x, y), x + x)
 
     def test_gather3(self):
+        # [FUNCTION DOC] Gather with sparse_grad on an input requiring grad.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return gather of a along dim 1 with index b and sparse
+            # gradient.
             return torch.gather(a, 1, b, sparse_grad=True)
 
         self.common(
@@ -5614,7 +6784,12 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_device_assert(self):
+        # [FUNCTION DOC] Checks the device assert path with different sizes: a compiled function
+        # that reshapes a vector into rows of six, sums, and gathers using a truncated float index;
+        # called with 30 and 36 elements and compared with eager.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sum x reshaped into rows of 6, then gather by the truncated
+            # integer index from y.
             x = torch.sum(x.view(int(x.shape[0] / 6), 6), dim=1)
             return torch.gather(x, 0, torch.trunc(y).to(torch.int64))
 
@@ -5627,7 +6802,11 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(torch.compile(fn)(x2, y), fn(x2, y))
 
     def test_slice1(self):
+        # [FUNCTION DOC] Slicing along dim 1 with positive and negative bounds, including bounds
+        # out of range.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return sums of complementary slices, the same on a plus one,
+            # and two slices with out-of-range negative bounds.
             return (
                 a[:, :10, 0] + a[:, 10:, 0],
                 (a + 1)[:, :10, 0] + (a + 1)[:, 10:, 0],
@@ -5641,7 +6820,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_slice2(self):
+        # [FUNCTION DOC] Strided slices with negative bounds and negative indices, with and without
+        # an add.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return sums of slices of a with step 2 and negative indices,
+            # and the same for a plus constants.
             return (
                 a[:-1, ::2, -1] + a[-1:, 1::2, -2],
                 (a + 1)[:-1, ::2, -1] + (a + 2)[-1:, 1::2, -2],
@@ -5655,7 +6838,11 @@ for dtype in (torch.int32, torch.int64):
     # It's a view so it doesn't generate a kernel
     @expectedFailureCodegenDynamic
     def test_slice3(self):
+        # [FUNCTION DOC] Aten slice with a negative end derived from a scalar argument; this is
+        # just a view so no kernel is generated, hence an expected failure of the dynamic codegen
+        # check.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Slice a along dim 0 from 0 to minus b.
             return torch.ops.aten.slice.Tensor(a, 0, 0, -b)
 
         x = torch.rand(48, 3, 512, 512)
@@ -5663,8 +6850,12 @@ for dtype in (torch.int32, torch.int64):
 
     @expectedFailureCodegenDynamic
     def test_slice4(self):
+        # [FUNCTION DOC] Empty slices whose start or end must be clamped (start after end, start
+        # beyond the size, negative starts below the size); expected failure of the dynamic codegen
+        # check.
         # empty slices that require clamping the start or end
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return four empty or clamped aten slices of a along dim 0.
             return (
                 aten.slice.Tensor(a, 0, 2, 0, 1),
                 aten.slice.Tensor(a, 0, a.shape[0], a.shape[0] + 10, 1),
@@ -5676,7 +6867,11 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (x,))
 
     def test_split_with_list(self):
+        # [FUNCTION DOC] Split by a list of section sizes (three different lists summing to the dim
+        # size) with a pointwise op before and after.
         def fn(a, sizes):
+            # [FUNCTION DOC] HELPER: Split a doubled on the last dim by sizes and add one to each
+            # piece.
             return [t + 1.0 for t in torch.split(a * 2.0, sizes, -1)]
 
         self.common(fn, (torch.randn(2, 2, 10), [3, 3, 4]))
@@ -5684,9 +6879,14 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.randn(2, 2, 10), [1, 2, 3, 4]))
 
     def test_split_with_integer(self):
+        # [FUNCTION DOC] Split with an integer chunk size under dynamic shapes: checks that shapes
+        # of the pieces are correct for even splits (10 in 5 and 5, 12 in 4 thrice) and an uneven
+        # split (10 in 3, 3, 3, 1).
         # argument `split_size_or_sections` is integer
         @torch.compile(dynamic=True)
         def f(x, sizes):
+            # [FUNCTION DOC] HELPER: Compiled function splitting x on the last dim by the given
+            # size.
             return torch.split(x, sizes, -1)
 
         # split into equally sized chunks, 10 = 5 + 5
@@ -5708,7 +6908,11 @@ for dtype in (torch.int32, torch.int64):
         self.assertTrue(r4.size() == (2, 1))
 
     def test_tensor_split_with_scalar_tensor_sections(self):
+        # [FUNCTION DOC] tensor_split with a scalar tensor as the number of sections; inputs are
+        # not copied to the GPU.
         def fn(a, sections):
+            # [FUNCTION DOC] HELPER: Split a doubled on the last dim into sections and add one to
+            # each.
             return tuple(t + 1.0 for t in torch.tensor_split(a * 2.0, sections, -1))
 
         self.common(
@@ -5718,6 +6922,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_split_overload_packet_lowering(self):
+        # [FUNCTION DOC] Builds an FX graph calling the aten split packet with a list of sizes and
+        # getitem, compiles it directly with compile_fx and checks that both output slices equal
+        # slices of the input.
         graph = torch.fx.Graph()
         x_node = graph.placeholder("x")
         split_node = graph.call_function(torch.ops.aten.split, (x_node, [1, 1], 0))
@@ -5731,7 +6938,10 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(actual, (x[:1], x[1:]))
 
     def test_unsafe_split_empty_tensor_zero_size(self):
+        # [FUNCTION DOC] unsafe_split on an empty tensor with split sizes 0 and 2; compiled results
+        # equal eager, resetting dynamo between sizes.
         def fn(x, split_size, dim):
+            # [FUNCTION DOC] HELPER: Call unsafe_split on x with the given size and dim.
             return torch.unsafe_split(x, split_size=split_size, dim=dim)
 
         x = torch.ones((0,), device=self.device)
@@ -5741,7 +6951,11 @@ for dtype in (torch.int32, torch.int64):
             self.assertEqual(actual, fn(x, split_size, -1))
 
     def test_split_empty_dim(self):
+        # [FUNCTION DOC] Split and unsafe_split along a zero-length dim with sizes 0 and 2 plus a
+        # tensor created from the other dims.
         def fn(x, split_size):
+            # [FUNCTION DOC] HELPER: Return split and unsafe_split along dim 1, and a ones vector
+            # sized by dim 0.
             return (
                 torch.split(x, split_size, dim=1),
                 torch.unsafe_split(x, split_size=split_size, dim=1),
@@ -5753,10 +6967,15 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (x, 2))
 
     def test_split_zero_size_nonempty_dim_errors(self):
+        # [FUNCTION DOC] Split and unsafe_split by size 0 on a non-empty dim must raise a
+        # RuntimeError saying split_size can only be 0 if the dimension size is 0, in eager and
+        # compiled.
         def split_fn(x):
+            # [FUNCTION DOC] HELPER: Split x with size 0 on the last dim.
             return torch.split(x, 0, -1)
 
         def unsafe_split_fn(x):
+            # [FUNCTION DOC] HELPER: Unsafe split x with size 0 on the last dim.
             return torch.unsafe_split(x, split_size=0, dim=-1)
 
         x = torch.ones((2,), device=self.device)
@@ -5770,10 +6989,14 @@ for dtype in (torch.int32, torch.int64):
                 torch.compile(fn, fullgraph=True)(x)
 
     def test_split_negative_size_empty_dim_errors(self):
+        # [FUNCTION DOC] Split and unsafe_split with a negative size on an empty dim must raise a
+        # RuntimeError about non-negative split size in eager and compiled modes.
         def split_fn(x):
+            # [FUNCTION DOC] HELPER: Split x with size -1 on the last dim.
             return torch.split(x, -1, -1)
 
         def unsafe_split_fn(x):
+            # [FUNCTION DOC] HELPER: Unsafe split x with size -1 on the last dim.
             return torch.unsafe_split(x, split_size=-1, dim=-1)
 
         x = torch.ones((0,), device=self.device)
@@ -5787,7 +7010,9 @@ for dtype in (torch.int32, torch.int64):
                 torch.compile(fn, fullgraph=True)(x)
 
     def test_split_size_greater_than_dim(self):
+        # [FUNCTION DOC] Split with a size larger than the dimension (5 over a 2-element vector).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return split, unsafe_split of x with size 5, and x plus one.
             return (
                 torch.split(x, 5, -1),
                 torch.unsafe_split(x, split_size=5, dim=-1),
@@ -5797,16 +7022,24 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.randn((2,), device=self.device),))
 
     def test_split_failed(self):
+        # [FUNCTION DOC] Compiling a split with sizes that do not add up to the dim length must
+        # raise a RuntimeError.
         @torch.compile(backend="inductor")
         def fn(a):
+            # [FUNCTION DOC] HELPER: Split a into sizes 2, 1, 1 along dim 1.
             return torch.split(a, [2, 1, 1], dim=1)
 
         with self.assertRaisesRegex(RuntimeError, ""):
             fn(torch.randn(1, 5))
 
     def test_inductor_assert(self):
+        # [FUNCTION DOC] A Python assert on dynamic input sizes inside a dynamic compiled function
+        # is carried into the compiled code; the function returns the cosine and equals eager when
+        # the assertion holds.
         @torch.compile(backend="inductor", dynamic=True)
         def fn(a):
+            # [FUNCTION DOC] HELPER: Assert that the first two dims are at least 2 and 4, return
+            # cos of a.
             assert a.shape[0] >= 2 and a.shape[1] >= 4  # noqa: S101
             return a.cos()
 
@@ -5816,11 +7049,16 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(fn(inp), inp.cos())
 
     def test_split(self):
+        # [FUNCTION DOC] Splitting into chunks of 3 on the last dim with four returned pieces,
+        # tested directly and after an add.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Split a into chunks of 3 on the last dim and return the first
+            # four.
             t = torch.split(a, 3, -1)
             return (t[0], t[1], t[2], t[3])
 
         def fn2(a):
+            # [FUNCTION DOC] HELPER: Apply the split helper to a plus one.
             return fn(a + 1)
 
         self.common(
@@ -5834,7 +7072,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_unsafe_chunk_empty_tensor(self):
+        # [FUNCTION DOC] unsafe_chunk on empty tensors with 4, 2 and 3 chunks: the compiled
+        # function returns the expected number of empty chunks and matches eager.
         def fn(x, chunks):
+            # [FUNCTION DOC] HELPER: Return the unsafe_chunk of x with the given chunks along dim
+            # 0.
             return torch.unsafe_chunk(x, chunks=chunks, dim=0)
 
         x = torch.zeros(0)
@@ -5854,9 +7096,15 @@ for dtype in (torch.int32, torch.int64):
         [subtest(False), subtest(True, decorators=[skip_if_not_triton])],
     )
     def test_low_memory_max_pool(self, dilation: int, dim: int, use_block_ptr: bool):
+        # [FUNCTION DOC] Parametrized over dilation, 2D/3D and block pointer use: the low-memory
+        # max pool prims (values with offsets, and conversion from offsets to indices) are compared
+        # with eager for a random input; block pointer variant skipped on non-triton.
         prims = torch.ops.prims
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Run the low-memory max pool prim with kernel 3 (3 by 3 or 3 by
+            # 3 by 2), stride 2, padding 1 and the test dilation, then convert offsets to indices;
+            # return values, indices and offsets.
             kernel_size = [3, 3] if dim == 2 else [3, 3, 2]
             stride = [2] * dim
             padding = [1] * dim
@@ -5884,6 +7132,8 @@ for dtype in (torch.int32, torch.int64):
             self.common(fn, (torch.randn(1, 3, *[10] * dim),))
 
     def test_max_unpool2d_channels_last(self):
+        # [FUNCTION DOC] Regression for issue 187173: max_unpool2d on channels-last pooled data
+        # must keep the output memory format (strides) like eager. CPU only.
         # https://github.com/pytorch/pytorch/issues/187173
         if self.device != "cpu":
             raise unittest.SkipTest(
@@ -5891,6 +7141,7 @@ for dtype in (torch.int32, torch.int64):
             )
 
         def fn(p, i):
+            # [FUNCTION DOC] HELPER: Apply max_unpool2d with output size 8 by 8.
             return torch.nn.functional.max_unpool2d(p, i, (8, 8))
 
         x = torch.randn(2, 4, 8, 8, device=self.device).to(
@@ -5903,46 +7154,63 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(expected, actual)
 
     def test_max_unpool_empty_output(self):
+        # [FUNCTION DOC] Max unpool 1D, 2D and 3D modules with padding that makes the output empty
+        # (single-element inputs); each is checked with the common helper.
         class Unpool1d(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a 1-D max unpool layer with kernel 2, stride 2,
+            # padding 1.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the 1-D max unpool layer.
                 super().__init__()
                 self.unpool = nn.MaxUnpool1d(kernel_size=2, stride=2, padding=1)
 
             def forward(self, x, indices):
+                # [FUNCTION DOC] HELPER: Apply the unpool layer to x and indices.
                 return self.unpool(x, indices)
 
         x1d = torch.randn(1, 1, 1, device=self.device)
         self.common(Unpool1d().to(self.device), (x1d, x1d.long()))
 
         class Unpool2d(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a 2-D max unpool layer with kernel 2, stride 2,
+            # padding 1.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the 2-D max unpool layer.
                 super().__init__()
                 self.unpool = nn.MaxUnpool2d(kernel_size=2, stride=2, padding=1)
 
             def forward(self, x, indices):
+                # [FUNCTION DOC] HELPER: Apply the unpool layer to x and indices.
                 return self.unpool(x, indices)
 
         x2d = torch.randn(1, 1, 1, 1, device=self.device)
         self.common(Unpool2d().to(self.device), (x2d, x2d.long()))
 
         class Unpool3d(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a 3-D max unpool layer with kernel 2, stride 2,
+            # padding 1.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the 3-D max unpool layer.
                 super().__init__()
                 self.unpool = nn.MaxUnpool3d(kernel_size=2, stride=2, padding=1)
 
             def forward(self, x, indices):
+                # [FUNCTION DOC] HELPER: Apply the unpool layer to x and indices.
                 return self.unpool(x, indices)
 
         x3d = torch.randn(1, 1, 1, 1, 1, device=self.device)
         self.common(Unpool3d().to(self.device), (x3d, x3d.long()))
 
     def test_max_unpool2d_channels_last_stride(self):
+        # [FUNCTION DOC] max_unpool2d on a channels-last pooled tensor should keep channels-last
+        # strides (exact stride check). Only on CPU and XPU.
         if self.device not in ("cpu", "xpu"):
             raise unittest.SkipTest(
                 "only CPU and XPU max_unpool2d preserve channels-last layout"
             )
 
         def fn(x, indices):
+            # [FUNCTION DOC] HELPER: Apply max_unpool2d with kernel 2 and stride 2.
             return F.max_unpool2d(x, indices, kernel_size=2, stride=2)
 
         x = torch.randn(2, 3, 4, 4, device=self.device).contiguous(
@@ -5952,9 +7220,14 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (pooled, indices), exact_stride=True)
 
     def test_to_dtype(self):
+        # [FUNCTION DOC] Dtype conversions with the copy op using the integer dtype code 6
+        # (float32), the to op with another dtype (float64, or bfloat16 on MPS) and conversion to
+        # bool.
         new_dtype = torch.float64 if self.device != "mps" else torch.bfloat16
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return copies/conversions of a and b to float32, float64 (or
+            # the test dtype) and bool.
             return (
                 aten._to_copy(a, dtype=6),
                 aten._to_copy(b + 1, dtype=6),
@@ -5972,7 +7245,11 @@ for dtype in (torch.int32, torch.int64):
 
     @requires_gpu()
     def test_to_device(self):
+        # [FUNCTION DOC] Device transfer through the aten copy op: a CPU input is copied to the GPU
+        # device and a GPU input to the CPU, with float32 dtype and strided layout. Requires a GPU.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Copy a to the opposite device (GPU if on CPU, CPU otherwise)
+            # with dtype code 6 and layout 0.
             if a.device.type == "cpu":
                 return aten._to_copy(
                     a, device=torch.device(GPU_TYPE), dtype=6, layout=0
@@ -5986,7 +7263,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_to_memory_format(self):
+        # [FUNCTION DOC] Conversion between contiguous and channels-last memory formats of a four
+        # dimensional tensor in both directions.
         def fn(a, memory_format):
+            # [FUNCTION DOC] HELPER: Return a converted to the given memory format.
             return a.to(memory_format=memory_format)
 
         self.common(
@@ -6003,7 +7283,12 @@ for dtype in (torch.int32, torch.int64):
 
     @requires_gpu()
     def test_to_device_constant(self):
+        # [FUNCTION DOC] Constants created on one device and moved to another inside the compiled
+        # function (an arange and a tensor built from a Python list), added to the input. Requires
+        # a GPU.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Create an arange and a list-based tensor on the other device
+            # and return them transferred to the device of a, one added to a.
             d1 = a.device.type
             if d1 == "cpu":
                 d2 = GPU_TYPE
@@ -6024,11 +7309,15 @@ for dtype in (torch.int32, torch.int64):
 
     @requires_gpu()
     def test_to_copy_fp64_to_no_fp64_device(self):
+        # [FUNCTION DOC] Regression for issue 180664: when the target device does not support
+        # float64 (patched), a float64 CPU tensor moved to the GPU as float32 must cast on the CPU
+        # first, so the generated triton code has no float64 pointer arguments. Requires a GPU.
         # See https://github.com/pytorch/pytorch/issues/180664
         # When the target device does not support fp64, _to_copy should
         # convert dtype on CPU before the device transfer so that no fp64
         # buffer is allocated on the target device.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Convert x to float32 on the GPU device.
             return x.to(dtype=torch.float32, device=GPU_TYPE)
 
         x = torch.randn(4, 4, dtype=torch.float64, device="cpu")
@@ -6043,7 +7332,11 @@ for dtype in (torch.int32, torch.int64):
     @requires_gpu()
     @xfail_if_triton_cpu
     def test_multi_device(self):
+        # [FUNCTION DOC] Computation that moves between CPU and GPU several times with adds in each
+        # device; low precision check disabled. Requires a GPU; expected to fail on Triton CPU.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply ten additive steps to x, moving to the GPU and back to
+            # the CPU twice.
             x = x + 1
             x = x + 2
             x = x.to(device=GPU_TYPE)
@@ -6068,10 +7361,13 @@ for dtype in (torch.int32, torch.int64):
 
     @requires_multigpu()
     def test_multi_gpu_device(self):
+        # [FUNCTION DOC] Division on one device followed by a transfer to the second GPU and a
+        # multiply; requires several GPUs; low precision off. See issue 92627.
         # TODO: https://github.com/pytorch/pytorch/issues/92627
         x = torch.rand([4], device=GPU_TYPE)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Divide x by y, move to the GPU with index 1, and double.
             r = torch.ops.aten.div(x, y)
             r = r.to(f"{GPU_TYPE}:1")
             return 2 * r
@@ -6081,14 +7377,20 @@ for dtype in (torch.int32, torch.int64):
     @requires_multigpu()
     @recover_orig_fp32_precision
     def test_multi_gpu_recompile_on_index(self):
+        # [FUNCTION DOC] Compiling a matmul on tensors on GPU 0 and then on GPU 1 must trigger a
+        # guard failure about device index mismatch (recompile). Sets float32 matmul precision to
+        # high and restores it afterwards. Requires multiple GPUs.
         torch.set_float32_matmul_precision("high")
 
         def gemm(x, y):
+            # [FUNCTION DOC] HELPER: Matrix product of x and y.
             return x @ y
 
         failed_guard = None
 
         def fail(guard):
+            # [FUNCTION DOC] HELPER: Guard failure callback that stores the failed guard in the
+            # enclosing variable.
             nonlocal failed_guard
             failed_guard = guard
 
@@ -6110,7 +7412,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_unbind(self):
+        # [FUNCTION DOC] Unbind of a 3-D tensor along the default dim and along the last dim.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return unbind of a along dim 0 and along dim -1.
             return torch.unbind(a), torch.unbind(a, -1)
 
         self.common(
@@ -6119,21 +7423,32 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_conv1d_with_permute(self):
+        # [FUNCTION DOC] Regression for issue 159462: a 1-D convolution applied after a permute
+        # that puts channels last; low precision check disabled.
         # fix https://github.com/pytorch/pytorch/issues/159462
         class ConvModel(nn.Module):
+            # [CLASS DOC] HELPER: Module with a single 1-D convolution (1 to 64 channels, kernel 3,
+            # padding 1) applied after permuting dims 1 and 2.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the convolution layer.
                 super().__init__()
                 self.conv = nn.Conv1d(1, 64, kernel_size=3, padding=1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Permute x to (0, 2, 1) and apply the convolution.
                 x = x.permute(0, 2, 1)
                 return self.conv(x)
 
         self.common(ConvModel(), (torch.randn([32, 100, 1]),), check_lowp=False)
 
     def test_conv1d_depthwise(self):
+        # [FUNCTION DOC] Depthwise 1-D convolution (768 channels, kernel 9, no bias) on an input
+        # with a channels-last-like custom stride; low precision check disabled.
         class ConvModel(nn.Module):
+            # [CLASS DOC] HELPER: Module with one depthwise 1-D convolution of 768 channels, kernel
+            # size 9, stride 1, padding 4, no bias.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the depthwise convolution layer.
                 super().__init__()
                 self.conv = nn.Conv1d(
                     768,
@@ -6146,6 +7461,7 @@ for dtype in (torch.int32, torch.int64):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the convolution to x.
                 return self.conv(x)
 
         input_tensor = torch.randn([1, 768, 512]).as_strided(
@@ -6154,6 +7470,9 @@ for dtype in (torch.int32, torch.int64):
         self.common(ConvModel(), (input_tensor,), check_lowp=False)
 
     def test_convolution1(self):
+        # [FUNCTION DOC] 2-D convolution followed by ReLU and a tuple wrapper, with relaxed
+        # tolerances for known small mismatches and a reference computed in the low precision dtype
+        # unless running on HIP.
         m = torch.nn.Sequential(
             torch.nn.Conv2d(5, 6, [3, 3]),
             torch.nn.ReLU(),
@@ -6175,7 +7494,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_convolution2(self):
+        # [FUNCTION DOC] Transposed convolution through the aten convolution op (stride 4, group
+        # count 1) on a 1-D input; low precision check disabled.
         def fn(x, w, b):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple with a transposed aten convolution
+            # of x with weight w and bias b.
             # transposed conv
             return (aten.convolution(x, w, b, [4], [0], [1], True, [0], 1),)
 
@@ -6190,6 +7513,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_convolution3(self):
+        # [FUNCTION DOC] Convolution whose stride, padding and dilation are given as one-element
+        # lists (broadcast to both dims), then ReLU; same tolerance handling as the first
+        # convolution test.
         # Test stride or padding or dilation is 1 element list.
         m = torch.nn.Sequential(
             torch.nn.Conv2d(5, 6, [3, 3], stride=[1], padding=[0], dilation=[1]),
@@ -6210,7 +7536,10 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide
     def test_convolution4(self):
+        # [FUNCTION DOC] Depthwise convolution (groups equal to channel count) with the output
+        # summed. Skipped on GPU Halide.
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Apply a grouped conv2d of x with w and return the sum.
             x = F.conv2d(x, w, groups=w.shape[0])
             return x.sum()
 
@@ -6223,7 +7552,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_convolution5(self):
+        # [FUNCTION DOC] Convolution whose dilation is the size of the batch dim (marked dynamic if
+        # possible but specialized), output summed. On XPU float32 default tolerances are used.
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Apply conv2d with dilation equal to the first dim size of x
+            # and return the sum.
             x = F.conv2d(x, w, dilation=[x.size(0)])
             return x.sum()
 
@@ -6243,6 +7576,8 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (x, w), atol=atol, rtol=rtol)
 
     def test_conv3d(self):
+        # [FUNCTION DOC] 3-D convolution with kernel 7 followed by a tuple wrapper, relaxed
+        # tolerances and a low precision reference unless on HIP.
         m = torch.nn.Sequential(
             torch.nn.Conv3d(3, 3, kernel_size=7),
             ToTuple(),
@@ -6260,6 +7595,8 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_conv2d_channels_last(self):
+        # [FUNCTION DOC] CPU-only 1x1 convolution under channels_last: checks three cases where
+        # only the weight, only the activation, or both are channels last.
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("only support cpu conv2d channels_last")
 
@@ -6287,7 +7624,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_conv2d_backward_channels_last(self):
+        # [FUNCTION DOC] Convolution backward through the aten op with a channels-last weight and
+        # all three output masks enabled; low precision off.
         def fn(grad_output, inp, weight):
+            # [FUNCTION DOC] HELPER: Call the aten convolution backward with bias size 320, unit
+            # stride, no padding, dilation 1, and gradient masks for input, weight and bias.
             convolution_backward_8 = torch.ops.aten.convolution_backward.default(
                 grad_output,
                 inp,
@@ -6351,6 +7692,12 @@ for dtype in (torch.int32, torch.int64):
         kernel: int,
         nhwc: bool,
     ):
+        # [FUNCTION DOC] Parametrized conv2d backward with Triton as the backend for weight and
+        # input gradients under max-autotune; varies dilation, stride, padding, kernel size,
+        # channel and group configurations, and NHWC weights. Output spatial sizes are derived from
+        # the input size 16. Uses float32 (float16 with a looser tolerance on some ROCm Navi
+        # archs). Skipped on CPU, on ROCm 7.14 and later, and under the subprocess compile mode
+        # (TF32 settings are not propagated). TF32 is turned off.
         in_channels = channels_groups[0]
         out_channels = channels_groups[1]
         groups = channels_groups[2]
@@ -6362,6 +7709,8 @@ for dtype in (torch.int32, torch.int64):
             self.skipTest("Expected failure under subprocess compile mode")
 
         def fn(grad_output, inp, weight):
+            # [FUNCTION DOC] HELPER: Call the aten convolution backward with the parametrized
+            # stride, padding, dilation and group count and all gradient masks enabled.
             conv_backward = torch.ops.aten.convolution_backward.default(
                 grad_output,
                 inp,
@@ -6425,6 +7774,11 @@ for dtype in (torch.int32, torch.int64):
         }
     )
     def test_conv2d_backward_triton_disabled(self):
+        # [FUNCTION DOC] On NVIDIA CUDA the Triton conv backward kernels are force-disabled (issue
+        # 187081), so even with Triton requested the lowering must fall back to ATEN: the generated
+        # code must not contain the triton template kernel for convolution backward and must
+        # contain the aten convolution backward call (spelling depends on the wrapper). CUDA only;
+        # skipped on CPU and ROCm.
         # On NVIDIA CUDA the Triton conv backward kernels hit a ptxas illegal
         # memory access (#187081) and are force-disabled; even when TRITON is
         # requested the lowering must fall back to ATEN. Assert the Triton
@@ -6434,6 +7788,8 @@ for dtype in (torch.int32, torch.int64):
             self.skipTest("CUDA-only behavior")
 
         def fn(grad_output, inp, weight):
+            # [FUNCTION DOC] HELPER: Call the aten convolution backward with dilation 2, padding 1
+            # and masks for input and weight only.
             return torch.ops.aten.convolution_backward.default(
                 grad_output,
                 inp,
@@ -6498,6 +7854,10 @@ for dtype in (torch.int32, torch.int64):
         kernel: int,
         nhwc: bool,
     ):
+        # [FUNCTION DOC] Parametrized transposed 2-D convolution forward using Triton under
+        # max-autotune; varies stride, dilation, padding, kernel, channel/group configuration and
+        # NHWC layout. Skipped on CPU, under dynamic shapes (known codegen failure) and under the
+        # subprocess compile mode. TF32 off.
         in_channels = channels_groups[0]
         out_channels = channels_groups[1]
         groups = channels_groups[2]
@@ -6509,6 +7869,8 @@ for dtype in (torch.int32, torch.int64):
             self.skipTest("Expected failure under subprocess compile mode")
 
         def fn(x, weight):
+            # [FUNCTION DOC] HELPER: Call the aten transposed convolution with the parametrized
+            # options and no bias.
             return torch.ops.aten.convolution(
                 x,
                 weight,
@@ -6549,10 +7911,14 @@ for dtype in (torch.int32, torch.int64):
     )
     @with_tf32_off
     def test_conv_transpose2d_output_padding_triton(self):
+        # [FUNCTION DOC] Transposed 2-D convolution with output padding using Triton under
+        # max-autotune. Skipped on CPU and under dynamic shapes. TF32 off.
         if is_dynamic_shape_enabled():
             self.skipTest("Expected codegen failure under dynamic shapes")
 
         def fn(x, weight):
+            # [FUNCTION DOC] HELPER: Call the aten transposed convolution with stride 2, padding 1,
+            # dilation 1 and output padding 1.
             return torch.ops.aten.convolution(
                 x,
                 weight,
@@ -6577,6 +7943,8 @@ for dtype in (torch.int32, torch.int64):
         }
     )
     def test_conv_transpose1d_triton_fallback(self):
+        # [FUNCTION DOC] A 1-D transposed convolution module with Triton requested must gracefully
+        # fall back to ATEN rather than crash. Skipped on CPU and under dynamic shapes.
         """ConvTranspose1d should fall back to ATEN gracefully, not crash."""
         if is_dynamic_shape_enabled():
             self.skipTest("Expected codegen failure under dynamic shapes")
@@ -6590,6 +7958,9 @@ for dtype in (torch.int32, torch.int64):
         [subtest(False), subtest(True, decorators=[skip_if_not_triton])],
     )
     def test_conv3d_channels_last(self, use_block_ptr: bool):
+        # [FUNCTION DOC] Parametrized by block pointer use: 1x1x1 3-D convolution under
+        # channels_last_3d memory format in three cases (only weight, only activation, both). CPU
+        # only (skipped on GPU); the block pointer variant needs triton.
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("only support cpu conv3d channels_last")
 
@@ -6626,9 +7997,15 @@ for dtype in (torch.int32, torch.int64):
     @xfail_if_mps  # Non-divisible input sizes are not implemented on MPS device
     @parametrize("combo_kernels", (False, True))
     def test_adaptive_avg_pool2d1(self, combo_kernels):
+        # [FUNCTION DOC] Parametrized over the combo kernels config: aten adaptive average pool 2D
+        # to output 6 by 6 and (on input plus one) 2 by 5 on 16 by 16 input, then on 3 by 3 input
+        # (lowered to an ordinary average pool) and on 6 by 6 input (no-op). Skipped on GPU Halide
+        # (slow); expected failure on MPS (non-divisible sizes).
         with config.patch(combo_kernels=combo_kernels):
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Return adaptive average pool of x to 6 by 6 and of x plus
+                # 1 to 2 by 5.
                 return aten._adaptive_avg_pool2d(x, (6, 6)), aten._adaptive_avg_pool2d(
                     x + 1, (2, 5)
                 )
@@ -6653,8 +8030,11 @@ for dtype in (torch.int32, torch.int64):
 
     @xfail_if_mps  # Non-divisible input sizes are not implemented on MPS device
     def test_adaptive_avg_pool2d2(self):
+        # [FUNCTION DOC] Adaptive average pool with a big kernel (21 by 21 input to 4 by 4) falls
+        # back to eager, so zero kernels must be generated. Expected failure on MPS.
         # Big kernel size, use fallback
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return adaptive average pool of x to 4 by 4.
             return aten._adaptive_avg_pool2d(x, (4, 4))
 
         torch._inductor.metrics.generated_kernel_count = 0
@@ -6670,7 +8050,12 @@ for dtype in (torch.int32, torch.int64):
     @xfail_if_mps  # Non-divisible input sizes are not implemented on MPS device
     @parametrize("comprehensive_padding", (False, True))
     def test_adaptive_avg_pool2d_flatten_sum(self, comprehensive_padding):
+        # [FUNCTION DOC] Parametrized by comprehensive padding: adaptive average pool to 7 followed
+        # by flatten and sum, on float64 33 channel inputs on a GPU. Skipped on GPU Halide;
+        # expected failure on MPS.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adaptive average pool x to size 7, flatten from dim 1, sum on
+            # the last dim.
             y = F.adaptive_avg_pool2d(x, 7)
             return y.flatten(1).sum(dim=-1)
 
@@ -6683,7 +8068,10 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide  # slow
     def test_adaptive_max_pool2d1(self):
+        # [FUNCTION DOC] Adaptive max pool to 6 by 6 on inputs of 16 by 16, 3 by 3 and 6 by 6 (the
+        # last is a no-op). Skipped on GPU Halide (slow).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten adaptive max pool of x to 6 by 6.
             return aten.adaptive_max_pool2d(x, (6, 6))
 
         self.common(
@@ -6705,8 +8093,11 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide  # slow
     def test_adaptive_max_pool2d2(self):
+        # [FUNCTION DOC] Adaptive max pool with a big kernel size falls back; asserts that zero
+        # kernels were generated. Skipped on GPU Halide.
         # Big kernel size, use fallback
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten adaptive max pool of x to 4 by 4.
             return aten.adaptive_max_pool2d(x, (4, 4))
 
         torch._inductor.metrics.generated_kernel_count = 0
@@ -6719,8 +8110,11 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide  # slow
     def test_adaptive_max_pool2d3(self):
+        # [FUNCTION DOC] Adaptive max pool to 2 by 2 for a big kernel input (12 by 12) and a small
+        # one (4 by 4), exercising the fallback to ordinary max pool. Skipped on GPU Halide.
         # test when adaptive_max_pool2d fallbacks to max_pool2d
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten adaptive max pool of x to 2 by 2.
             return aten.adaptive_max_pool2d(x, (2, 2))
 
         # Big kernel (12 / 2 * 12 / 2 > 25)
@@ -6737,7 +8131,10 @@ for dtype in (torch.int32, torch.int64):
 
     @xfail_if_mps_unimplemented
     def test_fractional_max_pool2d1(self):
+        # [FUNCTION DOC] Fractional max pool 2D (kernel 3, output 2 by 2) with random samples
+        # tensor input. Expected failure on MPS.
         def fn(x, samples):
+            # [FUNCTION DOC] HELPER: Return aten fractional max pool of x with the given samples.
             return aten.fractional_max_pool2d(x, (3, 3), (2, 2), samples)
 
         self.common(
@@ -6746,9 +8143,12 @@ for dtype in (torch.int32, torch.int64):
 
     @xfail_if_mps_unimplemented
     def test_fractional_max_pool2d2(self):
+        # [FUNCTION DOC] Fractional max pool with a large kernel (6 by 5, output 3 by 3) so that
+        # the kernel loop is not unrolled. Expected failure on MPS.
         # large kernel size without unrolling
 
         def fn(x, samples):
+            # [FUNCTION DOC] HELPER: Return aten fractional max pool of x with kernel 6 by 5.
             return aten.fractional_max_pool2d(x, (6, 5), (3, 3), samples)
 
         self.common(
@@ -6759,7 +8159,10 @@ for dtype in (torch.int32, torch.int64):
 
     @xfail_if_mps_unimplemented
     def test_fractional_max_pool2d3(self):
+        # [FUNCTION DOC] Fractional max pool with a 1 by 1 kernel and 16 by 16 output size.
+        # Expected failure on MPS.
         def fn(x, samples):
+            # [FUNCTION DOC] HELPER: Return aten fractional max pool with kernel 1 by 1.
             return aten.fractional_max_pool2d(x, (1, 1), (16, 16), samples)
 
         self.common(
@@ -6770,12 +8173,17 @@ for dtype in (torch.int32, torch.int64):
     @config.patch(fallback_random=True)
     @skip_if_halide  # Can only unroll for loops over a constant extent
     def test_fractional_max_pool2d4(self):
+        # [FUNCTION DOC] Fractional max pool with indices using a rectangular kernel and output
+        # size, with random fallback and seeded generators. Skipped on Halide; expected failure on
+        # MPS.
         random.seed(1234)
         torch.manual_seed(1234)
 
         # check rectangular kernel/output size
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return functional fractional max pool with indices of x with
+            # kernel 4 by 3 and output 3 by 2.
             return torch.nn.functional.fractional_max_pool2d_with_indices(
                 x, (4, 3), (3, 2)
             )
@@ -6784,7 +8192,10 @@ for dtype in (torch.int32, torch.int64):
 
     @xfail_if_mps_unimplemented
     def test_fractional_max_pool2d5(self):
+        # [FUNCTION DOC] Fractional max pool with a 3 by 3 kernel and 1 by 1 output on 6 by 6
+        # inputs. Expected failure on MPS.
         def fn(x, samples):
+            # [FUNCTION DOC] HELPER: Return aten fractional max pool of x to 1 by 1 with kernel 3.
             return aten.fractional_max_pool2d(x, (3, 3), (1, 1), samples)
 
         self.common(
@@ -6792,12 +8203,17 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_multi_threading(self):
+        # [FUNCTION DOC] Runs a compiled linear model from two threads, each in a copy of the
+        # current context, with no-grad inference repeated three times; passes if no exception or
+        # deadlock occurs.
         model = torch.nn.Linear(2, 3).eval()
         inp = torch.randn(4, 2)
 
         num_run = 3
 
         def run_weights_sharing_model(m, inp):
+            # [FUNCTION DOC] HELPER: Thread target that runs the compiled module on the input
+            # several times under no-grad.
             with torch.no_grad():
                 for _ in range(num_run):
                     y = m(inp)
@@ -6818,12 +8234,18 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_triton_cpu("Flaky on Triton CPU")
     @skip_if_gpu_halide  # https://github.com/halide/Halide/issues/8311
     def test_adaptive_avg_pool2d_low_prec(self):
+        # [FUNCTION DOC] Adaptive average pool to 1 by 1 in half and bfloat16 (when supported):
+        # compiled output must be close to eager. Flaky on Triton CPU (skipped) and skipped on GPU
+        # Halide.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one adaptive average pool to a 1 by 1 output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the pooling layer.
                 super().__init__()
                 self.avgpool = torch.nn.AdaptiveAvgPool2d((1, 1))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the pooling layer to x.
                 x = self.avgpool(x)
                 return x
 
@@ -6839,14 +8261,22 @@ for dtype in (torch.int32, torch.int64):
             self.assertTrue(torch.allclose(res, expected))
 
     def test_buffer_copied_in_graph(self):
+        # [FUNCTION DOC] A module that mutates a buffer in place in forward must bump the buffer
+        # version counter the same number of times in compiled mode as in eager (compares the
+        # version deltas of all buffers).
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a one-element zero buffer and two zero parameters
+            # whose forward increments the buffer and returns product-sum plus the buffer sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the buffer and the two parameters.
                 super().__init__()
                 self.buf = torch.nn.Buffer(torch.zeros(1))
                 self.w1 = torch.nn.Parameter(torch.zeros(1))
                 self.w2 = torch.nn.Parameter(torch.zeros(1))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add one to the buffer in place and return the sum of the
+                # weight product with x plus the buffer sum.
                 self.buf.add_(1)
                 return (self.w1 * x * self.w2).sum() + self.buf.sum()
 
@@ -6886,8 +8316,13 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide
     def test_buffer_copied_in_graph_with_different_shapes(self):
+        # [FUNCTION DOC] Same buffer version counter check as the previous test but with a larger 4
+        # by 4 buffer and a matrix multiply with a differently shaped input. Skipped on GPU Halide.
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 4 by 4 buffer of ones and a 4 by 2 weight
+            # parameter; the forward increments the buffer and returns matmul sum plus buffer sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the buffer and the weight parameter.
                 super().__init__()
                 self.buf = torch.nn.Buffer(torch.ones(4, 4))
                 self.w = torch.nn.Parameter(
@@ -6895,6 +8330,8 @@ for dtype in (torch.int32, torch.int64):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add one to the buffer in place and return the sum of the
+                # weight matmul with x plus the buffer sum.
                 self.buf.add_(1)
                 return (self.w @ x).sum() + self.buf.sum()
 
@@ -6933,12 +8370,18 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(eager_delta, compile_delta)
 
     def test_buffer_batch_norm(self):
+        # [FUNCTION DOC] Batch norm training updates running statistics buffers; checks that the
+        # version counter deltas for compiled equal eager, where the eager running mean and
+        # variance counters are adjusted by one (known issue 120622).
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a 1-D batch norm layer over 100 features.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the batch norm layer.
                 super().__init__()
                 self.m = torch.nn.BatchNorm1d(100)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the batch norm layer to x.
                 return self.m(x)
 
         model_for_eager = MyModel().to(self.device)
@@ -6984,6 +8427,8 @@ for dtype in (torch.int32, torch.int64):
 
     @xfail_if_mps  # Non-divisible input sizes are not implemented on MPS device
     def test_adaptive_avg_pool_with_output_size_0(self):
+        # [FUNCTION DOC] Adaptive average pool with output size 0 in 1-D and 2-D, including an
+        # integer input for 2-D. Expected failure on MPS.
         m1 = nn.AdaptiveAvgPool1d(0)
         self.common(m1, (torch.randn(1, 2),))
         m2 = nn.AdaptiveAvgPool2d(0)
@@ -6991,7 +8436,10 @@ for dtype in (torch.int32, torch.int64):
         self.common(m2, (torch.randint(0, 8, (1, 2, 3)),))
 
     def test_max_pool2d1(self):
+        # [FUNCTION DOC] Max pool with indices with kernel 3 and stride 2 on a random 4D input.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten max pool with indices of x with kernel 3 and
+            # stride 2.
             return aten.max_pool2d_with_indices(x, [3, 3], [2, 2])
 
         self.common(
@@ -7001,7 +8449,11 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide  # slow
     def test_max_pool2d2(self):
+        # [FUNCTION DOC] Same max pool on a larger input (16 by 64 by 55 by 55). Skipped on GPU
+        # Halide.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten max pool with indices of x with kernel 3 and
+            # stride 2.
             return aten.max_pool2d_with_indices(x, [3, 3], [2, 2])
 
         self.common(
@@ -7011,7 +8463,11 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide  # slow
     def test_max_pool2d3(self):
+        # [FUNCTION DOC] Max pool with indices with padding 1, given both as full lists and as
+        # one-element lists, on negative values. Skipped on GPU Halide.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return max pool with indices with padded kernel 3 stride 2,
+            # using list arguments and one-element list arguments.
             # with padding
             return (
                 aten.max_pool2d_with_indices(x, [3, 3], [2, 2], [1, 1]),
@@ -7036,7 +8492,11 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_halide  # Can only unroll for loops over a constant extent
     def test_max_pool2d4(self):
+        # [FUNCTION DOC] Max pool with indices with padding 0, dilation 1 and ceil mode on. Skipped
+        # on Halide (needs constant extent loops).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten max pool with indices with kernel 3, stride 2, no
+            # padding, dilation 1 and ceil mode true.
             # with padding
             return aten.max_pool2d_with_indices(x, [3, 3], [2, 2], [0, 0], [1, 1], True)
 
@@ -7047,7 +8507,11 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide  # slow
     def test_max_pool2d5(self):
+        # [FUNCTION DOC] Max pool with indices with an empty stride list (default to kernel size).
+        # Skipped on GPU Halide.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten max pool with indices of x with kernel 3 and empty
+            # stride.
             return aten.max_pool2d_with_indices(x, [3, 3], [])
 
         self.common(
@@ -7058,8 +8522,12 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_gpu_halide  # slow
     @parametrize("dilation", (1, 2))
     def test_max_pool2d6(self, dilation: int):
+        # [FUNCTION DOC] Parametrized over dilation 1 and 2: max pool with a big 13 by 13 kernel
+        # and default stride. Skipped on GPU Halide.
         # Big kernel size
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten max pool with indices with kernel 13 and the test
+            # dilation.
             return aten.max_pool2d_with_indices(
                 x, [13, 13], [], dilation=[dilation] * 2
             )
@@ -7071,8 +8539,11 @@ for dtype in (torch.int32, torch.int64):
 
     # From https://github.com/pytorch/pytorch/issues/94775
     def test_max_pool2d7(self):
+        # [FUNCTION DOC] Max pool with ceil mode and kernel 1 stride 2 on 6 by 7 (issue 94775).
         # ceil mode turns on
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return functional max pool 2D of x with kernel 1, stride 2 and
+            # ceil mode.
             return torch.nn.functional.max_pool2d(
                 x, 1, stride=(2, 2), padding=0, ceil_mode=True
             )
@@ -7084,8 +8555,12 @@ for dtype in (torch.int32, torch.int64):
 
     # From https://github.com/pytorch/pytorch/issues/93384
     def test_max_pool2d8(self):
+        # [FUNCTION DOC] Max pool with indices with non-unit dilation and rectangular kernel (issue
+        # 93384).
         # dilation is not 1
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten max pool with indices with kernel 3 by 2, stride 2
+            # by 1, padding 1 and dilation 1 by 2.
             return aten.max_pool2d_with_indices(x, [3, 2], [2, 1], [1, 1], [1, 2])
 
         self.common(
@@ -7094,7 +8569,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_avg_pool2d1(self):
+        # [FUNCTION DOC] Average pool 2D with kernel 3 and stride 2 on a random 4D tensor.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten avg pool 2D of x with kernel 3 and stride 2.
             return aten.avg_pool2d(x, [3, 3], [2, 2])
 
         self.common(
@@ -7103,7 +8580,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_avg_pool2d2(self):
+        # [FUNCTION DOC] Average pool 2D with kernel 3 and stride 2 on a large (16 by 64 by 55 by
+        # 55) input.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return aten avg pool 2D of x with kernel 3 and stride 2.
             return aten.avg_pool2d(x, [3, 3], [2, 2])
 
         self.common(
@@ -7112,7 +8592,12 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_avg_pool2d3(self):
+        # [FUNCTION DOC] Average pool with padding 1, given as full lists and as one-element lists,
+        # on a negative arange image. Low precision checking is skipped for Halide (misaligned
+        # addresses).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return avg pool with kernel 3 stride 2 padding 1 using list
+            # arguments and one-element list arguments.
             return (
                 aten.avg_pool2d(x, [3, 3], [2, 2], [1, 1]),
                 aten.avg_pool2d(
@@ -7136,7 +8621,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_avg_pool2d4(self):
+        # [FUNCTION DOC] Average pool with ceil mode enabled on a 111 by 111 image.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return avg pool with kernel 3, stride 2, no padding, ceil mode
+            # true.
             return aten.avg_pool2d(x, [3, 3], [2, 2], [0, 0], True)
 
         self.common(
@@ -7145,7 +8633,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_avg_pool2d5(self):
+        # [FUNCTION DOC] Average pool with padding 1 and padding excluded from the divisor count.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return avg pool with kernel 3, stride 2, padding 1 and no
+            # padding counted.
             return aten.avg_pool2d(x, [3, 3], [2, 2], [1, 1], count_include_pad=False)
 
         self.common(
@@ -7155,7 +8646,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_avg_pool2d6(self):
+        # [FUNCTION DOC] Average pool with padding 1 and an explicit divisor override of 3.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return avg pool with kernel 3, stride 2, padding 1, divisor
+            # override 3.
             return aten.avg_pool2d(x, [3, 3], [2, 2], [1, 1], divisor_override=3)
 
         self.common(
@@ -7165,8 +8659,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_avg_pool2d7(self):
+        # [FUNCTION DOC] Average pool with a large 13 by 13 kernel with stride 1 (not equal to the
+        # kernel); asserts that zero kernels were generated (fallback to eager).
         # Large kernel size with stride != size
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return avg pool with kernel 13, stride 1 and no padding.
             return aten.avg_pool2d(x, [13, 13], [1, 1], [0, 0])
 
         torch._inductor.metrics.generated_kernel_count = 0
@@ -7177,8 +8674,12 @@ for dtype in (torch.int32, torch.int64):
         assertGeneratedKernelCountEqual(self, 0)
 
     def test_avg_pool2d8(self):
+        # [FUNCTION DOC] Average pool with ceil mode, padding 1, kernel 3, stride 2 on a small
+        # image (issue 100987).
         # https://github.com/pytorch/pytorch/issues/100987
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return avg pool with kernel 3, stride 2, padding 1 and ceil
+            # mode.
             return aten.avg_pool2d(
                 x, kernel_size=3, stride=2, padding=1, ceil_mode=True
             )
@@ -7192,7 +8693,12 @@ for dtype in (torch.int32, torch.int64):
     @tf32_on_and_off(0.006)
     @skip_if_gpu_halide  # slow
     def test_alexnet_prefix(self):
+        # [FUNCTION DOC] The first layers of AlexNet: 11x11 stride-4 convolution, ReLU and max
+        # pool, on strided CPU inputs with loose tolerances; run with TF32 on and off (accuracy
+        # tolerance 0.006 for TF32). Skipped on GPU Halide (slow).
         def forward(arg6, arg7, arg16):
+            # [FUNCTION DOC] HELPER: Convolve arg16 with arg7 and bias arg6, apply ReLU, max pool
+            # with kernel 3 and stride 2, and return the pooled values in a tuple.
             convolution = torch.ops.aten.convolution(
                 arg16, arg7, arg6, [4, 4], [2, 2], [1, 1], False, [0, 0], 1
             )
@@ -7220,7 +8726,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_elu(self):
+        # [FUNCTION DOC] ELU with SELU constants plus 2, and ELU with other scalar parameters on x
+        # plus one.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return elu with the SELU alpha and scale plus 2, and elu with
+            # alpha 2, scale 3 and input scale 4 of x plus one.
             return aten.elu(x, 1.6732632423543772, 1.0507009873554805) + 2, aten.elu(
                 x + 1, 2, 3, 4
             )
@@ -7233,10 +8743,13 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_celu_zero_alpha_raises(self):
+        # [FUNCTION DOC] In-place celu with alpha zero must raise a RuntimeError saying alpha
+        # cannot be 0, both in eager and when compiled (issue 183762), not silently produce NaN.
         # https://github.com/pytorch/pytorch/issues/183762
         # torch.compile must raise for celu_ with alpha=0, matching eager behavior
         # instead of silently producing NaN via division by zero.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply in-place celu with alpha 0.0 to a clone of x.
             return torch.celu_(x.clone(), alpha=0.0)
 
         x = torch.tensor([[-2.0, -0.5, 0.0], [1.0, 3.0, -4.0]], device=self.device)
@@ -7248,7 +8761,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_tan(self):
+        # [FUNCTION DOC] Tangent of a random tensor and of x plus one.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return tan of x plus 2 and tan of x plus 1.
             return aten.tan(x) + 2, aten.tan(x + 1)
 
         self.common(
@@ -7257,7 +8772,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_tanh(self):
+        # [FUNCTION DOC] Hyperbolic tangent of a random tensor and of x plus one.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return tanh of x plus 2 and tanh of x plus 1.
             return aten.tanh(x) + 2, aten.tanh(x + 1)
 
         self.common(
@@ -7268,7 +8785,10 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_halide  # lgamma not implemented
     @xfail_if_triton_cpu
     def test_lgamma(self):
+        # [FUNCTION DOC] Log-gamma function together with cos of x plus one. Skipped on Halide (not
+        # implemented); expected failure on Triton CPU.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return lgamma of x plus 2 and cos of x plus 1.
             return aten.lgamma(x) + 2, aten.cos(x + 1)
 
         self.common(
@@ -7277,7 +8797,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_cos(self):
+        # [FUNCTION DOC] Cosine of x and of x plus one.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return cos of x plus 2 and cos of x plus 1.
             return aten.cos(x) + 2, aten.cos(x + 1)
 
         self.common(
@@ -7286,7 +8808,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_sin(self):
+        # [FUNCTION DOC] Sine of x and of x plus one.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return sin of x plus 2 and sin of x plus 1.
             return aten.sin(x) + 2, aten.sin(x + 1)
 
         self.common(
@@ -7295,7 +8819,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_repeat(self):
+        # [FUNCTION DOC] Repeat with various repeat counts, including a zero count (empty output)
+        # and more repeat dims than tensor dims.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return four repeats of x with different repeat lists.
             return (
                 x.repeat(0, 1, 1, 1),
                 x.repeat(2, 2, 3, 1),
@@ -7309,9 +8836,13 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_repeat_as_strided(self):
+        # [FUNCTION DOC] Reproducer for issue 127474: repeat followed by as_strided with the
+        # repeated tensor strides, then a sum with itself.
         # Reproducer for #127474
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Repeat x by 3 by 2, take an as_strided 3 by 2 view with the
+            # stride of the repeated tensor, and return it plus itself.
             view_size = (3, 2)
             full = x.repeat((3, 2))
             view = torch.as_strided(full, view_size, full.stride())
@@ -7322,8 +8853,13 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.randn(1, 1),))
 
     def test_as_strided_on_views(self):
+        # [FUNCTION DOC] Regression for issue 163286: as_strided applied on views produced by view
+        # with a dtype change (bfloat16 to float16 and back); the result dtype must be bfloat16 in
+        # eager and compiled, and values must match with the reference not upcast.
         # https://github.com/pytorch/pytorch/issues/163286
         def fn(a):
+            # [FUNCTION DOC] HELPER: Flatten a, reinterpret as float16, as_strided to 2 by 5,
+            # reinterpret as bfloat16, as_strided to 10 by 10 and return it.
             c = a.view(-1)
             # convert to float16
             d = c.view(torch.float16)
@@ -7346,9 +8882,13 @@ for dtype in (torch.int32, torch.int64):
             raise AssertionError(f"Expected dtype torch.bfloat16, got {out.dtype}")
 
     def test_as_strided_on_split_view(self):
+        # [FUNCTION DOC] as_strided without an explicit storage offset applied to the halves of a
+        # split must keep the offsets of the split views instead of using the base start.
         # as_strided without an explicit storage_offset must preserve the
         # offset of split/slice views instead of resetting to the base tensor.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Split x into two halves of 3, take as_strided of two elements
+            # from each and return their sum.
             a, b = x.split(3)
             a_s = a.as_strided((2,), (1,))
             b_s = b.as_strided((2,), (1,))
@@ -7357,7 +8897,10 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.arange(6, dtype=torch.float32),))
 
     def test_repeat_interleave(self):
+        # [FUNCTION DOC] repeat_interleave with scalar repeats on flattened input, on dim 0, and
+        # with the size of dim 1 on dim 1.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return three repeat_interleave results of x.
             return (
                 x.repeat_interleave(2),
                 x.repeat_interleave(3, dim=0),
@@ -7371,7 +8914,11 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(implicit_fallbacks=True)
     def test_repeat_interleave_2(self):
+        # [FUNCTION DOC] repeat_interleave with a repeats tensor and an explicit output size of 12,
+        # with implicit fallbacks enabled.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Call the aten repeat_interleave Tensor overload with output
+            # size 12.
             return torch.ops.aten.repeat_interleave.Tensor(x, output_size=12)
 
         self.common(
@@ -7381,10 +8928,14 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(fallback_random=True)
     def test_randn_with_dtype_and_device(self):
+        # [FUNCTION DOC] CPU-only: random normal tensor created with the dtype and device of the
+        # input, shifted by one in place; fallback random is on so results match eager.
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("only support cpu randn_with_dtype_and_device test")
 
         def fn(vectors):
+            # [FUNCTION DOC] HELPER: Create a random normal tensor of shape 12 by last dim by 1 by
+            # 64 on the device and dtype of vectors, add 1 in place and return it.
             rotations_shape = (12, vectors.shape[-1], 1, 64)
             random_rotations = torch.randn(
                 rotations_shape, device=vectors.device, dtype=vectors.dtype
@@ -7399,7 +8950,11 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(fallback_random=True)
     def test_normal_fallback(self):
+        # [FUNCTION DOC] With random fallback on, torch.normal with tensor mean and std and with
+        # scalar parameters must match eager values.
         def fn_scalar():
+            # [FUNCTION DOC] HELPER: Return a normal sample of shape 2 by 3 on the device with
+            # scalar mean 0 and std 1.
             return torch.normal(0.0, 1.0, size=(2, 3), device=self.device)
 
         mean = torch.ones(10, device=self.device) * 0.1
@@ -7410,7 +8965,12 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(fallback_random=False)
     def test_normal_no_fallback(self):
+        # [FUNCTION DOC] With random fallback off, torch.normal compiled (tensor and scalar forms)
+        # gives results of the right shape, float32 dtype and device type, and the compiled random
+        # values differ from eager ones for the same seed (not an eager fallback).
         def fn_scalar():
+            # [FUNCTION DOC] HELPER: Return a normal sample of shape 2 by 3 on the device with
+            # scalar mean 0 and std 1.
             return torch.normal(0.0, 1.0, size=(2, 3), device=self.device)
 
         mean = torch.ones(10, device=self.device) * 0.1
@@ -7436,6 +8996,8 @@ for dtype in (torch.int32, torch.int64):
         self.assertNotEqual(eager_out, compiled_out)
 
     def test_embedding(self):
+        # [FUNCTION DOC] Embedding layer with padding index 0 followed by ReLU and a tuple wrapper,
+        # on random integer indices.
         m = torch.nn.Sequential(
             torch.nn.Embedding(10, 4, padding_idx=0),
             torch.nn.ReLU(),
@@ -7452,10 +9014,15 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_triton_cpu  # cpp-only RuntimeError contract
     @config.patch({"cpp.threads": 1})
     def test_embedding_out_of_bounds_indices(self):
+        # [FUNCTION DOC] CPU bounds check regression: compiled embedding with valid indices equals
+        # eager; indices -1, -2, -5 and 5 (and computed negative indices) must raise IndexError in
+        # eager and a RuntimeError mentioning index out of bounds when compiled. Runs with a single
+        # CPU thread; skipped for Halide, Pallas and Triton CPU.
         if self.device != "cpu":
             raise unittest.SkipTest("CPU bounds check regression")
 
         def fn(indices, weight):
+            # [FUNCTION DOC] HELPER: Return embedding lookup of indices in weight.
             return F.embedding(indices, weight)
 
         weight = torch.tensor(
@@ -7480,6 +9047,8 @@ for dtype in (torch.int32, torch.int64):
                 compiled_fn(indices, weight)
 
         def computed_negative_fn(weight):
+            # [FUNCTION DOC] HELPER: Build indices as an arange of 3 minus 1 (so one is negative)
+            # and return embedding lookup in weight.
             indices = torch.arange(3, device=weight.device) - 1
             return F.embedding(indices, weight)
 
@@ -7492,8 +9061,12 @@ for dtype in (torch.int32, torch.int64):
             compiled_computed_negative_fn(weight)
 
     def test_embedding_sparse(self):
+        # [FUNCTION DOC] Embedding with sparse gradient enabled and a weight requiring grad (issue
+        # 150656).
         # Fix https://github.com/pytorch/pytorch/issues/150656
         def fn(weight, indices):
+            # [FUNCTION DOC] HELPER: Return embedding lookup of indices in weight with sparse
+            # gradient.
             return F.embedding(indices, weight, sparse=True)
 
         indices = torch.randint(10, (2, 3))
@@ -7506,10 +9079,15 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(implicit_fallbacks=True)
     def test_no_grad_embedding_renorm_negative_indices(self):
+        # [FUNCTION DOC] In-place embedding renorm (no grad) with negative index values using
+        # implicit fallbacks, CUDA only: the compiled call must return the same tensor and leave
+        # the same modified weight as eager on a large bfloat16 (or float32) weight.
         if self.device != "cuda":
             raise unittest.SkipTest("requires cuda")
 
         def fn(weight, indices):
+            # [FUNCTION DOC] HELPER: Call the aten no-grad embedding renorm on the weight with the
+            # given indices, max norm 1.0 and norm type 1.0.
             return torch.ops.aten._no_grad_embedding_renorm_(
                 weight, indices, max_norm=1.0, norm_type=1.0
             )
@@ -7534,7 +9112,10 @@ for dtype in (torch.int32, torch.int64):
 
     @torch._inductor.config.patch("combo_kernels", True)
     def test_mean(self):
+        # [FUNCTION DOC] Mean over all elements, last dim, dim -2 with keepdim and dims 0 and 1,
+        # with combo kernels enabled.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the four mean variants of x.
             return (
                 x.mean(),
                 x.mean(-1),
@@ -7553,7 +9134,12 @@ for dtype in (torch.int32, torch.int64):
     )
     @parametrize("tile_reduction", (False, True))
     def test_var_mean(self, tile_reduction: bool):
+        # [FUNCTION DOC] Parametrized by tiled reductions: variance and mean over the last dim and
+        # over dims 1 and 3, with combo kernels enabled and nd tiling configured to match. Skipped
+        # under TorchInductor testing and on ROCm (issue 165879).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return var_mean over the last dim and over dims 1 and 3,
+            # flattened into one tuple.
             return (
                 *torch.var_mean(x, -1),
                 *torch.var_mean(x, [1, 3]),
@@ -7572,14 +9158,22 @@ for dtype in (torch.int32, torch.int64):
             )
 
     def test_var_mean_div_by(self):
+        # [FUNCTION DOC] Variance and mean with keepdim over dim 2, followed by dividing the input
+        # by the variance.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x divided by var, var and mean (computed on dim 2, kept
+            # dims).
             var, mean = torch.var_mean(x, dim=2, keepdim=True)
             return x / var, var, mean
 
         self.common(fn, (torch.rand([1, 17, 2048]),))
 
     def test_var_correction(self):
+        # [FUNCTION DOC] Variance along the last dim with correction values 1.3, 3 and 10, for 8
+        # elements and for 4 elements (unrolled reduction).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return variance along the last dim with three different
+            # corrections.
             dim = -1
             return (
                 torch.var(x, dim=dim, correction=1.3),
@@ -7593,8 +9187,12 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(pick_loop_orders=True)
     def test_transposed_propagates(self):
+        # [FUNCTION DOC] Compiles an add of two differently laid out permuted tensors with
+        # pick-loop- orders enabled and checks the output keeps the stride of the first operand
+        # (and has stride 1 on dim 2), i.e. the transposed layout propagates.
         @torch.compile(backend="inductor", fullgraph=True)
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compiled function returning x plus y.
             return x + y
 
         a = torch.randn(1, 4, 4, 4, device=self.device).permute(0, 2, 3, 1)
@@ -7605,7 +9203,10 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide
     def test_std(self):
+        # [FUNCTION DOC] Variance and standard deviation with positional unbiased flags, over all
+        # elements, the last dim, dims 0 and 1, and dim -2 with keepdim. Skipped on GPU Halide.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return eight variance and standard deviation variants of x.
             return (
                 torch.var(x, True),
                 torch.var(x, False),
@@ -7623,7 +9224,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_embedding_bag(self):
+        # [FUNCTION DOC] Aten _embedding_bag with weights, indices and offsets and default options.
         def fn(w, i, o):
+            # [FUNCTION DOC] HELPER: Call the aten embedding bag op with sum-style defaults.
             return aten._embedding_bag(w, i, o, False, 0, False, None)
 
         self.common(
@@ -7632,6 +9235,8 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_batch_norm_2d(self):
+        # [FUNCTION DOC] Batch norm 2D plus ReLU in eval mode on two input shapes; low precision
+        # check disabled.
         m = torch.nn.Sequential(
             torch.nn.BatchNorm2d(10),
             torch.nn.ReLU(),
@@ -7647,11 +9252,17 @@ for dtype in (torch.int32, torch.int64):
     # From yolov3
     @with_tf32_off
     def test_batch_norm_2d_2(self):
+        # [FUNCTION DOC] Reproducer from yolov3 (GPU only): a stride-2 convolution, batch norm with
+        # custom eps and momentum, and in-place leaky ReLU on a large input; compiled output is
+        # compared with eager with loose tolerances. TF32 is turned off.
         if self.device == "cpu":
             raise unittest.SkipTest(f"requires {GPU_TYPE}")
 
         class Repro(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module chaining a 64 to 128 channel 3x3 stride-2 convolution
+            # without bias, batch norm and in-place leaky ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the convolution, batch norm and leaky ReLU layers.
                 super().__init__()
                 self.self_0 = torch.nn.Conv2d(
                     64,
@@ -7671,6 +9282,8 @@ for dtype in (torch.int32, torch.int64):
                 self.self_2 = torch.nn.LeakyReLU(negative_slope=0.1, inplace=True)
 
             def forward(self, l_input_: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Apply the layers in order and return the result as a
+                # one-element tuple.
                 self_0 = self.self_0(l_input_)
                 self_1 = self.self_1(self_0)
                 self_2 = self.self_2(self_1)
@@ -7684,6 +9297,8 @@ for dtype in (torch.int32, torch.int64):
 
     @patch.object(config.trace, "enabled", True)
     def test_layer_norm(self):
+        # [FUNCTION DOC] Layer norm plus ReLU in eval mode under no-grad with Inductor tracing
+        # enabled; on non-CPU devices exactly one kernel must be generated.
         m = torch.nn.Sequential(
             torch.nn.LayerNorm(32),
             torch.nn.ReLU(),
@@ -7695,6 +9310,9 @@ for dtype in (torch.int32, torch.int64):
             assertGeneratedKernelCountEqual(self, 1)
 
     def test_layer_norm_rejects_complex_inputs(self):
+        # [FUNCTION DOC] Layer norm on complex64 input must raise RuntimeError in eager and in
+        # compiled mode, where the message must say native_layer_norm does not support complex
+        # inputs. Only validated on CPU and CUDA.
         if self.device not in ("cpu", "cuda"):
             raise unittest.SkipTest("Only validated on CPU/CUDA")
 
@@ -7714,6 +9332,9 @@ for dtype in (torch.int32, torch.int64):
 
     @torch._functorch.config.patch("donated_buffer", True)
     def test_matmul_layer_norm(self):
+        # [FUNCTION DOC] Matrix multiply followed by layer norm with donated buffers enabled, with
+        # gradient-requiring inputs, compared with eager (forward and gradients as handled by the
+        # common helper).
         batch_size = 32
         seq_length = 50
         hidden_size = 256
@@ -7732,6 +9353,8 @@ for dtype in (torch.int32, torch.int64):
         layer_norm = torch.nn.LayerNorm(hidden_size, device=self.device)
 
         def foo(inp, weight):
+            # [FUNCTION DOC] HELPER: Matmul inp with weight and apply the shared layer norm to the
+            # result.
             matmul_output = inp @ weight
             final_output = layer_norm(matmul_output)
             return final_output
@@ -7739,7 +9362,9 @@ for dtype in (torch.int32, torch.int64):
         self.common(foo, (inp, weight), check_lowp=False)
 
     def test_transpose_add(self):
+        # [FUNCTION DOC] Transpose plus add of two matrices; on non-CPU devices exactly one kernel.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the transpose of a plus b.
             return a.t() + b
 
         self.common(
@@ -7750,7 +9375,10 @@ for dtype in (torch.int32, torch.int64):
 
     @patch.object(config.triton, "persistent_reductions", True)
     def test_softmax_one_kernel_persist(self):
+        # [FUNCTION DOC] Softmax written by hand (max, exp, normalize) with persistent reductions
+        # enabled; one generated kernel expected on non-CPU devices.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Softmax of x over dim 1 built from amax, exp and sum.
             dim = 1
             x_max = torch.amax(x, dim, keepdim=True)
             unnormalized = torch.exp(x - x_max)
@@ -7763,7 +9391,10 @@ for dtype in (torch.int32, torch.int64):
 
     @patch.object(config.triton, "persistent_reductions", False)
     def test_softmax_one_kernel_loop(self):
+        # [FUNCTION DOC] Same hand-written softmax with persistent reductions disabled (loop
+        # reductions); one generated kernel expected on non-CPU devices.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Softmax of x over dim 1 built from amax, exp and sum.
             x_max = torch.amax(x, 1, keepdim=True)
             unnormalized = torch.exp(x - x_max)
             result = unnormalized / torch.sum(unnormalized, 1, keepdim=True)
@@ -7774,7 +9405,11 @@ for dtype in (torch.int32, torch.int64):
             assertGeneratedKernelCountEqual(self, 1)
 
     def test_complex_fallback(self):
+        # [FUNCTION DOC] Complex64 pointwise math must fall back to eager, so zero generated
+        # kernels; then a module computing a real expression converted to complex64 is checked,
+        # which generates one kernel on non-CPU devices.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x times x plus 10.
             return x * x + 10
 
         self.common(
@@ -7784,7 +9419,10 @@ for dtype in (torch.int32, torch.int64):
         assertGeneratedKernelCountEqual(self, 0)
 
         class ToComplex(nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward computes x plus x plus 12 and converts to
+            # complex64.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus x plus 12 converted to complex64.
                 return (x + x + 12).to(torch.complex64)
 
         self.common(ToComplex(), (torch.rand([1, 2, 4, 8]),), check_lowp=False)
@@ -7793,6 +9431,9 @@ for dtype in (torch.int32, torch.int64):
             assertGeneratedKernelCountEqual(self, 1)
 
     def test_complex_python_literal_backward(self):
+        # [FUNCTION DOC] Backward through complex multiplication and division by Python complex
+        # literals for each supported complex dtype: compiled absolute-sum value and input gradient
+        # must match eager. Skipped if no complex dtype is supported.
         dtypes = [
             dtype
             for dtype in (torch.complex64, torch.complex128)
@@ -7824,10 +9465,15 @@ for dtype in (torch.int32, torch.int64):
                     self.assertEqual(x.grad, x_ref.grad)
 
     def test_complex_zero_dim_scalar(self):
+        # [FUNCTION DOC] A zero-dimensional complex64 tensor from scalar_tensor added to itself
+        # compiles and gives the eager value (exercises constant folding of view with dtype on 0-d
+        # tensors).
         # Test that 0-d complex tensors can be compiled without crashing.
         # This exercises a fix in constant folding where view.dtype on 0-d
         # complex tensors would fail because view ops pass through unchanged.
         def fn():
+            # [FUNCTION DOC] HELPER: Create a 0-d complex64 scalar tensor with value 2.5 and return
+            # it plus itself.
             out = torch.ops.aten.scalar_tensor(
                 s=2.5,
                 dtype=torch.complex64,
@@ -7844,6 +9490,9 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(actual, expected)
 
     def test_view_dtype_0d_smaller_to_larger_element_size(self):
+        # [FUNCTION DOC] Builds an FX graph with a 0-d float32 scalar tensor viewed as complex64
+        # (output element larger than input) and runs the uniform value constant folder; the view
+        # node must not be replaced by a constant and the folder must not crash.
         # Test that constant folding handles view.dtype on 0-d tensors when
         # the input element size is SMALLER than the output dtype itemsize.
         # This is the opposite case of test_complex_zero_dim_scalar which
@@ -7888,10 +9537,14 @@ for dtype in (torch.int32, torch.int64):
         self.assertNotIn(view_node, folder.node_replacements)
 
     def test_complex_1d_constant_tensor(self):
+        # [FUNCTION DOC] A one-dimensional complex64 constant tensor filled with 2.5+1j added to
+        # itself compiles and equals eager (constant folding with differing element sizes).
         # Test that 1-d complex constant tensors can be compiled without crashing.
         # This exercises view.dtype on non-0-d tensors during constant folding
         # where element sizes differ (complex64 -> float32 or vice versa).
         def fn():
+            # [FUNCTION DOC] HELPER: Create a length-2 complex64 filled tensor and return it plus
+            # itself.
             out = torch.full([2], 2.5 + 1.0j, dtype=torch.complex64, device=self.device)
             out = out + out
             return out
@@ -7902,10 +9555,14 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(actual, expected)
 
     def test_complex_uniform_constant_folding(self):
+        # [FUNCTION DOC] Regression for issue 174891: a complex constant mask of ones added to a
+        # complex input; constant folding must not treat the viewed result as uniform since element
+        # count can change with view dtype.
         # Fix https://github.com/pytorch/pytorch/issues/174891
         # view.dtype with mismatched element sizes changes element count,
         # so constant folding must not treat the result as uniform.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create a 2 by 1 complex64 ones tensor and return x plus it.
             mask = torch.ones(2, 1, dtype=torch.complex64, device=self.device)
             return x + mask
 
@@ -7916,6 +9573,8 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(actual, expected)
 
     def test_view_dtype_non_0d_larger_to_smaller_element_size(self):
+        # [FUNCTION DOC] FX graph test: a length-2 complex64 filled constant viewed as float32
+        # (larger element to smaller); the uniform constant folder must not fold the view node.
         # Non-0-d counterpart of test_view_dtype_0d_smaller_to_larger_element_size.
         # element_size (8) > itemsize (4): complex64 -> float32.
         import torch.fx as fx
@@ -7953,6 +9612,8 @@ for dtype in (torch.int32, torch.int64):
         self.assertNotIn(view_node, folder.node_replacements)
 
     def test_view_dtype_non_0d_smaller_to_larger_element_size(self):
+        # [FUNCTION DOC] FX graph test: a length-2 float32 filled constant viewed as complex64
+        # (smaller element to larger); the uniform constant folder must not fold the view node.
         # Non-0-d counterpart of test_view_dtype_0d_smaller_to_larger_element_size.
         # element_size (4) < itemsize (8): float32 -> complex64.
         import torch.fx as fx
@@ -7990,6 +9651,10 @@ for dtype in (torch.int32, torch.int64):
         self.assertNotIn(view_node, folder.node_replacements)
 
     def test_uniform_value_mul_by_zero(self):
+        # [FUNCTION DOC] Uniform value constant folder test for multiplication by integer zero: for
+        # float32, float16, bfloat16 and complex64 inputs the multiply must not be folded to zero
+        # (NaN and infinity times zero are NaN), while int32 and int64 inputs are folded. Builds a
+        # small FX graph per dtype and checks the folder's replacement map.
         # x * 0 is uniformly 0 only for non-floating-point dtypes. For float and
         # complex, nan * 0 == nan and (+/-inf) * 0 == nan, so the uniform-value
         # peephole must not fold x * 0 -> 0 (it would drop NaN/Inf when x is not
@@ -8023,17 +9688,23 @@ for dtype in (torch.int32, torch.int64):
             )
 
     def test_mul_by_zero_extremal(self):
+        # [FUNCTION DOC] End to end check that multiplying NaN, infinities and finite values by
+        # zero keeps NaN results like eager rather than folding to zero.
         # End-to-end: x * 0 must preserve NaN/Inf to match eager (nan*0=nan,
         # inf*0=nan); folding x * 0 -> 0 would drop them. Via CommonTemplate this
         # also runs on CPU (CpuTests) by default.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple with a times zero.
             return (a * 0,)
 
         self.common(fn, [torch.tensor([np.nan, np.inf, -np.inf, 0.0, 1.0, -1.0])])
 
     @config.patch(fallback_random=True)
     def test_uniform(self):
+        # [FUNCTION DOC] Uniform random fill (aten uniform) of a transposed tensor with random
+        # fallback on, with exact stride checking; reference is not upcast.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Call the aten uniform default overload on x with range 0 to 1.
             return aten.uniform.default(x, 0, 1)
 
         a = torch.randn([5, 3]).permute(1, 0)
@@ -8047,7 +9718,11 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(fallback_random=False)
     def test_uniform_no_fallback(self):
+        # [FUNCTION DOC] With random fallback off, compiled aten uniform preserves shape, dtype,
+        # device type and strides of a transposed input, and its values differ from eager under the
+        # same seed (not an eager fallback).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Call the aten uniform default overload on x with range 0 to 1.
             return aten.uniform.default(x, 0, 1)
 
         a = torch.randn([5, 3]).permute(1, 0)
@@ -8068,7 +9743,12 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(fallback_random=False)
     def test_uniform_non_contiguous_view(self):
+        # [FUNCTION DOC] In-place uniform fill on a non-contiguous strided slice view compiled with
+        # random fallback off: result keeps the view shape and strides and all values lie in the
+        # range 0 to 1.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Take every second row of dim 1 as a view, fill it uniformly in
+            # place and return it.
             y = x[:, ::2, :]
             y.uniform_(0.0, 1.0)
             return y
@@ -8082,7 +9762,10 @@ for dtype in (torch.int32, torch.int64):
         self.assertTrue(bool(((res >= 0.0) & (res <= 1.0)).all()))
 
     def test_complex_from_real_imag(self):
+        # [FUNCTION DOC] Complex tensor built from real and imaginary parts that are the same
+        # transposed tensor; exact strides compared.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Call aten complex on x and y.
             return aten.complex.default(x, y)
 
         a = torch.randn([5, 3]).permute(1, 0)
@@ -8097,7 +9780,11 @@ for dtype in (torch.int32, torch.int64):
     @xfail_if_mps_unimplemented  # aten::linalg_eig not implemented for MPS
     @skipIfNoLapack
     def test_linalg_eig_stride_consistency(self):
+        # [FUNCTION DOC] Eigen decomposition of a random 5 by 5 float32 matrix: only the
+        # eigenvector output is returned and strides and dtype are checked exactly against eager.
+        # Expected failure on MPS; skipped without LAPACK.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the eigenvectors from the linalg eig of x.
             eigenvals, eigenvecs = torch.linalg.eig(x)
             return eigenvecs
 
@@ -8112,11 +9799,18 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_view_as_complex(self):
+        # [FUNCTION DOC] view_as_complex of a contiguous clone of a strangely strided real tensor
+        # with trailing dim 2; compiled and eager outputs must be equal.
         class Repro(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that clones its input contiguously and converts it with
+            # view_as_complex, returning a one-element tuple.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Call the parent constructor only.
                 super().__init__()
 
             def forward(self, view_2):
+                # [FUNCTION DOC] HELPER: Clone the input to contiguous format, view as complex and
+                # return it in a tuple.
                 clone = torch.ops.aten.clone.default(
                     view_2, memory_format=torch.contiguous_format
                 )
@@ -8136,7 +9830,11 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(o1, o2)
 
     def test_view_as_complex_non_contiguous(self):
+        # [FUNCTION DOC] view_as_complex on a transposed and reshaped (so non-contiguous input
+        # path) tensor, with exact stride check and no low precision check.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Transpose dims 1 and 2, reshape to (2, 8, 4, -1, 2) and return
+            # the complex view.
             y = x.transpose(1, 2)
             z = y.reshape(2, 8, 4, -1, 2)
             return torch.view_as_complex(z)
@@ -8146,7 +9844,9 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (x,), exact_stride=True, check_lowp=False)
 
     def test_view_as_real(self):
+        # [FUNCTION DOC] view_as_real of a complex64 vector, with one added.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return view_as_real of x plus 1.
             y = torch.view_as_real(x)
             return y + 1
 
@@ -8155,11 +9855,15 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (x,))
 
     def test_complex_real_imag_conj(self):
+        # [FUNCTION DOC] Regression for issue 171665: real plus imaginary parts of a conjugated
+        # complex tensor; clone operations from resolving the conjugate bit must not be removed as
+        # no-ops.
         # Regression test for https://github.com/pytorch/pytorch/issues/171665
         # Tests that extracting real/imag from conjugated tensors works when compiled.
         # The issue was that clone operations from resolve_conj() were incorrectly
         # removed by remove_noop_ops because same_meta didn't check is_conj().
         def fn(x):
+            # [FUNCTION DOC] HELPER: Conjugate x and return real part plus imaginary part.
             x = x.conj()
             return x.real + x.imag
 
@@ -8168,15 +9872,22 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (x,))
 
     def test_complex_conv2d_conj(self):
+        # [FUNCTION DOC] Regression for issue 171665: complex convolution applied to a conjugated
+        # input, compared with eager; low precision check disabled.
         # Regression test for https://github.com/pytorch/pytorch/issues/171665
         # Tests that complex convolution works on conjugated inputs when compiled.
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one complex64 2x2 convolution (1 to 1 channels)
+            # applied to the conjugated input reshaped to 2 by 1 by 2 by 2.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the complex convolution layer.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 2, dtype=torch.complex64)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Conjugate x, view it as 2 by 1 by 2 by 2 and apply the
+                # convolution.
                 x = x.conj()
                 x = x.view(2, 1, 2, 2)
                 return self.conv(x)
@@ -8187,7 +9898,11 @@ for dtype in (torch.int32, torch.int64):
         self.common(model, (x,), check_lowp=False)
 
     def test_polar(self):
+        # [FUNCTION DOC] torch.polar from a distance and angle in the highest precision float of
+        # the device; reference not upcast on MPS.
         def fn(dist, angle):
+            # [FUNCTION DOC] HELPER: Return the complex number from magnitudes dist and angles
+            # angle.
             return torch.polar(dist, angle)
 
         dtype = highest_precision_float(self.device)
@@ -8199,7 +9914,12 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide  # incorrect result on CUDA
     def test_cauchy(self):
+        # [FUNCTION DOC] Cauchy kernel style sum of reciprocal differences of two vectors, with
+        # loose tolerances; on non-CPU devices exactly one kernel. Skipped on GPU Halide (wrong
+        # result).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the sum of the reciprocal of (x with a new last dim
+            # minus y).
             return torch.sum(1 / (torch.unsqueeze(x, -1) - y))
 
         self.common(
@@ -8219,7 +9939,12 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_gpu_halide  # misaligned address error
     def test_fusing_write_into_disjoint_read(self):
+        # [FUNCTION DOC] Fusing a write into a buffer region that is read in a disjoint region: an
+        # in-place copy from a flipped copy of a tensor (two kernels expected), and, on non-CPU
+        # devices, a large slice update that depends on overlapping ranges (issue only appears on
+        # CUDA with large tensors). Skipped on GPU Halide.
         def test_flip(a):
+            # [FUNCTION DOC] HELPER: Copy the flipped version of a into a in place and return a.
             return a.copy_(torch.flip(a, (0,)))
 
         self.common(test_flip, (torch.rand([20]),))
@@ -8230,6 +9955,8 @@ for dtype in (torch.int32, torch.int64):
         if self.device != "cpu":
 
             def f(a):
+                # [FUNCTION DOC] HELPER: Add 1 to columns 20 to 40 in place and then write columns
+                # 2 to 900025 from columns 1 to 900024 plus 2.
                 a[:, 20:40] = a[:, 20:40] + 1
                 a[:, 2:900025] = a[:, 1:900024] + 2
 
@@ -8237,7 +9964,11 @@ for dtype in (torch.int32, torch.int64):
             self.common(f, (a,))
 
     def test_inplace_flip(self):
+        # [FUNCTION DOC] In-place flip of one tensor via copy, plus another computation reusing the
+        # same sizes, on large inputs with loose tolerances.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Copy the dim 1 flip of x into x, add the keepdim row sum of y
+            # to y, and return x plus that.
             x.copy_(x.flip(1))
             y = y.sum(dim=1, keepdim=True) + y
             return x + y
@@ -8247,7 +9978,12 @@ for dtype in (torch.int32, torch.int64):
         self.common(f, (x, y), atol=1e-3, rtol=1e-3)
 
     def test_gather_scatter(self):
+        # [FUNCTION DOC] Graph message passing pattern: gather node features by source and
+        # destination edge indices, compute edge features, and scatter-add them into a zero tensor;
+        # two kernels expected on non-CPU devices.
         def fn(node_feat, edge_index):
+            # [FUNCTION DOC] HELPER: Gather source and destination node features, subtract and add
+            # one, scatter-add into zeros at the destination indices and return the result.
             src_node_feat = node_feat[edge_index[0]]
             dst_node_feat = node_feat[edge_index[1]]
             edge_feat = src_node_feat - dst_node_feat + 1
@@ -8274,9 +10010,14 @@ for dtype in (torch.int32, torch.int64):
 
     @config.patch(max_fusion_size=1)
     def test_no_mega_fusion_during_lowering(self):
+        # [FUNCTION DOC] With the maximum fusion size set to 1, a chain of fifty adds must not be
+        # fused during lowering; prints the generated kernel count and, off CPU, asserts more than
+        # one kernel was generated.
         n = 50
 
         def fn(*args):
+            # [FUNCTION DOC] HELPER: Add all given arguments to the first one in a loop and return
+            # the sum.
             x = args[0]
             for i in range(n):
                 x = torch.add(x, args[i])
@@ -8292,7 +10033,11 @@ for dtype in (torch.int32, torch.int64):
             self.assertTrue(torch._inductor.metrics.generated_kernel_count > 1)
 
     def test_move_arange(self):
+        # [FUNCTION DOC] An arange created on CPU and moved to the input device then added; the
+        # move must be optimized away so only one kernel is generated.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return a CPU arange of the length of x, moved to the device of
+            # x, plus x.
             return torch.arange(len(x), device="cpu").to(x.device) + x
 
         self.common(fn, (torch.randn([32]),), check_lowp=False)
@@ -8300,7 +10045,10 @@ for dtype in (torch.int32, torch.int64):
         assertGeneratedKernelCountEqual(self, 1)
 
     def test_leaky_relu(self):
+        # [FUNCTION DOC] Leaky ReLU with slope 0.2 and with the default slope.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return leaky relu of x with slope 0.2 plus 2 and with the
+            # default slope of x plus one.
             return aten.leaky_relu(x, 0.2) + 2, aten.leaky_relu(x + 1)
 
         self.common(
@@ -8309,7 +10057,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_gelu(self):
+        # [FUNCTION DOC] GELU of x and of x plus one.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return gelu of x plus 2 and gelu of x plus 1.
             return aten.gelu(x) + 2, aten.gelu(x + 1)
 
         self.common(
@@ -8318,12 +10068,15 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_infinitely_differentiable_gelu_backward_bfloat16(self):
+        # [FUNCTION DOC] Infinitely differentiable GELU backward in bfloat16, seeded; CUDA only
+        # with sm80; reference kept in bfloat16.
         if self.device != "cuda":
             raise unittest.SkipTest("requires CUDA")
         if not SM80OrLater:
             raise unittest.SkipTest("uses bfloat16 which requires SM >= 80")
 
         def fn(grad, self):
+            # [FUNCTION DOC] HELPER: Call the aten infinitely differentiable gelu backward op.
             return aten.infinitely_differentiable_gelu_backward(grad, self)
 
         torch.manual_seed(0)
@@ -8338,7 +10091,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_clone(self):
+        # [FUNCTION DOC] Clone of x plus 2 and clone of x plus one.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return clone of x plus 2 and clone of x plus 1.
             return aten.clone(x) + 2, aten.clone(x + 1)
 
         self.common(
@@ -8348,14 +10103,21 @@ for dtype in (torch.int32, torch.int64):
 
     @torch._inductor.config.patch(fallback_random=True)
     def test_clone_dropout(self):
+        # [FUNCTION DOC] Dropout applied after a transpose-contiguous, with random fallback on to
+        # match eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Make the transpose of x contiguous and apply dropout.
             y = x.t().contiguous()
             return torch.nn.functional.dropout(y)
 
         self.common(fn, (torch.randn(3, 4),))
 
     def test_masked_fill(self):
+        # [FUNCTION DOC] Masked fill with scalar fill values and with a negated mask on a halved
+        # tensor.
         def fn(mask, value):
+            # [FUNCTION DOC] HELPER: Return masked_fill of value with mask and -10000.0 plus 2, and
+            # a masked_fill of half the value with the negated mask and 667.
             return aten.masked_fill(value, mask, -10000.0) + 2, aten.masked_fill(
                 value / 2.0, torch.logical_not(mask), 667
             )
@@ -8369,7 +10131,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_masked_fill_promotion(self):
+        # [FUNCTION DOC] Masked fill with a float scalar tensor as the fill value on float (half on
+        # GPU) and integer inputs; compiled results equal eager (type promotion of the fill value).
         def fn(mask, value):
+            # [FUNCTION DOC] HELPER: Return masked_fill of value with mask and a scalar tensor 3.5.
             return aten.masked_fill(value, mask, torch.tensor(3.5))
 
         opt_fn = torch.compile(fn, backend="inductor")
@@ -8388,7 +10153,10 @@ for dtype in (torch.int32, torch.int64):
             self.assertEqual(fn(*inputs), opt_fn(*inputs))
 
     def test_masked_scatter(self):
+        # [FUNCTION DOC] Masked scatter of a source vector into a 10 by 10 tensor using a random
+        # boolean mask; the source has as many elements as the mask has true entries.
         def fn(value, mask, source):
+            # [FUNCTION DOC] HELPER: Return masked_scatter of source into value at mask.
             return torch.masked_scatter(value, mask, source)
 
         value = make_tensor(10, 10, dtype=torch.float32, device=self.device)
@@ -8400,7 +10168,11 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (value, mask, source))
 
     def test_scatter_empty_index(self):
+        # [FUNCTION DOC] Scatter with empty index tensors: an adaptive max pool to size 0 produces
+        # an empty tensor used as destination, index and source, followed by hardswish.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create the empty pooled tensor, scatter it into itself on the
+            # last dim and apply hardswish.
             m = torch.nn.AdaptiveMaxPool1d((0,), return_indices=False).eval()
             empty_tensor = m(x)
             result = torch.scatter(empty_tensor, -1, empty_tensor, empty_tensor)
@@ -8411,7 +10183,10 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (x,))
 
     def test_fill1(self):
+        # [FUNCTION DOC] Fill with a Python scalar: ones_like tensor and its aten fill with 2.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return ones_like of x and the fill-with-scalar-2 of the same
+            # tensor.
             tmp = torch.ones_like(x)
             return tmp, aten.fill.Scalar(tmp, 2)
 
@@ -8421,7 +10196,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_fill2(self):
+        # [FUNCTION DOC] Fill with a scalar tensor: ones_like tensor and its aten fill with tensor
+        # 3.0.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return ones_like of x and fill of it with a tensor holding
+            # 3.0.
             tmp = torch.ones_like(x)
             return tmp, aten.fill.Tensor(tmp, torch.tensor(3.0))
 
@@ -8431,7 +10210,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_pow1(self):
+        # [FUNCTION DOC] Integer powers from -8 to 8 of a random tensor.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return a list of x raised to each exponent from -8 to 8.
             return [aten.pow(x, e) for e in range(-8, 9)]
 
         self.common(
@@ -8440,7 +10221,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_pow2(self):
+        # [FUNCTION DOC] Powers with huge exponent and huge base (1000 to the x and x to the 1000)
+        # on float32 with relaxed tolerances.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return 1000 raised to x and x raised to 1000.
             return aten.pow(1000, x), aten.pow(x, 1000)
 
         self.common(
@@ -8461,8 +10245,12 @@ for dtype in (torch.int32, torch.int64):
     @skip_if_gpu_halide  # https://github.com/halide/Halide/issues/8318
     @config.patch("halide.scheduler_cuda", "Li2018")
     def test_pow3(self):
+        # [FUNCTION DOC] Power of 0.5 (special-cased to sqrt) of a zero-dim tensor sum; compares
+        # compiled to eager with the same helper. Skipped on GPU Halide.
         # power of 0.5 is special-cased, arbitrary power would still produce triton codegen error
         def fn(x):
+            # [FUNCTION DOC] HELPER: Add x to a scalar tensor 0.123 and raise the sum to the power
+            # 0.5.
             z = torch.tensor(0.123, device=self.device)
             w = z + x
             return torch.pow(w, 0.5)
@@ -8472,7 +10260,10 @@ for dtype in (torch.int32, torch.int64):
         self.assertTrue(same(opt(input), fn(input)))
 
     def test_pow_int(self):
+        # [FUNCTION DOC] Integer power of integer tensors with a constant exponent (0x57) and a
+        # tensor exponent up to the type's max, across uint8, int8, int16, int32 and int64.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return x to the power 87 and x to the power y.
             return torch.pow(x, 0x57), torch.pow(x, y)
 
         for dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
@@ -8490,12 +10281,19 @@ for dtype in (torch.int32, torch.int64):
 
     @skip_if_triton_cpu
     def test_pow_backward_dynamic_symint_exponent(self):
+        # [FUNCTION DOC] Regression for issue 185715: pow backward with a symbolic integer exponent
+        # under dynamic shapes must not specialize the exponent. Checks compiled value and gradient
+        # against eager for exponents 0 to 3 on a base containing zero (with nan avoidance mask),
+        # and that changing the exponent among 2 to 5 does not trigger recompilation (one frame).
+        # Skipped on Triton CPU.
         # Under dynamic=True the integer exponent becomes a symbolic scalar;
         # pow's backward formula compared it with Scalar::equal, which was NYI
         # for symbolic scalars. It must instead emit the general gradient and
         # mask exponent == 0 (gradient 0) without specializing the exponent.
         # Issue #185715.
         def fn(x, exponent):
+            # [FUNCTION DOC] HELPER: Compute x to the exponent and the gradient of its sum with
+            # respect to x; return both.
             y = torch.pow(x, exponent)
             (grad,) = torch.autograd.grad(y.sum(), x)
             return y, grad
@@ -8523,7 +10321,12 @@ for dtype in (torch.int32, torch.int64):
 
     @xfail_if_triton_cpu
     def test_pow_symfloat(self):
+        # [FUNCTION DOC] A power of a Python float derived from a symbolic size (square root of the
+        # size raised to ten) used to scale a tensor, compiled with dynamic shapes and full graph.
+        # Expected failure on Triton CPU.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compute the square root of the first dim, raise it to the
+            # tenth power and multiply x by it.
             r = math.sqrt(x.size(0))
             r = r**10
             return x * r
@@ -8533,7 +10336,10 @@ for dtype in (torch.int32, torch.int64):
         self.assertEqual(cfn(x), fn(x))
 
     def test_glu(self):
+        # [FUNCTION DOC] Gated linear unit over the last dim, dim 1 and dim 2 of a four dimensional
+        # tensor.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return glu of x on dims -1, 1 and 2.
             return aten.glu(x, -1), aten.glu(x, 1), aten.glu(x, 2)
 
         self.common(
@@ -8542,7 +10348,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_unsigned_constant_tensors(self):
+        # [FUNCTION DOC] Unsigned 8-bit constant tensor created in the function and used in
+        # addition and negation.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create a uint8 constant 7 and return it plus x, its negation,
+            # and the negation plus x.
             c = torch.tensor(7, dtype=torch.uint8)
             return c + x, torch.neg(c), torch.neg(c) + x
 
@@ -8555,7 +10365,13 @@ for dtype in (torch.int32, torch.int64):
     @config.patch(size_asserts=os.environ.get("TORCHINDUCTOR_SIZE_ASSERTS") == "1")
     @torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
     def test_nonzero_unbacked_refinement(self):
+        # [FUNCTION DOC] Nonzero with an unbacked size refined by a check that the count equals 4:
+        # works for an input with four non-zero entries, and compiled with an input with no
+        # non-zero entries must raise a RuntimeError. Output size assertions are controlled by an
+        # env var; dynamic output shape ops are captured.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Take the nonzero indices of x, check the first dim is 4 and
+            # add 3.
             z = x.nonzero()
             torch._check(z.size(0) == 4)
             return z + 3
@@ -8570,7 +10386,12 @@ for dtype in (torch.int32, torch.int64):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_unbacked_floordiv_simplify(self):
+        # [FUNCTION DOC] Unbacked integer read from a tensor item with a check on its floor
+        # division by 2 (equal to 3): used as a size for new_ones; tested with values 6 and 7.
+        # Scalar outputs are captured.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Read y as a Python scalar, check z floor-divided by 2 equals 3
+            # and return x plus a ones tensor of length z.
             z = y.item()
             torch._check(z // 2 == 3)
             return x + x.new_ones(z)
@@ -8593,7 +10414,12 @@ for dtype in (torch.int32, torch.int64):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_unbacked_floordiv_simplify_errors(self):
+        # [FUNCTION DOC] Same setup as the previous test but with a zeros tensor, called with the
+        # value 8 which violates the check (8 floor-divided by 2 is not 3): compiled call must
+        # raise a RuntimeError (from inside the compiler, without a Dynamo graph break).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Read y as a Python scalar, check z floor-divided by 2 equals 3
+            # and return x plus a zeros tensor of length z.
             z = y.item()
             torch._check(z // 2 == 3)
             return x + x.new_zeros(z)
@@ -8604,9 +10430,15 @@ for dtype in (torch.int32, torch.int64):
             torch.compile(fn)(torch.randn(8), torch.tensor(8))
 
     def test_cat(self):
+        # [FUNCTION DOC] Concatenation with several patterns on a 2-D input: along the last dim
+        # with a slice, of two copies along dim 0, and of mixed dtypes (float32 with float64, or
+        # half on MPS) for type promotion. Also run on a 4-D channels-last input.
         tgt_dtype = torch.double if self.device != "mps" else torch.half
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return three cats of a: with a sliced plus one and a plus 2 on
+            # the last dim, of doubled a with itself on dim 0, and of doubled a with a converted
+            # copy.
             tmp = a * 2
             return (
                 torch.cat((a, a[:, :4] + 1, a + 2), -1),
@@ -8624,7 +10456,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_cat_uint8(self):
+        # [FUNCTION DOC] Concatenation of a zero-filled expanded uint8 column with a uint8 matrix
+        # on the last dim.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Prepend an expanded zero column to x along the last dim.
             batch_shape = x.shape[:1]
             out = torch.cat([x.new_zeros(1).expand(batch_shape + (1,)), x], dim=-1)
             return out
@@ -8635,7 +10470,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_cat_empty(self):
+        # [FUNCTION DOC] Concatenation of tensors where one is an empty 1-D tensor, at the end, in
+        # the middle and at the start (legacy empty tensor handling).
         def fn_2(*tensors):
+            # [FUNCTION DOC] HELPER: Concatenate all given tensors on dim 0.
             return torch.cat(tensors)
 
         self.common(
@@ -8662,14 +10500,22 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_cat_empty_index(self):
+        # [FUNCTION DOC] Concatenation of a tensor indexed from an empty tensor (zero-size dim)
+        # with a larger tensor.
         def fn(out, x):
+            # [FUNCTION DOC] HELPER: Concatenate the first element of out with x on dim 0.
             return torch.cat([out[0], x], dim=0)
 
         self.common(fn, (torch.randn(1, 0, 64), torch.randn(128, 64)))
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_cat_unbacked_legacy_empty(self):
+        # [FUNCTION DOC] Concatenating a 2-D tensor with a 1-D tensor whose size comes from an
+        # unbacked scalar equal to zero must raise a RuntimeError saying 2-D tensors were expected
+        # for tensor number 1 (legacy empty tensors are not special cased with unbacked sizes).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Read y as a scalar and concatenate x with a ones tensor of
+            # that length.
             z = y.item()
             return torch.cat([x, x.new_ones(z)])
 
@@ -8687,7 +10533,10 @@ for dtype in (torch.int32, torch.int64):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_cat_unbacked_empty_1d(self):
+        # [FUNCTION DOC] Concatenating a 1-D tensor with a ones tensor whose length is an unbacked
+        # scalar, tested with length 0 and 3.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Read y as a scalar and concatenate x with ones of that length.
             z = y.item()
             return torch.cat([x, x.new_ones(z)])
 
@@ -8709,7 +10558,11 @@ for dtype in (torch.int32, torch.int64):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_cat_unbacked_2d(self):
+        # [FUNCTION DOC] Concatenating a 2-D tensor with a ones tensor having an unbacked number of
+        # rows, tested with 0 and 4 rows.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Read y as a scalar and concatenate x with ones of that many
+            # rows.
             z = y.item()
             return torch.cat([x, x.new_ones(z, x.shape[1])])
 
@@ -8730,7 +10583,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_cat_negative_dim(self):
+        # [FUNCTION DOC] Concatenation along the last dim with negative dim, including empty 1-D
+        # tensors in the middle and at the start.
         def fn(*tensors):
+            # [FUNCTION DOC] HELPER: Concatenate the given tensors on dim -1.
             return torch.cat(tensors, dim=-1)
 
         self.common(
@@ -8761,8 +10617,11 @@ for dtype in (torch.int32, torch.int64):
 
     @expectedFailureCodegenDynamic
     def test_cat_single_empty(self):
+        # [FUNCTION DOC] Concatenation of a single empty tensor; expected failure of the dynamic
+        # codegen check about dynamic dimension.
         # fails dynamic check for 'has a dynamic dimension'
         def fn_2(*tensors):
+            # [FUNCTION DOC] HELPER: Concatenate all given tensors on dim 0.
             return torch.cat(tensors)
 
         self.common(
@@ -8771,7 +10630,10 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_cat_empty_1d_negative_dim(self):
+        # [FUNCTION DOC] Concatenating an empty 1-D bfloat16 tensor with a 4-D tensor along dim -2
+        # (key cache pattern).
         def fn(cache, new_keys):
+            # [FUNCTION DOC] HELPER: Concatenate cache and new_keys on dim -2.
             return torch.cat([cache, new_keys], dim=-2)
 
         self.common(
@@ -8783,7 +10645,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_cat_empty_1d_negative_dim_zero_output(self):
+        # [FUNCTION DOC] Concatenating an empty 1-D bfloat16 tensor with a 4-D tensor having a zero
+        # sized dim along dim -2 (zero-size output), and concatenating two empty 1-D float32
+        # tensors (all inputs skipped, early return path).
         def fn(cache, new_keys):
+            # [FUNCTION DOC] HELPER: Concatenate cache and new_keys on dim -2.
             return torch.cat([cache, new_keys], dim=-2)
 
         self.common(
@@ -8796,6 +10662,7 @@ for dtype in (torch.int32, torch.int64):
 
         # Covers the early-return path when all inputs are skipped as 1-D empty
         def fn_all_empty(a, b):
+            # [FUNCTION DOC] HELPER: Concatenate a and b on dim 0.
             return torch.cat([a, b], dim=0)
 
         self.common(
@@ -8807,7 +10674,9 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_cat_upcasting(self):
+        # [FUNCTION DOC] Concatenation of float32 and float16 tensors on dim 1 (result upcast).
         def fn(arg4_1, slice_7):
+            # [FUNCTION DOC] HELPER: Return the aten cat of arg4_1 and slice_7 on dim 1 in a tuple.
             cat_1 = aten.cat.default([arg4_1, slice_7], 1)
             return (cat_1,)
 
@@ -8820,7 +10689,12 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_cat_extern_kernel(self):
+        # [FUNCTION DOC] Concatenating the result of a matmul chain (extern kernel outputs) with a
+        # loop-based tensor; tolerances differ for XPU; low precision check disabled due to large
+        # matmul accuracy.
         def fn(x1, x2, x3, x4):
+            # [FUNCTION DOC] HELPER: Matmul x2 and x3, narrow to 100 columns, matmul with x4, and
+            # concatenate with x1 on dim 1.
             x = torch.mm(x2, x3)
             s = torch.narrow(x, 1, 0, 100)
             x = torch.mm(s, x4)
@@ -8859,7 +10733,14 @@ for dtype in (torch.int32, torch.int64):
         }
     )
     def test_remove_no_ops(self):
+        # [FUNCTION DOC] Checks that no-op pointwise operations after a matmul are removed (adding
+        # or subtracting zeros, multiplying or dividing by ones, as tensors and as Python scalars):
+        # the generated code for each must contain no fused CPU kernel / triton kernel. Repeated
+        # for float16 and bfloat16 (supported ones), including a broadcast-shape case that must not
+        # be treated as a no-op. Joint graph constant folding on and GEMM backend forced to ATEN.
+        # Skipped on GPU Halide.
         def matmul_with_op(x, y, fn):
+            # [FUNCTION DOC] HELPER: Apply a function fn to the matrix product of x and y.
             return fn(x @ y)
 
         foo_opt = torch.compile(matmul_with_op)
@@ -8912,7 +10793,11 @@ for dtype in (torch.int32, torch.int64):
             )
 
     def test_remove_noop_copy(self):
+        # [FUNCTION DOC] Copy of a broadcast tensor into a cosine result and sine of it; and a
+        # mixed-dtype update that copies a max reduction into an element of another float32 tensor
+        # in place; both compared with eager (no-op copy removal must preserve semantics).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Take cos of x, copy y into it in place and return sin of that.
             x = x.cos()
             a = x.copy_(y)
             return a.sin()
@@ -8920,6 +10805,8 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.randn(8, 8), torch.randn(8)))
 
         def fn2(a, b):
+            # [FUNCTION DOC] HELPER: Write the max of abs of a, converted to a's dtype, into
+            # element 0 of b in place and return b.
             abs_max = torch.abs(a).max()
             b[0] = abs_max.to(a.dtype)
             return b
@@ -8933,7 +10820,11 @@ for dtype in (torch.int32, torch.int64):
         )
 
     def test_remove_noop_clone(self):
+        # [FUNCTION DOC] Clone followed by reshape and swapped column assignment, then added to the
+        # original: checks no-op clone removal does not break aliasing semantics.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Clone x, reshape to rows of 4, swap columns 0 and 2 in place
+            # via indexing and return the result plus x.
             y = x.clone().reshape(-1, 4)
             y[:, [2, 0]] = y[:, [0, 2]]
             return y + x
@@ -8941,6 +10832,9 @@ for dtype in (torch.int32, torch.int64):
         self.common(fn, (torch.randn(2, 4),))
 
     def test_same_meta_non_tensor(self):
+        # [FUNCTION DOC] Unit test of the post-grad helper that compares FX node metadata: nodes
+        # with symbolic integer values are not considered the same, a None value vs tensor is not
+        # the same, and a node with itself the same tensor is the same.
         from torch._inductor.fx_passes.post_grad import same_meta
 
         g = torch.fx.Graph()
@@ -8965,7 +10859,11 @@ for dtype in (torch.int32, torch.int64):
         "https://github.com/pytorch/pytorch/issues/151384",
     )
     def test_remove_noop_slice(self):
+        # [FUNCTION DOC] No-op slice removal with dynamic shapes: slicing the whole last dim must
+        # vanish from the post-grad graph (graph compared to an expected text with only two adds).
+        # Skipped on Linux, macOS, ASAN and ROCm (issue 151384).
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one, take a full-range slice on the last dim and add one.
             x = x + 1
             size = x.shape[-1]
             y = torch.ops.aten.slice(x, -1, 0, size)  # noop
@@ -9000,7 +10898,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         "https://github.com/pytorch/pytorch/issues/151379",
     )
     def test_remove_noop_slice1(self):
+        # [FUNCTION DOC] A slice that cuts the last element (not a no-op) must remain in the
+        # post-grad graph with dynamic dims 0 and 1; graph compared to expected text. Skipped on
+        # Linux, macOS, ASAN, ROCm and slow builds.
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one, slice the last dim from 0 to -1 and add one.
             x = x + 1
             y = torch.ops.aten.slice(x, -1, 0, -1)  # not a noop
             return y + 1
@@ -9032,7 +10934,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "f32[s77, s27,
         "https://github.com/pytorch/pytorch/issues/151382",
     )
     def test_remove_noop_slice_scatter(self):
+        # [FUNCTION DOC] No-op slice_scatter removal: scattering a tensor into an empty tensor of
+        # the same size covering the whole last dim must vanish; expected post-grad graph keeps the
+        # empty allocation (dead) and two adds. Skipped on Linux, macOS, ASAN, ROCm and slow
+        # builds.
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one, create an empty tensor like it, scatter the full
+            # slice into it, and add one.
             x = x + 1
             y = torch.empty_like(x)
             size = x.shape[-1]
@@ -9061,11 +10969,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_cat_of_loops_and_extern_kernel(self):
+        # [FUNCTION DOC] Concatenation of the output of a convolution (extern kernel) and of a max
+        # pool (loop kernel) on channels-last inputs through the inductor backend; values and
+        # strides of the output must equal eager.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 1x1 convolution from 64 to 5 channels and a 2x2 max
+            # pool; the forward concatenates the convolved x and pooled y along channels.
             def __init__(
                 self,
                 **kwargs,
             ):
+                # [FUNCTION DOC] HELPER: Create the convolution and pooling layers.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(
                     64,
@@ -9076,6 +10990,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 self.max_pool2d = torch.nn.MaxPool2d(2)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Apply convolution to x, max pool to y and concatenate on
+                # dim 1.
                 x1 = self.conv(x)
                 y1 = self.max_pool2d(y)
                 return torch.cat([x1, y1], 1)
@@ -9093,7 +11009,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(y.stride(), opt_y.stride())
 
     def test_cat_inplace(self):
+        # [FUNCTION DOC] Concatenation of a single tensor followed by an in-place sine on the
+        # source: the returned concatenation result must not alias the later mutated tensor.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Concatenate the single tensor x, apply sin in place to x, and
+            # return the concatenation result.
             rt = torch.cat([x])
             v = x.sin_()
             return rt
@@ -9106,7 +11026,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(res, expected)
 
     def test_stack(self):
+        # [FUNCTION DOC] Stack of two expanded tensors (broadcast 1 by 16 and 12 by 1 to 12 by 16)
+        # along dim 2.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Expand a and b to 12 by 16 and stack them on dim 2.
             return torch.stack(
                 [
                     a.expand(12, 16),
@@ -9118,7 +11041,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn([1, 16]), torch.randn([12, 1])))
 
     def test_hardtanh(self):
+        # [FUNCTION DOC] Hard tanh with default bounds of x, x plus one, and x minus one.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return hardtanh of x, x plus 1 and x minus 1.
             return F.hardtanh(x), F.hardtanh(x + 1), F.hardtanh(x - 1)
 
         self.common(
@@ -9127,11 +11052,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_hardtanh_backward_low_precision_boundary(self):
+        # [FUNCTION DOC] Regression for issue 185472: hardtanh backward in bfloat16 must compare in
+        # float32 like the eager kernel; at the value that bfloat16 rounds from 0.7, the gradient
+        # must equal eager (1, because it is inside the bounds in float32). Compares gradients from
+        # eager and compiled runs.
         # hardtanh_backward must compare in opmath (fp32) like the eager kernel.
         # bf16(0.7) rounds to 0.69921875, so an input at that value is inside
         # (-0.7, 0.7) in fp32 (grad 1) but at the bound in bf16 (grad 0).
         # Regression test for issue #185472.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply hardtanh with bounds -0.7 and 0.7.
             return F.hardtanh(x, min_val=-0.7, max_val=0.7)
 
         x = torch.tensor(
@@ -9143,7 +11073,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(x.grad, x_c.grad)
 
     def test_hardsigmoid(self):
+        # [FUNCTION DOC] Hard sigmoid at x, x plus 3 and x minus 3.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return hardsigmoid of x, x plus 3 and x minus 3.
             return F.hardsigmoid(x), F.hardsigmoid(x + 3), F.hardsigmoid(x - 3)
 
         self.common(
@@ -9152,7 +11084,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_hardswish(self):
+        # [FUNCTION DOC] Hard swish at x, x plus 3 and x minus 3.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return hardswish of x, x plus 3 and x minus 3.
             return F.hardswish(x), F.hardswish(x + 3), F.hardswish(x - 3)
 
         self.common(
@@ -9161,7 +11095,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_rsqrt(self):
+        # [FUNCTION DOC] Reciprocal square root of x and of x plus one minus 2 (random values may
+        # be negative so NaNs can appear).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return rsqrt of x and rsqrt of x plus 1 minus 2.
             return torch.rsqrt(x), torch.rsqrt(x + 1) - 2
 
         self.common(
@@ -9170,7 +11107,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_expm1(self):
+        # [FUNCTION DOC] expm1 for float16, float32, float64, int32 and int64 (supported ones) on
+        # random values and on values near zero.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return expm1 of x and twice expm1 of x.
             return torch.expm1(x), torch.expm1(x) * 2
 
         for dtype in (torch.float16, torch.float, torch.double, torch.int, torch.int64):
@@ -9188,12 +11128,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps_unimplemented
     def test_adaptive_pool_errors_with_long(self):
+        # [FUNCTION DOC] Adaptive max pool of an int64 argmax result (long tensor) for 1D, 2D and
+        # 3D must raise a RuntimeError saying not implemented (or an AOTI API failure). Expected
+        # failure on MPS.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module taking an adaptive pooling layer, whose forward applies
+            # argmax over dim 1 (producing a long tensor) and then the pooling layer.
             def __init__(self, pool_operator):
+                # [FUNCTION DOC] HELPER: Store the pooling layer given.
                 super().__init__()
                 self.pool = pool_operator
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Take argmax over dim 1 of x and pass it through the
+                # pooling layer.
                 x = torch.argmax(x, dim=1)
                 x = self.pool(x)
                 return x
@@ -9210,12 +11158,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps_unimplemented
     def test_adaptive_avg_pool_errors_with_long(self):
+        # [FUNCTION DOC] Adaptive average pool of an int64 argmax result for 1D, 2D and 3D must
+        # raise a RuntimeError saying not implemented (or an AOTI API failure). Expected failure on
+        # MPS.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module taking a pooling layer, whose forward applies argmax over
+            # dim 1 to its input and then the pooling layer.
             def __init__(self, pool_operator):
+                # [FUNCTION DOC] HELPER: Store the pooling layer given.
                 super().__init__()
                 self.pool = pool_operator
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Take argmax over dim 1 of x and pass it through the
+                # pooling layer.
                 x = torch.argmax(x, dim=1)
                 x = self.pool(x)
                 return x
@@ -9232,6 +11188,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._dynamo.config.patch(recompile_limit=12)
     def test_avg_pool_errors_with_uint(self):
+        # [FUNCTION DOC] Average pool (1D, 2D, 3D) on unsigned integer tensors (uint8 to uint64)
+        # must raise a not implemented RuntimeError (or AOTI failure) when compiled. Recompile
+        # limit raised to 12.
         for dim in (1, 2, 3):
             for dtype in (torch.uint8, torch.uint16, torch.uint32, torch.uint64):
                 x = torch.randn([2] * (dim + 2)).to(dtype)
@@ -9243,9 +11202,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                     c_op(x, kernel_size=2, stride=2)
 
     def test_replication_pad_errors_with_bool(self):
+        # [FUNCTION DOC] Replication padding (1D, 2D, 3D) on a bool tensor (from signbit) must
+        # raise a not implemented RuntimeError (or AOTI failure) when compiled.
         for dim in (1, 2, 3):
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Take the sign bit of x and apply a replication pad layer
+                # of padding 1 of the loop's dimensionality.
                 x = torch.signbit(x)
                 x = eval(f"nn.ReplicationPad{dim}d(padding=1)")(x)
                 return x
@@ -9258,10 +11221,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 c_fn(x)
 
     def test_convolution_errors_on_input_weight_dtype_mismatch(self):
+        # [FUNCTION DOC] CUDA only: convolution of a half input with a float32 weight must raise a
+        # RuntimeError saying input and weight types should be the same.
         if self.device != "cuda":
             raise unittest.SkipTest("CUDA only")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Convolve x with the enclosing weight without bias.
             return torch.nn.functional.conv2d(x, weight, bias=None)
 
         weight = torch.randn((1, 1, 1, 1), device=self.device, dtype=torch.float32)
@@ -9276,6 +11242,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._dynamo.config.patch(recompile_limit=32)
     def test_convolution_errors_with_uint_input_float_weight(self):
+        # [FUNCTION DOC] CPU only: convolution of unsigned integer inputs (uint8 to uint64) with
+        # float32 weights for 1D, 2D, 3D must raise a RuntimeError about the input and weight
+        # types, unexpected scalar type or not implemented. Recompile limit raised to 32.
         if self.device != "cpu":
             raise unittest.SkipTest("CPU only")
 
@@ -9297,7 +11266,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                     c_op(x, weight, stride=4, padding=2, groups=8)
 
     def test_log1p(self):
+        # [FUNCTION DOC] log1p for float16, float32, float64, int32, int64 (supported ones) on
+        # random values and on values near zero.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return log1p of x and twice log1p of x.
             return torch.log1p(x), torch.log1p(x) * 2
 
         for dtype in (torch.float16, torch.float, torch.double, torch.int, torch.int64):
@@ -9315,6 +11287,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(force_disable_caches=True)
     def test_deterministic_codegen(self):
+        # [FUNCTION DOC] Generated kernel code must be independent of compile order and compile
+        # ids: three functions (two identical in structure, one with swapped ops) are compiled in
+        # one order, the reset and recompiled in another, and then again with a patched compile
+        # context using an unusual compile id; the identical-structure kernels must have equal code
+        # each time and same-function code must not change. Caches are disabled; skipped for CPU
+        # cpp wrapper.
         if "cpu" in str(self.device) and config.cpp_wrapper:
             raise unittest.SkipTest(
                 "run_and_get_kernels can't extract kernels from CPU cpp_wrapper code"
@@ -9322,14 +11300,18 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile(fullgraph=True)
         def a(x):
+            # [FUNCTION DOC] HELPER: Compiled function computing softmax of sin of cos of x.
             return x.cos().sin().softmax(-1)
 
         @torch.compile(fullgraph=True)
         def b(x):
+            # [FUNCTION DOC] HELPER: Compiled function computing softmax of cos of sin of x.
             return x.sin().cos().softmax(-1)
 
         @torch.compile(fullgraph=True)
         def c(x):
+            # [FUNCTION DOC] HELPER: Compiled function with the same computation as the first
+            # helper.
             return x.cos().sin().softmax(-1)
 
         x = torch.randn(16, 256, device=self.device)
@@ -9366,16 +11348,23 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(force_disable_caches=True)
     def test_deterministic_codegen_on_graph_break(self):
+        # [FUNCTION DOC] The same function applied twice in one compiled function separated by a
+        # graph break should produce identical kernel code for both graph segments (or a single
+        # deduplicated kernel with cpp wrapper lazy compile). Caches disabled; skipped for CPU cpp
+        # wrapper.
         if "cpu" in str(self.device) and config.cpp_wrapper:
             raise unittest.SkipTest(
                 "run_and_get_kernels can't extract kernels from CPU cpp_wrapper code"
             )
 
         def a(x):
+            # [FUNCTION DOC] HELPER: Return softmax of sin of cos of x.
             return x.cos().sin().softmax(-1)
 
         @torch.compile()
         def b(x):
+            # [FUNCTION DOC] HELPER: Apply the helper function, break the graph, and apply it
+            # again.
             x = a(x)
             torch._dynamo.graph_break()
             x = a(x)
@@ -9402,6 +11391,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         }
     )
     def test_deterministic_codegen_with_suffix(self):
+        # [FUNCTION DOC] The kernel generated for a softmax function must be the same code as the
+        # first kernel in a function that adds a matmul after it (unique kernel suffix handling).
+        # Caches disabled, ATEN GEMM backend, native matmul off; skipped for CPU cpp wrapper.
         if "cpu" in str(self.device) and config.cpp_wrapper:
             raise unittest.SkipTest(
                 "run_and_get_kernels can't extract kernels from CPU cpp_wrapper code"
@@ -9409,10 +11401,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile(fullgraph=True)
         def a(x):
+            # [FUNCTION DOC] HELPER: Compiled function returning softmax of sin of cos of x.
             return x.cos().sin().softmax(-1)
 
         @torch.compile(fullgraph=True)
         def b(x, y):
+            # [FUNCTION DOC] HELPER: Compiled function computing the softmax of sin of cos of x and
+            # multiplying it by y with a matmul.
             x = x.cos().sin().softmax(-1)
             x = torch.matmul(x, y)
             return x
@@ -9424,7 +11419,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(code0, code1)
 
     def test_flip(self):
+        # [FUNCTION DOC] Flip along the last dim, and along dims 0 and 2.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return flip of x on the last dim and flip on dims 0, 2 minus
+            # 2.
             return torch.flip(x, (-1,)), torch.flip(x, (0, 2)) - 2
 
         self.common(
@@ -9433,7 +11431,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_signbit(self):
+        # [FUNCTION DOC] Sign bit of x and a bitwise operation on the sign bit of negated x.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return signbit of x and not signbit of negated x bitwise-and
+            # 1.
             return torch.signbit(x), ~torch.signbit(-x) & 1
 
         self.common(
@@ -9442,7 +11443,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_signbit_unsigned_dtypes(self):
+        # [FUNCTION DOC] Sign bit of bool and unsigned integer tensors (uint8 to uint64); all
+        # result values are false.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return signbit of x.
             return torch.signbit(x)
 
         for dtype in [
@@ -9456,14 +11460,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.common(fn, [x], check_lowp=False)
 
     def test_sign_dtype(self):
+        # [FUNCTION DOC] Sign of x then tanh, checking sign keeps a float dtype.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return tanh of sign of x.
             y = torch.sign(x)
             return torch.tanh(y)
 
         self.common(fn, (torch.randn([1, 2, 6, 6]),))
 
     def test_frac_signed_zero(self):
+        # [FUNCTION DOC] frac of tensors including negative zero must keep the sign of zero:
+        # compares the frac values and reciprocal of frac bitwise (as int32) with eager, and checks
+        # the first element is positive zero with an infinite reciprocal.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return frac of x and the reciprocal of frac of x.
             y = torch.frac(x)
             return y, 1.0 / y
 
@@ -9483,14 +11493,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(actual_recip.cpu()[0].item(), float("inf"))
 
     def test_fmod(self):
+        # [FUNCTION DOC] Floating-point remainder fmod of two tensors, and of a scaled tensor.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return fmod of a and b, and fmod of three times a and b minus
+            # 2.
             return torch.fmod(a, b), torch.fmod(3.0 * a, b) - 2.0
 
         shape = [1, 2, 6, 6]
         self.common(fn, (torch.randn(shape), torch.randn(shape)))
 
     def test_fmod_zero_dim(self):
+        # [FUNCTION DOC] fmod between a vector and a zero-dimensional tensor, and the reverse.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple with fmod of a and b.
             return (torch.fmod(a, b),)
 
         self.common(
@@ -9510,7 +11525,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_halide  # log2 not implemented for halide
     def test_log2(self):
+        # [FUNCTION DOC] Base-2 logarithm of positive values and of a shifted value. Skipped on
+        # Halide.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return log2 of x and log2 of x plus 1 minus 2.
             return torch.log2(x), torch.log2(x + 1) - 2
 
         self.common(
@@ -9519,7 +11537,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_logsumexp(self):
+        # [FUNCTION DOC] logsumexp over the last dim and over dim 0 of a matrix of values near ten.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return logsumexp over the last dim and logsumexp over dim 0
+            # minus 2.
             return torch.logsumexp(x, -1), torch.logsumexp(x, 0) - 2
 
         self.common(
@@ -9529,7 +11550,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_halide  # log2 not implemented for halide
     def test_log_fp64(self):
+        # [FUNCTION DOC] Natural log and base-2 log of float64 values; expects a TypeError if
+        # float64 is unsupported on the device. Skipped on Halide.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return log and log2 of x.
             return torch.log(x), torch.log2(x)
 
         _dtype = torch.float64
@@ -9545,7 +11569,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_bitwise(self):
+        # [FUNCTION DOC] Bitwise not, or, xor and and of two random int32 vectors.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return bitwise not of x and bitwise or, xor, and of x and y.
             return (
                 torch.bitwise_not(x),
                 torch.bitwise_or(x, y),
@@ -9562,8 +11588,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_bitwise2(self):
+        # [FUNCTION DOC] Bitwise not, or, xor and and on random boolean tensors.
         # again with bool types
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return bitwise not of x and bitwise or, xor, and of x and y.
             return (
                 torch.bitwise_not(x),
                 torch.bitwise_or(x, y),
@@ -9580,8 +11608,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_bitwise3(self):
+        # [FUNCTION DOC] Repro for issue 97968: max, clamp_max and clamp_min combined with bitwise
+        # ops on broadcast int8 inputs.
         # Repro for https://github.com/pytorch/pytorch/issues/97968
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return max of bitwise and with y, clamp_max of bitwise or with
+            # y and clamp_min of bitwise xor with y.
             return (
                 torch.max(torch.bitwise_and(x, y), y),
                 torch.clamp_max(torch.bitwise_or(x, y), y),
@@ -9597,13 +11629,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_inf(self):
+        # [FUNCTION DOC] Operations with positive and negative infinity constants (add, multiply).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a plus infinity, a plus negative infinity and a times
+            # negative infinity.
             return a + float("inf"), a + float("-inf"), a * -float("inf")
 
         self.common(fn, (torch.randn(8),))
 
     def test_remainder(self):
+        # [FUNCTION DOC] Remainder of two random tensors, also with shifted operands.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return remainder of a and b, of a plus 1 and b minus 1, and of
+            # a minus 1 and b plus 1.
             return (
                 torch.remainder(a, b),
                 torch.remainder(a + 1, b - 1),
@@ -9615,7 +11653,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @parametrize("y", (3.14, torch.tensor(3.14)))
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_remainder_scalar_values(self, y, dtype):
+        # [FUNCTION DOC] Parametrized over a Python float or float tensor divisor and half or
+        # bfloat16 inputs: remainder of a low precision vector.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return remainder of a and b.
             return torch.remainder(a, b)
 
         x = torch.tensor([-4.0, 0.0, 0.4, 4], dtype=dtype, device=self.device)
@@ -9626,6 +11667,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_pallas  # cpp-only RuntimeError contract
     @skip_if_triton_cpu  # cpp-only RuntimeError contract
     def test_fmod_uint8_zero_divisor_cpu_inductor_raises_error(self):
+        # [FUNCTION DOC] CPU only: fmod of a uint8 tensor by a uint8 divisor containing a zero must
+        # raise a RuntimeError mentioning ZeroDivisionError in compiled code. Seeded; skipped for
+        # Halide, Pallas and Triton CPU.
         if self.device != "cpu":
             raise unittest.SkipTest(
                 "CPU-only: uint8 Inductor integer divide-by-zero RuntimeError check"
@@ -9645,6 +11689,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_pallas  # cpp-only RuntimeError contract
     @skip_if_triton_cpu  # cpp-only RuntimeError contract
     def test_remainder_uint8_zero_divisor_cpu_inductor_raises_error(self):
+        # [FUNCTION DOC] CPU only: remainder of a uint8 tensor by a uint8 divisor containing a zero
+        # must raise a RuntimeError mentioning ZeroDivisionError in compiled code. Seeded; skipped
+        # for Halide, Pallas and Triton CPU.
         if self.device != "cpu":
             raise unittest.SkipTest(
                 "CPU-only: uint8 Inductor integer divide-by-zero RuntimeError check"
@@ -9663,7 +11710,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             opt(inp, divisor)
 
     def test_zeros(self):
+        # [FUNCTION DOC] Factory ops zeros (shape given as a tuple and as separate arguments), ones
+        # and full with a float value, mixed with an add.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a plus 1, two zeros tensors of shape 1 by 8 by 64 by
+            # 64, a CPU zeros 2 by 3, a plus ones, and a full tensor of 3.1416.
             return (
                 a + 1,
                 torch.zeros(
@@ -9687,7 +11738,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn(8),))
 
     def test_new_ones(self):
+        # [FUNCTION DOC] new_ones and new_zeros through the aten ops with an empty shape, explicit
+        # device, dtype code 6 and layout 0.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a scalar new_ones and a scalar new_zeros like a.
             return (
                 aten.new_ones(
                     a, [], device=a.device, dtype=6, layout=0, pin_memory=False
@@ -9700,25 +11754,36 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn(8),))
 
     def test_full_like(self):
+        # [FUNCTION DOC] full_like with 7.777 minus one.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return full_like of a with 7.777 minus 1.
             return torch.full_like(a, 7.777) - 1
 
         self.common(fn, (torch.randn(8),))
 
     def test_full_like_transposed(self):
+        # [FUNCTION DOC] full_like of a transposed tensor must preserve its strides (exact stride
+        # check).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return full_like of a with 3.
             return torch.full_like(a, 3)
 
         self.common(fn, (torch.randn(4, 5, 6).transpose(1, -1),), exact_stride=True)
 
     def test_full_like_sliced(self):
+        # [FUNCTION DOC] full_like of a sliced (stride 2 in the last dim) tensor must preserve
+        # strides.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return full_like of a with 3.
             return torch.full_like(a, 3)
 
         self.common(fn, (torch.rand(3, 4)[:, ::2],), exact_stride=True)
 
     def test_full_truncation(self):
+        # [FUNCTION DOC] full_like with a float value into every dtype from all_types (including
+        # integer dtypes where the value truncates); expects TypeError for unsupported dtypes.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a plus full_like of a with 7.777.
             return a + torch.full_like(a, 7.777)
 
         for dtype in all_types():
@@ -9735,7 +11800,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 )
 
     def test_full_boolean(self):
+        # [FUNCTION DOC] Full with a boolean fill value computed from a Python integer argument
+        # (compare to 1024), then plus one; checked for values 1024 and 1023.
         def fn(n):
+            # [FUNCTION DOC] HELPER: Create a one-element full tensor with the value n at least
+            # 1024 and return it and it plus one.
             x = torch.full((1,), n >= 1024, device=self.device)
             return x, x + 1
 
@@ -9743,7 +11812,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (1023,))
 
     def test_index1(self):
+        # [FUNCTION DOC] Advanced indexing with two index tensors, for 1-D index tensors and for
+        # broadcast 2-D index tensors.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return aten index of a with index list b and c.
             return aten.index(a, [b, c])
 
         self.common(
@@ -9764,7 +11836,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index2(self):
+        # [FUNCTION DOC] Advanced indexing with one index tensor, and with a leading None index.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return aten index of a with b, and with None followed by b.
             return (
                 aten.index(a, [b]),
                 aten.index(a, [None, b]),
@@ -9779,7 +11853,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index3(self):
+        # [FUNCTION DOC] Mixed indexing: slice, index tensor, None and second index tensor, and a
+        # constant integer.
         def fn(x, ia, ib):
+            # [FUNCTION DOC] HELPER: Return x indexed by slice, ia, a new axis, ib and the constant
+            # 0.
             return (x[:, ia, None, ib, 0],)
 
         self.common(
@@ -9792,7 +11870,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_output_strides(self):
+        # [FUNCTION DOC] Output strides of a compiled function must match eager: a
+        # permute-contiguous then graph break then view; and slicing, transposing and squeezing a
+        # tensor should not copy (output shares storage with the input).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Permute x to channels last order, make contiguous, break the
+            # graph and view as rows of 4.
             y = x.permute(0, 2, 3, 1).contiguous()
             torch._dynamo.graph_break()
             return y.view(-1, 4)
@@ -9805,6 +11888,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         # no redundant copy
         def foo(x):
+            # [FUNCTION DOC] HELPER: Strided slice, transpose, slice and squeeze x; a view-only
+            # function.
             return x[0:2:2].T[3:].squeeze(0)
 
         foo_opt = torch.compile(foo, backend="inductor")
@@ -9812,7 +11897,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(inp.storage(), out.storage())
 
     def test_empty_output_strides(self):
+        # [FUNCTION DOC] An empty tensor output (shape 2 by 0 by 0) from new_empty has the same
+        # strides when compiled and in eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return a new empty tensor of shape 2 by 0 by 0 like x.
             return x.new_empty((2, 0, 0))
 
         inp = torch.randn(1, device=self.device)
@@ -9821,7 +11909,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(compiled.stride(), eager.stride())
 
     def test_index_select(self):
+        # [FUNCTION DOC] index_select along dims 0, 1 and chained dims 2 and 1, for int32 and int64
+        # indices.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return index_select results of a along dim 0, dim 1, and
+            # nested dim 2 then dim 1.
             return (
                 torch.index_select(a, 0, b),
                 torch.index_select(a, 1, b),
@@ -9841,6 +11933,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skipCUDAIf(not TEST_CUDNN, "CUDNN not available")
     @skipIfXpu
     def test_cudnn_rnn(self):
+        # [FUNCTION DOC] Recurrent network op on the GPU through cudnn (or miopen on HIP) with a
+        # 4-layer, 2048-size, 92 step input and flattened weights; low precision check disabled.
+        # Skipped on CPU, XPU, without cudnn, and expected failure on MPS.
         if self.device == "cpu":
             raise unittest.SkipTest(f"requires {GPU_TYPE}")
 
@@ -9866,6 +11961,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             a4,
             a5,
         ):
+            # [FUNCTION DOC] HELPER: Gather the sixteen weight tensors into a list and call the
+            # aten cudnn rnn op (or the miopen rnn op on HIP) with the fixed hyperparameters;
+            # returns its outputs.
             a1 = [
                 b0,
                 b1,
@@ -9952,7 +12050,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_upsample_nearest1d(self):
+        # [FUNCTION DOC] Nearest neighbor 1D upsample to several output sizes and by scale factor
+        # 2.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return five aten upsample nearest 1D results of a (four sizes
+            # and one scale factor).
             return (
                 aten.upsample_nearest1d(a, [74], None),
                 aten.upsample_nearest1d(a, [70], None),
@@ -9964,7 +12066,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn([2, 4, 37]),))
 
     def test_upsample_nearest2d(self):
+        # [FUNCTION DOC] Nearest neighbor 2D upsample to several output sizes and by scale factor
+        # 2.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return five aten upsample nearest 2D results of a.
             return (
                 aten.upsample_nearest2d(a, [74, 76]),
                 aten.upsample_nearest2d(a, [70, 75]),
@@ -9976,7 +12081,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn([2, 4, 37, 38]),))
 
     def test_upsample_nearest2d_neg(self):
+        # [FUNCTION DOC] Nearest 2D upsample with negative scale values and an explicit output size
+        # (scales ignored in favor of the size).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple with aten upsample nearest 2D to 37
+            # by 38 with scales -1.
             return (
                 aten.upsample_nearest2d(
                     a, output_size=[37, 38], scales_h=-1, scales_w=-1
@@ -9986,7 +12095,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn([2, 4, 37, 38]),))
 
     def test_upsample_nearest3d(self):
+        # [FUNCTION DOC] Nearest neighbor 3D upsample to several output sizes and scale factor 2.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return five aten upsample nearest 3D results of a.
             return (
                 aten.upsample_nearest3d(a, [74, 76, 78], None),
                 aten.upsample_nearest3d(a, [70, 75, 80], None),
@@ -9998,9 +12109,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn([2, 4, 37, 38, 39]),))
 
     def test_upsample_nearest2d_backward(self):
+        # [FUNCTION DOC] Backward of nearest 2D upsample from a 6 by 12 gradient to several input
+        # sizes (including repeated and odd sizes).
         func = torch.ops.aten.upsample_nearest2d_backward
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the upsample nearest 2D backward of a to five different
+            # input sizes.
             return (
                 func(a, output_size=[6, 12], input_size=[3, 3, 3, 6]),
                 func(a, output_size=[6, 12], input_size=[3, 3, 4, 5]),
@@ -10013,7 +12128,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_x86_mac()
     def test_upsample_bilinear2d_a(self):
+        # [FUNCTION DOC] Bilinear 2D upsample to an explicit size without align corners and by a
+        # scale factor with align corners; relaxed tolerances. Skipped on x86 macOS.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return aten upsample bilinear 2D to 45 by 45 and by scale 2
+            # with align corners.
             return (
                 aten.upsample_bilinear2d(a, [45, 45], False, None),
                 aten.upsample_bilinear2d(a, None, True, [2.0, 2.0]),
@@ -10022,7 +12141,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn([2, 4, 37, 38]),), atol=2.5e-5, rtol=1.3e-6)
 
     def test_upsample_bilinear2d_b(self):
+        # [FUNCTION DOC] Bilinear 2D upsample with scale factor 2 and align corners on a 40 by 59
+        # input; relaxed tolerances.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return aten upsample bilinear 2D by scale 2 with align
+            # corners.
             return aten.upsample_bilinear2d(a, None, True, [2.0, 2.0])
 
         self.common(
@@ -10036,7 +12159,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # accuracy issue
     def test_reflection_pad2d(self):
+        # [FUNCTION DOC] Reflection pad 2D with fixed padding and with a padding list given as a
+        # runtime argument. Skipped on GPU Halide (accuracy).
         def fn(a, pad):
+            # [FUNCTION DOC] HELPER: Return reflection pad 2D of a with padding 1 on all sides and
+            # with the given pad list.
             return (
                 aten.reflection_pad2d(a, [1, 1, 1, 1]),
                 aten.reflection_pad2d(a, pad),
@@ -10051,7 +12178,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_reflection_pad2d_channels_last(self):
+        # [FUNCTION DOC] Reflection pad 2D on a channels-last input; compiled output stride order
+        # should be preserved.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return reflection pad 2D of a with asymmetric padding in a
+            # tuple.
             return (aten.reflection_pad2d(a, [1, 2, 2, 1]),)
 
         # channels_last input: stride order should be preserved in compiled output
@@ -10062,8 +12193,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_reflection_pad2d_backward(self):
+        # [FUNCTION DOC] Reflection pad 2D backward for a range of padding lists, including zero
+        # and negative paddings, on an 8 by 8 image. Uses a local template that builds the input,
+        # computes the padded forward result to get a gradient with matching shape and compares
+        # compiled backward with eager.
         def template(size, padding):
+            # [FUNCTION DOC] HELPER: For the given input size and padding, create an integer-valued
+            # float input, pad it for the forward shape, draw a random gradient of that shape and
+            # run the backward check through the common helper (low precision check off on Halide).
             def fn(grad_output, x):
+                # [FUNCTION DOC] HELPER: Return the aten reflection pad 2D backward for grad_output
+                # and x with the enclosing padding.
                 return aten.reflection_pad2d_backward(grad_output, x, padding)
 
             x = torch.randint(0, 999, size=size, dtype=torch.float32)
@@ -10083,7 +12223,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         template([1, 1, 8, 8], [2, 2, -1, 0])
 
     def test_grid_sampler_2d(self):
+        # [FUNCTION DOC] Grid sampler 2D with two settings of interpolation and padding modes on a
+        # large 352 by 352 image with a random grid in [-1, 1]; relaxed tolerances and low
+        # precision check disabled.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return grid_sampler_2d of a with grid b for (bilinear, zeros
+            # padding, align corners) and (bilinear, border padding, no align corners).
             return (
                 aten.grid_sampler_2d(a, b, 0, 0, True),
                 aten.grid_sampler_2d(a, b, 0, 1, False),
@@ -10105,6 +12250,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu()
     def test_grid_sampler_expand_preserves_view(self):
+        # [FUNCTION DOC] GPU only (CUDA or XPU): a module that samples an expanded single-channel
+        # image with a learned grid for each of three channels then applies a linear layer; checks
+        # the compiled forward and backward run and the grid parameter receives a gradient
+        # (expanded views must be preserved rather than materialized).
         if not self.device.startswith("cuda") and not self.device.startswith("xpu"):
             self.skipTest("requires CUDA or XPU")
 
@@ -10119,7 +12268,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         device = self.device
 
         class ExpandGridSampler(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a learnable grid of repeats by 13 by 13 by 2 and a
+            # linear layer over the concatenated per-channel samples; forward samples each input
+            # channel (expanded across repeats) with the grid using bilinear border mode and
+            # applies the linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the grid parameter and the linear layer on the
+                # enclosing device.
                 super().__init__()
                 self.grid = torch.nn.Parameter(
                     torch.randn(repeats, grid_size, grid_size, 2, device=device)
@@ -10129,6 +12284,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 )
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: For each channel of x, expand to the repeat count,
+                # grid-sample with the learned grid, transpose and flatten the result; concatenate
+                # the per-channel patches and apply the linear layer.
                 per_channel = []
                 for i in range(channels):
                     channel = x[:, i, ...].expand(repeats, -1, -1, -1)
@@ -10154,7 +12312,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertIsNotNone(model.grid.grad)
 
     def test_upsample_bicubic2d(self):
+        # [FUNCTION DOC] Bicubic 2D upsample to 128 by 128 with align corners and to 128 by 256
+        # without, with slightly relaxed tolerances.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the two aten bicubic upsample results of a.
             return (
                 aten.upsample_bicubic2d(a, (128, 128), True),
                 aten.upsample_bicubic2d(a, (128, 256), False),
@@ -10171,9 +12332,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_float_index_expression(self):
+        # [FUNCTION DOC] Checks index propagation does not generate non-integral index expressions
+        # for bicubic upsample: the generated code must not match a regular expression for a half
+        # times an index variable.
         # Test that index propagation doesn't generate bad index_expr calls like
         # ops.index_expr(0.5*x, dtype) where the expression is not integral
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the aten bicubic upsample of x to 256 by 256 without
+            # align corners.
             return aten.upsample_bicubic2d(x, (256, 256), False)
 
         x = torch.randn(1, 1, 128, 128, dtype=torch.float32, device=self.device)
@@ -10186,15 +12352,24 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_float_index_expression_type_promotion(self):
+        # [FUNCTION DOC] Float index expression (one divided by a size) added to an integer arange
+        # must go through type promotion.
         # Test that float indexing expressions participate in type promotion
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x plus one divided by the first dim size of x.
             return x + 1.0 / x.size(0)
 
         x = torch.arange(10)
         self.common(fn, (x,))
 
     def test_sort(self):
+        # [FUNCTION DOC] Sort with values and indices of an integer-valued float tensor, called
+        # with both descending flags (the helper ignores the flag and always sorts ascending).
+        # KNOWN ISSUE: the inner function ignores the descending argument, so both calls test
+        # ascending sort only.
         def fn(a, descending):
+            # [FUNCTION DOC] HELPER: Return the ascending sort of a; the descending argument is
+            # unused.
             return torch.sort(a)
 
         inp = torch.randint(0, 999, size=[1, 1, 8, 8], dtype=torch.float32)
@@ -10204,7 +12379,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @parametrize("stable", (True, False))
     @parametrize("descending", (True, False))
     def test_nan_sort(self, descending, stable):
+        # [FUNCTION DOC] Parametrized over descending and stable: sorting a tensor that contains
+        # NaN values; compiled equals eager with NaN equal (for non-stable sorts only the values
+        # are compared since indices may differ).
         def test_sort(x, descending, stable):
+            # [FUNCTION DOC] HELPER: Sort x with the given flags; return both values and indices
+            # for stable sorts and only values otherwise.
             out = torch.sort(x, descending=descending, stable=stable)
             if stable:
                 return out
@@ -10233,7 +12413,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(a, b, equal_nan=True)
 
     def test_sort_stable(self):
+        # [FUNCTION DOC] Stable sort with duplicates in the data (so indices are deterministic) for
+        # a 128-wide and a non-power-of-two 120-wide row, ascending and descending.
         def fn(a, descending):
+            # [FUNCTION DOC] HELPER: Return the stable sort of a along the last dim.
             return a.sort(dim=-1, stable=True, descending=descending)
 
         # Duplicates give deterministic indices when stable sorting
@@ -10249,7 +12432,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (inp, True))
 
     def test_sort_bool(self):
+        # [FUNCTION DOC] Stable sort of boolean data converted to int8, ascending and descending.
         def fn(a, descending):
+            # [FUNCTION DOC] HELPER: Return the stable sort of a converted to int8.
             return torch.sort(a.to(torch.int8), stable=True, descending=descending)
 
         inp = torch.randint(0, 2, size=[10, 128], dtype=torch.bool)
@@ -10258,7 +12443,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skipIfWindows(msg="Crash UT")
     def test_sort_transpose(self):
+        # [FUNCTION DOC] Stable sort of a transposed large (10 by 4097) tensor, both directions.
+        # Skipped on Windows (crash).
         def fn(a, descending):
+            # [FUNCTION DOC] HELPER: Return the stable sort of a.
             return torch.sort(a, stable=True, descending=descending)
 
         inp = torch.randn(4097, 10).transpose(0, 1)
@@ -10266,7 +12454,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (inp, True))
 
     def test_topk(self):
+        # [FUNCTION DOC] Top two elements along the last dim.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return top 2 of a along the last dim.
             return torch.topk(a, 2, -1)
 
         self.common(
@@ -10274,9 +12464,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_multinomial(self):
+        # [FUNCTION DOC] Multinomial sampling with replacement is stochastic, so only shape and
+        # value range are checked: a 1-D weight vector gives 4 samples in range, and a 2-D weight
+        # matrix gives 3 samples per row in range (compiled with a lambda).
         # aten.multinomial output is stochastic so we can only check shape/range,
         # not exact values. Verifies the op compiles and runs without error.
         def fn(weights):
+            # [FUNCTION DOC] HELPER: Draw 4 samples with replacement from the weights.
             return torch.multinomial(weights, num_samples=4, replacement=True)
 
         cfn = torch.compile(fn)
@@ -10294,15 +12488,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue((result2d >= 0).all() and (result2d < 8).all())
 
     def test_bincount(self):
+        # [FUNCTION DOC] Bincount with a minimum length of 8 (data-dependent output size handled by
+        # an eager fallback); output is deterministic so exact comparison is used.
         # aten.bincount: data-dependent output size; routes to ATen eager kernel.
         # Output is deterministic, so exact comparison is valid.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return bincount of x with minlength 8.
             return torch.bincount(x, minlength=8)
 
         self.common(fn, (torch.randint(0, 8, (30,), dtype=torch.int64),))
 
     def test_bincount_with_weights(self):
+        # [FUNCTION DOC] Bincount with float32 weights.
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Return weighted bincount of x with minlength 8.
             return torch.bincount(x, weights=w, minlength=8)
 
         self.common(
@@ -10314,7 +12513,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_bincount_with_int_weights(self):
+        # [FUNCTION DOC] Bincount with int32 weights.
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Return weighted bincount of x with minlength 8.
             return torch.bincount(x, weights=w, minlength=8)
 
         self.common(
@@ -10326,7 +12527,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_bincount_empty_with_weights(self):
+        # [FUNCTION DOC] Bincount of an empty integer tensor with empty weights.
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Return weighted bincount of x with minlength 8.
             return torch.bincount(x, weights=w, minlength=8)
 
         self.common(
@@ -10339,10 +12542,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @lowering.force_fallback(aten.quantize_per_tensor.default)
     def test_quantize_per_tensor_fallback_output_dtype(self):
+        # [FUNCTION DOC] With the lowering for quantize per tensor forced to the eager fallback
+        # (decorator), a compiled quantization on CPU returns a quint8 quantized tensor with the
+        # same scale, zero point and integer representation as eager. Skipped on non-CPU devices.
         if self.device != "cpu":
             raise unittest.SkipTest("quantized tensor kernels are CPU-only")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Quantize x per tensor with scale 0.1 and zero point 5 to
+            # quint8.
             return torch.quantize_per_tensor(x, 0.1, 5, torch.quint8)
 
         x = torch.randn(16, dtype=torch.float32, device=self.device)
@@ -10354,15 +12562,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(out.int_repr(), ref.int_repr())
 
     def test_unique(self):
+        # [FUNCTION DOC] Unique with sorting, inverse indices and counts on an int64 vector.
         # aten._unique2: torch.unique() backend; multi-output with data-dependent size.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return unique of x with inverse and counts, sorted.
             return torch.unique(x, sorted=True, return_inverse=True, return_counts=True)
 
         self.common(fn, (torch.tensor([3, 1, 2, 1, 3, 3], dtype=torch.int64),))
 
     def test_unique_dim(self):
+        # [FUNCTION DOC] Unique along dim 0 of an int64 matrix with duplicate rows, inverse and
+        # counts.
         # aten.unique_dim: torch.unique(dim=N) backend.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return unique rows of x with inverse and counts.
             return torch.unique(
                 x, dim=0, sorted=True, return_inverse=True, return_counts=True
             )
@@ -10370,15 +12583,21 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.tensor([[1, 2], [1, 2], [3, 4]], dtype=torch.int64),))
 
     def test_unique_consecutive(self):
+        # [FUNCTION DOC] Unique_consecutive over runs of identical adjacent elements, with inverse
+        # and counts.
         # aten.unique_consecutive: runs of identical adjacent elements.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return unique_consecutive of x with inverse and counts.
             return torch.unique_consecutive(x, return_inverse=True, return_counts=True)
 
         self.common(fn, (torch.tensor([1, 1, 2, 2, 3, 1, 1], dtype=torch.int64),))
 
     def test_unique_dim_consecutive(self):
+        # [FUNCTION DOC] Unique_consecutive along dim 0 of a matrix with repeated adjacent rows.
         # aten.unique_dim_consecutive: consecutive unique rows/cols.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return unique_consecutive of x along dim 0 with inverse and
+            # counts.
             return torch.unique_consecutive(
                 x, dim=0, return_inverse=True, return_counts=True
             )
@@ -10389,8 +12608,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_amp_update_scale(self):
+        # [FUNCTION DOC] GradScaler scale update op (in place) on a scale of 1024, a zero growth
+        # tracker and no infinity found; compiled result equals eager on cloned inputs.
         # aten._amp_update_scale_: GradScaler update step, routes to ATen eager.
         def fn(scale, growth_tracker, found_inf):
+            # [FUNCTION DOC] HELPER: Call the in-place amp update scale with growth factor 2.0,
+            # backoff factor 0.5 and growth interval 2000.
             return torch._amp_update_scale_(
                 scale,
                 growth_tracker,
@@ -10409,7 +12632,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(result, expected)
 
     def test_long_tensor(self):
+        # [FUNCTION DOC] Long tensors created in the function (LongTensor and as_tensor) moved to
+        # the input device and combined with the input.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a constant 294 long tensor minus a and a constant 295
+            # tensor plus a.
             return (
                 torch.LongTensor([294]).to(a.device) - a,
                 torch.as_tensor([295]).to(a.device) + a,
@@ -10419,7 +12646,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # correctness issue
     def test_constant_pad_1d(self):
+        # [FUNCTION DOC] Constant padding in 1-D (last dim) with fill values 6.0 and 99.0 of
+        # different widths. Skipped on GPU Halide (correctness issue).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return constant_pad_nd of a with pad [0, 1] value 6.0 and with
+            # pad
+            # [2, 3] value 99.0.
             return (
                 aten.constant_pad_nd(a, [0, 1], 6.0),
                 aten.constant_pad_nd(a, [2, 3], 99.0),
@@ -10428,7 +12660,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randint(0, 999, size=[2, 16, 31], dtype=torch.float32),))
 
     def test_constant_pad_fill_dtype(self):
+        # [FUNCTION DOC] Constant padding of a boolean tensor with float fill values 1.0 and 0.0
+        # and bitwise-and with a boolean tensor; checks the fill value is converted to bool.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return padded a with fill 1.0 and with fill 0.0, each
+            # bitwise-and b.
             return (
                 aten.constant_pad_nd(a, (1, 1), 1.0) & b,
                 aten.constant_pad_nd(a, (1, 1), 0.0) & b,
@@ -10441,7 +12677,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # misaligned address
     def test_constant_pad_2d(self):
+        # [FUNCTION DOC] Constant padding in 2-D with several pad amounts. Skipped on GPU Halide
+        # (misaligned address).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return constant_pad_nd with symmetric padding 1 and value 6.0,
+            # and with padding [1, 2, 3, 4] and value 99.0.
             return (
                 aten.constant_pad_nd(a, [1, 1, 1, 1], 6.0),
                 aten.constant_pad_nd(a, [1, 2, 3, 4], 99.0),
@@ -10452,7 +12692,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_constant_pad_2d_strides_nonpositive(self):
+        # [FUNCTION DOC] Constant padding with negative padding that crops the tensor on an
+        # empty_strided input with non-default strides (non-positive/cropped strides case).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Apply constant_pad_nd with a pad list cropping two elements
+            # from dim 1.
             return torch.constant_pad_nd(a, [0, 0, 0, -2, 0, 0])
 
         self.common(
@@ -10460,6 +12704,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_constant_pad_nd_fallback_python_dispatch_stride(self):
+        # [FUNCTION DOC] CPU only (and not under subprocess compile): registers custom fake and
+        # runtime python dispatch handlers for the constant_pad_nd op that return contiguous empty
+        # tensors, forces the fallback lowering, compiles a small FX graph with size asserts on,
+        # and runs it under a custom dispatch mode with the python dispatcher: output stride must
+        # be the contiguous one produced by the custom handler, the fake handler must be called at
+        # least once during compile and the runtime handler exactly once. Restores the original
+        # python key table and clears the dispatch cache afterwards.
         if self.device != "cpu":
             raise unittest.SkipTest("compile_fx_inner repro is CPU-only")
         if torch._inductor.compile_fx.fx_compile_mode == FxCompileMode.SUBPROCESS:
@@ -10474,9 +12725,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         calls = {"fake": 0, "runtime": 0}
 
         class ConstantPadRuntimeMode(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Empty TorchDispatchMode subclass used only as a key for
+            # registering the runtime python dispatch handler.
             pass
 
         def contiguous_strides(shape):
+            # [FUNCTION DOC] HELPER: Compute contiguous row-major strides for a shape.
             strides = []
             running = 1
             for dim in reversed(shape):
@@ -10485,6 +12739,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             return tuple(strides)
 
         def custom_constant_pad_nd(x, pad, value=0):
+            # [FUNCTION DOC] HELPER: Compute the padded output shape by adding low and high pads
+            # per dim and return an uninitialized tensor with contiguous strides, dtype and device
+            # of x.
             shape = list(x.shape)
             for dim, (low, high) in enumerate(
                 reversed(list(zip(pad[::2], pad[1::2]))),
@@ -10499,14 +12756,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
         def fake_constant_pad_nd(mode, x, pad, value=0):
+            # [FUNCTION DOC] HELPER: Fake tensor mode handler: count the call in the fake counter
+            # and return the custom constant pad result.
             calls["fake"] += 1
             return custom_constant_pad_nd(x, pad, value)
 
         def runtime_constant_pad_nd(mode, x, pad, value=0):
+            # [FUNCTION DOC] HELPER: Runtime dispatch mode handler: count the call in the runtime
+            # counter and return the custom constant pad result.
             calls["runtime"] += 1
             return custom_constant_pad_nd(x, pad, value)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return a tuple with constant_pad_nd of x cropping one column
+            # from dim 2.
             return (op(x, [0, -1, 0, 0], 0),)
 
         gm = torch.fx.symbolic_trace(fn)
@@ -10541,7 +12804,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # misaligned address
     def test_constant_pad_3d(self):
+        # [FUNCTION DOC] Constant padding in 3-D with full paddings and with padding only on one
+        # dim. Skipped on GPU Halide (misaligned address).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return constant_pad_nd of a with six pad values and 6.0, and
+            # with pad only on dim 1.
             return (
                 aten.constant_pad_nd(a, [1, 2, 3, 4, 5, 6], 6.0),
                 aten.constant_pad_nd(a, [0, 0, 3, 4, 0, 0], 6.0),
@@ -10552,8 +12819,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_constant_pad_float64(self):
+        # [FUNCTION DOC] Repro for issue 93351: functional pad followed by a comparison, in
+        # float64; expects a TypeError if float64 is unsupported.
         # Repro for https://github.com/pytorch/pytorch/issues/93351
         def fn(input):
+            # [FUNCTION DOC] HELPER: Pad input by one on the left of the last dim and return where
+            # the padded tensor is greater than the original (broadcast over the changed shape).
             v1 = torch.nn.functional.pad(input, pad=(1, 0))
             return torch.gt(v1, input)
 
@@ -10569,7 +12840,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.common(fn, (x,))
 
     def test_constant_pad_nd_inplace(self):
+        # [FUNCTION DOC] A constant pad with zero padding must return a new tensor, not the input.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return constant_pad_nd of a with an all-zero pad list.
             return aten.constant_pad_nd(a, [0, 0])
 
         x = torch.randn([2], device=self.device)
@@ -10578,19 +12851,26 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(y is not x)
 
     def test_constant_pad_nd_fused_with_split_reduction(self):
+        # [FUNCTION DOC] Regression: the fill value of a pad fused with the second stage of a split
+        # reduction (a cumulative sum of a mask sum) was dropped because the load was served from
+        # the common-subexpression store cache; checks numerics for a large boolean mask.
         # https://github.com/pytorch/pytorch/issues/<你的issue号>
         # The pad's fill value used to be dropped when the pad was fused with
         # the second stage of a split reduction: the body's load is served
         # from the CSE store cache (producer fused into the same kernel), so
         # no tl.load is emitted and the masked-load `other` never applies.
         def fn(mask):
+            # [FUNCTION DOC] HELPER: Sum the mask over the last dim to int32, cumulative sum over
+            # dim 0 and pad one zero on the left.
             lengths = mask.sum(dim=-1, dtype=torch.int32)
             return F.pad(torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0))
 
         self.common(fn, (torch.ones(1, 16384, dtype=torch.bool),))
 
     def test_l1_loss(self):
+        # [FUNCTION DOC] L1 loss and MSE loss between two tensors; low precision check disabled.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return l1 loss and mse loss of a and b.
             return torch.nn.functional.l1_loss(a, b), torch.nn.functional.mse_loss(a, b)
 
         self.common(
@@ -10603,20 +12883,29 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_triu(self):
+        # [FUNCTION DOC] Upper triangular masks with diagonals 1, 0 and 2.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return triu of a with diagonals 1, 0 and 2.
             return aten.triu(a, 1), aten.triu(a, 0), aten.triu(a, 2)
 
         self.common(fn, (torch.randn([2, 10, 10]),))
 
     def test_no_op_reduction(self):
+        # [FUNCTION DOC] Reductions over dims of size one (no-op reductions): a sum and an amax
+        # with keepdim.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the last-dim sum of a and amax of a plus one on dim 1
+            # with keepdim.
             return a.sum(-1), torch.amax(a + 1, 1, keepdim=True)
 
         self.common(fn, (torch.randn([8, 1, 1]),))
 
     def test_inplace_add(self):
+        # [FUNCTION DOC] In-place add on a compiled function: the output must be the same object as
+        # the first input and its value must equal the original plus the second input.
         @torch.compile(backend="inductor")
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Add y into x in place and return x.
             return x.add_(y)
 
         inputs = (
@@ -10632,7 +12921,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # xmask from triton load/store if xnumel = 1
     @requires_gpu()
     def test_single_elem(self):
+        # [FUNCTION DOC] Single element tensor add on a GPU, testing removal of the mask from loads
+        # and stores when the element count is one.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple with a plus one.
             b = a + 1
             return (b,)
 
@@ -10640,7 +12932,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu()
     def test_single_elem_indirect(self):
+        # [FUNCTION DOC] Single element indirect load on a GPU (index tensor given inside a tuple).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Gather from a by index b and add one, returning a tuple.
             c = a[b] + 1
             return (c,)
 
@@ -10654,7 +12948,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu()
     def test_xblock_divides_xnumel(self):
+        # [FUNCTION DOC] On a GPU, checks add on a vector whose length is a multiple of the block
+        # size (1024, mask dropped) and one that is not (1025).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple with a plus one.
             b = a + 1
             return (b,)
 
@@ -10664,8 +12961,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn(1025),))
 
     def test_inplace_mixed_dtype_ops(self):
+        # [FUNCTION DOC] Compiled function with chained in-place add and multiply of tensors of
+        # different dtypes (float and double, or half on MPS); result must equal the eager chain.
         @torch.compile(backend="inductor")
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compute x plus y as float, add y in place, then multiply by y
+            # in place; return the result.
             z = x + y.float()
             w = z.add_(y)
             return w.mul_(y)
@@ -10683,8 +12984,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         {"triton.unique_kernel_names": True, "triton.descriptive_names": False}
     )
     def test_kernel_names(self):
+        # [FUNCTION DOC] Kernel name generation with unique non-descriptive names enabled; compiled
+        # doubling must be correct.
         @torch.compile(backend="inductor")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return two times x.
             return 2 * x
 
         inputs = (rand_strided((8,), (1,), device=self.device),)
@@ -10693,8 +12997,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @config.patch({"triton.cudagraphs": True})
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     def test_strided_inputs(self):
+        # [FUNCTION DOC] Strided (non-contiguous) and contiguous inputs added, with cuda graphs and
+        # automatic dynamic shapes enabled in config.
         @torch.compile(backend="inductor")
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return x plus y.
             return x + y
 
         inputs = (
@@ -10706,7 +13013,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @config.patch({"triton.cudagraphs": True})
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     def test_input_mutation1(self):
+        # [FUNCTION DOC] Input mutation: a function copies a result into its argument and returns a
+        # product expression; compiled twice with different inputs, outputs and mutated inputs must
+        # equal eager. Uses cuda graphs config and automatic dynamic shapes.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compute b as a plus 1, copy it into a in place, and return a
+            # times b divided by a plus 2.
             b = a + 1
             a.copy_(b)
             c = a + 2
@@ -10728,7 +13040,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(same(arg3, arg4))
 
     def test_input_mutation2(self):
+        # [FUNCTION DOC] Input mutation through a flattened view copy of a constant into the input;
+        # outputs and mutated input must equal eager (requires input that requires grad).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compute a plus 1, overwrite the flattened a with 66.0 and
+            # return the earlier sum and a plus 2.
             b = a + 1
             a.view(64).copy_(torch.tensor([66.0], device=a.device))
             c = a + 2
@@ -10746,7 +13062,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(same(arg1, arg2))
 
     def test_input_mutation3(self):
+        # [FUNCTION DOC] Many chained in-place ops on an input and on a view of it (add, multiply,
+        # sigmoid, add, multiply, relu); outputs and mutated input must equal eager.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Apply in-place add, mul, sigmoid to a, view as flat, then
+            # in-place add, mul, relu and return the view.
             a += 1
             a *= 2
             aten.sigmoid_(a)
@@ -10766,7 +13086,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(same(arg1, arg2))
 
     def test_input_mutation4(self):
+        # [FUNCTION DOC] Input mutation by in-place relu returning the input.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Apply relu in place on a and return a.
             torch.relu_(a)
             return a
 
@@ -10780,7 +13102,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(same(arg1, arg2))
 
     def test_input_mutation5(self):
+        # [FUNCTION DOC] Input mutation after a read: ceil of an integer scalar tensor, then
+        # in-place add of 10; compiled output and mutated input equal eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compute x ceil, add 10 in place to x and return the earlier
+            # value.
             tmp = x.ceil()
             x.add_(10)
             return tmp
@@ -10798,7 +13124,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(expect, actual)
 
     def test_slice_mutation1(self):
+        # [FUNCTION DOC] Mutation of slices of a zeros tensor (a column then a row) interleaved
+        # with reads and clones.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Create zeros like a, take a copy b plus one, set column 3 to
+            # 3.0, clone, set row 4 to 4.0, and return x, b, the clone, and x plus one.
             x = torch.zeros_like(a)
             b = x + 1
             x[:, 3] = 3.0
@@ -10811,7 +13141,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # accuracy issue
     def test_slice_mutation2(self):
+        # [FUNCTION DOC] In-place slice updates with overlapping source and destination ranges,
+        # compared with eager on the mutated input. Skipped on GPU Halide (accuracy).
         def fn(a):
+            # [FUNCTION DOC] HELPER: Add one to columns 20 to 40 in place, then assign columns 1 to
+            # 10 plus 2 into columns 2 to 11.
             a[:, 20:40] = a[:, 20:40] + 1
             a[:, 2:11] = a[:, 1:10] + 2
 
@@ -10823,7 +13157,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(same(arg1, arg2))
 
     def test_slice_mutation3(self):
+        # [FUNCTION DOC] In-place fill of a 2 by 2 slice of the input; mutated input must equal
+        # eager.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Fill the top-left 2 by 2 block of a with 10 in place.
             a[:2, :2].fill_(10)
 
         opt_fn = torch._dynamo.optimize_assert(compile_fx)(fn)
@@ -10835,7 +13172,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(x1, x2)
 
     def test_tensor_index_slice(self):
+        # [FUNCTION DOC] Advanced indexing mixing slices and index tensors (1D and broadcast index
+        # pairs at various positions) of a five dimensional arange tensor; compared against eager
+        # with assert_close.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Build index tensors and return a list of ten different mixed
+            # indexing results of a.
             x = torch.tensor([1, 2], device=self.device)
             y = torch.tensor([2, 3], device=self.device)
             xx = torch.tensor([1, 2], device=self.device).view(1, 2)
@@ -10861,7 +13203,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._dynamo.config.patch(recompile_limit=10)
     def test_tensor_index_put_slice(self):
+        # [FUNCTION DOC] Index assignment of zeros through mixed slice and index tensor patterns
+        # (ten variants selected by a version integer) on clones of an int32 tensor; compiled
+        # result must equal eager for each version. Recompile limit raised to 10.
         def fn(a, version):
+            # [FUNCTION DOC] HELPER: Build index tensors and, depending on version, assign
+            # zeros_like of a chosen indexed view back to that index pattern; return a.
             x = torch.tensor([1, 2], device=self.device, dtype=torch.int32)
             y = torch.tensor([2, 3], device=self.device, dtype=torch.int32)
 
@@ -10900,7 +13247,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             torch.testing.assert_close(ref, test)
 
     def test_indirect_load_broadcast(self):
+        # [FUNCTION DOC] Indirect load with broadcast: gather rows of a large matrix using a
+        # strided all-zero index tensor and add a broadcast column.
         def fn(in_ptr0, in_ptr1, in_ptr2):
+            # [FUNCTION DOC] HELPER: Return gather of in_ptr1 along dim 0 by in_ptr2 plus in_ptr0.
             return torch.gather(in_ptr1, 0, in_ptr2) + in_ptr0
 
         arg190 = rand_strided((32, 21), (1, 32), device=self.device, dtype=torch.int64)
@@ -10918,10 +13268,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_roi_align(self):
+        # [FUNCTION DOC] ROI align from torchvision on zero tensors; skipped if torchvision roi
+        # align is unavailable.
         if not has_torchvision_roi_align():
             raise unittest.SkipTest("requires torchvision")
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Call the torchvision roi_align op with scale 0.25, output 7 by
+            # 7, sampling ratio 2 and no alignment.
             return torch.ops.torchvision.roi_align(a, b, 0.25, 7, 7, 2, False)
 
         self.common(fn, (torch.zeros([4, 256, 296, 304]), torch.zeros([2292, 5])))
@@ -10929,7 +13283,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # https://github.com/halide/Halide/issues/8256
     @config.patch("halide.scheduler_cuda", "Li2018")
     def test_nll_loss_forward(self):
+        # [FUNCTION DOC] NLL loss forward with unit reduction code and ignore index -100, for
+        # targets all zeros and targets mostly ignored. Halide CUDA scheduler overridden.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return aten nll_loss_forward of a and b with no weights,
+            # reduction 1 and ignore index -100.
             return aten.nll_loss_forward(a, b, None, 1, -100)
 
         labels = (
@@ -10945,7 +13303,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps  # dtypes mismatch
     def test_nll_loss_backward(self):
+        # [FUNCTION DOC] NLL loss backward for the same two target patterns with a scalar total
+        # weight tensor. Expected failure on MPS (dtype mismatch).
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return aten nll_loss_backward with gradient a, input b, target
+            # c, no weights, reduction 1 and ignore index -100.
             return aten.nll_loss_backward(
                 a, b, c, None, 1, -100, torch.tensor(1.0, device=self.device)
             )
@@ -10963,9 +13325,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_nll_loss_backward_1d_input(self):
+        # [FUNCTION DOC] NLL loss backward with a 1-D input and 1-D target (used to crash the
+        # decomposition because the index was 2D for a 1D scatter) and with a scalar target.
         # 1D input with 1D target used to crash the decomposition because
         # target.unsqueeze(0) produced a 2D index for a 1D scatter.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return aten nll_loss_backward with no reduction, ignore index
+            # 10 and unit total weight.
             return aten.nll_loss_backward(
                 a, b, c, None, 0, 10, torch.tensor(1.0, device=self.device)
             )
@@ -10982,7 +13348,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_isinf(self):
+        # [FUNCTION DOC] isinf and isnan on a vector with infinities and NaN for float32, float64,
+        # half and bfloat16 (expects TypeError when unsupported).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return isinf and isnan of x.
             return x.isinf(), x.isnan()
 
         values = [1, float("inf"), 2, float("-inf"), float("nan")]
@@ -10997,7 +13366,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_halide  # different nan behavior in ==
     def test_isinf2(self):
+        # [FUNCTION DOC] Equality comparison of a vector with infinities and NaN against a tensor
+        # created in the function. Skipped on Halide (different NaN behavior).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compare x elementwise with a constant tensor containing 1,
+            # inf, 2, -inf and nan.
             y = torch.tensor(
                 [1, float("inf"), 2, float("-inf"), float("nan")], device=self.device
             )
@@ -11008,7 +13381,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_any(self):
+        # [FUNCTION DOC] any/all reductions: any over the last dim, any of isinf, all of isinf on
+        # dim 0, and all of the negated isinf; on a negative vector and on a matrix with one
+        # infinity.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the four any/all reductions of x.
             return (
                 x.any(-1),
                 x.isinf().any(),
@@ -11023,7 +13400,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide
     def test_multilayer_any(self):
+        # [FUNCTION DOC] Multilayer (large) any of isinf and all of isfinite over a 9 by 3 by 353
+        # by 353 tensor, with and without an infinity at the end. Skipped on GPU Halide.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return any of isinf and all of isfinite over x.
             return (x.isinf().any(), x.isfinite().all())
 
         sample = torch.rand(9, 3, 353, 353)
@@ -11033,7 +13413,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, [sample])
 
     def test_inplace_activations(self):
+        # [FUNCTION DOC] Several in-place activations on adjusted copies of the input (hardswish,
+        # hardtanh, leaky relu, silu), log1p, and masked fills with an all-false and an all-true
+        # mask.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply the in-place activations to x plus one copies and return
+            # the seven results.
             a = aten.hardswish_(x + 1)
             b = aten.hardtanh_(x + 1)
             c = aten.leaky_relu_(x + 1)
@@ -11046,7 +13431,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, [torch.randn(64) * 10])
 
     def test_baddbmm(self):
+        # [FUNCTION DOC] Batched add-matmul with a broadcast bias for beta equal to 0 and 1, with
+        # both a random bias and a NaN-filled bias (beta 0 must ignore the NaNs); relaxed
+        # tolerances.
         def fn(a, b, c, beta):
+            # [FUNCTION DOC] HELPER: Call aten baddbmm of a, b and c with the given beta.
             return aten.baddbmm(a, b, c, beta=beta)
 
         b = torch.randn(6, 128, 64)
@@ -11068,7 +13457,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch({"triton.max_tiles": 2})
     def test_fuse_tiled(self):
+        # [FUNCTION DOC] Fusion of kernels with tiling when the maximum number of tiles is 2: a
+        # column vector, a row vector and a matrix with pointwise ops.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return a plus b (broadcast outer sum) and c plus one.
             return a + b, c + 1
 
         self.common(
@@ -11076,7 +13468,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_expand_as(self):
+        # [FUNCTION DOC] expand_as of a tensor with a size-one dim to the shape of another, with
+        # and without preceding adds.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a expanded as b, and (a plus 1) expanded as (b plus 1),
+            # plus 1.
             return aten.expand_as(a, b), aten.expand_as(a + 1, b + 1) + 1
 
         self.common(
@@ -11088,7 +13484,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_put1(self):
+        # [FUNCTION DOC] index_put (out of place) and in-place index_put on a large 4D tensor with
+        # a random permutation index; and a second case with arange index and broadcast values.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return index_put of a at b with c, and in-place index_put of a
+            # plus one at b plus one with c plus one, plus 1.
             return (
                 torch.index_put(a, [b], c),
                 torch.index_put_(a + 1, [b + 1], c + 1) + 1,
@@ -11107,6 +13507,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_copy_error_checks(self):
+        # [FUNCTION DOC] Error checking of index_copy with invalid arguments: a scalar source, a
+        # source of wrong dimensionality, a source with wrong slice shape, and a wrong number of
+        # indices; each compiled call must raise a RuntimeError matching the expected message.
         cases = (
             (
                 torch.randn(4, device=self.device),
@@ -11145,7 +13548,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                     fn(x, dim, index, y)
 
     def test_index_put2(self):
+        # [FUNCTION DOC] index_put with accumulate on a 100 row tensor with many repeated random
+        # indices; low precision check skipped (triton issue 558).
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return index_put of a at b with c with accumulation.
             return torch.index_put(a, [b], c, True)
 
         self.common(
@@ -11160,7 +13566,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_put3(self):
+        # [FUNCTION DOC] In-place index_put with a leading None index (indexing the middle dim) on
+        # a tensor and a derived copy.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Index-put c into a at (None, b, None) in place, make a plus
+            # one and index-put c plus one at b plus one on it, and return both.
             torch.ops.aten.index_put_(a, (None, b, None), c)
             a1 = a + 1
             torch.ops.aten.index_put_(a1, (None, b + 1, None), c + 1)
@@ -11176,9 +13586,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_put4(self):
+        # [FUNCTION DOC] index_put with a boolean mask index whose broadcast with the value is
+        # invalid for the first operand (issue 97104), using a zero-dimensional value.
         # a, b[0] are not broadcastable
         # https://github.com/pytorch/pytorch/issues/97104
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return index_put of a at b with c.
             return torch.index_put(a, [b], c)
 
         self.common(
@@ -11191,7 +13604,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_put_as_masked_fill(self):
+        # [FUNCTION DOC] In-place index_put with a boolean mask index and a scalar value
+        # (equivalent to masked fill), with accumulate false and true.
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Clone a, index-put c into the clone at the mask b with
+            # accumulate flag d, and return the clone.
             a = a.clone()
             torch.ops.aten.index_put_(a, [b], c, d)
             return a
@@ -11217,7 +13634,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_put_fallback1(self):
+        # [FUNCTION DOC] In-place index_put with a boolean mask on a vector and a value tensor with
+        # as many elements as true entries (fallback path), with accumulate false and true.
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Clone a, index-put c at mask b with accumulate flag d, return
+            # the clone.
             a = a.clone()
             torch.ops.aten.index_put_(a, [b], c, d)
             return a
@@ -11243,7 +13664,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_put_fallback2(self):
+        # [FUNCTION DOC] In-place index_put with a leading None, an integer index and a boolean
+        # mask (fallback path), with a scalar value, accumulate false and true.
         def fn(a, b, c, d, e):
+            # [FUNCTION DOC] HELPER: Clone a, index-put d at (None, b, c) with accumulate flag e,
+            # return the clone.
             a = a.clone()
             torch.ops.aten.index_put_(a, [None, b, c], d, e)
             return a
@@ -11270,6 +13695,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_put_deterministic_fallback(self):
+        # [FUNCTION DOC] index_put with accumulate under deterministic mode must use the
+        # deterministic fallback and match eager. Skipped on MPS.
         if is_mps_backend(self.device):
             # MPS has no deterministic implementation for
             # index_put_(accumulate=True) on floating dtypes
@@ -11277,6 +13704,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         with DeterministicGuard(True):
 
             def fn(a, b, c):
+                # [FUNCTION DOC] HELPER: Return index_put of a at b with c, accumulate true.
                 return torch.index_put(a, [b], c, True)
 
             self.common(
@@ -11291,7 +13719,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # https://github.com/halide/Halide/issues/8312
     def test_index_put_index(self):
+        # [FUNCTION DOC] index_put followed by indexing with the same index. Skipped on GPU Halide.
         def fn(ind, x, src):
+            # [FUNCTION DOC] HELPER: Put src into x at ind through the aten op, then index the
+            # result at ind.
             y = torch.ops.aten.index_put.default(x, [ind], src)
             return torch.ops.aten.index.Tensor(y, [ind])
 
@@ -11299,7 +13730,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, args)
 
     def test_index_put_reinplace(self):
+        # [FUNCTION DOC] In-place index_put on an input followed by an expand of the result must be
+        # reinplaced so only one kernel is generated.
         def fn(x, idx):
+            # [FUNCTION DOC] HELPER: Put a ones tensor into x at idx in place and return x expanded
+            # to two rows.
             src = torch.ones(idx.size(0), device=x.device)
             x.index_put_((idx,), src)
             return x.expand((2, x.shape[0]))
@@ -11311,7 +13746,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         assertGeneratedKernelCountEqual(self, 1)
 
     def test_index_put_failed_reinplace(self):
+        # [FUNCTION DOC] Out-of-place index_put where the input is also returned; reinplacing is
+        # not possible so two kernels are generated.
         def fn(x, idx):
+            # [FUNCTION DOC] HELPER: Put ones into x at idx out of place, returning both x and the
+            # result.
             src = torch.ones(idx.size(0), device=x.device)
             y = x.index_put((idx,), src)
             return x, y
@@ -11325,8 +13764,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_halide
     @skip_if_pallas
     def test_index_put_duplicate_indices_no_accumulate(self):
+        # [FUNCTION DOC] Regression for issue 174074: augmented assignment through a list index
+        # with duplicate indices and no accumulation, on a wide (2048 columns) tensor that uses
+        # multiple GPU blocks, so races between blocks would show. Skipped on Halide and Pallas.
         # https://github.com/pytorch/pytorch/issues/174074
         def fn(x):
+            # [FUNCTION DOC] HELPER: Double row 0 in place through a repeated list index and return
+            # x.
             x[[0, 0]] += x[[0, 0]]
             return x
 
@@ -11337,8 +13781,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_pallas
     def test_index_put_duplicate_indices_accumulate(self):
+        # [FUNCTION DOC] index_put with accumulate and duplicate indices, which is well defined; a
+        # wide tensor row is added twice. Skipped on Pallas.
         # accumulate=True is well-defined with duplicate indices.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Accumulate twice the row 0 values into row 0 in place and
+            # return x.
             idx = torch.tensor([0, 0], device=x.device)
             vals = x[[0, 0]] * 2
             x.index_put_((idx,), vals, accumulate=True)
@@ -11348,12 +13796,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (x,))
 
     def test_index_ops_on_expanded_tensor(self):
+        # [FUNCTION DOC] Index ops (index_add, index_copy, index_fill, index_put with and without
+        # accumulation) applied to an expanded (stride-0) zeros tensor; compiled equals eager with
+        # low precision check off.
         def make_input(src):
+            # [FUNCTION DOC] HELPER: Build a zeros tensor of one row and the source width expanded
+            # to one more row than the source.
             return torch.zeros(1, src.size(1), device=src.device).expand(
                 src.size(0) + 1, -1
             )
 
         def check(fn):
+            # [FUNCTION DOC] HELPER: Run the common check for a function of an index tensor and a
+            # ones source tensor.
             idx = torch.tensor([0, 1, 0], device=self.device)
             src = torch.ones(3, 8, device=self.device)
             self.common(fn, (idx, src), check_lowp=False)
@@ -11369,7 +13824,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_ops_on_expanded_tensor_dim1(self):
+        # [FUNCTION DOC] index_add on dim 1 of an expanded (stride-0) zeros tensor.
         def fn(idx, src):
+            # [FUNCTION DOC] HELPER: Expand a zeros column to src.size(1) plus five columns and
+            # index_add src into dim 1 at idx.
             x = torch.zeros(src.size(0), 1, device=src.device).expand(
                 -1, src.size(1) + 5
             )
@@ -11380,8 +13838,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (idx, src), check_lowp=False)
 
     def test_adding_tensor_offsets(self):
+        # [FUNCTION DOC] A compiled slice on views with different storage offsets (full tensor, a
+        # view starting at 128): results equal eager, checking offsets are added correctly.
         @torch.compile(fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return elements 16 to 31 of x.
             return x[16:32]
 
         with torch.no_grad():
@@ -11392,7 +13853,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # Requires a Triton CPU fix for scalar tl.device_assert conditions.
     @xfail_if_triton_cpu
     def test_index_float_zero(self):
+        # [FUNCTION DOC] Float scalar used as an index: a tanh-filled tensor from an item scalar is
+        # clamped and used for embedding lookup under dynamic shapes. Requires a Triton CPU fix;
+        # expected failure there.
         def fn(arg0, arg1, arg2):
+            # [FUNCTION DOC] HELPER: Fill a tanh tensor with a scalar from arg1, clamp to a valid
+            # row index, convert to long and embed in arg2.
             t1 = torch.tanh(arg0)
             t2 = t1.clone()
             t2.fill_(arg1.item())
@@ -11410,7 +13876,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # from GPT2ForSequenceClassification
     @skip_if_gpu_halide
     def test_index_tensor(self):
+        # [FUNCTION DOC] Tensor indexing pattern from GPT2 sequence classification: counts non-zero
+        # tokens, subtracts one and indexes the logits with an iota and the position. Skipped on
+        # GPU Halide.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compute the last non-pad position from x with ne, sum and sub
+            # and index y with an iota and that position.
             ne = torch.ops.aten.ne.Scalar(x, 0)
             sum = torch.ops.aten.sum.dim_IntList(ne, [-1])
             sub = torch.ops.aten.sub.Tensor(sum, 1)
@@ -11429,9 +13900,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @parametrize("combo_kernels", (False, True))
     @config.patch(fallback_random=True)
     def test_bernoulli1(self, combo_kernels):
+        # [FUNCTION DOC] Parametrized by combo kernels: mean of in-place Bernoulli samples with
+        # probability 0.3 over a 200 by 200 tensor, with fallback random and loose tolerance.
         with config.patch(combo_kernels=combo_kernels):
 
             def fn(a):
+                # [FUNCTION DOC] HELPER: Fill a clone of a in place with Bernoulli samples and
+                # return their mean (sum divided by the element count).
                 b = a.clone()
                 # aten.bernoulli_() uses aten.bernoulli.p() behind the scene, so it will be decomposed.
                 return aten.bernoulli_(b).sum() / torch.prod(torch.tensor(a.size()))
@@ -11448,7 +13923,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_triton_cpu
     def test_bernoulli2(self):
+        # [FUNCTION DOC] Mean of Bernoulli samples drawn from a probability tensor of 0.3 values.
+        # Skipped on Triton CPU.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the sum of Bernoulli samples of a divided by the
+            # product of its sizes.
             return aten.bernoulli(a).sum() / torch.prod(torch.tensor(a.size()))
 
         p = 0.3
@@ -11460,7 +13939,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_narrow(self):
+        # [FUNCTION DOC] Narrow along two dims, and narrow_copy.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return narrow of x on dim 1, narrow of x plus 2 on dim 0 plus
+            # 1, and narrow_copy of x.
             return (
                 aten.narrow(x, 1, 10, 16),
                 aten.narrow(x + 2, 0, 10, 16) + 1,
@@ -11470,13 +13952,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, [torch.randn(64, 64)])
 
     def test_as_strided(self):
+        # [FUNCTION DOC] as_strided on contiguous input and on a channels-last 5-D view of a
+        # channels-last tensor, with and without a preceding add.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return as_strided views of x and of x plus 1 (plus 2) with
+            # shape 8 by 8 by 64.
             return (
                 aten.as_strided(x, (8, 8, 64), (8 * 64, 64, 1), 0),
                 aten.as_strided(x + 1, (8, 8, 64), (8 * 64, 64, 1), 0) + 2,
             )
 
         def fn_channels_last(x):
+            # [FUNCTION DOC] HELPER: Return as_strided views of x and of x plus 1 (plus 2) with a
+            # 5-D channels-last-like shape and strides.
             return (
                 aten.as_strided(
                     x, (8, 384, 2, 20, 12), (153600, 1, 61440, 384, 7680), 0
@@ -11494,10 +13982,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_exact_stride(self):
+        # [FUNCTION DOC] Exact stride preservation: a function writes its result into an
+        # empty_strided tensor with the input strides; compiled output strides must equal eager for
+        # a column view of a larger tensor.
         full = torch.randn((16, 16), device=self.device)
         view = torch.as_strided(full, (16, 8), full.stride())
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compute x plus x, copy it into an empty_strided tensor with
+            # the same strides as x and return that.
             result = x + x
             result_strided = torch.empty_strided(
                 x.size(), x.stride(), device=self.device
@@ -11512,6 +14005,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(reference_out.stride(), actual_out.stride())
 
     def test_nonzero_static_stride(self):
+        # [FUNCTION DOC] Fake tensor propagation of nonzero_static produces the same strides as
+        # eager.
         from torch._subclasses import FakeTensorMode
 
         L = 8
@@ -11528,7 +14023,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_triton_cpu
     def test_like_channels_last(self):
+        # [FUNCTION DOC] zeros_like with preserve format and rand_like of a channels-last tensor
+        # keep the strides in compiled code. Skipped on Triton CPU.
         def foo():
+            # [FUNCTION DOC] HELPER: Create a random NCHW tensor, a channels-last contiguous copy,
+            # a zeros_like of it preserving format, and a rand_like of the plain tensor; return the
+            # three.
             randn = torch.randn((4, 3, 8, 8), device=self.device, dtype=torch.float32)
             xc = randn.contiguous(memory_format=torch.channels_last)
             clone = torch.zeros_like(xc, memory_format=torch.preserve_format)
@@ -11542,7 +14042,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(t.stride(), t_comp.stride())
 
     def test_as_strided_scatter(self):
+        # [FUNCTION DOC] as_strided_scatter writing into every second column of an affine
+        # transformed input.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Scatter b times 2 minus 4 into a times 8 plus 10 using half
+            # the width and stride 2 at offset 0.
             return aten.as_strided_scatter(
                 a * 8 + 10,
                 b * 2 - 4,
@@ -11554,7 +14058,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, [torch.randn(10, 1024), torch.randn(10, 512)])
 
     def test_select_scatter(self):
+        # [FUNCTION DOC] select_scatter of a slice into index 0 of dim 1 and into index 1 of dim 0
+        # of a 3-D tensor.
         def fn(x, a, b):
+            # [FUNCTION DOC] HELPER: Return select_scatter of x with a at dim 1 index 0 and with b
+            # at dim 0 index 1.
             return (
                 aten.select_scatter(x, a, 1, 0),
                 aten.select_scatter(x, b, 0, 1),
@@ -11570,7 +14078,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_select_scatter_dtype_consistency(self):
+        # [FUNCTION DOC] select_scatter where the source dtype (float32) differs from the base
+        # dtype (int64 or float64): result must keep the base dtype and equal eager.
         def fn(x, a):
+            # [FUNCTION DOC] HELPER: Return a one-element tuple with select_scatter of a into x at
+            # dim 1 index 0.
             return (torch.select_scatter(x, a, 1, 0),)
 
         for dtype in [
@@ -11588,7 +14100,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_diagonal_scatter_backward(self):
+        # [FUNCTION DOC] Backward of the sum of diagonal_scatter for several shapes, offsets and
+        # dim pairs (as subtests): compiled value and the gradients with respect to the base and
+        # the source equal eager.
         def fn(x, a, offset, dim1, dim2):
+            # [FUNCTION DOC] HELPER: Return the sum of diagonal_scatter of a into x with the offset
+            # and dims.
             return torch.diagonal_scatter(x, a, offset, dim1, dim2).sum()
 
         cases = [
@@ -11621,6 +14138,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 self.assertEqual(y.grad, y_ref.grad)
 
     def test_diagonal_scatter_overlap_input(self):
+        # [FUNCTION DOC] Regression: diagonal_scatter decomposition clones must materialize a
+        # contiguous buffer when the input has internal overlap (such as an expanded scalar with
+        # stride zero), otherwise a diagonal write would corrupt other positions; checked via the
+        # gradients of the sum of diagonal_scatter, which are computed on an expanded gradient.
         # The decomposition for diagonal_scatter (and the other *_scatter ops)
         # uses clone_preserve_strides, which must materialize a contiguous
         # buffer when the input has internal memory overlap (e.g. an expand
@@ -11628,6 +14149,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # the entire output and corrupts non-diagonal positions. This pattern
         # arises naturally in the backward of diagonal_scatter(x, src).sum().
         def fn(x, src):
+            # [FUNCTION DOC] HELPER: Return the sum of diagonal_scatter of src into x on the main
+            # diagonal.
             return torch.diagonal_scatter(x, src, 0).sum()
 
         x = torch.randn(8, 8, device=self.device, requires_grad=True)
@@ -11646,7 +14169,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # accuracy issue
     def test_slice_scatter(self):
+        # [FUNCTION DOC] slice_scatter along dim 2 with start 10 and end -10, and with a step of 2
+        # on a narrowed source. Skipped on GPU Halide (accuracy).
         def fn(x, a):
+            # [FUNCTION DOC] HELPER: Return slice_scatter of a into x on dim 2 from 10 to -10, and
+            # the strided version with the source narrowed to 40 along dim 2 and step 2.
             return (
                 aten.slice_scatter(x, a, 2, 10, -10),
                 aten.slice_scatter(x, a[:, :, :40], 2, 10, -10, 2),
@@ -11662,7 +14189,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # accuracy issue
     def test_slice_scatter_backward_with_overlapping_base(self):
+        # [FUNCTION DOC] Backward of slice_scatter followed by sum where the scattered region
+        # overlaps the base: compiled value and the gradients for base and source equal eager with
+        # a given upstream gradient. Seeded; skipped on GPU Halide (accuracy).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the sum over dim 1 of slice_scatter of y into x on dim
+            # 1 from 0 to 6.
             return torch.slice_scatter(x, y, dim=1, start=0, end=6).sum(dim=1)
 
         torch.manual_seed(0)
@@ -11685,7 +14217,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(y.grad, y_ref.grad)
 
     def test_slice_scatter2(self):
+        # [FUNCTION DOC] slice_scatter with an end of int64 max over dim 0 (whole tensor).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return aten slice_scatter of b into a on dim 0 from 0 to int64
+            # max.
             return aten.slice_scatter(a, b, 0, 0, 9223372036854775807)
 
         self.common(
@@ -11697,7 +14232,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_slice_scatter3(self):
+        # [FUNCTION DOC] slice_scatter of every second column starting at 1 with end int64 max.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return slice_scatter of b into a on dim 1 from 1, step 2.
             return aten.slice_scatter.default(a, b, 1, 1, 9223372036854775807, 2)
 
         self.common(
@@ -11709,7 +14246,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_slice_scatter4(self):
+        # [FUNCTION DOC] slice_scatter with start 2 and step 3 up to int64 max over nine columns.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return slice_scatter of b into a on dim 1 from 2 with step 3.
             return aten.slice_scatter.default(a, b, 1, 2, 9223372036854775807, 3)
 
         self.common(
@@ -11721,8 +14260,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_slice_scatter5(self):
+        # [FUNCTION DOC] slice_scatter with empty slices that need clamping of start or end, with
+        # an empty source.
         # empty slices that require clamping the start or end
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return four slice_scatter results of b into a with empty or
+            # clamped ranges on dim 0.
             return (
                 aten.slice_scatter.default(a, b, 0, 2, 0, 1),
                 aten.slice_scatter.default(a, b, 0, a.shape[0], a.shape[0] + 10, 1),
@@ -11736,13 +14279,26 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @with_tf32_off
     def test_slice_scatter_reinplace(self):
+        # [FUNCTION DOC] KV cache update pattern: a module writes a projected input into a slice of
+        # a large cache buffer inside no-grad and then reads a prefix of the cache for attention
+        # scores. Checks results and that the update is reinplaced so one kernel is generated (two
+        # with native matmul on CUDA triton). TF32 off.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module with a 64 to 64 linear layer without bias and a zero cache
+            # buffer of shape 56 by 384 by 8 by 64 on the given device; forward projects the input,
+            # writes it into the cache at the start position and returns attention-like scores
+            # against the cache.
             def __init__(self, device):
+                # [FUNCTION DOC] HELPER: Create the linear layer and the zero cache tensor on the
+                # device.
                 super().__init__()
                 self.linear1 = nn.Linear(64, 64, bias=False)
                 self.cache_k = torch.zeros((56, 384, 8, 64), device=device)
 
             def forward(self, x, start_pos):
+                # [FUNCTION DOC] HELPER: Project x with the linear layer, write the result into the
+                # cache slice starting at start_pos under no-grad, read the cache prefix and return
+                # the batched matmul of the transposed projection with the transposed keys.
                 bsz, seqlen, _, _ = x.shape
                 xk = self.linear1(x)
                 with torch.no_grad():
@@ -11773,8 +14329,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             assertGeneratedKernelCountEqual(self, 1)
 
     def test_slice_scatter_dtype_consistency(self):
+        # [FUNCTION DOC] Dtype consistency of slice_scatter when source is int64 or float64 and the
+        # destination is float32.
         # Test dtype consistency of slice_scatter
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return slice_scatter of x into y on dim 0.
             return torch.slice_scatter(y, x, 0)
 
         for dtype in [
@@ -11793,7 +14352,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # compile error on gpu
     def test_scatter1(self):
+        # [FUNCTION DOC] Aten scatter with a single index on a 2 by 3 zeros tensor with a negative
+        # dim. Skipped on GPU Halide (compile error).
         def fn(a, dim, index, b):
+            # [FUNCTION DOC] HELPER: Return aten scatter of b into a at index along dim.
             return aten.scatter(a, dim, index, b)
 
         self.common(
@@ -11807,6 +14369,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_scatter2(self):
+        # [FUNCTION DOC] Scatter with add reduction over zero indices into a 64 by 512 tensor.
+        # Skipped on CUDA (unstable on sm86); low precision check off for XPU.
         if self.device == "cuda":
             raise unittest.SkipTest("unstable on sm86")
 
@@ -11815,6 +14379,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             check_lowp = False
 
         def fn(a, dim, index, b):
+            # [FUNCTION DOC] HELPER: Return scatter with the add reduction.
             return aten.scatter.reduce(a, dim, index, b, reduce="add")
 
         self.common(
@@ -11829,7 +14394,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_scatter3(self):
+        # [FUNCTION DOC] Scatter with add reduction and a scalar source (0.8) along the last dim,
+        # with relaxed tolerances.
         def fn(a, dim, index, b):
+            # [FUNCTION DOC] HELPER: Return scatter with the add reduction.
             return aten.scatter(a, dim, index, b, reduce="add")
 
         check_lowp = True
@@ -11853,7 +14421,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_scatter4(self):
+        # [FUNCTION DOC] Plain scatter with repeated indices along dim 0, in normal and
+        # deterministic mode.
         def fn(x, ind, src):
+            # [FUNCTION DOC] HELPER: Return torch scatter of src into x along dim 0 at ind.
             return torch.scatter(x, 0, ind, src)
 
         check_lowp = True
@@ -11873,7 +14444,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 )
 
     def test_scatter5(self):
+        # [FUNCTION DOC] In-place scatter with add and multiply reductions on a clone and on a copy
+        # plus one, returning both.
         def fn(a, dim, index, b, reduce):
+            # [FUNCTION DOC] HELPER: Clone a, scatter in place with the reduction, add 1.0 to get
+            # a1 and scatter again; return both.
             a = a.clone()
             a.scatter_(dim, index, b, reduce=reduce)
             a1 = a + 1.0
@@ -11898,7 +14473,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_scatter6(self):
+        # [FUNCTION DOC] Plain scatter with a scalar source along the last dim, in normal and
+        # deterministic mode.
         def fn(a, dim, index, b):
+            # [FUNCTION DOC] HELPER: Return aten scatter of b into a at index along dim.
             return aten.scatter(a, dim, index, b)
 
         check_lowp = True
@@ -11920,7 +14498,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @unittest.skip("Flaky test, needs debugging")
     def test_scatter_add1(self):
+        # [FUNCTION DOC] Scatter add on a small tensor (disabled as flaky).
         def fn(a, dim, index, b):
+            # [FUNCTION DOC] HELPER: Return aten scatter_add of b into a at index along dim.
             return aten.scatter_add(a, dim, index, b)
 
         check_lowp = True
@@ -11939,7 +14519,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_scatter_add2(self):
+        # [FUNCTION DOC] Scatter add with repeated indices on a 2 by 3 tensor.
         def fn(a, dim, index, b):
+            # [FUNCTION DOC] HELPER: Return aten scatter_add of b into a at index along dim.
             return aten.scatter_add(a, dim, index, b)
 
         check_lowp = True
@@ -11958,7 +14540,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_scatter_add3(self):
+        # [FUNCTION DOC] Scatter add into a 3-D tensor along the last dim, in normal and
+        # deterministic mode (deterministic skipped on XPU and MPS because unsupported).
         def fn(a, dim, index, b):
+            # [FUNCTION DOC] HELPER: Return aten scatter_add of b into a at index along dim.
             return aten.scatter_add(a, dim, index, b)
 
         check_lowp = True
@@ -11982,7 +14567,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 )
 
     def test_scatter_reduce1(self):
+        # [FUNCTION DOC] Scatter reduce with the sum reduction into a 3-D tensor.
         def fn(a, dim, index, b):
+            # [FUNCTION DOC] HELPER: Return aten scatter_reduce with the sum reduction.
             return aten.scatter_reduce(a, dim, index, b, "sum")
 
         check_lowp = True
@@ -12001,7 +14588,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_scatter_reduce2(self):
+        # [FUNCTION DOC] Scatter reduce with sum and amax reductions excluding the original values
+        # (include_self false), with all indices zero.
         def fn(a, dim, index, b, reduce):
+            # [FUNCTION DOC] HELPER: Return aten scatter_reduce with the given reduction, self
+            # excluded.
             return aten.scatter_reduce(a, dim, index, b, reduce, include_self=False)
 
         check_lowp = True
@@ -12022,7 +14613,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_scatter_reduce3(self):
+        # [FUNCTION DOC] In-place scatter_reduce with sum and prod reductions on a clone and a copy
+        # plus one.
         def fn(a, dim, index, b, reduce):
+            # [FUNCTION DOC] HELPER: Clone a, scatter_reduce in place, add 1.0 and scatter_reduce
+            # again; return both tensors.
             a = a.clone()
             a.scatter_reduce_(dim, index, b, reduce=reduce)
             a1 = a + 1.0
@@ -12047,12 +14642,18 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_scatter_reduce_fused_broadcast_non_power_of_2(self):
+        # [FUNCTION DOC] Regression for issue 178871: a scalar broadcast fused with a sum
+        # scatter_reduce whose store index simplifies to a constant; for non-power-of-2 input sizes
+        # (3 to 48) out-of-bounds threads must not do unmasked atomic adds. Compared with eager
+        # with relaxed tolerances (low precision off on XPU).
         # https://github.com/pytorch/pytorch/issues/178871
         # When inductor fuses a scalar broadcast with scatter_reduce("sum"),
         # the store index may simplify to a constant (e.g., output size 1).
         # For non-power-of-2 input sizes, XBLOCK > numel causes OOB threads
         # to execute tl.atomic_add without a mask, adding stale values.
         def fn(x, bias, idx):
+            # [FUNCTION DOC] HELPER: Add bias to x, then scatter-reduce (sum, including self) the
+            # result into a 1 by 1 zeros tensor using a broadcast index.
             src = x + bias
             out = torch.zeros(1, 1, device=x.device, dtype=x.dtype)
             return out.scatter_reduce(
@@ -12075,6 +14676,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide
     def test_dense_mask_index(self):
+        # [FUNCTION DOC] Dot-product style reduction over a selected row element: multiplies a long
+        # vector by a scalar chosen from a 3 element tensor and sums it; relaxed tolerances on CPU
+        # for reduction order differences. Skipped on GPU Halide.
         r"""
         There will be a little difference for reduce order between aten and inductor
         https://github.com/pytorch/pytorch/pull/122289
@@ -12087,6 +14691,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             kwargs["rtol"] = 1.3e-5
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Select index 2 of y on dim 0, multiply x by it and return the
+            # sum.
             y = torch.ops.aten.select.int(y, 0, 2)
             z = x * y
             return z.sum()
@@ -12094,13 +14700,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, [torch.randn(102400), torch.randn(3)], **kwargs)
 
     def test_empty1(self):
+        # [FUNCTION DOC] Empty tensor creation inside a compiled function; values are not compared.
         def fn():
+            # [FUNCTION DOC] HELPER: Return an uninitialized tensor of shape 1 by 128 by 128.
             return torch.empty((1, 128, 128))
 
         self.common(fn, [], assert_equal=False)
 
     def test_empty2(self):
+        # [FUNCTION DOC] Aten empty op inside a compiled function; values are not compared.
         def fn():
+            # [FUNCTION DOC] HELPER: Return the aten empty tensor of shape 1 by 128 by 128.
             return aten.empty((1, 128, 128))
 
         self.common(fn, [], assert_equal=False)
@@ -12140,12 +14750,18 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         name_fn=lambda constructor_case: constructor_case[0],
     )
     def test_constructors_pin_memory(self, constructor_case):
+        # [FUNCTION DOC] Parametrized over tensor constructors (tensor from a literal list, a big
+        # constant tensor, empty, ones, zeros, full, rand, rand_like, randn, randint): with the pin
+        # memory option the compiled output on CPU must be pinned and have the expected shape.
+        # Requires a GPU (for a pinned memory allocator), skipped on non-CPU devices and on macOS.
         if self.device != "cpu":
             raise unittest.SkipTest("pin_memory is not supported on non-CPU devices")
 
         _, constructor, args, expected_shape = constructor_case
 
         def fn():
+            # [FUNCTION DOC] HELPER: Call the constructor with its arguments, pinned memory and the
+            # test device.
             return constructor(*args, pin_memory=True, device=self.device)
 
         result = torch.compile(fn, backend="inductor")()
@@ -12157,10 +14773,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @dynamo_config.patch(assume_static_by_default=False)
     @config.patch({"fx_graph_cache": False})
     def test_tensor_pin_memory_dynamic_scalar_list(self):
+        # [FUNCTION DOC] Tensor built from a list of three dynamic scalars with pin memory must be
+        # pinned and equal the expected values; dynamic shapes by default and the FX graph cache
+        # disabled. Requires a GPU; CPU device only; skipped on macOS.
         if self.device != "cpu":
             raise unittest.SkipTest("pin_memory is not supported on non-CPU devices")
 
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Create a pinned tensor from the three scalar arguments.
             return torch.tensor([a, b, c], pin_memory=True, device=self.device)
 
         result = torch.compile(fn, backend="inductor")(1, 2, 3)
@@ -12168,6 +14788,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(result, torch.tensor([1, 2, 3], device=self.device))
 
     def test_mkldnn_constant_buffer_is_not_checked_for_pin_memory(self):
+        # [FUNCTION DOC] An MKLDNN tensor constant added to a graph lowering must not be treated as
+        # a pinned-memory constant: builds an empty FX graph, adds an MKLDNN converted constant and
+        # checks its layout is not pinned. CPU only; skipped without MKLDNN.
         if self.device != "cpu":
             raise unittest.SkipTest("MKLDNN constants are CPU-only")
         if not torch.backends.mkldnn.is_available():
@@ -12184,13 +14807,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertFalse(constant.get_layout().is_pinned)
 
     def test_new_empty(self):
+        # [FUNCTION DOC] new_empty creating a 1 by 128 by 128 tensor from a vector; values not
+        # compared.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return the aten new_empty of a with shape 1 by 128 by 128.
             return aten.new_empty(a, [1, 128, 128])
 
         self.common(fn, [torch.randn(55, device=self.device)], assert_equal=False)
 
     def test_empty_strided(self):
+        # [FUNCTION DOC] empty_strided with contiguous strides inside a compiled function; values
+        # not compared.
         def fn():
+            # [FUNCTION DOC] HELPER: Return an aten empty_strided tensor of shape 1 by 128 by 128
+            # with contiguous strides on the device.
             return aten.empty_strided(
                 [1, 128, 128], [16384, 128, 1], device=self.device
             )
@@ -12198,19 +14828,27 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, [], assert_equal=False)
 
     def test_new_empty_strided(self):
+        # [FUNCTION DOC] new_empty_strided from a vector input; values not compared.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return aten new_empty_strided of a with shape 1 by 128 by 128
+            # and contiguous strides.
             return aten.new_empty_strided(a, [1, 128, 128], [16384, 128, 1])
 
         self.common(fn, [torch.randn(55, device=self.device)], assert_equal=False)
 
     def test_dropout_trivial_0(self):
+        # [FUNCTION DOC] Dropout with probability 0 in training mode added to the input (identity).
         def fn1(a):
+            # [FUNCTION DOC] HELPER: Return dropout with probability 0.0 of a plus a.
             return torch.nn.functional.dropout(a, 0.0, True) + a
 
         self.common(fn1, [torch.randn(55)])
 
     def test_dropout_trivial_1(self):
+        # [FUNCTION DOC] Dropout with probability 1 in training mode (all zeros) added to the
+        # input.
         def fn2(a):
+            # [FUNCTION DOC] HELPER: Return dropout with probability 1.0 of a plus a.
             return torch.nn.functional.dropout(a, 1.0, True) + a
 
         self.common(fn2, [torch.randn(55)])
@@ -12218,11 +14856,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @config.patch({"triton.cudagraphs": True})
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     def test_dropout(self):
+        # [FUNCTION DOC] Dropout statistics with the default probability and with 0.5 on 1000 ones
+        # (seeded): the number of nonzero outputs is between 400 and 600 and the mean is about 1,
+        # with cuda graphs and automatic dynamic shapes enabled.
         random.seed(1234)
         torch.manual_seed(1234)
 
         @torch.compile(backend="inductor")
         def fn1(a):
+            # [FUNCTION DOC] HELPER: Compiled default-probability dropout of a.
             return torch.nn.functional.dropout(a)
 
         x = torch.ones(1000, device=self.device, dtype=torch.float32)
@@ -12235,6 +14877,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile(backend="inductor")
         def fn2(a):
+            # [FUNCTION DOC] HELPER: Compiled dropout of a with probability 0.5 in training mode.
             return torch.nn.functional.dropout(a, 0.5, True)
 
         result2 = fn2(x)
@@ -12244,8 +14887,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     @parametrize("cudagraphs", (True, False))
     def test_dropout_deterministic(self, cudagraphs):
+        # [FUNCTION DOC] Parametrized by cuda graphs on/off: compiled dropout is deterministic
+        # given the seed (same seeds reproduce the same three outputs) and different calls with the
+        # same seed give different outputs.
         @torch.compile(backend="inductor")
         def fn(a):
+            # [FUNCTION DOC] HELPER: Compiled dropout with probability 0.55 in training mode.
             return torch.nn.functional.dropout(a, 0.55, True)
 
         with patch.object(config.triton, "cudagraphs", cudagraphs):
@@ -12276,10 +14923,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @parametrize("combo_kernels", (False, True))
     def test_rand_like_deterministic(self, combo_kernels):
+        # [FUNCTION DOC] Parametrized by combo kernels: compiled rand_like returns the same values
+        # after reseeding, different values on consecutive calls, different values for the two
+        # rand_like calls in one function, and values in the range zero to one.
         with config.patch(combo_kernels=combo_kernels):
 
             @torch.compile(backend="inductor")
             def fn(a):
+                # [FUNCTION DOC] HELPER: Compiled function returning two independent rand_like
+                # samples of a.
                 return torch.rand_like(a), torch.rand_like(a)
 
             x = torch.ones(1024, device=self.device, dtype=torch.float32)
@@ -12314,13 +14966,21 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_needs_contiguous_strides(self):
+        # [FUNCTION DOC] Custom op whose output has non-contiguous strides feeding a second custom
+        # op tagged as needing contiguous strides, which asserts its input is contiguous; compiling
+        # must insert the required contiguity so the assertion does not fire. Uses implicit
+        # fallbacks.
         # Construct a custom op whose output strides are not contiguous
         @torch.library.custom_op("mylib::myop", mutates_args={})
         def myop(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation returning a transposed zeros matrix
+            # (non-contiguous strides).
             return torch.zeros(2, 2).t()
 
         @myop.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: Fake implementation of the first custom op; returns a
+            # transposed zeros matrix with matching strides.
             return torch.zeros(2, 2).t()
 
         # custom op that needs contiguous inputs
@@ -12330,15 +14990,21 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             tags=[torch._C.Tag.needs_contiguous_strides],
         )
         def second_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op tagged as needing contiguous strides; raises
+            # AssertionError if its input is not contiguous, else returns a ones matrix.
             if not x.is_contiguous():
                 raise AssertionError("Expected x to be contiguous")
             return torch.ones(2, 2)
 
         @second_op.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: Fake implementation of the second custom op; returns a ones
+            # matrix.
             return torch.ones(2, 2)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Call the first custom op on x and pass the result to the
+            # second.
             y = myop(x)
             return second_op(y)
 
@@ -12348,9 +15014,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_fallback_mutable_op_basic(self):
+        # [FUNCTION DOC] Fallback for a mutable custom op with a tensor list argument, a symbolic
+        # int and optional tensor argument, returning nothing: traces a function with clones and
+        # copies using make_fx, compiles the graph with compile_fx_inner, runs it and compares the
+        # mutated inputs with a plain eager run (ordering of copies versus the mutation preserved).
         with torch.library._scoped_library("mylib", "FRAGMENT") as m:
 
             def impl(a, b, c, d, e=2):
+                # [FUNCTION DOC] HELPER: Mutating op implementation: add the product of the first
+                # list tensor, c and e to a in place, and the second list tensor to d when d is
+                # given.
                 a.add_(b[0] * c * e)
                 if d is not None:
                     d.add_(b[1])
@@ -12363,6 +15036,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             # We do some clones and copy_ to test that Inductor doesn't reorder
             # the copy_ w.r.t. inplace_.
             def f(a, b1, b2, c, d):
+                # [FUNCTION DOC] HELPER: Clone inputs, call the mutable op on the clones, and copy
+                # the clones back into the originals; returns an empty tuple.
                 a_ = a.clone()
                 d_ = d if d is None else d.clone()
                 torch.ops.mylib.inplace_(a_, (b1, b2), c, d=d_)
@@ -12388,12 +15063,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_fallback_mutable_op_list_tensor(self):
+        # [FUNCTION DOC] Mutable custom op with an optional list of output tensors to be mutated:
+        # the compiled function must return the same results as eager, including the list tensor
+        # filled by the op.
         @torch.library.custom_op(
             "mylib::mysin",
             mutates_args=["out_list"],
             schema="(Tensor x, Tensor(a!)[]? out_list) -> Tensor",
         )
         def mysin(x, out_list) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that computes sin of x, copies it into the first
+            # list element when the list is given, and returns it.
             r = x.sin()
             if out_list is not None:
                 out_list[0].copy_(r)
@@ -12401,9 +15081,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @mysin.register_fake
         def _(x, out_list) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor like x.
             return torch.empty_like(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiply by 3, create a one-element list of empties, call the
+            # custom op, divide by 3 and return the result with the list element.
             x = x * 3
             s = [torch.empty_like(x)]
             x = mysin(x, s)
@@ -12417,9 +15100,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_fallback_mutable_op_with_return(self):
+        # [FUNCTION DOC] Same as the basic mutable op fallback test but the op also returns a
+        # tensor (the sum of the two list tensors): compiled outputs and mutated inputs must equal
+        # eager.
         with torch.library._scoped_library("mylib", "FRAGMENT") as m:
 
             def impl(a, b, c, d, e=2):
+                # [FUNCTION DOC] HELPER: Mutating op implementation that updates a and optionally
+                # d, and returns the sum of the two list tensors.
                 a.add_(b[0] * c * e)
                 if d is not None:
                     d.add_(b[1])
@@ -12433,6 +15121,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             # We do some clones and copy_ to test that Inductor doesn't reorder
             # the copy_ w.r.t. inplace_.
             def f(a, b0, b1, c, d):
+                # [FUNCTION DOC] HELPER: Clone inputs, call the mutable op on the clones, copy
+                # back, and return the op result in a tuple.
                 a_ = a.clone()
                 d_ = d if d is None else d.clone()
                 res = torch.ops.mylib.inplace_(a_, (b0, b1), c, d=d_)
@@ -12460,9 +15150,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_fallback_mutable_op_no_mutated_tensors(self):
+        # [FUNCTION DOC] Mutable custom op whose optional mutated argument is None, so nothing is
+        # mutated: compiled graph still runs and inputs equal eager.
         with torch.library._scoped_library("mylib", "FRAGMENT") as m:
 
             def impl(a, b):
+                # [FUNCTION DOC] HELPER: Add one to b in place when it is given.
                 if b is not None:
                     b.add_(1)
 
@@ -12470,6 +15163,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             m.impl("inplace_", impl, "CompositeExplicitAutograd")
 
             def f(a):
+                # [FUNCTION DOC] HELPER: Call the mutable op with None as the mutable argument;
+                # returns an empty tuple.
                 torch.ops.mylib.inplace_(a, None)
                 return ()
 
@@ -12487,9 +15182,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_fallback_mutable_op_list(self):
+        # [FUNCTION DOC] Mutable op with a list of mutated tensors compiled through make_fx and
+        # compile_fx_inner (the compiled function is not run); then a second custom op that writes
+        # sin of x into a list of outputs is defined and compiled with torch.compile.
+        # KNOWN ISSUE: the first part never runs the compiled function, and the sin_out custom op
+        # body reads the variable out from the enclosing scope instead of its own outs argument and
+        # is only traced (never executed eagerly), so the numeric behavior is not asserted.
         with torch.library._scoped_library("mylib", "FRAGMENT") as m:
 
             def impl(a, b):
+                # [FUNCTION DOC] HELPER: Add a to each tensor in the list b in place.
                 for bi in b:
                     bi.add_(a)
 
@@ -12497,6 +15199,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             m.impl("inplace_", impl, "CompositeExplicitAutograd")
 
             def f(a, b):
+                # [FUNCTION DOC] HELPER: Call the mutable list op and return None.
                 torch.ops.mylib.inplace_(a, b)
                 return None
 
@@ -12511,6 +15214,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.library.custom_op("mylib::sin_out", mutates_args={"outs"})
         def sin_out(x: torch.Tensor, outs: list[torch.Tensor]) -> None:
+            # [FUNCTION DOC] HELPER: Custom op that writes the sin of x numerically through numpy
+            # into the first two output tensors, after asserting the list has two entries.
+            # KNOWN ISSUE: it indexes a variable named out from the enclosing test scope instead of
+            # the outs argument.
             x_np = x.numpy()
             if len(outs) != 2:
                 raise AssertionError(f"Expected len(outs) == 2, got {len(outs)}")
@@ -12521,6 +15228,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def g(x):
+            # [FUNCTION DOC] HELPER: Compiled function that creates two empty outputs like x, fills
+            # them through the custom op and returns them.
             outs = [torch.empty_like(x) for _ in range(2)]
             sin_out(x, outs)
             return outs
@@ -12531,6 +15240,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps_unimplemented  # rng_prims not supported for MPS
     def test_functionalize_rng_wrappers(self):
+        # [FUNCTION DOC] The RNG state save and restore prims, exercised through make_fx tracing
+        # and compile_fx_inner (not torch.compile, since these ops are introduced by the
+        # partitioner): traces a function that generates two random tensors while saving the RNG
+        # state each time and regenerates both from the saved states; the regenerated tensors must
+        # equal the originals. Expected failure on MPS.
         # Ideally, we would like to use torch.compile for these operators. But
         # currently the plan is to introduce these operators at the partitioner
         # level, obviating the need to support them fully through the
@@ -12538,6 +15252,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # minifiers, we have ensure that they work with make_fx. This test uses
         # make_fx to do the testing. In future, we can move on torch.compile.
         def fn():
+            # [FUNCTION DOC] HELPER: Generate two 4 by 4 random tensors saving the RNG state before
+            # each, regenerate them with the saved states, and return the four tensors.
             rng_state1, a1 = torch._prims.rng_prims.run_and_save_rng_state(
                 torch.ops.aten.rand.default,
                 [4, 4],
@@ -12579,6 +15295,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_gpu_halide  # rand
     @xfail_if_mps
     def test_philox_rand(self):
+        # [FUNCTION DOC] Functionalized RNG ops (Philox) with a compiled function using rand_like
+        # twice: same seed reproduces values, different seed gives different values, for numel 1024
+        # and a non-multiple-of-4 numel 3; checks the device RNG offset after each (2048 and then
+        # 8). GPU only; expected failure on XPU and MPS; skipped on GPU Halide.
         if self.device == "cpu":
             raise unittest.SkipTest(
                 f"functionalization of rng ops supported only on {GPU_TYPE}"
@@ -12586,11 +15306,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile(backend="inductor")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the product of x with a rand_like sample, multiplied by
+            # a second rand_like sample.
             a = torch.rand_like(x) * x
             a = torch.rand_like(x) * a
             return a
 
         def check(x):
+            # [FUNCTION DOC] HELPER: Run the compiled function with seed 123, 1234 and 123 again
+            # and assert the first and third match and the first and second differ.
             torch.manual_seed(123)
             a = fn(x)
 
@@ -12616,7 +15340,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # Already on by default, just want to make sure
     @patch.object(torch._inductor.config, "allow_buffer_reuse", True)
     def test_reuse_buffers_with_aliasing(self):
+        # [FUNCTION DOC] Buffer reuse with aliasing view ops (view_as_complex and view_as_real
+        # chains) with buffer reuse enabled; checks numerics and that the generated triton code
+        # still contains an aten view_as_real call (otherwise the test needs new unlowered view
+        # ops).
+        # KNOWN ISSUE: the second function is defined but never used; the second check re-runs the
+        # first function.
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one, view as complex then as real, add one again and
+            # return it with the real view of the complex tensor plus one.
             z = x + 1
             z = torch.view_as_complex(z)
             a = torch.view_as_real(z)
@@ -12632,6 +15364,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue("aten.view_as_real" in code)
 
         def f2(x):
+            # [FUNCTION DOC] HELPER: Chain view_as_complex and view_as_real twice after adding one
+            # and return the final result and a real view of the complex tensor plus one (never
+            # called).
             z = x + 1
             z = torch.view_as_complex(z)
             z = torch.view_as_real(z)
@@ -12643,7 +15378,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(f, (torch.zeros((4, 2)),))
 
     def test_softmax_backward_data(self):
+        # [FUNCTION DOC] Aten softmax backward data on two random matrices.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the softmax backward of gradient a and output b over
+            # dim 1.
             return aten._softmax_backward_data(a, b, dim=1, input_dtype=torch.float32)
 
         self.common(
@@ -12663,10 +15401,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     )
     @with_tf32_off
     def test_randn_order_preserved(self, fallback_random):
+        # [FUNCTION DOC] Parametrized by random fallback (the non-fallback variant is an expected
+        # failure): the order of random number generation must match eager when random tensors are
+        # created before a convolution; compiled output equals eager with the same seed. Skipped on
+        # CPU; TF32 off.
         if self.device == "cpu":
             raise unittest.SkipTest("conv2d randn ordering requires CUDA")
 
         def fn():
+            # [FUNCTION DOC] HELPER: Create three random tensors, convolve two of them and add the
+            # first.
             a = torch.randn(2, 4, 4, 4, device=self.device)
             b = torch.randn(2, 3, 4, 4, device=self.device)
             c = torch.randn(4, 3, 3, 3, device=self.device)
@@ -12688,10 +15432,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @config.patch(fallback_random=True)
     @with_tf32_off
     def test_tuple_output_rng_order_preserved(self):
+        # [FUNCTION DOC] With random fallback, RNG order is preserved for a function producing a
+        # tuple output from native dropout followed by random tensors and a convolution. Skipped on
+        # CPU; TF32 off.
         if self.device == "cpu":
             raise unittest.SkipTest("conv2d randn ordering requires CUDA")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply native dropout to x, create two random tensors, convolve
+            # them and add the dropout result.
             dropped, _ = torch.ops.aten.native_dropout.default(x, 0.5, True)
             b = torch.randn(2, 3, 4, 4, device=x.device)
             c = torch.randn(4, 3, 3, 3, device=x.device)
@@ -12710,13 +15459,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(compiled_out, eager_out)
 
     def test_randn_like_empty(self):
+        # [FUNCTION DOC] randn_like of the min reduction of a tensor with a zero-sized dim, with
+        # exact stride checking.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward takes the min over dim 1 and returns a
+            # randn_like of it.
             def __init__(
                 self,
             ):
+                # [FUNCTION DOC] HELPER: Call the parent constructor.
                 super().__init__()
 
             def forward(self, v1: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Return randn_like of the min values of v1 over dim 1.
                 vx = v1.min(dim=1).values
                 v2 = torch.randn_like(vx)
                 return v2
@@ -12727,8 +15482,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(model, (x,), exact_stride=True)
 
     def test_randint(self):
+        # [FUNCTION DOC] randint in three forms (upper bound only, int32 with low and high, and
+        # randint_like with a huge bound): shapes are right, results reproduce after reseeding, and
+        # value ranges match (0 to 9, -4 to 6, and a large value range up to 2 to the power 50).
         @torch.compile(fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return a randint of 1024 elements below 10, an int32 randint
+            # in [-4, 7), and a randint_like of x below 2 to the power 50.
             return (
                 torch.randint(10, [1024], device=x.device),
                 torch.randint(-4, 7, [1024], dtype=torch.int32, device=x.device),
@@ -12757,11 +15517,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertLess(c0.max(), 2**50)
 
     def test_randint_distribution(self):
+        # [FUNCTION DOC] Statistical test that randint with a large upper bound (three quarters of
+        # 2 to the power 32, one million samples) is uniformly distributed over 8 bins within a
+        # tolerance of three times the expected relative error.
+        # KNOWN ISSUE: the compiled function parameter is spelled n_argsmax and is unused, the body
+        # reads the enclosing variable instead.
         @torch.compile(fullgraph=True)
         def fn(n_argsmax, size):
+            # [FUNCTION DOC] HELPER: Compiled function returning random integers below the
+            # enclosing upper bound; its first parameter is ignored (named with a typo).
             return torch.randint(n_max, (size,), device=self.device)
 
         def bin(index, max_size):
+            # [FUNCTION DOC] HELPER: Map sample values to bin indices by integer division by the
+            # bin width derived from the maximum and number of bins.
             return index // (max_size // n_bins)
 
         size = 1_000_000
@@ -12778,14 +15547,20 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(fallback_random=True)
     def test_like_rands(self):
+        # [FUNCTION DOC] rand_like, randn_like and randint_like with fallback random, compared to
+        # eager with exact strides.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return rand_like, randn_like and randint_like of x.
             return torch.rand_like(x), torch.randn_like(x), torch.randint_like(x, 1, 11)
 
         self.common(fn, [torch.zeros([20, 20])], exact_stride=True)
 
     @config.patch(fallback_random=True)
     def test_like_rands_sliced(self):
+        # [FUNCTION DOC] Like-random ops with fallback random on a sliced and permuted input, exact
+        # strides.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return two randn_like samples and a randint_like sample of x.
             return (
                 torch.randn_like(x),
                 torch.randn_like(x),
@@ -12796,6 +15571,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(fallback_random=True)
     def test_like_randn_non_contiguous_rng_consistency(self):
+        # [FUNCTION DOC] With random fallback, compiled randn_like on a non-contiguous (transposed)
+        # input produces the same values as eager under the same seed.
         x = torch.zeros((3, 6), device=self.device).t()
         self.assertFalse(x.is_contiguous())
 
@@ -12810,6 +15587,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(fallback_random=False)
     def test_fast_like_rands_decomps_use_non_eager_path(self):
+        # [FUNCTION DOC] With random fallback off, the compiled randn_like gives different values
+        # from eager for the same seed (it does not use the eager path).
         x = torch.zeros(3, 6, device=self.device)
 
         randn_like_compiled = torch.compile(torch.randn_like, backend="inductor")
@@ -12821,6 +15600,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(check_stack_no_cycles_TESTING_ONLY=True)
     def test_check_stack_no_cycles(self):
+        # [FUNCTION DOC] Compiles with the stack-cycle checking testing config enabled; passes if
+        # no exception occurs. Skipped for GPU cpp wrapper (codegen runs twice there).
         if config.cpp_wrapper and self.device != "cpu":
             raise unittest.SkipTest(
                 "codegen() gets called twice in cpp_wrapper GPU compilation, which "
@@ -12830,6 +15611,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile()
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return x multiplied by 3.
             return x * 3
 
         r = fn(torch.randn(2, device=self.device, requires_grad=True))
@@ -12838,6 +15620,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         # r.sum().backward()
 
     def test_like_rands2(self):
+        # [FUNCTION DOC] rand_like with a device string keyword argument: two calls give different
+        # values but equal shape and strides.
         # rand_like with kwargs `device` of str type
         d = self.device
         if not isinstance(d, str):
@@ -12845,6 +15629,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return rand_like of x on the enclosing device string.
             return torch.rand_like(x, device=d)
 
         x = torch.ones(10, device=self.device, dtype=torch.float32)
@@ -12857,10 +15642,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @skip_if_triton_cpu("Flaky on Triton CPU")
     def test_like_rands3(self):
+        # [FUNCTION DOC] rand_like with a device different from the input device, both ways between
+        # CPU and GPU: output devices are the requested ones with equal shapes and strides. GPU
+        # only; flaky on Triton CPU (skipped).
         # rand_like with `device` which is different from `x.device`
         def test_like_rands_on_different_device(device1, device2):
+            # [FUNCTION DOC] HELPER: Compile a function producing rand_like of a ones tensor on
+            # device1 with device2 as the target; return a clone of the result.
             @torch.compile
             def fn(x, device):
+                # [FUNCTION DOC] HELPER: Return rand_like of x on the given device.
                 return torch.rand_like(x, device=device)
 
             x = torch.ones(10, device=device1, dtype=torch.float32)
@@ -12874,7 +15665,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(a0.stride(), a1.stride())
 
     def test_max_pool2d_with_indices_backward(self):
+        # [FUNCTION DOC] Max pool backward with indices for 2 by 2 kernels computed from a forward
+        # pool and a random gradient.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return the aten max pool 2D backward of gradient a with input
+            # b and indices c, kernel 2 stride 2.
             return aten.max_pool2d_with_indices_backward(
                 a, b, [2, 2], [2, 2], [0, 0], [1, 1], False, c
             )
@@ -12901,7 +15696,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @xfail_if_mps  # Small tolerances bug
     @skip_if_gpu_halide  # slow
     def test_max_pool2d_with_indices_backward2(self):
+        # [FUNCTION DOC] Max pool backward with ceil mode, padding 1 and kernel 3, stride 2 on a
+        # larger image. Skipped on GPU Halide; expected failure on MPS (small tolerance bug).
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return the aten max pool 2D backward with kernel 3, stride 2,
+            # padding 1, ceil mode on.
             return aten.max_pool2d_with_indices_backward(
                 a, b, [3, 3], [2, 2], [1, 1], [1, 1], True, c
             )
@@ -12927,7 +15726,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     # From https://github.com/pytorch/torchdynamo/issues/1200
     def test_max_pool2d_with_indices_backward3(self):
+        # [FUNCTION DOC] Max pool backward with kernel 1 and stride 2 on a large input (from
+        # torchdynamo issue 1200).
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return the aten max pool 2D backward with kernel 1 and stride
+            # 2.
             return aten.max_pool2d_with_indices_backward(
                 a, b, [1, 1], [2, 2], [0, 0], [1, 1], False, c
             )
@@ -12954,7 +15757,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @xfail_if_mps  # Small tolerances bug
     @skip_if_halide  # hangs forever
     def test_max_pool2d_with_indices_backward4(self):
+        # [FUNCTION DOC] Max pool backward with a 5 by 5 kernel, stride 1 and padding 2 on a small
+        # image (torchdynamo issue 1352); outside XPU at least one kernel must be generated.
+        # Skipped on Halide; expected failure on MPS.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return the aten max pool 2D backward with kernel 5, stride 1,
+            # padding 2.
             return aten.max_pool2d_with_indices_backward(
                 a, b, [5, 5], [1, 1], [2, 2], [1, 1], False, c
             )
@@ -12984,8 +15792,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertGreater(torch._inductor.metrics.generated_kernel_count, 0)
 
     def test_max_pool2d_with_indices_backward5(self):
+        # [FUNCTION DOC] Max pool backward with a large 13 by 13 kernel, handled by a scatter-add
+        # decomposition; outside MPS and XPU at least one kernel must be generated.
         # Large window size - decomposition handles via scatter_add
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return the aten max pool 2D backward with kernel 13, stride 1,
+            # padding 2.
             return aten.max_pool2d_with_indices_backward(
                 a, b, [13, 13], [1, 1], [2, 2], [1, 1], False, c
             )
@@ -13016,8 +15828,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     # From https://github.com/pytorch/pytorch/issues/93384
     def test_max_pool2d_with_indices_backward6(self):
+        # [FUNCTION DOC] Max pool backward with a non-unit dilation (3 by 2 kernel, strides 2 and
+        # 1, padding 1, dilation 1 by 2); handled by the decomposition. Outside MPS and XPU at
+        # least one kernel must be generated.
         # dilation != 1 - decomposition handles all dilation cases
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return the aten max pool 2D backward with kernel 3 by 2,
+            # stride 2 by 1, padding 1 and dilation 1 by 2.
             return aten.max_pool2d_with_indices_backward(
                 a, b, [3, 2], [2, 1], [1, 1], [1, 2], False, c
             )
@@ -13047,7 +15864,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertGreater(torch._inductor.metrics.generated_kernel_count, 0)
 
     def test_max_pool2d_with_indices_backward_fallback(self):
+        # [FUNCTION DOC] Max pool backward with a plain 2x2 kernel; on XPU zero kernels are
+        # expected (native fallback), elsewhere at least one kernel.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Return the aten max pool 2D backward with kernel 2 and stride
+            # 2.
             return aten.max_pool2d_with_indices_backward(
                 a, b, [2, 2], [2, 2], [0, 0], [1, 1], False, c
             )
@@ -13076,13 +15897,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             assertGeneratedKernelCountGreater(self, 0)
 
     def test_issue102546(self):
+        # [FUNCTION DOC] Mean over dim 0 of a zero-dimensional tensor (issue 102546).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the mean of x over dim 0.
             return x.mean(0)
 
         self.common(fn, [torch.rand(())])
 
     def test_avg_pool2d_backward(self):
+        # [FUNCTION DOC] Average pool 2D backward with kernel 2 and stride 2, ceil mode on, on 7 by
+        # 7 gradients and 14 by 14 inputs.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the aten avg pool 2D backward of gradient a with input
+            # b.
             return aten.avg_pool2d_backward(
                 a,
                 b,
@@ -13104,7 +15931,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # slow
     def test_avg_pool2d_backward2(self):
+        # [FUNCTION DOC] Average pool 2D backward with kernel 3, stride 1, padding 1 on a 20 by 15
+        # image. Skipped on GPU Halide (slow).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the aten avg pool 2D backward with kernel 3, stride 1,
+            # padding 1.
             return aten.avg_pool2d_backward(
                 a,
                 b,
@@ -13125,7 +15956,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_avg_pool2d_backward3(self):
+        # [FUNCTION DOC] Average pool 2D backward with kernel 1 and stride 2 on a large channel
+        # count; exactly one kernel must be generated.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the aten avg pool 2D backward with kernel 1 and stride
+            # 2.
             return aten.avg_pool2d_backward(
                 a,
                 b,
@@ -13148,7 +15983,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         assertGeneratedKernelCountEqual(self, 1)
 
     def test_avg_pool2d_backward4(self):
+        # [FUNCTION DOC] Average pool 2D backward with a large 13 by 13 kernel; zero kernels are
+        # generated (eager fallback); low precision check off.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the aten avg pool 2D backward with kernel 13 and stride
+            # 1.
             return aten.avg_pool2d_backward(
                 a,
                 b,
@@ -13172,7 +16011,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         assertGeneratedKernelCountEqual(self, 0)
 
     def test_avg_pool3d_backward(self):
+        # [FUNCTION DOC] Average pool 3D backward with kernel 2 and stride 2, ceil mode on.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the aten avg pool 3D backward of gradient a with input
+            # b.
             return aten.avg_pool3d_backward(
                 a,
                 b,
@@ -13194,7 +16036,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_halide  # compiles for 5+ minutes
     def test_avg_pool3d_backward2(self):
+        # [FUNCTION DOC] Average pool 3D backward with kernel 3, stride 1, padding 1. Skipped on
+        # Halide (compiles for over five minutes).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the aten avg pool 3D backward with kernel 3, stride 1,
+            # padding 1.
             return aten.avg_pool3d_backward(
                 a,
                 b,
@@ -13215,7 +16061,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_avg_pool3d_backward3(self):
+        # [FUNCTION DOC] Average pool 3D backward with kernel 1 and stride 2; exactly one kernel
+        # must be generated.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the aten avg pool 3D backward with kernel 1 and stride
+            # 2.
             return aten.avg_pool3d_backward(
                 a,
                 b,
@@ -13238,7 +16088,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         assertGeneratedKernelCountEqual(self, 1)
 
     def test_avg_pool3d_backward4(self):
+        # [FUNCTION DOC] Average pool 3D backward with a large 13 kernel; zero kernels are
+        # generated; low precision check off.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the aten avg pool 3D backward with kernel 13 and stride
+            # 1.
             return aten.avg_pool3d_backward(
                 a,
                 b,
@@ -13263,7 +16117,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(search_autotune_cache=False)
     def test_mm_views(self):
+        # [FUNCTION DOC] Matrix multiply of views of transposed inputs with the search autotune
+        # cache off; the kernel count is 0 (template mm) or 1 with native matmul on CUDA triton.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Matrix product of a viewed as 32 by 32 and b viewed as 32 by
+            # 32.
             return torch.mm(a.view(32, 32), b.view(32, 32))
 
         self.common(
@@ -13287,8 +16145,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_dtype_sympy_expr(self):
+        # [FUNCTION DOC] A contiguous slice with dynamic shapes whose dtype comes from symbolic
+        # expressions; runs forward and backward through an optimize-assert inductor backend
+        # without error.
         @torch._dynamo.optimize_assert("inductor")
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a contiguous copy of a without its last row.
             y = a[..., :-1, :].contiguous()
             return y
 
@@ -13296,6 +16158,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         result.sum().backward()
 
     def test_dropout2(self):
+        # [FUNCTION DOC] Dropout with probability 0.33 on 100000 elements, with a weight requiring
+        # grad: eval mode gives all ones and gradient ones; train mode with a seed is checked for
+        # the drop rate (between 64 and 68 percent kept), equal masks in output and gradient and
+        # mean near one; the generated forward code uses the vectorized random helper exactly once
+        # (or the backend equivalent) and the backward none; a second run with the same seed gives
+        # the same values.
         n = 100000
         weight = torch.ones(
             n, device=self.device, dtype=torch.float32, requires_grad=True
@@ -13304,9 +16172,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch._dynamo.optimize_assert("inductor")
         def run(x, train=True):
+            # [FUNCTION DOC] HELPER: Compiled function applying dropout with p=0.33 to x times the
+            # weight.
             return F.dropout(x * weight, 0.33, train)
 
         def check(r, g):
+            # [FUNCTION DOC] HELPER: Check statistics of the output r and gradient g: equal nonzero
+            # positions, equal counts within the expected band, equal means and mean close to one.
             rmean = r.mean().item()
             gmean = g.mean().item()
             rcount = len(r.nonzero())
@@ -13368,6 +16240,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(search_autotune_cache=False)
     def test_dropout3(self):
+        # [FUNCTION DOC] Two linear layers each followed by dropout, forward and backward: the
+        # forward code has two random generation calls and the backward none on Halide and CUDA;
+        # the total number of generated kernels is 4 (6 with native matmul on CUDA triton, 4 on
+        # other backends). Search autotune cache off; skipped on MPS (no linear backward lowering).
         if is_mps_backend(self.device):
             raise unittest.SkipTest("MPS Inductor does not lower aten.linear_backward")
 
@@ -13380,6 +16256,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch._dynamo.optimize_assert("inductor")
         def run(x):
+            # [FUNCTION DOC] HELPER: Compiled function applying the module to x.
             return m(x)
 
         torch._inductor.metrics.generated_kernel_count = 0
@@ -13415,11 +16292,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps  # Only works for Triton on CUDA
     def test_randn_uses_randn4x(self):
+        # [FUNCTION DOC] CUDA only: a compiled random normal of 1024 elements uses the vectorized
+        # randn helper exactly once and no plain triton randn. Expected failure on MPS.
         if self.device != "cuda":
             raise unittest.SkipTest("Only valid for CUDA!")
 
         @torch.compile
         def fn():
+            # [FUNCTION DOC] HELPER: Return a random normal vector of 1024 elements on the device.
             return torch.randn([1024], device=self.device)
 
         torch.manual_seed(1234)
@@ -13430,11 +16310,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps  # Only works for Triton on CUDA
     def test_rand4x_falls_back_in_reduction(self):
+        # [FUNCTION DOC] CUDA only: when rand is consumed in a reduction the vectorized rand4x
+        # helper is not used and plain rand appears once in the code. Expected failure on MPS.
         if self.device != "cuda":
             raise unittest.SkipTest("Only valid for CUDA!")
 
         @torch.compile
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the row sums of a rand_like sample times x.
             return (torch.rand_like(x) * x).sum(dim=1)
 
         result, (code,) = run_and_get_code(fn, torch.ones([8, 32], device=self.device))
@@ -13445,11 +16328,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @xfail_if_mps  # Only works for Triton on CUDA
     @config.patch(align_random_eager=True)
     def test_align_random_eager_skips_rand4x(self):
+        # [FUNCTION DOC] CUDA only, with align_random_eager on: a compiled rand uses the
+        # eager-aligned random kernel helper instead of rand4x or plain rand. Expected failure on
+        # MPS.
         if self.device != "cuda":
             raise unittest.SkipTest("Only valid for CUDA!")
 
         @torch.compile
         def fn():
+            # [FUNCTION DOC] HELPER: Return a uniform random vector of 1024 elements.
             return torch.rand([1024], device=self.device)
 
         torch.manual_seed(1234)
@@ -13461,11 +16348,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps  # Only works for triton
     def test_randint_kernel_count(self):
+        # [FUNCTION DOC] On GPU, a function with three randint calls produces a single generated
+        # source file with two triton kernel definitions (differing by seed offset specialization).
+        # Expected failure on MPS.
         if self.device != GPU_TYPE:
             raise unittest.SkipTest("Only valid for GPU!")
 
         @torch._dynamo.optimize_assert("inductor")
         def fn1():
+            # [FUNCTION DOC] HELPER: Return three random integer vectors of 32 elements below 10.
             random_tensor1 = torch.randint(10, [32], device=self.device)
             random_tensor2 = torch.randint(10, [32], device=self.device)
             random_tensor3 = torch.randint(10, [32], device=self.device)
@@ -13482,7 +16373,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(source_codes[0].count("async_compile.triton"), 2)
 
     def test_roll(self):
+        # [FUNCTION DOC] Roll with two shifts along two dims and with one shift on the flattened
+        # tensor.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return roll of a by (-3, 10) on dims (1, 2) and roll by 5.
             return (
                 aten.roll(a, [-3, 10], [1, 2]),
                 aten.roll(a, [5]),
@@ -13496,8 +16390,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_argmax_min_int32(self):
+        # [FUNCTION DOC] Regression for issue 94055: argmax on dim 3 of an int32 tensor combined
+        # with minimum against another int32 tensor.
         # https://github.com/pytorch/pytorch/issues/94055
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Take the argmax of a over dim 3 and return the minimum of b
+            # and it.
             c = a.argmax(3)
             return torch.min(b, c)
 
@@ -13506,7 +16404,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (a, b))
 
     def test_argmax_argmin1(self):
+        # [FUNCTION DOC] Full-tensor argmax and argmin of a 3-D random tensor.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return argmax and argmin of x over all elements.
             return (aten.argmax(x), aten.argmin(x))
 
         self.common(
@@ -13517,7 +16417,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_argmax_argmin2(self):
+        # [FUNCTION DOC] argmax and argmin along dims 0 and 1 of a square matrix.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return argmax and argmin of x on dim 0 and dim 1.
             return (
                 aten.argmax(x, 0),
                 aten.argmin(x, 0),
@@ -13528,7 +16430,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn([144, 144]),))
 
     def test_argmax_argmin_with_duplicates(self):
+        # [FUNCTION DOC] argmax and argmin along dims 0 and 1 with many tied values, for an
+        # unrolled reduction (6 by 6, values 0-1), a persistent reduction (32 by 32) and a
+        # non-persistent reduction (1028 by 1028).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return argmax and argmin of x along dim 0 and along dim 1.
             return (
                 aten.argmax(x, 0),
                 aten.argmin(x, 0),
@@ -13550,7 +16456,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_halide  # nan behavior
     def test_argmax_argmin_with_nan(self):
+        # [FUNCTION DOC] argmax and argmin along dims 0 and 1 when some columns are NaN, for the
+        # three reduction sizes (unrolled, persistent, non-persistent). Skipped on Halide (NaN
+        # behavior).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return argmax and argmin of x along dim 0 and along dim 1.
             return (
                 aten.argmax(x, 0),
                 aten.argmin(x, 0),
@@ -13578,10 +16488,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_cuda
     def test_max_min_bool(self):
+        # [FUNCTION DOC] Regression for issues 174069 and 184893: max and min with indices over
+        # dims 0 and 1 of boolean tensors returned wrong indices on Triton and CPU. Checked for
+        # five shapes (small, unrolled, persistent, non-persistent) with a different fixed seed per
+        # shape since the index of ties depends on the data. Requires CUDA.
         # Regression test for https://github.com/pytorch/pytorch/issues/174069
         # and https://github.com/pytorch/pytorch/issues/184893
         # max/min on boolean tensors returned incorrect indices on Triton and CPU.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return max and min (values and indices) of x along dim 0 and
+            # dim 1.
             return (
                 x.max(0),
                 x.min(0),
@@ -13604,8 +16520,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.common(fn, (t1,))
 
     def test_max_min_bool_keepdim(self):
+        # [FUNCTION DOC] Second reproducer of issue 184893: the index output of a min with keepdim
+        # over a boolean 3-D tensor with a fixed seed.
         # keepdim=True variant -- second reproducer from #184893
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the indices of the min of x on dim 1 with kept dim.
             return x.min(1, keepdim=True)[1]
 
         torch.manual_seed(184893)
@@ -13613,7 +16532,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (t,))
 
     def test_conv_backward(self):
+        # [FUNCTION DOC] Convolution backward for 2-D, a 2-D version with only the input gradient,
+        # a 1-D version and a 3-D version, built from slices of shared 5-D tensors via a helper
+        # that shrinks the rank; run with cudnn enabled and TF32 off.
+        # KNOWN ISSUE: the 1-D case inputs are produced with the same rank as the 2-D case (4), not
+        # 3.
         def fn(rank4_inps, rank3_inps, rank5_inps):
+            # [FUNCTION DOC] HELPER: Run the aten convolution backward four times (2-D with all
+            # grads, 2-D with only input grad, 1-D, 3-D) with unit strides, no padding, and return
+            # all outputs.
             out1 = aten.convolution_backward(
                 *rank4_inps,
                 [C],
@@ -13668,6 +16595,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         weight = torch.randn(C, C, 3, 3, 3)
 
         def shrink_rank(x, rank):
+            # [FUNCTION DOC] HELPER: Repeatedly select index 0 of the last dim until the tensor has
+            # the requested rank, then make it contiguous.
             res = x
             while res.dim() > rank:
                 res = torch.select(res, -1, 0)
@@ -13684,7 +16613,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_argmax_argmin3(self):
+        # [FUNCTION DOC] argmax and argmin along dim 0 and the last dim of a small-integer matrix
+        # (many ties).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return argmax and argmin of x along dim 0 and dim -1.
             return (
                 aten.argmax(x, 0),
                 aten.argmin(x, 0),
@@ -13698,7 +16630,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_vdd_clamp(self):
+        # [FUNCTION DOC] Clamp with only a minimum (3) of a scaled random vector requiring grad.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return clamp_min of x with 3.
             return torch.clamp_min(x, 3)
 
         self.common(
@@ -13715,6 +16649,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         ],
     )
     def test_tmp_not_defined_issue1(self, use_block_ptr):
+        # [FUNCTION DOC] Regression for an undefined temporary variable error in generated code
+        # (layer norm style graph with variance, sum and rsqrt-like terms), with block pointers;
+        # only on triton.
         def forward(
             primals_3,
             primals_4,
@@ -13723,6 +16660,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             div_default,
             reciprocal_default,
         ):
+            # [FUNCTION DOC] HELPER: Compute variances, a normalized-and-affine result, a second
+            # variance, a reshaped variance, a sum and an epsilon-adjusted variance, returning
+            # three of them.
             var_default = torch.ops.aten.var(
                 convert_element_type_default, [2], correction=0
             )
@@ -13760,7 +16700,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     )
     @skip_if_gpu_halide
     def test_tmp_not_defined_issue2(self):
+        # [FUNCTION DOC] Regression for another undefined temporary variable error: divides and
+        # multiplies strided tensors then sums, returning an unrelated constant tensor too; relaxed
+        # tolerances. Skipped on GPU Halide and in the parallelnative environment (asan).
         def forward(arg38_1, arg81_1, getitem_17, new_zeros_default_4):
+            # [FUNCTION DOC] HELPER: Return new_zeros_default_4 and the sum of the product of the
+            # quotient of getitem_17 by arg81_1 with arg38_1.
             div_tensor_7 = torch.ops.aten.div.Tensor(getitem_17, arg81_1)
             mul_tensor_24 = torch.ops.aten.mul.Tensor(div_tensor_7, arg38_1)
             sum_default_7 = torch.ops.aten.sum.default(mul_tensor_24)
@@ -13783,6 +16728,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @skip_if_halide  # cascading accuracy issues due rsqrt fallback
     def test_tmp_not_defined_issue3(self):
+        # [FUNCTION DOC] Regression for another undefined temporary variable error from a
+        # recommender model graph (embedding bag with weights, softmax, var_mean and layernorm
+        # style math) with input specs parsed from the function annotations and constants as
+        # attributes. Requires a GPU; expected failure on MPS; skipped on Halide.
         test_device = torch.device(type=self.device)
         test_device_0 = (
             torch.device(type=self.device, index=0)
@@ -13800,6 +16749,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             primals_6: "f32[1739, 4190]",
             primals_48: "f32[6144, 4191]",
         ):
+            # [FUNCTION DOC] HELPER: Graph with a module-like first parameter holding lifted
+            # constants; performs indexing, addmm, softmax, a weighted embedding bag, var_mean
+            # based normalization and a transpose, and returns sixteen intermediate tensors.
             _tensor_constant0: "i64[4190]" = self._tensor_constant0
             lift_fresh_copy: "i64[4190]" = torch.ops.aten.lift_fresh_copy.default(
                 _tensor_constant0
@@ -13904,7 +16856,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_gpu_halide
     @config.patch("halide.scheduler_cpu", "Mullapudi2016")
     def test_misaligned_address_issue1(self):
+        # [FUNCTION DOC] Regression for a misaligned address error: gather of a single element per
+        # row from a 1000-wide row with a non-aligned index tensor. CPU Halide scheduler
+        # overridden; skipped on GPU Halide.
         def forward(sub_tensor_1, unsqueeze_default):
+            # [FUNCTION DOC] HELPER: Return the aten gather of sub_tensor_1 along dim 1 with the
+            # index.
             gather_default = torch.ops.aten.gather.default(
                 sub_tensor_1, 1, unsqueeze_default
             )
@@ -13918,7 +16875,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(forward, args)
 
     def test_invalid_operand_issue1(self):
+        # [FUNCTION DOC] Regression for an invalid operand error: a chain of slice_scatter and
+        # select_scatter updates feeding an embedding lookup of a flattened index tensor.
         def forward(arg0_1, arg1_1, arg3_1, squeeze, view_1, slice_1):
+            # [FUNCTION DOC] HELPER: Update an id matrix through nested slice_scatter and
+            # select_scatter ops, flatten it, look up embeddings and return the embedding and
+            # view_1.
             slice_scatter = torch.ops.aten.slice_scatter.default(
                 slice_1, arg3_1, 1, 1, 9223372036854775807
             )
@@ -13950,7 +16912,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(forward, args)
 
     def test_sizehint_issue1(self):
+        # [FUNCTION DOC] Regression for a size hint issue: unfold (im2col) with kernel and stride 4
+        # on a strided 4-D input.
         def forward(x):
+            # [FUNCTION DOC] HELPER: Return the functional unfold of x with kernel 4, dilation 1,
+            # no padding and stride 4.
             return torch.nn.functional.unfold(
                 x, kernel_size=[4, 4], dilation=1, padding=0, stride=[4, 4]
             )
@@ -13962,6 +16928,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(forward, args)
 
     def test_zero_dim_reductions(self):
+        # [FUNCTION DOC] Reductions over a zero-sized dim, for keepdim true and false: argmin,
+        # argmax, max and min must raise an IndexError saying the reduction dim must have non-zero
+        # size when traced and compiled; sum, prod, any and all must compile and run.
+        # KNOWN ISSUE: the final closeness check is outside the operator loop, so only the result
+        # of the last operator in the list is compared.
         for kd in [True, False]:
             inps0 = (torch.zeros(2, 0, device=self.device, dtype=torch.float16), 1, kd)
             failed_ops = [aten.argmin, aten.argmax, aten.max, aten.min]
@@ -13983,7 +16954,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertTrue(torch.allclose(actual, expected, atol=1e-3, rtol=1e-3))
 
     def test_unfold_zero_dimension_tensor(self):
+        # [FUNCTION DOC] unfold_copy with size zero on a tensor with a zero-sized dim; compiled
+        # equals eager.
         def forward(x):
+            # [FUNCTION DOC] HELPER: Return unfold_copy of x on dim 1 with size 0 and step 7.
             return torch.unfold_copy(dimension=1, input=x, size=0, step=7)
 
         x = torch.rand([1, 0], dtype=torch.float32)
@@ -13994,7 +16968,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(y, compiled_y)
 
     def test_unfold_backward_overlapping_windows(self):
+        # [FUNCTION DOC] unfold_backward with overlapping windows (size 8, step 4): an int64
+        # gradient case (issue 171370; skipped on MPS) and a float32 gradient with the shape
+        # produced by unfold; compiled output equals eager.
         def forward(grad, input_sizes):
+            # [FUNCTION DOC] HELPER: Call the aten unfold_backward with dim 1, size 8, step 4 and
+            # given input sizes.
             return torch.ops.aten.unfold_backward(
                 grad,
                 input_sizes=input_sizes,
@@ -14024,12 +17003,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(actual, expected)
 
     def test_zero_element_mutation(self):
+        # [FUNCTION DOC] In-place leaky ReLU module applied to a zero-element tensor.
         class CustomModel(nn.Module):
+            # [CLASS DOC] HELPER: Module with one in-place leaky ReLU layer (negative slope
+            # 5.2955089).
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the layer.
                 super().__init__()
                 self.layer1 = nn.LeakyReLU(negative_slope=5.2955089, inplace=True)
 
             def forward(self, inputs):
+                # [FUNCTION DOC] HELPER: Apply the layer to the inputs.
                 return self.layer1(inputs)
 
         ip_size = [0]
@@ -14039,13 +17023,18 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(mymodel, (input_tensor,))
 
     def test_lerp(self):
+        # [FUNCTION DOC] Lerp with a large weight on non-contiguous inputs (transposed first
+        # operand) and on contiguous inputs.
         # non-contiguous inputs for lerp
         def fn0(i0, i1):
+            # [FUNCTION DOC] HELPER: Transpose i0 on dims -2 and -3 and return lerp of i1 toward it
+            # with weight 70000.
             x1 = i0.transpose(-2, -3)
             return torch.lerp(i1, x1, 70000)
 
         # contiguous inputs for lerp
         def fn1(i0, i1):
+            # [FUNCTION DOC] HELPER: Return lerp of i1 toward i0 with weight 70000.
             return torch.lerp(i1, i0, 70000)
 
         self.common(fn0, [torch.rand(10, 3, 10), torch.rand(3, 10, 10)])
@@ -14056,6 +17045,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         test_dtypes,
     )
     def test_unspec_inputs(self, dtype):
+        # [FUNCTION DOC] Parametrized over dtypes: arithmetic with a 0-dim CPU scalar tensor and a
+        # GPU tensor in both argument orders (unspecialized scalar inputs on a mixed-device call).
+        # Skipped on CPU, GPU Halide, and unsupported dtypes.
         if self.device == "cpu":
             raise unittest.SkipTest("Testing mixed devices")
 
@@ -14072,6 +17064,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the sum, product and quotient of x and y.
             return x + y, x * y, x / y
 
         opt = torch.compile(fn, backend="inductor")
@@ -14085,6 +17078,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @dynamo_config.patch(automatic_dynamic_shapes=True)
     def test_list_clearing(self):
+        # [FUNCTION DOC] Checks the compiled graph frees its input list entries: for a plain
+        # context and (on GPU) a cuda graph config, after the compiled call reaches the matrix
+        # multiply (observed via a dispatch mode), the input list must be empty and weak references
+        # to the inputs dead; an extra run with new inputs is done on GPU to check warmup and
+        # record paths. On CPU the multiply must be seen; on GPU the list must be empty after the
+        # call.
         if self.device == "cpu":
             contexts = [contextlib.nullcontext]
         else:
@@ -14102,6 +17101,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 inp_refs = [weakref.ref(inp) for inp in inps]
 
                 def fn(x, y):
+                    # [FUNCTION DOC] HELPER: Return the square of the matrix product (x plus y
+                    # times itself) in a tuple.
                     a = x + y
                     return (a @ a,)
 
@@ -14112,7 +17113,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 matmul_seen = False
 
                 class TestRefMode(TorchDispatchMode):
+                    # [CLASS DOC] HELPER: Dispatch mode that, on seeing the out variant of mm, runs
+                    # garbage collection, records that mm was seen and asserts the input list is
+                    # empty and both weak references to the original inputs are dead, then runs the
+                    # op normally.
                     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                        # [FUNCTION DOC] HELPER: Dispatch hook: for the mm out op check input
+                        # deallocation (via the enclosing test case) and record it; always execute
+                        # the function with its arguments and return the result.
                         kwargs = kwargs if kwargs else {}
 
                         nonlocal inps
@@ -14156,7 +17164,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                     self.assertEqual(len(inps), 0)
 
     def test_dtype_mismatch_issue(self):
+        # [FUNCTION DOC] Padding followed by softmax on a 3-D tensor with last dim 63 (padded to
+        # 64), a dtype mismatch regression.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Pad x by one on the last dim and softmax over the last dim.
             attn = torch.nn.functional.pad(x, [0, 1])
             return attn.softmax(dim=-1)
 
@@ -14164,7 +17175,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (x,))
 
     def test_vectorized_ops_masked(self):
+        # [FUNCTION DOC] Vectorized masked index with a mask over the last dim (63 of 64 indices).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Build an arange of 64, a mask for values below 63 and apply
+            # the unsafe masked index with fill value 7 on the last dim.
             index = torch.arange(64, device=x.device)
             mask = index.view(1, 1, 64) < 63
             indices = [None, None, index]
@@ -14174,7 +17188,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (x,))
 
     def test_vectorized_ops_masked_var_novec(self):
+        # [FUNCTION DOC] Masked index with a mask on 10 indices over an 8 wide input, where
+        # vectorization is not applicable.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply the unsafe masked index on the last dim with an arange
+            # of 10, a mask of values below 5 and fill value 7.
             index = torch.arange(10, device=x.device)
             mask = (index < 5).view(1, 1, 1, 10)
             indices = [None, None, None, index]
@@ -14184,14 +17202,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (x,))
 
     def test_diagonal_copy(self):
+        # [FUNCTION DOC] diagonal_copy of wide, square and tall matrices.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return diagonal_copy of x.
             return torch.diagonal_copy(x)
 
         for x in (torch.randn(2, 3), torch.randn(2, 2), torch.randn(3, 2)):
             self.common(fn, (x,))
 
     def test_copy_with_scalar_src(self):
+        # [FUNCTION DOC] Copy of a Python scalar into a zeros tensor then addition to the input.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Fill a zeros buffer with 2 through copy and return x plus the
+            # buffer.
             buffer = torch.zeros_like(x)
             buffer.copy_(2)
             result = x + buffer
@@ -14201,10 +17224,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (x,))
 
     def test_kwargs(self):
+        # [FUNCTION DOC] histogramdd with keyword weight and bins on a 4 by 2 input, CPU only.
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("histogramdd only supports cpu")
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the 2-D histogram of x with 3 bins per dim and weights
+            # y.
             return torch.histogramdd(
                 x,
                 bins=[3, 3],
@@ -14222,6 +17248,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @torch._inductor.config.patch("shape_padding", True)
     def test_shape_padding(self):
+        # [FUNCTION DOC] Shape padding enabled: mm, matmul and addmm on odd sizes, then bmm, matmul
+        # and baddbmm batched, for float16 and float32, GPU only; expected failure of the dynamic
+        # codegen check since inputs get specialized.
         dtypes = [
             torch.float16,
             torch.float32,
@@ -14230,6 +17259,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         b, m, n, k = 7, 11, 13, 15
 
         def gen(*shape, dtype=torch.float32):
+            # [FUNCTION DOC] HELPER: Generate a random tensor of the shape on the GPU scaled by 1/k
+            # plus one.
             return torch.randn(*shape, device=GPU_TYPE, dtype=dtype) / k + 1.0
 
         for dtype in dtypes:
@@ -14252,10 +17283,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @torch._inductor.config.patch("layout_optimization", True)
     @tf32_on_and_off(0.005)
     def test_inductor_layout_optimization_input_mutations(self):
+        # [FUNCTION DOC] Layout optimization with a mutated input: a function multiplies its input
+        # in place and applies a 3 to 128 channel 1x1 convolution (channels over 64 enable NHWC
+        # layout optimization); compiled outputs, shapes, strides and the mutated input must equal
+        # eager. GPU only; TF32 on and off.
         # channel dim must be > 64 for inductor to do layout optimization and use NHWC
         mod = nn.Conv2d(3, 128, 1, stride=1, bias=False).to(self.device)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Double x in place and apply the convolution module.
             x.mul_(2)
             out = mod(x)
             return out
@@ -14279,6 +17315,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         not IS_BIG_GPU, "Skipping triton backend only since not big GPU (not enough SM)"
     )
     def test_inductor_multiple_specializations(self):
+        # [FUNCTION DOC] Compiles a matmul with multiple specializations: a dynamic first dim vs a
+        # dim marked to specialize when it equals 16, with Triton max-autotune; results must be
+        # equal. GPU, triton and big GPUs only.
         @torch.compile(
             options={
                 "max_autotune": True,
@@ -14287,6 +17326,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             dynamic=False,
         )
         def inductor_matmul(a, b):
+            # [FUNCTION DOC] HELPER: Check that the first dim of a equals the second dim of b, and
+            # return the enclosing constant 16 and the matrix product.
             torch._check(a.shape[0] == b.shape[1])
             return (m, torch.mm(a, b))
 
@@ -14320,12 +17361,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     )
     @config.patch({"force_disable_caches": True})
     def test_mark_dynamic_with_hint_override(self):
+        # [FUNCTION DOC] mark_dynamic with a size hint override changes the generated triton code
+        # for a reduction over a 4096 by 512 tensor, while results still match. GPU, triton and big
+        # GPUs only; caches disabled.
         @torch.compile
         def no_override(x):
+            # [FUNCTION DOC] HELPER: Compiled sum of x over dim 0.
             return x.sum(dim=0)
 
         @torch.compile
         def override(x):
+            # [FUNCTION DOC] HELPER: Compiled sum of x over dim 0 (separately compiled copy).
             return x.sum(dim=0)
 
         x_small = torch.randn(4096, 512, device=GPU_TYPE)
@@ -14347,16 +17393,23 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     )
     @config.patch({"force_disable_caches": True})
     def test_mark_unbacked_with_hint_override(self):
+        # [FUNCTION DOC] mark_unbacked with a size hint override changes the generated triton code
+        # for a reduction while results stay close; and branching on the unbacked size raises a
+        # RuntimeError about guarding on a data-dependent expression. GPU, triton, big GPU only.
         @torch.compile
         def no_override(x):
+            # [FUNCTION DOC] HELPER: Compiled sum of x over dim 0.
             return x.sum(dim=0)
 
         @torch.compile
         def override(x):
+            # [FUNCTION DOC] HELPER: Compiled sum of x over dim 0 (separately compiled copy).
             return x.sum(dim=0)
 
         @torch.compile(fullgraph=True)
         def branching(x):
+            # [FUNCTION DOC] HELPER: Compiled function that branches on whether the first dim
+            # exceeds 4096.
             if x.shape[0] > 4096:
                 return 1
             return 2
@@ -14386,6 +17439,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         not IS_BIG_GPU, "Skipping triton backend only since not big GPU (not enough SM)"
     )
     def test_hint_override_cache_invalidation(self):
+        # [FUNCTION DOC] Different dynamic size hint overrides (48 and 99) compiled into a fresh
+        # inductor cache must not share cache entries: each generated code must contain its own
+        # hint in a strided random input and the second must not contain the first hint. GPU,
+        # triton, big GPUs only.
         """Different hint_override values must not produce stale cache hits."""
         from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
 
@@ -14393,6 +17450,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         HINT_B = 99
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sum x over dim 0.
             return x.sum(dim=0)
 
         x = torch.randn(256, 32, device=GPU_TYPE)
@@ -14410,6 +17468,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         code_b = codes_b[0]
 
         def has_hint(code, h):
+            # [FUNCTION DOC] HELPER: Return whether the code text has a random strided call whose
+            # first size equals the given hint.
             return f"rand_strided(({h}," in code or f"rand_strided(({h}, " in code
 
         self.assertTrue(
@@ -14427,10 +17487,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu()
     def test_stride_preservation_with_stride_modifying_fx_pass(self):
+        # [FUNCTION DOC] A custom post-grad FX pass that inserts permute, contiguous clone and
+        # permute at the graph output (changing strides) is installed in config; the compiled
+        # output must keep equal values and strides to eager. GPU only.
         def f(x):
+            # [FUNCTION DOC] HELPER: Return x plus one.
             return x + 1
 
         def custom_pass(g: torch.fx.Graph) -> None:
+            # [FUNCTION DOC] HELPER: Graph pass that finds the output node, asserts it has one
+            # argument, and inserts a transpose, a contiguous clone and a transpose back of the
+            # first output; updates the output node and returns the graph.
             """
             Applies `lambda x: x.t().contiguous().t()` to the output.
             """
@@ -14469,8 +17536,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(y.stride(), y_compiled.stride())
 
     def test_int_input_dynamic_shapes(self):
+        # [FUNCTION DOC] A dynamic compiled multiplication by an integer input (9132): the constant
+        # must not be matched as a graph constant.
         @torch.compile(dynamic=True)
         def fn(x, i):
+            # [FUNCTION DOC] HELPER: Multiply x by the integer i.
             y = x * i
             return y
 
@@ -14478,16 +17548,24 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, [torch.randn(3, 1, 1, 1, 1), 9132])
 
     def test_float_repr_dynamic_shapes(self):
+        # [FUNCTION DOC] Dynamic shape linear interpolation with a scale factor of 1/300 (float
+        # repr in generated index math).
         @torch.compile(dynamic=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return linear interpolation of x with scale factor 1/300.
             return F.interpolate(x, scale_factor=1 / 300, mode="linear")
 
         self.common(fn, [torch.randn(1, 8, 396 * 300)])
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_pattern_matcher_unbacked(self):
+        # [FUNCTION DOC] Pattern matcher with unbacked symbols: builds a top-k mask from a tensor
+        # percentage (scalar capture on) compiled with full graph; passes if it compiles and runs.
         @torch.compile(fullgraph=True)
         def get_mask(W: torch.Tensor, percentage_nonzeros: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Compute the number of elements to keep from the percentage,
+            # take top k absolute indices, scatter True into a boolean mask and view it as the
+            # input shape.
             total_elements = W.numel()
             k = total_elements * percentage_nonzeros
             top_k_indices = torch.topk(torch.abs(W).flatten(), k.int())[1]
@@ -14501,6 +17579,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         get_mask(x, p)
 
     def test_flexible_layout_immutable_free_symbols(self):
+        # [FUNCTION DOC] FlexibleLayout free symbol checks: padding strides does not add symbols
+        # and works; setting the size to the same symbols in another order works; setting a size
+        # containing a new symbol raises an AssertionError saying free symbols changed.
         import sympy
 
         x = sympy.Symbol("x")
@@ -14524,20 +17605,30 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             layout.size = (z,)
 
     def test_sqrt_dynamic_shapes(self):
+        # [FUNCTION DOC] Square root on a symbolic integer size (TIMM convit model, issue 97877) in
+        # a helper method of a module computing an arange of the integer square root of the patch
+        # count. CPU only.
         # TIMM convit_base model: https://github.com/pytorch/pytorch/issues/97877.
         # TODO: support cuda path.
         if self.device == GPU_TYPE:
             raise unittest.SkipTest("sqrt dynamic shapes only supports cpu")
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward unpacks the shape of the input and returns
+            # an arange of the integer square root of its second dim.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Call the parent constructor.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Read batch, count and channel from the shape of x and
+                # return the result of the relative index helper for the count.
                 B, N, C = x.shape
                 return self.get_rel_indices(N)
 
             def get_rel_indices(self, num_patches: int) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return an arange up to the integer square root of
+                # num_patches.
                 img_size = int(num_patches**0.5)
                 ind = torch.arange(img_size)
                 return ind
@@ -14550,9 +17641,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_rsqrt_dynamic_shapes(self):
+        # [FUNCTION DOC] Reciprocal square root on a symbolic size (hf_BigBird) used to scale a
+        # batched matmul under dynamic shapes.
         # From HF hf_BigBird model.
         @torch.compile(dynamic=True)
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Divide bmm of a and b by the reciprocal of the square root of
+            # the size of a's dim 1.
             r = 1 / math.sqrt(a.size(1))
             return torch.bmm(a, b) / r
 
@@ -14565,8 +17660,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_index_dynamic_shapes(self):
+        # [FUNCTION DOC] Reproducer from vision_maskrcnn: bilinear-style resize index math under
+        # dynamic shapes with sizes multiplied by a float scale (ceil/floor of symbolic sizes),
+        # built from iota, clamp, int conversion and two indexed gathers; compared with eager.
         # Repro from vision_maskrcnn
         def fn(arg0_1):
+            # [FUNCTION DOC] HELPER: Compute output sizes by scaling the input sizes with 1.8735,
+            # build source coordinate vectors, gather four neighbours with advanced indexing and
+            # blend them with the fractional weights; returns the first slice of the result in a
+            # tuple.
             unsqueeze = arg0_1.unsqueeze(0)
             sym_size = arg0_1.size(1)
             ceil = math.ceil(sym_size * 1.8735363483428955)
@@ -14629,16 +17731,24 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_halide  # log2 not yet implemented
     @skip_if_triton_cpu  # log2 implemented only in Dec 2024
     def test_pow_by_natural_log2_dynamic_shapes(self):
+        # [FUNCTION DOC] Power of two raised to a floor of a log2 of a symbolic size, added to a
+        # tensor under dynamic shapes. Skipped on Halide and on Triton CPU.
         @torch.compile(dynamic=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Add 2 raised to floor of log2 of the first dim plus 1 to x.
             return x + 2 ** (math.floor(math.log2(x.shape[0]) + 1))
 
         self.common(fn, [torch.randn(5)])
 
     def test_setitem_with_int_parameter(self):
+        # [FUNCTION DOC] Item assignment with an integer parameter: compiling once per distinct
+        # index with a counter backend; the number of compiled frames is 2 under assume-static
+        # (static index then dynamic), 1 otherwise, and an extra compile occurs for a negative
+        # index.
         x = torch.zeros(7, device=self.device)
 
         def fn(n, a):
+            # [FUNCTION DOC] HELPER: Set element n of a to -1 and return a.
             a[n] = -1
             return a
 
@@ -14664,10 +17774,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(profiler_mark_wrapper_call=True)
     def test_profiler_mark_wrapper_call(self):
+        # [FUNCTION DOC] With the profiler wrapper call marking config on, a compiled addition
+        # under the profiler must record an event whose name contains the Inductor wrapper call
+        # marker.
         from torch.profiler import profile
 
         @torch.compile(backend="inductor", fullgraph=True)
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus b.
             return a + b
 
         a = torch.rand((100,), device=self.device)
@@ -14682,7 +17796,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_insignificant_strides(self):
+        # [FUNCTION DOC] Output strides for a view that adds a size-one dim: the compiled stride
+        # must equal the eager stride.
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one and view as rows of shape (-1, 1, 2).
             tmp = x + 1
             return tmp.view(-1, 1, 2)
 
@@ -14695,7 +17812,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @unittest.skipIf(IS_X86 and not HAS_AVX2, "Requires AVX2")
     def test_pixel_shuffle_channels_last(self):
+        # [FUNCTION DOC] Pixel shuffle with a factor of 2 followed by ReLU on a channels-last
+        # input. Skipped on x86 without AVX2.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply pixel shuffle with factor 2 then ReLU.
             x = torch.nn.functional.pixel_shuffle(x, 2)
             x = torch.nn.functional.relu(x)
             return x
@@ -14706,18 +17826,29 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_where_broadcast(self):
+        # [FUNCTION DOC] where with broadcasting of a one-element condition (issue 93374), and an
+        # FX traced module with a module constant used in a where and bitwise-not on uint8 data
+        # (issue 94725) compiled through compile_fx_inner and compared with eager.
         # https://github.com/pytorch/pytorch/issues/93374
         def fn(x, p1, p0):
+            # [FUNCTION DOC] HELPER: Return where of condition x choosing p1 else p0.
             o = torch.where(x, p1, p0)
             return o
 
         # https://github.com/pytorch/pytorch/issues/94725
         class Repro(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a scalar float buffer; the forward converts input to
+            # bool, bitwise-nots it, and selects between the lifted constant and arg0_1 with where;
+            # returns the selection and the negated mask.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the scalar random buffer.
                 super().__init__()
                 self._tensor_constant0 = nn.Buffer(torch.randn([], dtype=torch.float32))
 
             def forward(self, arg0_1, arg1_1):
+                # [FUNCTION DOC] HELPER: Convert arg1_1 to bool, invert it, copy the module
+                # constant, and return where(inverted, constant copy, arg0_1) along with the
+                # inverted mask.
                 convert_element_type = torch.ops.prims.convert_element_type.default(
                     arg1_1, torch.bool
                 )
@@ -14748,7 +17879,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(inductor_out, eager_out)
 
     def test_require_stride_expanded(self):
+        # [FUNCTION DOC] Convolution whose input is an expanded (squeezed channels-last) tensor and
+        # whose bias is None: the expanded dim must not cause an extra copy when requiring a stride
+        # order, so no kernels are generated.
         def forward(arg6, arg7, arg16):
+            # [FUNCTION DOC] HELPER: Unsqueeze the image, convolve with weight arg7 (stride 4,
+            # padding 2) and bias arg6, and return the result in a tuple.
             convolution = torch.ops.aten.convolution(
                 arg16.unsqueeze(0), arg7, arg6, [4, 4], [2, 2], [1, 1], False, [0, 0], 1
             )
@@ -14788,7 +17924,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         "Does not support SDPA or pre-SM80 hardware",
     )
     def test_sdpa(self, use_block_ptr: bool, prefer_nd_tiling: bool):
+        # [FUNCTION DOC] Scaled dot product efficient attention with a bias that is computed by a
+        # matmul, view, permute and expand pipeline, parametrized over nd tiling and block pointer
+        # use: checks accuracy with loose tolerance and that block pointers appear in the Triton
+        # code exactly when requested (except on Halide). GPU only; needs flash attention platform
+        # support.
         def foo(arg0_1, arg1_1, arg2_1, arg3_1, arg4_1):
+            # [FUNCTION DOC] HELPER: Project the bias tensor with a matmul, reshape and permute it
+            # to batch, heads, queries and keys, make it contiguous, expand, and use it as the mask
+            # in the efficient scaled dot product attention; return the attention output.
             view = torch.ops.aten.view.default(arg3_1, [23760, 128])
             arg3_1 = None
             mm = torch.ops.aten.mm.default(view, arg4_1)
@@ -14867,12 +18011,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         "Does not support mem_eff_attention",
     )
     def test_sdpa_unaligned_mask(self):
+        # [FUNCTION DOC] Efficient attention with an attention mask whose last dim (15) is not
+        # aligned, created by padding to 16 and slicing back to 15; compared against eager with
+        # loose tolerances. GPU only; needs memory-efficient attention support.
         def foo(
             arg0_1: "f32[8, 8, 16, 16]",
             arg1_1: "f32[8, 8, 15, 16]",
             arg2_1: "f32[8, 8, 15, 16]",
             arg3_1: "f32[1, 1, 16, 15]",
         ):
+            # [FUNCTION DOC] HELPER: Pad the mask, slice it back, expand to the head layout and run
+            # the efficient scaled dot product attention; return the output.
             constant_pad_nd: "f32[1, 1, 16, 16]" = (
                 torch.ops.aten.constant_pad_nd.default(arg3_1, [0, 1], 0.0)
             )
@@ -14913,8 +18062,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     )
     @config.patch(freezing=True)
     def test_sdpa_unaligned_mask_freezing(self):
+        # [FUNCTION DOC] Same unaligned mask attention test but with the mask stored as a module
+        # attribute and freezing enabled; the compiled module under no-grad must match eager.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a random mask attribute of shape 1 by 1 by 16 by
+            # 15 whose forward pads it, slices, expands and runs efficient attention against the
+            # inputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the random mask on the GPU.
                 super().__init__()
                 self.arg3_1 = torch.rand(1, 1, 16, 15, device=GPU_TYPE)
 
@@ -14924,6 +18079,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 arg1_1: "f32[8, 8, 15, 16]",
                 arg2_1: "f32[8, 8, 15, 16]",
             ):
+                # [FUNCTION DOC] HELPER: Pad the stored mask, slice, expand and run efficient
+                # scaled dot product attention with the given query, key and value; return the
+                # output.
                 arg3_1 = self.arg3_1
                 constant_pad_nd: "f32[1, 1, 16, 16]" = (
                     torch.ops.aten.constant_pad_nd.default(arg3_1, [0, 1], 0.0)
@@ -14961,10 +18119,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(out_eager, out_compiled, atol=0.02, rtol=1e4)
 
     def test_where_with_logical_op(self):
+        # [FUNCTION DOC] where driven by logical and and logical or of two float tensors producing
+        # 1.0 or 0.0.
         def fn_and(x, y):
+            # [FUNCTION DOC] HELPER: Return 1.0 where both inputs are nonzero else 0.0.
             return torch.where(torch.logical_and(x, y), 1.0, 0.0)
 
         def fn_or(x, y):
+            # [FUNCTION DOC] HELPER: Return 1.0 where either input is nonzero else 0.0.
             return torch.where(torch.logical_or(x, y), 1.0, 0.0)
 
         self.common(
@@ -14977,14 +18139,23 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_conv_with_as_strided(self):
+        # [FUNCTION DOC] Convolution followed by constant pad, nested as_strided views with strides
+        # that depend on the shapes, and a contiguous clone, under a deterministic guard (warn
+        # only) with tolerances covering fp16 gemm noise on one ROCm architecture; low precision
+        # check off on Halide.
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Module with a 256 to 384 channel 1x1 convolution; forward pads
+            # the output, takes two nested strided views and returns a contiguous clone.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the convolution layer.
                 super().__init__()
                 self.kv = torch.nn.Conv2d(
                     256, 384, kernel_size=(1, 1), stride=(1, 1), bias=False
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Convolve x, pad by 2 on all sides, apply two as_strided
+                # views with fixed sizes and strides and return a contiguous clone.
                 convolution = self.kv(x)
                 constant_pad_nd = torch.ops.aten.constant_pad_nd.default(
                     convolution, [2, 2, 2, 2], 0.0
@@ -15014,8 +18185,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_inplace_where_pointwise(self):
+        # [FUNCTION DOC] Setting an element of a one-element tensor in a function that then
+        # multiplies it with a larger one (issue 96446).
         # https://github.com/pytorch/pytorch/issues/96446
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Set the first element of a to 2 and return a times b.
             a[0] = 2
             return a * b
 
@@ -15023,8 +18197,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_triton_cpu
     def test_view_on_aliased(self):
+        # [FUNCTION DOC] View on aliased tensors (issue 96728): a max reduction concatenated with
+        # another tensor and rounded, with a comparison whose result is discarded; plus a function
+        # creating a constant tensor, concatenating it with itself, and comparing with an outer
+        # tensor. Expected failure on Triton CPU.
         # https://github.com/pytorch/pytorch/issues/96728
         def fn1(a, b):
+            # [FUNCTION DOC] HELPER: Take the max of a over dim 0, concatenate with b, round,
+            # compute and discard a comparison, and return the rounded tensor.
             a = a.max(0).values
             c = torch.cat((a, b))
             c = c.round()
@@ -15034,6 +18214,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         some_const = torch.tensor(6324)
 
         def fn2():
+            # [FUNCTION DOC] HELPER: Concatenate a constant 1 by 1 tensor with itself and discard a
+            # comparison against the outer constant; return the concatenation.
             a = torch.tensor([[0.6324]])
             ret = torch.cat((a, a), dim=0)
             some_const >= a[0]  # noqa: B015
@@ -15043,8 +18225,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn2, ())
 
     def test_argmax_to_float(self):
+        # [FUNCTION DOC] Argmax of zeros converted to float and averaged (issue 97127).
         # https://github.com/pytorch/pytorch/issues/97127
         def fn():
+            # [FUNCTION DOC] HELPER: Return the mean of float argmax over dim 0 of a 2 by 2 zeros
+            # tensor.
             a = torch.zeros([2, 2])
             b = a.argmax(0)
             return b.float().mean()
@@ -15052,8 +18237,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, ())
 
     def test_const_int32_to_float(self):
+        # [FUNCTION DOC] int32 constant tensor sum converted to float32 and scaled (issue 97124).
         # https://github.com/pytorch/pytorch/issues/97124
         def fn():
+            # [FUNCTION DOC] HELPER: Add an int32 zeros tensor to itself, convert to float32 and
+            # multiply by 0.8.
             a = torch.zeros([1, 2], dtype=torch.int32)
             a = a + a
             b = a.to(dtype=torch.float32)
@@ -15062,10 +18250,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, ())
 
     def test_getitem(self):
+        # [FUNCTION DOC] Indexing a tensor with a Python list's index of a feature name (constant
+        # integer index known at trace time).
         out_features = ["p3", "p4", "p5", "p6", "p7"]
         in_feature = "p5"
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a indexed at the position of the enclosing feature name
+            # in the list of names.
             return a[out_features.index(in_feature)]
 
         x = [
@@ -15077,7 +18269,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         same(fn(x), opt_fn(x))
 
     def test_pad_view(self):
+        # [FUNCTION DOC] Pad followed by a view that swaps the last two dim sizes on a large
+        # tensor.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Pad one row at the end of dim -2, then view with the last two
+            # sizes swapped.
             y = torch.nn.functional.pad(a, (0, 0, 0, 1))
             y = y.view(*y.size()[:-2], y.size(-1), y.size(-2))
             return y
@@ -15086,7 +18282,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (x,))
 
     def test_pad_single(self):
+        # [FUNCTION DOC] Padding of a 1 by 1 by 1 tensor by 10 on both sides of the last dim.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Return a padded by (10, 10).
             y = torch.nn.functional.pad(a, (10, 10))
             return y
 
@@ -15094,7 +18292,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (x,))
 
     def test_pad_cast(self):
+        # [FUNCTION DOC] Padding of an integer tensor cast to float32 first, for int32 and int64.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Convert x to float32 and pad three elements at the end of the
+            # last dim.
             return torch.nn.functional.pad(x.to(torch.float32), (0, 3, 0, 0))
 
         for dtype in [torch.int32, torch.int64]:
@@ -15104,6 +18305,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_triton  # No inductor data type propagation pass on scheduler nodes
     @skip_if_halide  # bf16
     def test_data_type_propogation(self):
+        # [FUNCTION DOC] C++ backend only (needs a compiler; skipped for triton and Halide): lowers
+        # a max pool graph on bfloat16 channels-last input to a scheduler node, runs the data type
+        # propagation pass over its loop body, and checks the dtype recorded on each op node:
+        # placeholders none, boolean ops bool, constant/to_dtype/index_expr the requested dtype,
+        # index math int64, load/store the buffer dtype, reductions their reduction dtype, masked
+        # subblocks float, and_ bool, maximum float and the output bfloat16.
         from torch._dynamo.utils import detect_fake_mode
         from torch._inductor.codegen.common import boolean_ops
         from torch._inductor.compile_fx import shape_env_from_inputs
@@ -15114,12 +18321,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         from torch.fx.passes.fake_tensor_prop import FakeTensorProp
 
         def get_data_type(node: torch.fx.Node):
+            # [FUNCTION DOC] HELPER: Return the data type stored in a node's optimization context
+            # metadata, or None when absent.
             if OptimizationContext.key in node.meta:
                 return node.meta[OptimizationContext.key].dtype
             else:
                 return None
 
         def func(arg0_1):
+            # [FUNCTION DOC] HELPER: Max pool with indices of arg0_1 (kernel 3, stride 2, padding
+            # 1) and return the values in a tuple.
             max_pool2d_with_indices = torch.ops.aten.max_pool2d_with_indices.default(
                 arg0_1, [3, 3], [2, 2], [1, 1]
             )
@@ -15223,7 +18434,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @xfailIfS390X
     @skip_if_gpu_halide  # accuracy error
     def test_AllenaiLongformerBase_repro(self):
+        # [FUNCTION DOC] Reproduction of a Longformer attention pattern: scalar window size
+        # division with truncation, zeros buffer slicing assignment, view and transpose, then
+        # filling a part with negative infinity. On the C++ backend the generated code must contain
+        # the window constant cast the expected number of times (2 with vector ISA, else 1).
+        # Expected failure of the dynamic codegen check; skipped on s390x and GPU Halide.
         def fn(query, scores, window_overlap):
+            # [FUNCTION DOC] HELPER: Create a zeros tensor of chunk layout from the scores, copy a
+            # slice of scores into it, view and transpose to sequence-major layout, then overwrite
+            # the beginning window with negative infinity and return it.
             batch_size, seq_len, num_heads, _ = query.size()
             chunks_count = torch.div(seq_len, window_overlap, rounding_mode="trunc") - 1
             diagonal_attention_scores = scores.new_zeros(
@@ -15271,7 +18490,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, args)
 
     def test_cumsum_pattern_matcher_issue(self):
+        # [FUNCTION DOC] Cumulative sum of an attention mask built with ones, converted to long,
+        # and the sum pattern matched in HF models; exact comparison tolerance.
         def fn(input_ids) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Build a ones mask with the sequence length of the input ids
+            # and return its cumulative sum over dim 1 as long.
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
             batch_size, seq_length = input_shape
@@ -15290,6 +18513,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     def _check_resize_common(
         self, fn, x, size_or_y, memory_format, inplace, deterministic
     ):
+        # [FUNCTION DOC] HELPER: Shared checker for resize tests (static method taking the test
+        # case): runs fn eagerly and compiled on cloned inputs, compares the first elements (all
+        # elements in deterministic mode; else only the smaller of the input and target element
+        # counts since the rest is uninitialized) and the strides of both outputs.
         x = x.to(self.device)
         x_ref_arg = x.clone()
         x_opt_arg = x.clone()
@@ -15300,6 +18527,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         actual = opt_fn(x_opt_arg, size_or_y, memory_format)
 
         def get_numel(size_or_y):
+            # [FUNCTION DOC] HELPER: Return the number of elements of a tensor, or the product of
+            # sizes of a shape.
             if isinstance(size_or_y, torch.Tensor):
                 return size_or_y.numel()
             else:
@@ -15320,6 +18549,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @staticmethod
     def _cases_resize_common():
+        # [FUNCTION DOC] HELPER: Generator of resize test cases: pairs of input and target shapes
+        # (1-D to 4-D, 5-D and empty), with contiguous, channels last or channels last 3D formats
+        # as applicable, and extra non-contiguous inputs for the 100 element cases; yields input
+        # tensor, target size and memory format.
         sizes = [
             ((2,), (1, 3, 2, 3)),
             ((100,), (1, 3, 2, 3)),
@@ -15344,15 +18577,22 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                     yield x_strided, y_size, memory_format
 
     def test_resize_overlapping_strides(self):
+        # [FUNCTION DOC] Resize on a stride-zero view should read logical elements rather than raw
+        # storage: resizing an expanded 100 element view to 50 elements.
         # Resize on a stride-0 view should read logical elements, not raw storage.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create a stride-zero 100-element view of x and resize it to 50
+            # elements.
             view = torch.as_strided(x, (100,), (0,))
             return torch.ops.aten.resize(view, (50,))
 
         self.common(fn, (torch.ones(10),))
 
     def test_resize(self):
+        # [FUNCTION DOC] Aten resize over all resize test cases in deterministic and
+        # non-deterministic mode, compared via the shared checker.
         def fn(x, size, memory_format):
+            # [FUNCTION DOC] HELPER: Call aten resize of x to the size with the memory format.
             # NOTE: Tensor.resize() =/= aten::resize()
             return torch.ops.aten.resize(x, size, memory_format=memory_format)
 
@@ -15373,6 +18613,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @staticmethod
     def _cases_resize_as_common():
+        # [FUNCTION DOC] HELPER: Generator of resize_as test cases: for each resize case, yields a
+        # contiguous target tensor with the memory format, a target in the memory format with the
+        # preserve format flag, and a reversed-dim permuted target with the preserve format flag.
         for x, y_size, memory_format in CommonTemplate._cases_resize_common():
             # each sizes /memory_format combination tested in 2 ways:
             # 1. y is contiguous fn gets memory_format kwargs
@@ -15391,7 +18634,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_resize_as(self):
+        # [FUNCTION DOC] Aten resize_as over all resize_as cases in deterministic and
+        # non-deterministic mode, compared via the shared checker.
         def fn(x, y, memory_format):
+            # [FUNCTION DOC] HELPER: Call aten resize_as of x like y with the memory format.
             return torch.ops.aten.resize_as(x, y, memory_format=memory_format)
 
         for deterministic in [True, False]:
@@ -15410,7 +18656,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                     )
 
     def test_inplace_resize_as(self):
+        # [FUNCTION DOC] In-place resize_as compiled with the inductor backend on a small tensor
+        # and larger target; the compiled call is executed (the closeness result is not asserted).
+        # KNOWN ISSUE: the comparison result is discarded, so the test does not assert anything.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Resize x in place like y and return x.
             x.resize_as_(y)
             return x
 
@@ -15422,7 +18672,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_triton_cpu
     def test_erfc(self):
+        # [FUNCTION DOC] Complementary error function of a random matrix. Expected failure on
+        # Triton CPU.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return erfc of x.
             return torch.erfc(x)
 
         self.common(fn, (torch.randn(8, 8),))
@@ -15430,7 +18683,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_halide  # erfinv not implemented
     @xfail_if_triton_cpu
     def test_erfinv(self):
+        # [FUNCTION DOC] Inverse error function of values drawn uniformly from -1 to 1. Skipped on
+        # Halide; expected failure on Triton CPU.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return erfinv of x.
             return torch.erfinv(x)
 
         # domain for erfinv is (-1, 1)
@@ -15438,7 +18694,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (x,))
 
     def test_uint(self):
+        # [FUNCTION DOC] uint8 negation wrap around: comparison of the constant 5 with its negation
+        # in unsigned 8 bit arithmetic.
         def fn(z):
+            # [FUNCTION DOC] HELPER: Compare uint8 5 with its negation, ignoring the input.
             x = torch.tensor(5, device=z.device, dtype=torch.uint8)
             y = torch.neg(x)
             return x < y
@@ -15446,10 +18705,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn(26),))
 
     def test_scaled_dot_product_attention(self):
+        # [FUNCTION DOC] Scaled dot product attention with transposes and an explicit scale of
+        # 0.125, returning the first two outputs; loosened tolerances to pass the low precision
+        # check. Skipped on CUDA platforms without flash attention.
         if self.device == "cuda" and not PLATFORM_SUPPORTS_FLASH_ATTENTION:
             raise unittest.SkipTest("Can't run flash attention on this platform")
 
         def fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Run scaled dot product attention on q (made contiguous after
+            # transpose), transposed k and v with scale 0.125; return the first two entries.
             return torch.nn.functional.scaled_dot_product_attention(
                 q.transpose(1, 2).contiguous(),
                 k.transpose(1, 2),
@@ -15472,6 +18736,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_pallas  # cpp-only fusion path
     @skip_if_triton_cpu
     def test_group_norm_sdpa_bmm_cpu_cpp_fusion(self):
+        # [FUNCTION DOC] CPU only: a graph with group norm, scaled dot product attention, RReLU and
+        # batched matmul with a sigmoid branch, compiled with full graph; result equals eager
+        # (checks the C++ fusion path). Skipped on Halide, Pallas and Triton CPU.
         if self.device != "cpu":
             raise unittest.SkipTest("cpu only")
 
@@ -15479,6 +18746,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         rrelu = nn.RReLU().eval()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compute sigmoid of x, group norm of x, self attention on it,
+            # RReLU of the result and batched matmul of the sigmoid with it.
             y = torch.sigmoid(x)
             z = group_norm(x)
             z = F.scaled_dot_product_attention(z, z, z)
@@ -15495,12 +18764,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_pallas  # cpp-only fusion path
     @skip_if_triton_cpu
     def test_group_norm_flatten_batch_norm_cpu_cpp_fusion(self):
+        # [FUNCTION DOC] CPU only: group norm, flatten, exponential of a clamp and batch norm
+        # (eval) compiled with full graph versus eager (C++ fusion path). Skipped on Halide, Pallas
+        # and Triton CPU.
         if self.device != "cpu":
             raise unittest.SkipTest("cpu only")
 
         bn = nn.BatchNorm1d(140).eval()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Group norm x into 14 groups, flatten from dim 1, exp of clamp
+            # at max 20 and apply the enclosing batch norm.
             y = F.group_norm(x, 14)
             y = torch.flatten(y, start_dim=1)
             y = torch.exp(torch.clamp(y, max=20))
@@ -15517,12 +18791,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         not PLATFORM_SUPPORTS_MEM_EFF_ATTENTION, "Some archs don't support mem eff SDPA"
     )
     def test_scaled_dot_product_efficient_attention(self):
+        # [FUNCTION DOC] Efficient scaled dot product attention with an attention bias, returning
+        # the first two outputs (attention output and logsumexp), GPU only; skipped without mem
+        # efficient attention platform support; expected failure on MPS.
         if self.device == "cpu":
             raise unittest.SkipTest(f"requires {GPU_TYPE}")
 
         # The first two values should be the same, attention output
         # and logsumexp since dropout is not being set
         def fn(q, k, v, attn_bias, compute_log_sumexp):
+            # [FUNCTION DOC] HELPER: Call the aten efficient attention op and return the first two
+            # entries.
             return aten._scaled_dot_product_efficient_attention(
                 q, k, v, attn_bias, compute_log_sumexp
             )[:2]
@@ -15540,19 +18819,28 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_fft_real_input(self):
+        # [FUNCTION DOC] N-dimensional FFT of a real 16 cubed input; low precision check disabled.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the fftn of x.
             return torch.fft.fftn(x)
 
         self.common(fn, (torch.randn((16, 16, 16)),), check_lowp=False)
 
     def test_fft_real_input_real_output(self):
+        # [FUNCTION DOC] Real part of the N-dimensional FFT of a real input.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the real part of fftn of x.
             return torch.fft.fftn(x).real
 
         self.common(fn, (torch.randn((16, 16, 16)),), check_lowp=False)
 
     def test_searchsorted(self):
+        # [FUNCTION DOC] searchsorted over shapes (scalar-like sequence, scalar values, 1-D, N-D,
+        # prime sized) and all combinations of int32 output and right flag: once with a sorted
+        # sequence and no sorter, and once with an unsorted sequence plus the sorter indices; side
+        # string is derived from the right flag. Low precision check off.
         def fn(sorted_sequence, values, out_int32, right, side, sorter):
+            # [FUNCTION DOC] HELPER: Call torch searchsorted with all the given options.
             return torch.searchsorted(
                 sorted_sequence,
                 values,
@@ -15601,7 +18889,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_gpu_halide
     @skip_if_not_triton
     def test_searchsorted_broadcast(self):
+        # [FUNCTION DOC] On GPU with triton, searchsorted followed by unsqueeze, expand and
+        # contiguous must keep bucketize separate from the broadcast (not fused, since bucketize is
+        # expensive): the generated code must contain two triton kernels. Also compares numerics.
         def fn(sorted_sequence, values):
+            # [FUNCTION DOC] HELPER: Search values in the sorted sequence, add a trailing dim and
+            # expand to 64 along it and make contiguous.
             return (
                 torch.searchsorted(
                     sorted_sequence,
@@ -15627,7 +18920,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         FileCheck().check("def triton").check("def triton").run(code[0])
 
     def test_searchsorted_sliced_computed_boundaries(self):
+        # [FUNCTION DOC] searchsorted on a computed (offset by 10) boundary tensor with its last
+        # element dropped by a slice.
         def fn(boundaries, values):
+            # [FUNCTION DOC] HELPER: Add 10 to the boundaries, drop the last, and search values
+            # plus 10 with int32 output and right side.
             boundaries = boundaries + 10
             return torch.searchsorted(
                 boundaries[:-1], values + 10, out_int32=True, right=True
@@ -15639,7 +18936,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (boundaries, values), check_lowp=False)
 
     def test_searchsorted_sliced_computed_boundaries_offset(self):
+        # [FUNCTION DOC] searchsorted on a computed boundary tensor whose first element is dropped
+        # by a slice (storage offset case).
         def fn(boundaries, values):
+            # [FUNCTION DOC] HELPER: Add 10 to boundaries, drop the first, and search the values.
             boundaries = boundaries + 10
             return torch.searchsorted(
                 boundaries[1:], values, out_int32=True, right=True
@@ -15651,7 +18951,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (boundaries, values), check_lowp=False)
 
     def test_searchsorted_sliced_computed_sorter_offset(self):
+        # [FUNCTION DOC] searchsorted with a computed sequence and a computed sorter sliced from
+        # the start (sorter offset case).
         def fn(sequence, sorter, values):
+            # [FUNCTION DOC] HELPER: Add 10 to the sequence, copy the sorter via add zero, and
+            # search the values with the sorter minus its first entry.
             sequence = sequence + 10
             sorter = sorter + 0
             return torch.searchsorted(
@@ -15665,7 +18969,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (sequence, sorter, values), check_lowp=False)
 
     def test_searchsorted_nd_sliced_computed_boundaries_offset(self):
+        # [FUNCTION DOC] searchsorted on a 2-D computed boundary tensor sliced from the first row
+        # and column (offset case); UserWarnings are ignored.
         def fn(sequence, values):
+            # [FUNCTION DOC] HELPER: Add 10 to the sequence, slice off the first row and column,
+            # and search values.
             sequence = sequence + 10
             return torch.searchsorted(
                 sequence[1:, 1:], values, out_int32=True, right=True
@@ -15681,7 +18989,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.common(fn, (sequence, values), check_lowp=False)
 
     def test_searchsorted_nd_sliced_computed_sorter_offset(self):
+        # [FUNCTION DOC] searchsorted on a 2-D computed sequence and sorter both sliced from the
+        # first row and column; UserWarnings are ignored.
         def fn(sequence, sorter, values):
+            # [FUNCTION DOC] HELPER: Add 10 to the sequence and 0 to the sorter, slice both from
+            # the first row and column, and search values with the sorter.
             sequence = sequence + 10
             sorter = sorter + 0
             return torch.searchsorted(
@@ -15717,7 +19029,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.common(fn, (sequence, sorter, values), check_lowp=False)
 
     def test_searchsorted_expanded_boundaries_zero_stride(self):
+        # [FUNCTION DOC] searchsorted with a boundary tensor that is a stride-zero expansion of a
+        # one-element tensor; UserWarnings are ignored.
         def fn(base, values):
+            # [FUNCTION DOC] HELPER: Expand base to 5 elements and search values with int32 output
+            # and right side.
             return torch.searchsorted(
                 base.expand(5), values, out_int32=True, right=True
             )
@@ -15731,7 +19047,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @parametrize("nd_tiling", (False, True))
     def test_bucketize(self, nd_tiling: bool):
+        # [FUNCTION DOC] Parametrized by nd tiling: bucketize of a random matrix against six
+        # boundaries with int32 output and left side.
+        # KNOWN ISSUE: inside the loops over out_int32 and right the variables are reassigned to
+        # fixed values, so only one combination is tested.
         def fn(input, boundaries, out_int32, right):
+            # [FUNCTION DOC] HELPER: Call torch bucketize with the options.
             return torch.bucketize(input, boundaries, out_int32=out_int32, right=right)
 
         input = torch.rand((64, 64)) * 2 - 1
@@ -15747,7 +19068,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                     )
 
     def test_bucketize_default_kwargs(self):
+        # [FUNCTION DOC] Bucketize with default arguments of a vector into six offsets.
         def fn(input, offsets):
+            # [FUNCTION DOC] HELPER: Return bucketize of input against offsets.
             return torch.bucketize(input, offsets)
 
         input = torch.tensor(
@@ -15764,7 +19087,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     def test_bucketize_int(
         self, dtype_input: torch.dtype, dtype_boundaries: torch.dtype
     ):
+        # [FUNCTION DOC] Parametrized over all pairs of integer dtypes for the input and the
+        # boundaries: bucketize of random integers into squares-minus-512 boundaries with all
+        # combinations of int32 output and right flag.
         def fn(input, offsets, out_int32, right):
+            # [FUNCTION DOC] HELPER: Call torch bucketize with the options.
             return torch.bucketize(input, offsets, out_int32=out_int32, right=right)
 
         input = torch.randint(-(2**10), 2**10, (64, 64)).to(dtype_input)
@@ -15776,9 +19103,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @patch.object(config.triton, "autotune_pointwise", True)
     def test_bucketize_add_autotune(self):
+        # [FUNCTION DOC] Bucketize result plus a channels-last integer tensor with pointwise
+        # autotuning on (a 2D size hint pointwise kernel); one kernel generated.
         # Causes a @pointwise(size_hints) where size_hints is 2D
 
         def fn(input, offsets, add_value):
+            # [FUNCTION DOC] HELPER: Return bucketize of input against offsets plus add_value.
             return torch.bucketize(input, offsets) + add_value
 
         input = torch.rand((16, 16, 64, 64))
@@ -15792,7 +19122,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         assertGeneratedKernelCountEqual(self, 1)
 
     def test_bucketize_computed_offsets(self):
+        # [FUNCTION DOC] Bucketize against a computed boundary tensor (offsets shifted by 0.01).
         def fn(inp, offsets):
+            # [FUNCTION DOC] HELPER: Return bucketize of inp against offsets plus 0.01.
             return torch.bucketize(inp, offsets + 0.01)
 
         inp = torch.tensor(
@@ -15803,7 +19135,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (inp, offsets), check_lowp=False)
 
     def test_bucketize_sliced_computed_boundaries(self):
+        # [FUNCTION DOC] Bucketize an arange of a given count against computed (shifted by 10)
+        # boundaries with the last dropped and minus one.
         def fn(boundaries, count: int):
+            # [FUNCTION DOC] HELPER: Add 10 to boundaries, build an arange of count values,
+            # bucketize into all but the last boundary (int32, right) and subtract one.
             boundaries = boundaries + 10
             values = torch.arange(count, device=boundaries.device)
             return (
@@ -15815,7 +19151,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (boundaries, 10), check_lowp=False)
 
     def test_bucketize_sliced_computed_boundaries_offset(self):
+        # [FUNCTION DOC] Bucketize against computed boundaries with the first one dropped (offset
+        # case).
         def fn(boundaries, values):
+            # [FUNCTION DOC] HELPER: Add 10 to boundaries and bucketize values into the slice from
+            # index 1.
             boundaries = boundaries + 10
             return torch.bucketize(values, boundaries[1:], out_int32=True, right=True)
 
@@ -15825,7 +19165,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (boundaries, values), check_lowp=False)
 
     def test_bucketize_expanded_boundaries_zero_stride(self):
+        # [FUNCTION DOC] Bucketize against a stride-zero expansion of a one-element boundary
+        # tensor; UserWarnings ignored.
         def fn(base, values):
+            # [FUNCTION DOC] HELPER: Bucketize values into base expanded to 5 elements.
             return torch.bucketize(values, base.expand(5), out_int32=True, right=True)
 
         base = torch.tensor([12])
@@ -15836,7 +19179,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.common(fn, (base, values), check_lowp=False)
 
     def test_bucketize_scalar_various_values(self):
+        # [FUNCTION DOC] Bucketize of Python scalar values.
         def fn(boundaries, scalar_val):
+            # [FUNCTION DOC] HELPER: Return bucketize of the scalar against the boundaries.
             return torch.bucketize(scalar_val, boundaries)
 
         boundaries = torch.tensor([-0.9, -0.8, 0.1, 0.2, 0.5, 0.9])
@@ -15845,7 +19190,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.common(fn, (boundaries, scalar_val), check_lowp=False)
 
     def test_bucketize_scalar_with_options(self):
+        # [FUNCTION DOC] Bucketize of the scalar 0.5 for all combinations of output int32 and
+        # right.
         def fn(boundaries, out_int32, right):
+            # [FUNCTION DOC] HELPER: Return bucketize of 0.5 into the boundaries with options.
             return torch.bucketize(0.5, boundaries, out_int32=out_int32, right=right)
 
         boundaries = torch.tensor([-0.9, -0.8, 0.1, 0.2, 0.5, 0.9])
@@ -15858,7 +19206,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_gpu_halide
     @skip_if_not_triton
     def test_bucketize_broadcast(self):
+        # [FUNCTION DOC] On GPU with triton: bucketize followed by unsqueeze, expand to 64 and
+        # contiguous must keep bucketize in a separate kernel from the broadcast (two triton
+        # kernels).
         def fn(input, boundaries):
+            # [FUNCTION DOC] HELPER: Bucketize input, add a trailing dim and expand to 64, make
+            # contiguous.
             return (
                 torch.bucketize(input, boundaries)
                 .unsqueeze(-1)
@@ -15881,8 +19234,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_gpu_halide
     @skip_if_not_triton
     def test_bucketize_nan_consistency(self):
+        # [FUNCTION DOC] Regression for issue 173133: bucketize of a NaN value (from rsqrt of a
+        # negative number) must return the number of boundaries for both sides on eager and
+        # compiled. GPU with triton only.
         # Regression test for https://github.com/pytorch/pytorch/issues/173133.
         def fn(x, boundaries, right):
+            # [FUNCTION DOC] HELPER: Bucketize rsqrt of x against boundaries with the right option.
             return torch.bucketize(torch.rsqrt(x), boundaries, right=right)
 
         x = torch.tensor([-1.0], device=self.device)
@@ -15898,7 +19255,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @config.patch(assume_aligned_inputs=False)
     def test_config_option_dont_assume_alignment(self):
+        # [FUNCTION DOC] With input alignment assumption disabled, compiling a pointwise function
+        # on inputs with storage offsets from 0 to 4 and then running a second set of offsets must
+        # give correct results (nothing breaks across alignment configurations). GPU only.
         def fn(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Return sin of x plus cos of x.
             return x.sin() + x.cos()
 
         # Inductor specializes on the (unguarded) alignment of the initial input.
@@ -15925,6 +19286,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @config.patch(assume_aligned_inputs=False)
     def test_config_option_dont_assume_alignment_recompiles(self):
+        # [FUNCTION DOC] With input alignment assumption disabled: a compiled function run on a 32
+        # by 32 input, then a 64 by 64 input (allowed one guard failure for recompile) and then a
+        # 64 by 64 input with a different storage offset (must not add a guard failure beyond the
+        # previous count). Collects guard failures through a callback. GPU only.
         # Inputs:
         #  1. (32, 32) shape
         #  2. (64, 64) shape -> causes a recompile
@@ -15932,10 +19297,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         failed_guards = []
 
         def fail(guard):
+            # [FUNCTION DOC] HELPER: Guard failure callback appending the guard to the enclosing
+            # list.
             nonlocal failed_guards
             failed_guards.append(guard)
 
         def fn(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Return sin of x plus cos of x.
             return x.sin() + x.cos()
 
         base = torch.randn(64 * 64 + 64, dtype=torch.float32, device=self.device)
@@ -15972,7 +19340,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @config.patch(assume_aligned_inputs=False)
     def test_config_option_dont_assume_alignment_cudagraphs(self):
+        # [FUNCTION DOC] With input alignment assumption disabled, a dynamic compiled function in
+        # reduce-overhead mode (cuda graphs) on strided inputs of several sizes and offsets,
+        # including backward; the base tensor gradients must match eager. GPU only.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return cos of x times sin of x.
             return x.cos() * x.sin()
 
         fn_c = torch.compile(fn, mode="reduce-overhead", dynamic=True)
@@ -16005,17 +19377,23 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_1(self):
+        # [FUNCTION DOC] Custom operator registered through the test library helper (triple the
+        # input) with a meta function, used after relu and before cos with implicit fallbacks.
         import torch.library
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Eager kernel of the custom op, returning three times x.
             return 3 * x
 
         def foo_meta(x):
+            # [FUNCTION DOC] HELPER: Meta kernel of the custom op, returning an empty tensor like
+            # x.
             return torch.empty_like(x)
 
         define_custom_op_for_test("foo", foo, foo_meta)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply relu, the custom op and cos.
             a = torch.nn.functional.relu(x)
             b = torch.ops.test.foo(a)
             c = torch.cos(b)
@@ -16025,17 +19403,25 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_missing_op_info_log_is_lazy(self):
+        # [FUNCTION DOC] The warning log for a missing operator decomposition must be formatted
+        # lazily: with the logger level at warning (restored on cleanup) and the operator
+        # formatting function patched with a counting wrapper, compiling a graph using a fallback
+        # custom op calls the formatter only as needed. Uses implicit fallbacks.
         import torch._inductor.exc as exc
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Eager kernel of the custom op, returning a clone of x.
             return x.clone()
 
         def foo_meta(x):
+            # [FUNCTION DOC] HELPER: Meta kernel of the custom op, returning an empty tensor like
+            # x.
             return torch.empty_like(x)
 
         define_custom_op_for_test("foo_lazy_missing_op_log", foo, foo_meta)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Call the custom op on x.
             return torch.ops.test.foo_lazy_missing_op_log(x)
 
         logger = logging.getLogger("torch._inductor.graph")
@@ -16047,6 +19433,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         orig_operator_str = exc.MissingOperatorWithoutDecomp.operator_str
 
         def counted_operator_str(target, args, kwargs):
+            # [FUNCTION DOC] HELPER: Counting wrapper around the original operator string
+            # formatter: increments the enclosing counter and delegates to the original.
             nonlocal operator_str_calls
             operator_str_calls += 1
             return orig_operator_str(target, args, kwargs)
@@ -16062,17 +19450,22 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_2(self):
+        # [FUNCTION DOC] Custom op with a float scale argument returning two tensors, registered
+        # via the second test helper, used after relu with implicit fallbacks.
         import torch.library
 
         def foo(x, scale: float):
+            # [FUNCTION DOC] HELPER: Eager kernel returning scale times x and the cosine of x.
             return scale * x, torch.cos(x)
 
         def foo_meta(x, scale: float):
+            # [FUNCTION DOC] HELPER: Meta kernel returning two empty tensors like x.
             return torch.empty_like(x), torch.empty_like(x)
 
         define_custom_op_2_for_test("foo2", foo, foo_meta)
 
         def fn(x, scale: float):
+            # [FUNCTION DOC] HELPER: Apply relu and then the two-output custom op with the scale.
             a = torch.nn.functional.relu(x)
             return torch.ops.test.foo2(a, scale)
 
@@ -16080,18 +19473,24 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_3(self):
+        # [FUNCTION DOC] Custom op taking a list of tensors and returning their sum, registered via
+        # the third test helper.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Eager kernel summing the list of tensors into a zeros tensor.
             result = torch.zeros_like(x[0])
             for t in x:
                 result += t
             return result
 
         def foo_meta(x):
+            # [FUNCTION DOC] HELPER: Meta kernel returning an empty tensor like the first list
+            # element.
             return torch.empty_like(x[0])
 
         define_custom_op_3_for_test("foo3", foo, foo_meta)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Call the list custom op.
             return torch.ops.test.foo3(x)
 
         self.common(
@@ -16104,15 +19503,21 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_not_triton
     @config.patch(implicit_fallbacks=True)
     def test_generated_code_has_size_stride_assert(self):
+        # [FUNCTION DOC] On GPU triton: generated code for a custom op fallback must contain a size
+        # and stride assertion with the expected sizes and strides (symbolic names under dynamic
+        # shapes).
         def foo(x):
+            # [FUNCTION DOC] HELPER: Eager kernel of the custom op, returning three times x.
             return 3 * x
 
         def foo_meta(x):
+            # [FUNCTION DOC] HELPER: Meta kernel returning an empty tensor like x.
             return torch.empty_like(x)
 
         define_custom_op_for_test("foo", foo, foo_meta)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply relu and the custom op.
             a = torch.nn.functional.relu(x)
             b = torch.ops.test.foo(a)
             return b
@@ -16133,15 +19538,22 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_not_triton
     @config.patch(implicit_fallbacks=True)
     def test_generated_code_has_alignment_assert(self):
+        # [FUNCTION DOC] On GPU triton and without dynamic shapes: if the generated code for a
+        # custom op contains an alignment assertion, it must match the expected form with a tensor,
+        # alignment and name string; the test only prints the code and re-raises on mismatch, and
+        # is skipped silently when no assertion exists.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Eager kernel of the custom op, returning three times x.
             return 3 * x
 
         def foo_meta(x):
+            # [FUNCTION DOC] HELPER: Meta kernel returning an empty tensor like x.
             return torch.empty_like(x)
 
         define_custom_op_for_test("foo", foo, foo_meta)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply relu and the custom op.
             a = torch.nn.functional.relu(x)
             b = torch.ops.test.foo(a)
             return b
@@ -16166,15 +19578,21 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 print("Skipping: No assert_alignment found.")
 
     def test_assert_size_stride_op_name_pass(self):
+        # [FUNCTION DOC] assert_size_stride accepts a tensor with matching size and stride and an
+        # op name.
         tensor = torch.empty((16, 32))
         assert_size_stride(tensor, (16, 32), (32, 1), "torch.ops.dummy.op_name")
 
     def test_assert_size_stride_op_name_fail(self):
+        # [FUNCTION DOC] assert_size_stride with a mismatched size raises AssertionError whose
+        # message contains the op name.
         tensor = torch.empty((16, 32))
         with self.assertRaisesRegex(AssertionError, "torch.ops.dummy.op_name"):
             assert_size_stride(tensor, (32, 64), (32, 1), "torch.ops.dummy.op_name")
 
     def test_assert_size_stride_grouped_op_name_fail(self):
+        # [FUNCTION DOC] Grouped size and stride assertion with a mismatching second tensor raises
+        # AssertionError mentioning the op name.
         tensors = [torch.empty((16, 32)), torch.empty((8, 4))]
         with self.assertRaisesRegex(AssertionError, "torch.ops.dummy.op_name"):
             assert_size_stride_grouped(
@@ -16185,10 +19603,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_assert_alignment_op_name_pass(self):
+        # [FUNCTION DOC] assert_alignment accepts a tensor with alignment 16 and an op name.
         tensor = torch.empty((16, 32))
         assert_alignment(tensor, 16, "torch.ops.dummy.op_name")
 
     def test_assert_alignment_op_name_fail(self):
+        # [FUNCTION DOC] assert_alignment with alignment 0 (invalid) raises AssertionError
+        # mentioning the op name.
         tensor = torch.empty((16, 32))
         with self.assertRaisesRegex(AssertionError, "torch.ops.dummy.op_name"):
             assert_alignment(tensor, 0, "torch.ops.dummy.op_name")
@@ -16196,7 +19617,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @skip_if_not_triton
     def test_input_asserts_deferred_to_first_use(self):
+        # [FUNCTION DOC] On GPU triton: input assertions are emitted lazily: a grouped assertion
+        # for the first used inputs, then the assertion for the third input appears after the first
+        # matrix multiply (not hoisted to the top); checks code order (different patterns for cpp
+        # wrapper).
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Return the matrix product of the product of x and y with z.
             a = torch.mm(x, y)
             b = torch.mm(a, z)
             return b
@@ -16220,7 +19646,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @skip_if_not_triton
     def test_input_asserts_grouped_for_same_first_use(self):
+        # [FUNCTION DOC] On GPU triton: inputs first used by the same op get one grouped size and
+        # stride assertion (three single assertions for the cpp wrapper).
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Return x plus y plus z.
             return x + y + z
 
         x = torch.randn(16, 32, device=self.device)
@@ -16242,7 +19671,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         "Deferred alignment copies are not generated for cpp_wrapper",
     )
     def test_alignment_copy_deferred_to_first_use(self):
+        # [FUNCTION DOC] On GPU triton (not cpp wrapper): the copy for a misaligned input is
+        # emitted between the first and second matrix multiplies, at the first use of that input.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Return the matrix product of the product of x and y with z.
             a = torch.mm(x, y)
             b = torch.mm(a, z)
             return b
@@ -16263,7 +19695,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_not_triton
     @torch._inductor.config.patch(cpp_wrapper=True)
     def test_alignment_copy_not_emitted_for_cpp_wrapper(self):
+        # [FUNCTION DOC] With the cpp wrapper, generated code must not contain the Python alignment
+        # copy helper. GPU triton only.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the matrix product of x and y.
             return torch.mm(x, y)
 
         x = torch.randn(16, 32, device=self.device)
@@ -16274,6 +19709,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertNotIn("copy_if_misaligned", code[0])
 
     def test_copy_if_misaligned_returns_same_tensor_when_aligned(self):
+        # [FUNCTION DOC] The guards helper returns the same tensor object for an aligned tensor,
+        # and after deleting references the tensor is freed (weak reference dead).
         import weakref
 
         from torch._C._dynamo.guards import copy_if_misaligned
@@ -16286,6 +19723,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertIsNone(ref(), "aligned tensor should be freed")
 
     def test_copy_if_misaligned_clones_when_misaligned(self):
+        # [FUNCTION DOC] The guards helper clones a misaligned tensor (a view offset by one element
+        # of a larger tensor): the clone is a different object with aligned pointer, equal values,
+        # size and stride, and both the clone and the original are freed after deleting references.
         import weakref
 
         from torch._C._dynamo.guards import copy_if_misaligned
@@ -16308,6 +19748,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertIsNone(ref_orig(), "original tensor should be freed")
 
     def test_copy_if_misaligned_empty_tensor(self):
+        # [FUNCTION DOC] The alignment copy helper on an empty tensor returns a tensor of the same
+        # size.
         from torch._C._dynamo.guards import copy_if_misaligned
 
         x = torch.randn(0, device=self.device)
@@ -16317,12 +19759,18 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
     @torch._inductor.config.patch(implicit_fallbacks=True)
     def test_custom_op_unbacked_symints(self):
+        # [FUNCTION DOC] Custom ops whose fake implementations return unbacked symbolic sizes (an
+        # output of three unknown dims) followed by a second custom op; compiled with full graph
+        # and dynamic output shape ops captured, passes without error.
         @torch.library.custom_op("test_unbacked_symints::foo", mutates_args={})
         def foo(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation returning a clone of x.
             return x.clone()
 
         @foo.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: Fake implementation creating three new dynamic sizes and
+            # returning an empty tensor of that shape.
             u0 = torch.library.get_ctx().new_dynamic_size()
             u1 = torch.library.get_ctx().new_dynamic_size()
             u2 = torch.library.get_ctx().new_dynamic_size()
@@ -16330,16 +19778,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.library.custom_op("test_unbacked_symints::bar", mutates_args={})
         def bar(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation returning a clone of x.
             return x.clone()
 
         @bar.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor like x.
             return torch.empty_like(x)
 
         x = torch.randn(2, 3, 4)
 
         @torch.compile(fullgraph=True)
         def f(x):
+            # [FUNCTION DOC] HELPER: Apply the first custom op and then the second to the result.
             y = foo(x)
             z = bar(y)
             return z
@@ -16353,6 +19804,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @config.patch(implicit_fallbacks=True)
     @tf32_on_and_off(0.005)
     def test_custom_op_fixed_layout_sequential(self):
+        # [FUNCTION DOC] A custom op tagged as needing a fixed stride order after a convolution,
+        # with layout optimization on and output stride preservation off: inside the op the input
+        # must have the same strides as eager would produce. GPU only; TF32 on and off.
         import torch.library
 
         mod = nn.Conv2d(3, 128, 1, stride=1, bias=False).to(device=self.device)
@@ -16360,10 +19814,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         expected_stride = mod(inp).stride()
 
         def bar(x):
+            # [FUNCTION DOC] HELPER: Custom op kernel asserting its input has the stride expected
+            # from eager and returning a clone.
             self.assertEqual(x.stride(), expected_stride)
             return x.clone()
 
         def bar_meta(x):
+            # [FUNCTION DOC] HELPER: Meta kernel returning an empty tensor like x.
             return torch.empty_like(x)
 
         define_custom_op_for_test(
@@ -16374,6 +19831,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply the convolution and then the fixed-layout custom op.
             z = mod(x)
             output = torch.ops.test.bar(z)
             return output
@@ -16385,12 +19843,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_fixed_layout_tensor_list(self):
+        # [FUNCTION DOC] A custom op taking a list of tensors with the fixed stride order tag, fed
+        # by an op whose lowering returns a different stride than eager: the checker op must still
+        # see the eager (column-major) strides of its list input.
         def make_strided(x):
+            # [FUNCTION DOC] HELPER: Eager kernel returning an empty tensor with shape rows by 2
+            # and column-major strides.
             return torch.empty_strided(
                 (x.shape[0], 2), (1, x.shape[0]), dtype=x.dtype, device=x.device
             )
 
         def make_strided_meta(x):
+            # [FUNCTION DOC] HELPER: Meta kernel with the same shape and strides as the eager
+            # kernel.
             return torch.empty_strided(
                 (x.shape[0], 2), (1, x.shape[0]), dtype=x.dtype, device=x.device
             )
@@ -16405,6 +19870,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             torch.ops.test.make_strided_fixed_layout_list.default
         )
         def _(x):
+            # [FUNCTION DOC] HELPER: Lowering for the strided maker op that creates a buffer with
+            # row-major strides (different from eager).
             return lowering.empty_strided(
                 (x.get_size()[0], 2),
                 (2, 1),
@@ -16413,6 +19880,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
         def check_strides(xs):
+            # [FUNCTION DOC] HELPER: Check kernel: raises AssertionError if the first list tensor
+            # does not have column-major strides; returns ones like it.
             expected_stride = (1, xs[0].shape[0])
             if xs[0].stride() != expected_stride:
                 raise AssertionError(
@@ -16421,6 +19890,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             return torch.ones_like(xs[0])
 
         def check_strides_meta(xs):
+            # [FUNCTION DOC] HELPER: Meta kernel for the checker returning an empty tensor like the
+            # first.
             return torch.empty_like(xs[0])
 
         define_custom_op_3_for_test(
@@ -16431,6 +19902,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create the strided tensor and pass it in a list to the checker
+            # op.
             y = torch.ops.test.make_strided_fixed_layout_list(x)
             return torch.ops.test.check_fixed_layout_list([y])
 
@@ -16444,6 +19917,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @config.patch(implicit_fallbacks=True)
     @tf32_on_and_off(0.005)
     def test_mutable_custom_op_fixed_layout2(self):
+        # [FUNCTION DOC] Mutable custom ops with stride constraints in a scoped library: one op
+        # creates a tensor with column-major strides in eager but its lowering chooses row-major; a
+        # flexible layout op records the strides it sees when compiling; a mutating op needing
+        # fixed stride order checks it gets the eager stride order. After running, for static
+        # shapes outside ROCm the flexible op saw the lowered stride order, the mutating op the
+        # eager order, and they differ. GPU only; TF32 on and off.
         with torch.library._scoped_library("mylib", "DEF") as lib:
             from torch._inductor.ir import get_stride_order
             from torch._inductor.lowering import empty_strided, register_lowering
@@ -16455,24 +19934,31 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             lowered_stride_order = get_stride_order(lowered_stride)
 
             def expected_stride_for(x):
+                # [FUNCTION DOC] HELPER: Return column-major strides for a matrix x.
                 return (1, x.shape[0])
 
             lib.define("make_strided(Tensor x) -> Tensor")
 
             @torch.library.impl(lib, "make_strided", "CompositeExplicitAutograd")
             def _(x):
+                # [FUNCTION DOC] HELPER: Eager kernel of the strided maker op: empty tensor with
+                # the eager strides.
                 return torch.empty_strided(
                     x.shape, expected_stride_for(x), dtype=x.dtype, device=x.device
                 )
 
             @torch.library.impl(lib, "make_strided", "Meta")
             def _(x):
+                # [FUNCTION DOC] HELPER: Meta kernel of the strided maker op with the eager
+                # strides.
                 return torch.empty_strided(
                     x.shape, expected_stride_for(x), dtype=x.dtype, device=x.device
                 )
 
             @register_lowering(torch.ops.mylib.make_strided.default)
             def _(x):
+                # [FUNCTION DOC] HELPER: Lowering of the strided maker op: empty strided buffer
+                # with row-major strides.
                 size = x.get_size()
                 return empty_strided(
                     size,
@@ -16490,6 +19976,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
             @torch.library.impl(lib, "bar", "CompositeExplicitAutograd")
             def _(x, is_compiling):
+                # [FUNCTION DOC] HELPER: Eager kernel of the flexible layout op: records the input
+                # stride while compiling, clones, and asserts the clone has the same stride.
                 if is_compiling:
                     bar_strides.append(x.stride())
                 result = x.clone()
@@ -16501,6 +19989,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
             @torch.library.impl(lib, "bar", "Meta")
             def _(x, is_compiling):
+                # [FUNCTION DOC] HELPER: Meta kernel of the flexible layout op returning a clone.
                 return x.clone()
 
             lib.define(
@@ -16512,6 +20001,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
             @torch.library.impl(lib, "set_one", "CompositeExplicitAutograd")
             def _(x, is_compiling):
+                # [FUNCTION DOC] HELPER: Eager kernel of the mutating op: records the input stride
+                # when compiling, asserts the stride order equals the eager one, and fills x with
+                # ones.
                 if is_compiling:
                     set_one_strides.append(x.stride())
                 self.assertEqual(get_stride_order(x.stride()), expected_stride_order)
@@ -16519,9 +20011,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
             @torch.library.impl(lib, "set_one", "Meta")
             def _(x, is_compiling):
+                # [FUNCTION DOC] HELPER: Meta kernel of the mutating op returning None.
                 return None
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Create the strided tensor, pass through the flexible op,
+                # mutate the result with the fixed-order op, and return the square of it.
                 # The lowering chooses a different stride order than eager. The
                 # mutable custom op still needs the eager stride order.
                 z = torch.ops.mylib.make_strided(x)
@@ -16547,6 +20042,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_mutable_custom_op_fixed_layout(self):
+        # [FUNCTION DOC] A mutating custom op registered in a scoped library with the fixed stride
+        # order tag (in-place copy into a destination, meta kernel returning None): a function
+        # creates a CPU tensor, applies the op and squares the tensor; compiled with full graph
+        # equals eager.
         with torch.library._scoped_library("mylib", "DEF") as lib:
             lib.define(
                 "copy_(Tensor(a!) dst, Tensor src) -> ()",
@@ -16555,13 +20054,18 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
             @torch.library.impl(lib, "copy_", "Meta")
             def _(dst, src):
+                # [FUNCTION DOC] HELPER: Meta kernel of the copy op, returning None.
                 return None
 
             @torch.library.impl(lib, "copy_", "CompositeExplicitAutograd")
             def _(dst, src):
+                # [FUNCTION DOC] HELPER: Eager kernel of the copy op, copying src into dst in
+                # place.
                 dst.copy_(src)
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Fill a CPU tensor of 7s, mutate it with the custom copy op
+                # from x, and return its square.
                 full_default_3 = torch.full([3], 7.0, device="cpu")
                 chunk_cat_default_1 = torch.ops.mylib.copy_.default(full_default_3, x)
                 mul_out = torch.mul(full_default_3, full_default_3)
@@ -16577,10 +20081,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_fixed_layout_channels_last(self):
+        # [FUNCTION DOC] GPU only: a custom op with the fixed stride order tag after gelu and
+        # dropout in a channels-last module; the op must see the channels-last strides of its
+        # input, which equal the strides of the helper output computed in eager.
         class Block(nn.Module):
+            # [CLASS DOC] HELPER: Module with a dropout layer; forward applies gelu and dropout
+            # (helper) then the custom baz op.
             def __init__(
                 self,
             ):
+                # [FUNCTION DOC] HELPER: Create the sequence holding a single dropout layer with
+                # probability 0.1.
                 super().__init__()
 
                 self.in_layers = nn.Sequential(
@@ -16588,11 +20099,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 )
 
             def helper(self, x):
+                # [FUNCTION DOC] HELPER: Apply gelu then the dropout sequence to x.
                 out = F.gelu(x)
                 out = self.in_layers(out)
                 return out
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Run the helper and pass the result through the baz custom
+                # op.
                 out = self.helper(x)
                 out = torch.ops.test.baz(out)
                 return out
@@ -16604,10 +20118,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         expected_strides = model.helper(input_t).stride()
 
         def baz(x):
+            # [FUNCTION DOC] HELPER: Eager kernel of the baz op: asserts its input stride equals
+            # the eager strides and returns a clone.
             self.assertEqual(expected_strides, x.stride())
             return x.clone()
 
         def baz_meta(x):
+            # [FUNCTION DOC] HELPER: Meta kernel returning an empty tensor like x.
             return torch.empty_like(x)
 
         define_custom_op_for_test(
@@ -16623,6 +20140,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_default_layout_constraint(self):
+        # [FUNCTION DOC] Default layout constraint of a custom op without any tag: an in-place copy
+        # op that behaves differently for contiguous and non-contiguous sources (adds one only for
+        # contiguous), given a column-major source; compiled result must equal eager, showing the
+        # default constraint preserves eager strides.
         with torch.library._scoped_library("mylib", "DEF") as lib:
             lib.define(
                 "copy_(Tensor(a!) dst, Tensor src) -> ()",
@@ -16633,16 +20154,21 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
             @torch.library.impl(lib, "copy_", "Meta")
             def _(dst, src):
+                # [FUNCTION DOC] HELPER: Meta kernel of the copy op, returning None.
                 return None
 
             @torch.library.impl(lib, "copy_", "CompositeExplicitAutograd")
             def _(dst, src):
+                # [FUNCTION DOC] HELPER: Eager kernel of the copy op: copies src plus one into dst
+                # if src is contiguous else copies src.
                 if src.is_contiguous():
                     dst.copy_(src + 1)
                 else:
                     dst.copy_(src)
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Fill a 3 by 3 tensor of 7s on the device, mutate it with
+                # the copy op from x, and return its square.
                 full_default_3 = torch.full([3, 3], 7.0, device=self.device)
                 chunk_cat_default_1 = torch.ops.mylib.copy_.default(full_default_3, x)
                 mul_out = torch.mul(full_default_3, full_default_3)
@@ -16664,9 +20190,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # cuda error
     def test_buffer_use_after_remove(self):
+        # [FUNCTION DOC] Regression for issue 102857 (buffer used after removal): a rotation vector
+        # to rotation matrix computation with an einsum, compiled dynamically; sum of result and
+        # gradients of the rotation and translation parameters must equal eager. Skipped on GPU
+        # Halide.
         # https://github.com/pytorch/pytorch/issues/102857
 
         def rotvec_to_rotmat(rotvec) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Simplified conversion of rotation vectors to rotation
+            # matrices: compute the norm angle and unit axis, build nine Rodrigues terms from sin
+            # and cos, stack and reshape to batches of 3 by 3 matrices.
             """Simplified rotvec to rotmat code from RoMa
             (https://github.com/naver/roma/blob/06e4b0cdc1c802a60a012bb19c581d6600c63358/roma/mappings.py#L371)
             """
@@ -16703,6 +20236,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             return R
 
         def f(coord, rot, trans):
+            # [FUNCTION DOC] HELPER: Convert rot to matrices, rotate and translate coordinates with
+            # an einsum, and return the sum.
             rot_mat = rotvec_to_rotmat(rot)
             coord = torch.einsum("...ij,...bj->...bi", rot_mat, coord) + trans
             return coord.sum()
@@ -16710,6 +20245,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         foo_c = torch.compile(f, dynamic=True)
 
         def run(fn):
+            # [FUNCTION DOC] HELPER: Run the given function on ones coordinates with parameter
+            # tensors for rotation and translation, call backward on the result and return result
+            # and parameters.
             coord = torch.ones((2, 3), device=self.device)
             rot = nn.Parameter(torch.ones((2, 3), device=self.device))
             trans = nn.Parameter(torch.ones((2, 3), device=self.device))
@@ -16730,7 +20268,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @config.patch({"fx_graph_cache": False, "fx_graph_remote_cache": False})
     @skipIfWindows(msg="torch._dynamo.exc.Unsupported")
     def test_inner_fn_str_and_stride(self):
+        # [FUNCTION DOC] Scheduler hook check (FX graph cache disabled): for a function with two
+        # realized pointwise buffers on a transposed input, the hook receives three nodes with the
+        # strides (1, 2) on non-CPU devices, and the multiply node's inner function string contains
+        # the correct index expression rather than a stale cached one. Verifies the hook was called
+        # and results match eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Add one, realize, multiply by two, realize and return.
             x = x + 1
             x = test_operators.realize(x)
             x = x * 2
@@ -16742,6 +20286,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         called = False
 
         def hook_fn(scheduler, nodes):
+            # [FUNCTION DOC] HELPER: Scheduler init hook that records it was called and, on non-CPU
+            # devices, asserts the three nodes have strides (1, 2) and the multiply node has the
+            # expected index expression text.
             nonlocal called
             called = True
 
@@ -16769,10 +20316,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @parametrize("inplace", [False, True])
     def test_index_add_device_mismatch(self, inplace):
+        # [FUNCTION DOC] Parametrized over in-place: index_add with an index tensor on the CPU for
+        # GPU data must raise a RuntimeError in eager and in compiled code. GPU only.
         if self.device == "cpu":
             raise unittest.SkipTest("requires GPU for device mismatch test")
 
         def fn(x, source):
+            # [FUNCTION DOC] HELPER: Make a CPU random permutation index and index_add source into
+            # x, in place on a clone or out of place.
             index = torch.randperm(x.size(0))
             if inplace:
                 x = x.clone()
@@ -16791,7 +20342,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide  # cuda error
     def test_mutations_loop_fusion(self):
+        # [FUNCTION DOC] Loop fusion with a mutation-like op: index_add with alpha 2 on a
+        # one-element CPU tensor in the highest precision float, divided by 2. Skipped on GPU
+        # Halide.
         def fn(tensor, index, source):
+            # [FUNCTION DOC] HELPER: Return index_add of source into tensor at index with alpha
+            # 2.0, divided by 2.
             out = tensor.index_add(0, index, source, alpha=2.0) / 2
             return out
 
@@ -16815,6 +20371,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @serialTest()
     @largeTensorTest("13GB", inductor=True)
     def test_large_block_sizes(self):
+        # [FUNCTION DOC] Autotuned pointwise configs with huge block sizes that exceed shared
+        # memory must be skipped rather than fail: adds a transposed tensor of shape 2 to the 24 by
+        # 65 to a 65 by 2 to the 24 tensor. Needs 13GB; serial test.
         """
         Inductor will try triton configs like x = 64 and y = 1024 which will
         result in out of shared memory if dtype is fp32.
@@ -16825,6 +20384,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the transpose of x plus y.
             return x.t() + y
 
         # Use shape (2**24, 65) rather than (2**24, 128) potentially avoid OOM in
@@ -16836,9 +20396,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # Skipped on ROCm until https://github.com/ROCm/triton/issues/443 resolved
     @slowTest
     def test_fuse_large_params(self):
+        # [FUNCTION DOC] Compiles an AdamW optimizer step over 194 parameters with gradients to
+        # test fusing a large number of parameters. Marked slow.
         def pt2_optimizer_step(optimizer):
+            # [FUNCTION DOC] HELPER: Compile a function that performs the optimizer step and run
+            # it.
             @torch.compile()
             def f():
+                # [FUNCTION DOC] HELPER: Perform one optimizer step.
                 optimizer.step()
 
             f()
@@ -16857,8 +20422,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @xfail_if_mps
     @skip_if_gpu_halide
     def test_adaptive_avg_pool1d_argmax(self):
+        # [FUNCTION DOC] Adaptive average pool 1D to size 2 followed by argmax on float64 (issue
+        # 113013). Expected failure on MPS; skipped on GPU Halide.
         # https://github.com/pytorch/pytorch/issues/113013
         def fn(x):
+            # [FUNCTION DOC] HELPER: Pool x to size 2 and return the argmax of the result.
             x = torch.adaptive_avg_pool1d(input=x, output_size=2)
             x = torch.argmax(input=x)
             return x
@@ -16872,6 +20440,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         list(itertools.product(test_dtypes, test_dtypes)),
     )
     def test_dtypeview(self, dtype_x, dtype_y):
+        # [FUNCTION DOC] Parametrized over pairs of dtypes: matrix multiplications between tensors
+        # reinterpreted as another dtype with the dtype view op, for every view dtype for which
+        # eager succeeds; compared without float reference. Skipped on Triton CPU, ASAN and
+        # bfloat16 without sm80.
         if TEST_WITH_ASAN:
             return
 
@@ -16880,6 +20452,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         # https://github.com/pytorch/pytorch/issues/126338
         def fn(x, y, x_dtype, x2):
+            # [FUNCTION DOC] HELPER: View x as the dtype, view y as it plus one and x2 as it plus
+            # one; return x times y and x2 times x.
             x = x.view(x_dtype)
             y = y.view(x_dtype) + 1
             x2 = x2.view(x_dtype) + 1
@@ -16902,8 +20476,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_dtypeview_fusion(self):
+        # [FUNCTION DOC] Pointwise ops around a dtype view of float16 to int16 fuse into one
+        # kernel.
         @torch.compile
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function: add one, reinterpret as int16, multiply by
+            # two.
             x = x + 1
             x = torch.ops.aten.view.dtype(x, torch.int16)
             x = x * 2
@@ -16916,8 +20494,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @expectedFailureCodegenDynamic
     def test_reinterpret_dtypeview(self):
+        # [FUNCTION DOC] Reinterpreting views of a tensor as 10 by 10 and as int32 in both orders;
+        # for the Python wrapper the generated code contains a reinterpret before the dtype view
+        # call. Expected failure of the dynamic codegen check.
         @torch.compile
         def fn(x, x2):
+            # [FUNCTION DOC] HELPER: Return x viewed 10 by 10 then as int32, and x2 as int32 then
+            # 10 by 10.
             return x.view([10, 10]).view(torch.int32), x2.view(torch.int32).view(
                 [10, 10]
             )
@@ -16937,7 +20520,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @xfail_if_triton_cpu
     @requires_gpu()
     def test_scalar_cpu_tensor_arg(self):
+        # [FUNCTION DOC] A CPU scalar-like tensor argument (sum of a four element CPU tensor in
+        # several dtypes) added to a GPU tensor; inputs are not copied to the GPU. Expected failure
+        # on Triton CPU; requires a GPU.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return x plus the sum of y.
             return x + y.sum()
 
         test_dtypes = [
@@ -16960,7 +20547,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_float16_to_int16(self):
+        # [FUNCTION DOC] Float16 viewed as int16, doubled and added to a bit mask.
         def fn(x):
+            # [FUNCTION DOC] HELPER: View x as int16 and return twice it plus its bitwise and with
+            # 2.
             x_view = x.view(dtype=torch.int16)
             return x_view.mul(2) + x_view.bitwise_and(2)
 
@@ -16972,7 +20562,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skipCUDAIf(not SM80OrLater, "uses bfloat16 which requires SM >= 80")
     @skip_if_gpu_halide  # https://github.com/halide/Halide/issues/8311
     def test_bfloat16_to_int16(self):
+        # [FUNCTION DOC] Sum of two bfloat16 tensors viewed as int16 with arithmetic and bit ops;
+        # skipped if bfloat16 is unsupported and on CUDA below sm80 and on GPU Halide.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Add a and b, view as int16 and return twice it plus its
+            # bitwise and with 2.
             x = a + b
             x_view = x.view(dtype=torch.int16)
             return x_view.mul(2) + x_view.bitwise_and(2)
@@ -16986,7 +20580,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(ref, actual)
 
     def test_float32_to_int32(self):
+        # [FUNCTION DOC] Sum of two float32 tensors viewed as int32 with arithmetic and bit ops.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Add a and b, view as int32 and return twice it plus its
+            # bitwise and with 2.
             x = a + b
             x_view = x.view(dtype=torch.int32)
             return x_view.mul(2) + x_view.bitwise_and(2)
@@ -16998,9 +20595,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(ref, actual)
 
     def test_randint_int64_mod(self):
+        # [FUNCTION DOC] Remainder of int64 random integers (-5 to 5) by 10 compiles (used to fail
+        # because of the C++ random int64 return type, issue 117435); results lie in zero to nine.
         # This used to not compile due to a wrong return type of randint64_cpu
         # See https://github.com/pytorch/pytorch/issues/117435
         def fn(n):
+            # [FUNCTION DOC] HELPER: Return random int64 values in [-5, 5) of n elements modulo 10.
             return (
                 torch.randint(
                     low=-5, high=5, size=(n,), dtype=torch.int64, device=self.device
@@ -17020,6 +20620,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         ],
     )
     def test_pointwise(self, name, op):
+        # [FUNCTION DOC] Parametrized over every function in the special functions module (except
+        # softmax, log_softmax, logsumexp): applies the function to float32 inputs shaped per
+        # function family (binary, polygamma, multigammaln, polynomial order argument, default
+        # unary), with many skip rules for Halide, Triton CPU, Pallas and half precision
+        # limitations on GPU; on MPS a set of unimplemented functions expect NotImplementedError.
+        # Tolerances 1e-4.
         dtype = torch.float32
         check_lowp = True
         if self.device == GPU_TYPE and name in {
@@ -17134,6 +20740,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Apply the special function to two tensors.
                 return op(x, y)
 
         elif name in {"xlog1py", "xlogy", "zeta"}:
@@ -17143,6 +20750,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Apply the special function to two tensors.
                 return op(x, y)
 
         elif name == "multigammaln":
@@ -17152,6 +20760,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
             def fn(x, p):
+                # [FUNCTION DOC] HELPER: Apply the special function to a tensor and an integer p.
                 return op(x, p)
 
         elif name == "polygamma":
@@ -17161,6 +20770,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
             def fn(n, x):
+                # [FUNCTION DOC] HELPER: Apply the special function to an integer order and a
+                # tensor.
                 return op(n, x)
 
         elif "_polynomial_" in name:
@@ -17170,12 +20781,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
             def fn(x, n):
+                # [FUNCTION DOC] HELPER: Apply the special polynomial function to a tensor and an
+                # integer degree.
                 return op(x, n)
 
         else:
             args = (torch.randn(8, 8, dtype=dtype, device=self.device),)
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Apply the special function to a tensor.
                 return op(x)
 
         ctx = (
@@ -17197,8 +20811,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     # codegen test fails with no dynamic for loop in dynamic shape tests
     @expectedFailureCodegenDynamic
     def test_view_uint8_through_differing_bitwidths(self):
+        # [FUNCTION DOC] Viewing uint8 data as int16, int32 and int64 and back to uint8 (different
+        # bit widths) on a 4096 square tensor; expected failure of the dynamic codegen check.
         # https://github.com/pytorch/pytorch/issues/120998
         def fn(x, view_dtype):
+            # [FUNCTION DOC] HELPER: View x as the view dtype and then as uint8.
             return x.view(view_dtype).view(torch.uint8)
 
         view_dtypes = [torch.int16, torch.int32, torch.int64]
@@ -17213,8 +20830,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             )
 
     def test_view_dtype_fallback_layout_constraint(self):
+        # [FUNCTION DOC] Regression for issue 185515: a dtype view of a contiguous clone of a
+        # channels-last tensor (fallback view with layout constraint), exact strides compared.
         # https://github.com/pytorch/pytorch/issues/185515
         def fn_to_contiguous(x):
+            # [FUNCTION DOC] HELPER: Clone x in contiguous format and view as uint8.
             return x.clone(memory_format=torch.contiguous_format).view(torch.uint8)
 
         x_cl = torch.randn(2, 3, 4, 4, dtype=torch.float32).to(
@@ -17224,8 +20844,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_split_with_sizes_with_unbacked_symints(self):
+        # [FUNCTION DOC] split_with_sizes with unbacked sizes from a tolist call and with an
+        # unbacked arange length; results have the expected numbers of outputs (2 and 3). Scalar
+        # outputs are captured.
         @torch.compile()
         def f(sz, x):
+            # [FUNCTION DOC] HELPER: Read two sizes from sz, split x by them and sort the second
+            # part.
             s0, s1 = sz.tolist()
             r0, r1 = torch.ops.aten.split_with_sizes.default(x, [s0, s1])
             return torch.ops.aten.sort.default(r1)
@@ -17239,6 +20864,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile()
         def f2(x):
+            # [FUNCTION DOC] HELPER: Create an arange of an unbacked length and split it in 5, 5,
+            # 10.
             y = torch.arange(x.item())
             return torch.ops.aten.split_with_sizes.default(y, [5, 5, 10])
 
@@ -17247,9 +20874,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_split_with_unbacked_symints(self):
+        # [FUNCTION DOC] Torch split with a list of sizes of an arange whose length is an unbacked
+        # scalar (issue 122937): three outputs expected.
         # https://github.com/pytorch/pytorch/issues/122937
         @torch.compile()
         def f(x):
+            # [FUNCTION DOC] HELPER: Create an arange up to the scalar x and split it into 5, 5,
+            # 10.
             y = torch.arange(x.item())
             return torch.split(y, [5, 5, 10])
 
@@ -17258,6 +20889,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps
     def test_generate_rand_fp8(self):
+        # [FUNCTION DOC] rand_strided can build a float8 e4m3 tensor (by generating in fp16 and
+        # casting, since normal sampling for fp8 lacks kernels); checks the dtype. Expected failure
+        # on MPS.
         """
         PyTorch can not generate fp8 tensors with a normal distribution because of
         missing needed kernels.
@@ -17274,8 +20908,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         [subtest(False), subtest(True, decorators=[skip_if_not_triton])],
     )
     def test_large_grid(self, use_block_ptr):
+        # [FUNCTION DOC] Large launch grid (16777472 by 8 elements, issue 123210) for reshape,
+        # permute and contiguous clone, with and without block pointers; all output values must be
+        # 1. Needs 1GB.
         # https://github.com/pytorch/pytorch/issues/123210
         def fn(primals_5):
+            # [FUNCTION DOC] HELPER: Reshape to rows of 2 by 4, permute last dims and return a
+            # contiguous clone.
             view = torch.ops.aten.reshape.default(primals_5, [-1, 2, 4])
             primals_5 = None
             permute = torch.ops.aten.permute.default(view, [0, 2, 1])
@@ -17294,9 +20933,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @skip_if_gpu_halide
     def test_pattern_matcher_multi_user(self):
+        # [FUNCTION DOC] Reproducer for issue 129685 (pattern matcher where a value has multiple
+        # users): cross entropy loss with ignore index and a logsumexp of the same scaled logits,
+        # with logits requiring grad. Skipped on GPU Halide.
         # Reproducer for https://github.com/pytorch/pytorch/issues/129685
 
         def forward(float_1, view_1):
+            # [FUNCTION DOC] HELPER: Scale float_1 by 1/64 into logits, compute cross entropy
+            # against view_1 ignoring class 5, and the logsumexp over the last dim; return both in
+            # a list.
             logits = float_1 / 64.0
             loss = torch.nn.functional.cross_entropy(logits, view_1, ignore_index=5)
             logsumexp = logits.logsumexp(dim=-1)
@@ -17308,6 +20953,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(forward, (a, b))
 
     def test_isin_tensor_scalar(self):
+        # [FUNCTION DOC] isin with scalar and tensor combinations (scalar elements with tensor test
+        # elements, tensor elements with scalar test elements, tensor elements with a
+        # zero-dimensional test tensor) for both invert settings, resetting dynamo between cases;
+        # and a zero-dimensional float element with assume_unique.
         for invert in [True, False]:
             torch._dynamo.reset()
             elements = 1
@@ -17327,8 +20976,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(torch.isin, (elements, test_elements), {"assume_unique": True})
 
     def test_mul_index_expr(self):
+        # [FUNCTION DOC] Minified reproducer for issue 111884: an iota outer product (unsqueeze and
+        # multiply by itself), negation and division by 16 with no inputs.
         # Minified repro from https://github.com/pytorch/pytorch/issues/111884
         def forward():
+            # [FUNCTION DOC] HELPER: Build an int64 iota of 16, multiply its column form with the
+            # row form, negate and divide by 16.
             iota = torch.ops.prims.iota.default(
                 16,
                 start=0,
@@ -17349,7 +21002,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(forward, ())
 
     def test_flip_cat(self):
+        # [FUNCTION DOC] Concatenate two column vectors, view flat, slice 3 and flip, with inputs
+        # requiring grad.
         def forward(unsqueeze, unsqueeze_1):
+            # [FUNCTION DOC] HELPER: Concatenate on dim 1, view as 4 elements, slice the first 3
+            # and flip.
             cat_1 = torch.ops.aten.cat.default([unsqueeze, unsqueeze_1], 1)
             view = torch.ops.aten.view.default(cat_1, [4])
             slice_5 = torch.ops.aten.slice.Tensor(view, 0, 0, 3)
@@ -17362,6 +21019,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_weight_norm_bwd(self):
+        # [FUNCTION DOC] Weight norm backward (issue 140452): the eager kernel gives wrong results
+        # for non-contiguous inputs, so implicit fallbacks must require contiguous inputs. Runs
+        # forward and backward under half autocast for a model with a weight-normalized linear
+        # layer (odd in-features to trigger comprehensive padding), eager first, then compiled, and
+        # compares the parameter gradients with tolerance 1e-3.
         """
         Weight norm backward eager kernel does not support non-contiguous
         inputs. Eager kernel silently produces incorrect results when
@@ -17372,7 +21034,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         """
 
         class Repro(nn.Module):
+            # [CLASS DOC] HELPER: Module with a weight-normalized linear layer (in features to 2)
+            # followed by a linear layer (2 to 1).
             def __init__(self, in_features):
+                # [FUNCTION DOC] HELPER: Create the two layers.
                 super().__init__()
                 self.weight_normed_linear = nn.utils.parametrizations.weight_norm(
                     nn.Linear(in_features, out_features=2)
@@ -17380,9 +21045,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 self.linear = nn.Linear(in_features=2, out_features=1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the weight-normalized layer then the final layer.
                 return self.linear(self.weight_normed_linear(x))
 
         def f(m, x):
+            # [FUNCTION DOC] HELPER: Under half autocast run the model on x, sum to a loss, call
+            # backward and return the loss.
             with torch.amp.autocast(device_type=self.device, dtype=torch.half):
                 loss = m(x).sum()
                 loss.backward()
@@ -17412,12 +21080,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
     def test_chunk_recompiles(self):
+        # [FUNCTION DOC] Recompilation counts for chunk with 4 chunks: size 4 compiles once; then
+        # multiples of 4 cause one dynamic recompilation (total 2) with no more; size 11 (4 chunks,
+        # last larger than 1) no recompile; size 10 (last chunk size 1) triggers a recompile (3);
+        # size 9 (fewer outputs) another (4). Uses a frame-counting backend.
         def f(x):
+            # [FUNCTION DOC] HELPER: Return x split into 4 chunks.
             return x.chunk(4)
 
         # Runs f and its torch.compile-d version with a fresh 1D tensor
         # of a specific size, and checks that the result is correct.
         def run(size):
+            # [FUNCTION DOC] HELPER: Create a random vector of the size, run eager and compiled
+            # chunk and compare the results.
             input = torch.randn(size)
             expected_out = f(input)
             actual_out = optf(input)
@@ -17459,7 +21134,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @dynamo_config.patch(error_on_recompile=True)
     def test_no_specization_over_symbolic_value(self):
+        # [FUNCTION DOC] With error on recompile enabled, a dynamic compiled function using a
+        # symbolic size in a full tensor must not specialize on the size: two different sizes use
+        # one compilation and match eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Create a one-element tensor filled with the first dim size and
+            # add it to x.
             s0 = x.shape[0]
             y = torch.full((1,), s0)
             return x + y
@@ -17477,9 +21157,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(res2, ref2)
 
     def test_conv_shape_check(self):
+        # [FUNCTION DOC] Regression for issue 144013: transposed convolution (1D, 2D, 3D) with
+        # padding larger than allowed on a 1-sized input followed by sigmoid must raise a
+        # RuntimeError saying output size is too small, both in eager and compiled.
         # https://github.com/pytorch/pytorch/issues/144013
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a transposed convolution of the given dimensionality
+            # (1 to 1 channels, kernel 2, padding 1) followed by sigmoid.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Create the transposed convolution layer for the
+                # dimensionality.
                 super().__init__()
                 conv_t_cls = eval(f"torch.nn.ConvTranspose{dim}d")
                 self.conv_t = conv_t_cls(
@@ -17487,6 +21174,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the transposed convolution then sigmoid.
                 x = self.conv_t(x)
                 x = torch.sigmoid(x)  # trigger condition
                 return x
@@ -17503,11 +21191,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_cuda
     def test_conv_transpose_zero_size_output(self):
+        # [FUNCTION DOC] CUDA only: a transposed convolution with parameters giving a zero-sized
+        # output (stride 2, padding 2) followed by tanh must produce a 1 by 1 by 0 by 0 output in
+        # eager and compiled, equal to each other.
         # CUDA/HIP support zero-sized spatial outputs for conv_transpose by
         # short-circuiting before backend libraries see empty tensor descriptors.
         # This test ensures compiled mode matches eager behavior.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a ConvTranspose2d of 3 to 1 channels, kernel 2,
+            # stride 2, padding 2, no bias, followed by tanh.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the transposed convolution layer.
                 super().__init__()
                 # ConvTranspose2d: in=3, out=1, kernel=2, stride=2, padding=2
                 # Output size = (input_size - 1) * stride - 2 * padding + kernel_size
@@ -17517,6 +21211,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the transposed convolution then tanh.
                 x = self.conv_transpose(x)
                 x = torch.tanh(x)
                 return x
@@ -17534,6 +21229,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_cuda
     def test_lazy_conv_zero_in_channels_backward(self):
+        # [FUNCTION DOC] CUDA only: lazy convolution layers (1D, 2D, 3D) given an input with zero
+        # channels; compiled output has zero channels and the right spatial shape, and backward
+        # works: the weight has zero input channels, the gradients have matching shapes, and the
+        # bias gradient is zeros.
         for dim in (1, 2, 3):
             conv_cls = getattr(torch.nn, f"LazyConv{dim}d")
             model = conv_cls(2, kernel_size=1).eval().to(GPU_TYPE)
@@ -17552,6 +21251,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @config.patch(fallback_random=True)
     def test_mix_device_index(self):
+        # [FUNCTION DOC] Tiny repro of an internal issue where Inductor assumed the wrong output
+        # stride for indexing with a combination of arange and argsort indices on a channels-last
+        # view (random fallback on, GPU): compares compiled with eager and checks the generated
+        # code asserts the expected output size and stride (as a regular expression with symbolic
+        # sizes under dynamic shapes).
         """
         A tiny repro for this meta internal issue: https://fb.workplace.com/groups/1075192433118967/posts/1567334737238065
         whose root cause is Inductor having wrong assumption of index.Tensor's output
@@ -17564,6 +21268,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
         def f(image_latent):
+            # [FUNCTION DOC] HELPER: Pick three random-ordered entries per batch from the latent
+            # with advanced indexing and merge batch and index dims with a view.
             indices = torch.argsort(torch.rand(2, 12), dim=-1)
 
             tar_latent = image_latent[torch.arange(2).unsqueeze(-1), indices[:, :3]]
@@ -17604,7 +21310,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             ).run(code)
 
     def test_lite_mode_fallback(self):
+        # [FUNCTION DOC] Lite compile mode keeps aten ops: the compiled sin and cos functions call
+        # the aten ops (or dispatcher calls for cpp wrapper) and, outside cpp wrapper, have no
+        # triton kernel runs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Return cos of sin of x.
             z = x.sin()
             return z.cos()
 
@@ -17626,10 +21336,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     # skip cpu test since rms norm is always decomposed on cpu
     def test_lite_mode_not_decompose(self):
+        # [FUNCTION DOC] Lite mode does not decompose the fused RMS norm op: the forward code (and
+        # the forward graph when gradients are required) keeps the aten fused RMS norm call (or its
+        # AOTI shim for cpp wrapper) and the backward case yields two generated codes. GPU only.
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
 
         def f(x, shape):
+            # [FUNCTION DOC] HELPER: Add one, apply the aten fused rms norm without weights and
+            # return the sum of its first two outputs.
             y = x + 1
             z = torch.ops.aten._fused_rms_norm(y, shape, None, None)
             return z[0] + z[1]
@@ -17656,15 +21371,22 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             FileCheck().check("torch.ops.aten._fused_rms_norm.default(").run(codes[0])
 
     def test_lite_regional_compile_flex_attention(self):
+        # [FUNCTION DOC] Lite mode regional compilation: a function with a region annotated for
+        # compilation by inductor containing flex attention with a block mask and a squared score
+        # modifier; running forward and backward must call the inductor compilation twice (two
+        # generated codes). GPU only.
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
 
         from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
         def _squared(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Score modifier squaring the score.
             return score * score
 
         def mask_mod(b, h, q, k):
+            # [FUNCTION DOC] HELPER: Mask modifier allowing all positions with non-negative query
+            # index.
             return q >= 0
 
         a = 12
@@ -17674,6 +21396,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply sin, then flex attention under a compile-with-inductor
+            # annotation using the block mask and squared score, then cos.
             x = torch.sin(x)
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 x = flex_attention(x, x, x, block_mask=block_mask, score_mod=_squared)
@@ -17704,12 +21428,18 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         "codegen invoke_subgraph is not implemented for cpp wrapper",
     )
     def test_lite_regional_compile_invoke_subgraph(self):
+        # [FUNCTION DOC] Lite mode regional compilation of a nested compile region (invoke
+        # subgraph) under an annotation: checks custom metadata propagation; forward and backward
+        # yield two generated codes. Skipped for cpp wrapper.
         # Checks that get_attr nodes custom metadata is propagated
         @torch.compiler.nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Nested compile region function computing sin of x.
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Add one, call the region function under an annotation and
+            # apply sigmoid.
             x = x + 1
             with fx_traceback.annotate({"compile_with_inductor": 0}):
                 z = gn(x)
@@ -17726,6 +21456,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         "codegen triton_kernel_wrapper_functional is not implemented for cpp wrapper",
     )
     def test_lite_triton_kernel_wrapper_functional(self):
+        # [FUNCTION DOC] Lite mode with the functional triton kernel wrapper: calls a doubling
+        # triton kernel through the wrapper with cloned tensor arguments; the original output
+        # tensor must remain unmodified. GPU only; skipped for cpp wrapper.
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
 
@@ -17738,6 +21471,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         kernel_side_table.reset_table()
 
         def f(x, output):
+            # [FUNCTION DOC] HELPER: Call the functional triton kernel wrapper with the doubling
+            # kernel on x and output (cloned) and return the output tensor.
             out = triton_kernel_wrapper_functional(
                 kernel_idx=kernel_side_table.add_kernel(mul2_kernel),
                 constant_args_idx=kernel_side_table.add_constant_args(
@@ -17763,7 +21498,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertNotEqual(out, t2)
 
     def test_lite_regional_compile_repeated_blocks(self):
+        # [FUNCTION DOC] Lite mode regional compilation with a repeated block: a module calls the
+        # same function twice, each with an annotated region; forward and backward produce two
+        # generated codes.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Apply sin, then multiply with y and add one under an
+            # annotation, and apply sin again.
             sin = torch.sin(x)
 
             with fx_traceback.annotate({"compile_with_inductor": 0}):
@@ -17773,10 +21513,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             return torch.sin(add)
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module calling the helper function twice in a row.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Call the parent constructor.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Apply the helper function to x and y, then again to the
+                # result and y.
                 a = fn(x, y)
                 return fn(a, y)
 
@@ -17794,8 +21538,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(len(codes), 2)
 
     def test_lite_dynamic_shape_assertion(self):
+        # [FUNCTION DOC] Lite mode keeps assertions on unbacked symbolic sizes: a module
+        # concatenating the input with itself (unbacked first dim) and adding one inside an
+        # annotated region is compiled in lite mode; the generated code must contain the
+        # non-negativity check for the unbacked size and its error message (C++ or Python form
+        # depending on wrapper).
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that concatenates its input with itself on dim 0 and adds
+            # one to the result inside a compile-with-inductor annotated region.
             def forward(self, c):
+                # [FUNCTION DOC] HELPER: Concatenate c with itself on dim 0, add one under the
+                # annotation and return the sum.
                 d = torch.concat([c, c], dim=0)
                 with fx_traceback.annotate({"compile_with_inductor": "my_region"}):
                     d = d + 1
@@ -17824,8 +21577,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @lowering.force_fallback(aten.sort.default)
     def test_size_asserts_for_multi_output_fallback(self):
+        # [FUNCTION DOC] With the sort lowering forced to the eager fallback, the generated code
+        # for a multi-output op must assert the size, stride and dtype of both output buffers
+        # (float32 values and int64 indices).
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function returning the sort of x.
             return x.sort()
 
         x = torch.randn(16, 32, device=self.device)
@@ -17851,8 +21608,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @lowering.force_fallback(aten.add.Tensor)
     def test_no_redundant_assignment_single_output_fallback(self):
+        # [FUNCTION DOC] With the add lowering forced to the eager fallback, a single output
+        # fallback must produce correct values, call the aten add in code, contain a size/stride
+        # (and, on CUDA with alignment asserts, an alignment) assertion naming the op, and not
+        # contain a redundant direct buffer-to-buffer assignment.
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function returning x plus 2.
             return x + 2
 
         x = torch.randn(16, 32, device=self.device)
@@ -17878,6 +21640,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu_and_triton
     @config.patch(use_fast_math=True)
     def test_prepare_softmax_with_fast_math(self):
+        # [FUNCTION DOC] Fast math flag enabled: a prepare-softmax style max and log-sum-exp
+        # computation compiled on a GPU with triton matches eager within tolerance; shapes are
+        # large only when the performance flag is on, in which case a benchmark time is printed.
         """
         Measure on a A100, perf is 3.487ms v.s. 3.358ms without or with flushing to zero. A 4% speedup.
         """
@@ -17891,6 +21656,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         x = torch.randn(M, N, dtype=torch.bfloat16, device=GPU_TYPE)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Return the row max and the log of the sum of exp of values
+            # shifted by the row max (keepdim), without computing the full softmax.
             """
             Not calling softmax directly to generate kernel just for
             computation of max & sum.
@@ -17923,7 +21690,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_no_inputs(self):
+        # [FUNCTION DOC] With graph partitioning enabled, a function with no tensor inputs (seeds
+        # the RNG and creates random integers) compiles and runs.
         def foo():
+            # [FUNCTION DOC] HELPER: Seed the RNG with 3 and return a random integer vector of 5.
             torch.manual_seed(3)
             return torch.randint(0, 5, (5,))
 
@@ -17932,7 +21702,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_mutation_real_name(self):
+        # [FUNCTION DOC] Graph partition with a mutation through a view: a diagonal of a product is
+        # overwritten, a device copy forces a partition, and the result combines matmul, copied and
+        # diagonal values; compiled equals eager.
         def f(x, y, z, other):
+            # [FUNCTION DOC] HELPER: Multiply x and y, copy other into the diagonal of the product
+            # in place, round trip the diagonal through CPU, and return matmul with z plus the
+            # round trip plus the diagonal.
             mul = x * y
             diag = torch.diagonal(mul)
             diag.copy_(other)
@@ -17954,7 +21730,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_arange1(self):
+        # [FUNCTION DOC] Graph partition with arange whose step is a runtime argument (int and
+        # float steps) on CPU.
         def fn(step, device):
+            # [FUNCTION DOC] HELPER: Return an arange from 512 to -512 with the step on the device.
             return torch.arange(512, -512, step, device=device)
 
         compiled_fn = torch.compile(fn)
@@ -17968,7 +21747,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_arange2(self):
+        # [FUNCTION DOC] Graph partition with arange having float bounds and the dtype of the input
+        # (float32 and int64).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return an arange from 0.1 to 8.0001 step 1 with the dtype and
+            # device of x.
             return torch.arange(0.1, 8.0001, 1, dtype=x.dtype, device=x.device)
 
         make_arg = functools.partial(
@@ -17985,7 +21768,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_argmax(self):
+        # [FUNCTION DOC] Graph partition on a function that argmax-es zeros and averages as float.
         def fn():
+            # [FUNCTION DOC] HELPER: Return the mean of float argmax over dim 0 of zeros.
             a = torch.zeros([2, 2])
             b = a.argmax(0)
             return b.float().mean()
@@ -17995,7 +21780,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_both_scalars(self):
+        # [FUNCTION DOC] Graph partition with two Python scalar inputs through aten arithmetic ops.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return add, sub and mul of a and b in both orders.
             return (
                 aten.add(a, b),
                 aten.add(b, a),
@@ -18012,7 +21799,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @torch._inductor.config.patch("graph_partition", True)
     @config.patch(assume_aligned_inputs=False)
     def test_graph_partition_misaligned_input(self):
+        # [FUNCTION DOC] Graph partition with misaligned inputs: reduce-overhead dynamic
+        # compilation on strided views with different offsets, comparing outputs and base tensor
+        # gradients with eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return cos of x times sin of x.
             return x.cos() * x.sin()
 
         fn_c = torch.compile(fn, mode="reduce-overhead", dynamic=True)
@@ -18053,7 +21844,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_constant_tensor1(self):
+        # [FUNCTION DOC] Graph partition with a constant int32 tensor converted to float and
+        # scaled.
         def fn():
+            # [FUNCTION DOC] HELPER: Add an int32 zeros tensor to itself, convert to float32,
+            # multiply by 0.8.
             a = torch.zeros([1, 2], dtype=torch.int32)
             a = a + a
             b = a.to(dtype=torch.float32)
@@ -18065,7 +21860,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_constant_tensor2(self):
+        # [FUNCTION DOC] Graph partition with a constant tensor created from a list in the
+        # function.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return a constant tensor of even numbers plus x.
             return torch.tensor(list(range(2, 40, 2)), device=self.device) + x
 
         compiled_fn = torch.compile(fn)
@@ -18076,7 +21874,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_scalar_inputs(self):
+        # [FUNCTION DOC] Graph partition with Python integer inputs used in several division modes.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return seven division results of a by b with different
+            # scalings and rounding modes.
             return (
                 aten.div(a, b, rounding_mode=None),
                 aten.div(a * 0.5, b, rounding_mode=None),
@@ -18092,7 +21893,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_unbacked_symint_as_output(self):
+        # [FUNCTION DOC] Graph partition where an unbacked symbolic int (from repeat_interleave
+        # with a dynamic repeats tensor) is used for index_select; compiled equals eager.
         def nested(x, repeats):
+            # [FUNCTION DOC] HELPER: Repeat the arange of repeats' length by repeats and select
+            # those rows of x.
             rank = torch.arange(repeats.numel(), device=x.device)
             index = rank.repeat_interleave(repeats, dim=0)
             return torch.index_select(x, index=index, dim=0)
@@ -18111,6 +21916,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_refcount(self):
+        # [FUNCTION DOC] Graph partition reference counting: with and without cuda graphs config,
+        # the compiled graph must free its inputs before the matrix multiply (checked in a dispatch
+        # mode after garbage collection), also on an extra run with more inputs, ending with an
+        # empty input list.
         contexts = [
             contextlib.nullcontext,
             lambda: torch._inductor.config.patch({"triton.cudagraphs": True}),
@@ -18125,6 +21934,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 inp_refs = [weakref.ref(inp) for inp in inps]
 
                 def fn(x, y):
+                    # [FUNCTION DOC] HELPER: Return the square of the matrix product (x plus y
+                    # times itself) in a tuple.
                     a = x + y
                     return (a @ a,)
 
@@ -18134,7 +21945,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 matmul_seen = False
 
                 class TestRefMode(TorchDispatchMode):
+                    # [CLASS DOC] HELPER: Dispatch mode that, at the out variant of mm, records
+                    # that mm was seen and raises AssertionError if the input list is not empty or
+                    # either input is still alive; it runs garbage collection before every op.
                     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                        # [FUNCTION DOC] HELPER: Dispatch hook: collect garbage, check reference
+                        # state when the op is mm out (raising AssertionError on failure) and
+                        # execute the op.
                         kwargs = kwargs if kwargs else {}
 
                         nonlocal inps
@@ -18180,10 +21997,18 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @torch._inductor.config.patch("graph_partition", True)
     def test_graph_partition_pad_dynamic(self):
+        # [FUNCTION DOC] Graph partition with same-style padding of an image with dynamic shapes:
+        # computes padding from sizes, kernel, stride and dilation and pads; compiled equals eager
+        # exactly.
         def get_same_padding(x: int, k: int, s: int, d: int):
+            # [FUNCTION DOC] HELPER: Compute the total padding needed for the same-style padding of
+            # size x with kernel k, stride s and dilation d; never negative.
             return max((math.ceil(x / s) - 1) * s + (k - 1) * d + 1 - x, 0)
 
         def pad_same(x, k, s, d=(1, 1), value=0):
+            # [FUNCTION DOC] HELPER: Pad the last two dims of x so the output matches same padding
+            # for kernel k, stride s and dilation d, only when padding is needed, using the given
+            # fill value.
             ih, iw = x.size()[-2:]
             pad_h, pad_w = (
                 get_same_padding(ih, k[0], s[0], d[0]),
@@ -18206,6 +22031,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_halide  # only 32-bit indexing
     @largeTensorTest("16GB", inductor=True)
     def test_split_reduction_with_int64_size(self):
+        # [FUNCTION DOC] Mean of a 30000 by 100000 float tensor (more than int32 range elements)
+        # compared with eager directly via allclose to avoid the memory cost of the common helper;
+        # checks split reductions with int64 sizes. Needs 16GB; skipped on Halide, triton CPU and
+        # CPU.
         if torch._inductor.config.cpu_backend == "triton":
             raise unittest.SkipTest(
                 "Fail for triton cpu backend with error: https://gist.github.com/shunting314/a873fb32b6b7b5a437f44280ae86839f"
@@ -18241,7 +22070,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         "https://github.com/pytorch/pytorch/issues/151512",
     )
     def test_remove_noop_view_default(self):
+        # [FUNCTION DOC] No-op reshape after transpose is removed: the post-grad graph is compared
+        # to an expected text containing just the permute, for static and dynamic leading
+        # dimension. Skipped on Linux, macOS, ASAN, ROCm and slow builds.
         def f(x):
+            # [FUNCTION DOC] HELPER: Transpose dims 1 and 2 and reshape back to the same shape.
             batch_size = x.shape[0]
             x = x.transpose(1, 2)  # (batch_size, 2, 3)
             x = x.reshape(batch_size, 2, 3)  # noop
@@ -18287,7 +22120,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "f32[s77, 3, 2][6, 2, 1]{str(x.dev
         "https://github.com/pytorch/pytorch/issues/151540",
     )
     def test_remove_noop_view_dtype(self):
+        # [FUNCTION DOC] No-op dtype view (uint8 to uint8) after transpose is removed from the
+        # post-grad graph, with all dims dynamic; compared to expected graph text. Skipped on
+        # Linux, macOS, ASAN, ROCm and slow builds.
         def f(x):
+            # [FUNCTION DOC] HELPER: Transpose dims 1 and 2 and view as uint8.
             x = x.transpose(1, 2)  # (batch_size, 2, 3)
             x = x.view(torch.uint8)  # noop
             return x
@@ -18313,9 +22150,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch("min_num_split", 256)
     def test_split_reduction_dynamic_shape(self):
+        # [FUNCTION DOC] Split reduction with a dynamic first dimension: an outer sum over dim 0 of
+        # a 4096 by 512 tensor marked dynamic with a minimum split count of 256; compiled matches
+        # eager within tolerance; with the performance flag a larger input is also benchmarked.
         from torch._dynamo.decorators import mark_dynamic
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum x over dim 0 (an outer reduction).
             # outer reduction
             return x.sum(dim=0)
 
@@ -18339,6 +22180,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_halide
     @expectedFailureCodegenDynamic
     def test_special_polygamma(self):
+        # [FUNCTION DOC] Special polygamma for orders 0, 1 and 2 of a zero-dimensional float32
+        # value. Skipped on Halide; expected failure of the dynamic codegen check.
         fn = torch.special.polygamma
         x = torch.tensor(2, dtype=torch.float32)
         self.common(fn, (0, x))
@@ -18349,6 +22192,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_halide
     @config.patch({"freezing": True})
     def test_dont_constant_fold(self):
+        # [FUNCTION DOC] Constant folding exclusions in freezing mode: for a module that multiplies
+        # two constant tensors and adds the input, once with multiplication registered as not to be
+        # folded (generated C++ kernel fuses add and mul) and once without (a fused add only);
+        # outputs equal eager. Skipped for triton and Halide.
         from torch._inductor.constant_folding import (
             add_dont_constant_fold,
             clear_dont_constant_fold,
@@ -18357,12 +22204,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         m = 5
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two random constant vectors of length 5; forward
+            # returns their product plus the input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the two constant tensors.
                 super().__init__()
                 self.w = torch.randn(m)
                 self.s = torch.randn(m)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the product of the two constants plus x.
                 return self.w * self.s + x
 
         x = torch.rand(m)
@@ -18382,13 +22233,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(refe_out, test_out)
 
     def test_triton_kernel_bool_param(self):
+        # [FUNCTION DOC] A module calling a triton kernel that takes a boolean parameter (adding a
+        # tensor to itself) from inside forward; checked with the common helper. GPU only.
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
 
         from torch.testing._internal.triton_utils import add_kernel_with_boolean_param
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward launches the boolean-parameter add kernel on
+            # x with the add flag set and returns the output.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Create a zeros output, launch the kernel with add_xy true
+                # and block size 1, and return the output.
                 out = torch.zeros_like(x)
                 add_kernel_with_boolean_param[1,](
                     in_ptr0=x,
@@ -18405,6 +22262,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu_and_triton
     def test_triton_kernel_bool_tensor_arg(self):
+        # [FUNCTION DOC] A module calling a triton kernel with a boolean tensor argument as a mask
+        # to add two tensors; masked halves selected by the mask. GPU only.
         if self.device != GPU_TYPE or self.device == "mps":
             raise unittest.SkipTest("requires GPU")
 
@@ -18413,7 +22272,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         )
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward launches the masked add kernel with a
+            # boolean mask tensor and returns the output.
             def forward(self, x, y, mask):
+                # [FUNCTION DOC] HELPER: Create a zeros output and launch the masked add kernel
+                # over the elements with block size 1024; return the output.
                 out = torch.zeros_like(x)
                 n = x.numel()
                 masked_add_kernel_with_bool_tensor[(n,)](
@@ -18437,7 +22300,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu_and_triton
     @parametrize("use_cat", [True, False])
     def test_copy_non_blocking_is_pinned(self, use_cat):
+        # [FUNCTION DOC] Parametrized by concatenation: device-to-host copies marked non blocking
+        # with an event recorded per copy are compiled; the compiled outputs equal eager and the
+        # profiler shows no pageable memory copy (copies target pinned memory). Skipped on Navi
+        # ROCm; needs GPU and triton.
         def f(a_list):
+            # [FUNCTION DOC] HELPER: Copy each tensor of the list to CPU non-blocking, record an
+            # event after each, synchronize all events and return either their concatenation or the
+            # list.
             a_cpu_list = []
             a_to_cpu_event_list = []
 
@@ -18483,7 +22353,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu_and_triton
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_non_blocking_d2h_event_sync(self):
+        # [FUNCTION DOC] A non-blocking device to host copy whose value is read as a Python scalar:
+        # the generated Python wrapper must create an event, record it and synchronize it. Scalar
+        # outputs captured, dynamic shapes; skipped for cpp wrapper and Halide; GPU triton only.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum of absolute values copied non-blocking to CPU and read as
+            # a scalar; return x clamped between 0 and that scalar.
             s = x.abs().sum().to("cpu", non_blocking=True).item()
             return torch.clamp(x, 0.0, s)
 
@@ -18502,7 +22377,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         "cpp_wrapper samples will lead to invalid indexing",
     )
     def test_inductor_triton_bucketize_respects_masking(self):
+        # [FUNCTION DOC] Indexing derived from searchsorted of arange values into a cumulative sum
+        # must respect masking in the generated triton bucketize code: result equals the reference
+        # repeat-interleave-style computation. Skipped for cpp wrapper.
         def fn(inp, repeats, output_size):
+            # [FUNCTION DOC] HELPER: Find, with searchsorted on the cumulative repeats, the source
+            # row for each output position and select those rows of inp.
             # return torch.repeat_interleave(inp, repeats, dim=0, output_size=output_size)
             idx = torch.searchsorted(
                 repeats.cumsum(0),
@@ -18524,8 +22404,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @parametrize("dtype", [torch.int32, torch.int64])
     @parametrize("nd", [1, 2])
     def test_repeat_interleave_Tensor_decomp(self, dtype, nd):
+        # [FUNCTION DOC] Parametrized over index dtype and rank: repeat_interleave with a tensor of
+        # repeats and fixed output size is lowered by a decomposition (on devices other than MPS)
+        # so the generated code no longer contains the aten op; outputs equal eager (issue 147160).
+        # Skipped if autotune at compile time is enabled.
         # https://github.com/pytorch/pytorch/issues/147160
         def f(input, repeats):
+            # [FUNCTION DOC] HELPER: Return repeat_interleave of input by repeats along dim 0 with
+            # output size 3, plus 1.
             return torch.repeat_interleave(input, repeats, dim=0, output_size=3) + 1
 
         input = torch.tensor([[1, 2], [3, 4]], dtype=dtype, device=self.device)
@@ -18544,6 +22430,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @staticmethod
     def _is_triggering_buffer_reuse(fn, *inputs):
+        # [FUNCTION DOC] HELPER: Static method that compiles and runs fn with buffer reuse allowed
+        # and disallowed, normalizes the AOT identifier in the generated code and returns whether
+        # the two generated code strings differ.
         with config.patch(allow_buffer_reuse=True):
             _, (code_allowed,) = run_and_get_code(fn, *inputs)
         with config.patch(allow_buffer_reuse=False):
@@ -18561,8 +22450,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         }
     )
     def test_allow_reuse_disable_if_exceed_peak(self):
+        # [FUNCTION DOC] When a node is the peak memory user (a matrix product of the centered
+        # input with itself), buffer reuse across it must not trigger, so allowing reuse generates
+        # the same code. Uses the ATEN GEMM backend and no native matmul; skipped when running
+        # under TorchInductor testing.
         @torch.compile
         def fn(inp):  # 1*N^2
+            # [FUNCTION DOC] HELPER: Compute a mean, a centered square, a matrix product of it with
+            # itself and a mean of the product.
             a = inp.mean(-1)  # 1*N^2 + N
             b = (inp - a) ** 2  # 2*N^2 + N
             c = b @ b  # 3*N^2 (!!) since this is the peak, can not reuse across
@@ -18573,11 +22468,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertFalse(CommonTemplate._is_triggering_buffer_reuse(fn, inp))
 
     def test_allow_reuse_active_if_under_peak(self):
+        # [FUNCTION DOC] When memory use stays under the peak, buffer reuse is active: a chain of
+        # matmuls of log-sum-exp centered squares generates different code with reuse allowed.
         def g(inp):
+            # [FUNCTION DOC] HELPER: Return the square of the input minus its logsumexp over the
+            # last dim.
             return (inp - torch.logsumexp(inp, -1)) ** 2
 
         @torch.compile
         def fn(m, inp):
+            # [FUNCTION DOC] HELPER: Five times multiply m by the shifted-and-squared value,
+            # feeding the result back.
             inp = m @ g(inp)
             inp = m @ g(inp)
             inp = m @ g(inp)
@@ -18591,7 +22492,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu_and_triton
     def test_cpu_scalar_with_gpu_tensor(self):
+        # [FUNCTION DOC] CPU scalar element of a CPU tensor added to a GPU tensor: matches eager
+        # with exactly one generated kernel. GPU and triton only.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus the first element of b.
             return a + b[0]
 
         a = torch.rand(20, device=GPU_TYPE)
@@ -18607,7 +22511,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu_and_triton
     @torch._inductor.config.patch(cpp_wrapper=True)
     def test_cpu_scalar_with_gpu_tensor_cpp(self):
+        # [FUNCTION DOC] Same CPU scalar and GPU tensor addition with the C++ wrapper; result
+        # matches eager. Skipped on ROCm.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus the first element of b.
             return a + b[0]
 
         a = torch.rand(20, device=GPU_TYPE)
@@ -18619,7 +22526,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu_and_triton
     def test_cpu_scalar_with_gpu_tensor_dynamic(self):
+        # [FUNCTION DOC] Same CPU scalar and GPU tensor addition with dynamic shapes; matches
+        # eager.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus the first element of b.
             return a + b[0]
 
         a = torch.rand(20, device=GPU_TYPE)
@@ -18630,7 +22540,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(eager, compiled)
 
     def test_cpu_scalar_with_cpu_tensor(self):
+        # [FUNCTION DOC] Indexing a CPU tensor element and adding to another CPU tensor: matches
+        # eager with one generated kernel.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus the first element of b.
             return a + b[0]
 
         a = torch.rand(20, device="cpu")
@@ -18644,7 +22557,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu_and_triton
     def test_gpu_scalar_with_gpu_tensor(self):
+        # [FUNCTION DOC] First element of a GPU tensor added to another GPU tensor: matches eager
+        # with one generated kernel. GPU and triton only.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus the first element of b.
             return a + b[0]
 
         a = torch.rand(20, device=GPU_TYPE)
@@ -18658,7 +22574,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu_and_triton
     def test_cpu_tensor_with_gpu_tensor(self):
+        # [FUNCTION DOC] Adding a GPU tensor and a CPU tensor of the same size must raise a
+        # RuntimeError when compiled. GPU and triton only.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus b.
             return a + b
 
         a = torch.rand(20, device=GPU_TYPE)
@@ -18668,7 +22587,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             compiled = torch.compile(fn, backend="inductor")(a, b)
 
     def test_cpu_tensor_with_cpu_tensor(self):
+        # [FUNCTION DOC] Adding two CPU tensors compiled matches eager.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus b.
             return a + b
 
         a = torch.rand(20, device="cpu")
@@ -18679,7 +22600,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(eager, compiled)
 
     def test_cpu_scalar_with_cpu_scalar(self):
+        # [FUNCTION DOC] Adding elements taken from two CPU tensors matches eager.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the first element of a plus the first element of b.
             return a[0] + b[0]
 
         a = torch.rand(20, device="cpu")
@@ -18691,7 +22614,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu_and_triton
     def test_gpu_scalar_with_cpu_tensor(self):
+        # [FUNCTION DOC] A GPU scalar element added to a CPU tensor must raise a RuntimeError when
+        # compiled. GPU and triton only.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return the first element of a plus b.
             return a[0] + b
 
         a = torch.rand(20, device=GPU_TYPE)
@@ -18703,7 +22629,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu_and_triton
     @config.patch(emulate_precision_casts=True)
     def test_emulate_precision_triton_fp_fusion(self):
+        # [FUNCTION DOC] With precision-emulating casts config on, a float16 multiply-add compiled
+        # on GPU disables fused multiply-add in the triton config (code contains the fp fusion
+        # disabled option) and output equals eager exactly.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Return 2.001 times a plus b.
             return 2.001 * a + b
 
         a = torch.full([256], 0.5001, device=GPU_TYPE, dtype=torch.float16)
@@ -18717,7 +22647,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu_and_triton
     @config.patch(runtime_triton_nan_asserts=True)
     def test_nan_assert_inside_triton_kernel(self):
+        # [FUNCTION DOC] With runtime triton NaN assertions on, the generated kernel includes the
+        # NaN or infinity assertion message and the output equals eager. GPU triton only.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Subtract one and replace NaN values by 3.14.
             x = x - 1
             # Uncomment the following line can trigger the failure of
             # the device size assertion
@@ -18736,6 +22669,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     )
     @requires_gpu_and_triton
     def test_repeat_interleave_decomposition_has_clamp(self):
+        # [FUNCTION DOC] The repeat_interleave decomposition with a large output size on GPU must
+        # clamp its indices: result has the expected size and all values lie in range, and the code
+        # uses the triton minimum. Skipped under dynamic shapes and when autotune at compile time
+        # is on.
         repeat = torch.ones(2560, dtype=torch.int64, device=GPU_TYPE)
         output_size = 505450
         data = torch.arange(2560, device=GPU_TYPE)
@@ -18747,6 +22684,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn(repeat, output_size, data):
+            # [FUNCTION DOC] HELPER: Compute the repeat_interleave indices from repeat with a fixed
+            # output size and index data with them.
             indices = torch.ops.aten.repeat_interleave.Tensor(
                 repeat, output_size=output_size
             )
@@ -18767,6 +22706,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(implicit_fallbacks=True)
     def test_custom_op_dce(self):
+        # [FUNCTION DOC] Custom ops that log a string and return a dummy tensor must not be removed
+        # by dead code elimination. Case one: an op declared as mutating unknown state and marked
+        # as having side effects, called in a compiled function with its result unused. Case two:
+        # an op with no mutated arguments, also marked as side-effecting. In both cases the test
+        # asserts the log is non-empty (the length check passes for any non-zero length). Uses
+        # implicit fallbacks and a scoped library.
         with torch.library._scoped_library("mylib", "FRAGMENT") as m:
             # CASE 1: The op should get wrapped with auto_functionalized, and
             # FX's DCE should not remove it because this op is registered as
@@ -18779,14 +22724,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 mutates_args="unknown",
             )
             def my_logger1(s: str, t: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Custom op implementation appending the string to the first
+                # log and returning a one-element zeros tensor.
                 log1.append(s)
                 return torch.zeros(1)
 
             @my_logger1.register_fake
             def my_logger1(s, t) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Fake implementation returning a one-element zeros tensor.
                 return torch.zeros(1)
 
             def foo(x):
+                # [FUNCTION DOC] HELPER: Create a scalar tensor from the first dim size, call the
+                # logging op on it (result unused), and return x plus x.
                 b = torch.scalar_tensor(x.shape[0])
                 torch.ops.mylib.my_logger1("moo", b)
                 return x + x
@@ -18804,14 +22754,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 mutates_args=(),
             )
             def my_logger2(s: str, t: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Custom op implementation appending the string to the
+                # second log and returning a one-element zeros tensor.
                 log2.append(s)
                 return torch.zeros(1)
 
             @my_logger2.register_fake
             def my_logger2(s, t) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Fake implementation returning a one-element zeros tensor.
                 return torch.zeros(1)
 
             def foo(x):
+                # [FUNCTION DOC] HELPER: Create a scalar tensor from the first dim size, call the
+                # second logging op on it (result unused), and return x plus x.
                 b = torch.scalar_tensor(x.shape[0])
                 torch.ops.mylib.my_logger2("moo", b)
                 return x + x
@@ -18821,6 +22776,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertTrue(len(log2), 1)
 
     def test_weight_norm_conv2d(self):
+        # [FUNCTION DOC] Fix for issue 165749: weight-normalized 2D convolution with 65 output
+        # channels: compiled forward output and parameter gradients (with the same upstream
+        # gradient) must match eager within 1e-3.
         """
         Verify fix for https://github.com/pytorch/pytorch/issues/165749
         """
@@ -18841,6 +22799,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @xfail_if_mps  # MPS codegen does not emit ReductionHint.OUTER
     def test_inner_reduction_detection(self):
+        # [FUNCTION DOC] An outer-style reduction (sum over dims 0 and 1 of a 100000 by 1 by 256
+        # tensor) must be hinted as an outer reduction and not inner in the generated triton code.
+        # Skipped on CPU; expected failure on MPS.
         if self.device == "cpu":
             self.skipTest("Skip for CPU device")
 
@@ -18848,6 +22809,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum x over dims 0 and 1.
             return x.sum(dim=(0, 1))
 
         code = run_and_get_triton_code(f, x)
@@ -18857,6 +22819,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @config.patch(force_disable_caches=True)
     @xfail_if_mps  # MPS codegen does not emit ReductionHint.OUTER
     def test_broadcasted_inner_reduction_detection(self):
+        # [FUNCTION DOC] Same reduction hint check for a tensor produced by expanding a broadcast
+        # dimension (stride zero): hinted outer, not inner. Caches disabled; skipped on CPU;
+        # expected failure on MPS.
         if self.device == "cpu":
             self.skipTest("Skip for CPU device")
 
@@ -18864,6 +22829,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def f(x):
+            # [FUNCTION DOC] HELPER: Sum x over dims 0 and 1.
             return x.sum(dim=(0, 1))
 
         code = run_and_get_triton_code(f, x)
@@ -18873,7 +22839,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_halide
     @requires_gpu_and_triton
     def test_triton_argmin_argmax_transpose_logical_index(self):
+        # [FUNCTION DOC] Argmin and argmax with logical (not physical) indexing on GPU for
+        # transposed, permuted, sliced and column-major inputs and several dtypes and shapes,
+        # compared via the common helper (the test redefines its inner function several times for
+        # each case). Skipped on Halide; needs GPU and triton.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Apply tan in place, transpose and return argmin of the result.
             x.tan_()
             x = x.t()
             return x.argmin()
@@ -18881,6 +22852,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn(6, 4, device=GPU_TYPE),))
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return argmin and argmax of the transposed input.
             return (x.t().argmin(), x.t().argmax())
 
         self.common(fn, (torch.randn(6, 4, device=GPU_TYPE),))
@@ -18888,6 +22860,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn(8, 6, device=GPU_TYPE, dtype=torch.float16),))
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Permute dims to (2, 0, 1) and return argmin and argmax of the
+            # result.
             # Permute: (A, B, C) -> (C, A, B)
             permuted = x.permute(2, 0, 1)
             return (permuted.argmin(), permuted.argmax())
@@ -18895,6 +22869,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.common(fn, (torch.randn(4, 6, 8, device=GPU_TYPE),))
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Slice the first 10 columns (a view with memory gaps) and
+            # return its argmin and argmax.
             # sliced tensor with gaps in memory
             sliced = x[:, :10]
             return (sliced.argmin(), sliced.argmax())
@@ -18903,6 +22879,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         # Test column major passed as input
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return argmin and argmax of x.
             return (x.argmin(), x.argmax())
 
         self.common(fn, (torch.randn(6, 4, device=GPU_TYPE).t().contiguous().t(),))
@@ -18910,7 +22887,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skip_if_halide
     @requires_gpu_and_triton
     def test_unbacked_float_item(self):
+        # [FUNCTION DOC] clamp with an upper bound read from a float tensor through item (unbacked
+        # float scalar). Skipped on Halide; needs GPU and triton.
         def fn(x, max_val):
+            # [FUNCTION DOC] HELPER: Clamp x between 0 and the scalar value of max_val.
             return torch.clamp(x, 0, max_val.item())
 
         self.common(
@@ -18923,7 +22903,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @config.patch(combo_kernels=True)
     def test_combo_kernel_filter_cpu(self):
+        # [FUNCTION DOC] Combo kernels filter: two pointwise ops and two reductions; on CPU combo
+        # kernels are skipped so four kernels are generated; on CUDA they are fused into two.
+        # Output equals eager.
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Return a times 4, b plus 8, the last-dim min of c and the
+            # last-dim max of d.
             a = a * 4
             b = b + 8
             return a, b, c.min(-1), d.max(-1)
@@ -18952,7 +22937,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @config.patch(combo_kernels=True)
     @torch._dynamo.config.patch(assume_static_by_default=False)
     def test_combo_kernel_store_mask(self):
+        # [FUNCTION DOC] Combo kernel with two mean reductions of the same input under dynamic
+        # shapes: generates one kernel and its store is guarded by the x mask. GPU and triton only.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the mean of x and the keepdim mean over dim -2.
             return (
                 x.mean(),
                 torch.mean(x, -2, keepdim=True),
@@ -18971,6 +22959,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_cuda_and_triton
     @config.patch({"emulate_precision_casts": True})
     def test_addcmul_fma_bitwise_equal(self):
+        # [FUNCTION DOC] With precision-emulating casts, addcmul (value 1 and value 2.5) must be
+        # bitwise equal to eager (small tolerance on ROCm). Expected failure on Triton CPU; CUDA
+        # and triton only.
         """Test that addcmul with FMA lowering produces bitwise equal results to eager."""
         self_tensor = torch.randn(64, 64, device=GPU_TYPE)
         tensor1 = torch.randn(64, 64, device=GPU_TYPE)
@@ -18986,6 +22977,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled addcmul of s, t1 and t2.
             return torch.addcmul(s, t1, t2)
 
         compiled_result = fn(self_tensor, tensor1, tensor2)
@@ -18996,6 +22988,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn2(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled addcmul of s, t1 and t2 with value 2.5.
             return torch.addcmul(s, t1, t2, value=2.5)
 
         compiled_result2 = fn2(self_tensor, tensor1, tensor2)
@@ -19005,6 +22998,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_cuda_and_triton
     @config.patch({"emulate_precision_casts": True})
     def test_addcmul_fma_uses_fma_instruction(self):
+        # [FUNCTION DOC] With precision-emulating casts, addcmul with value 2 compiles to code that
+        # uses the fused multiply-add language op. Expected failure on Triton CPU; CUDA only.
         """Test that addcmul generates code using FMA instruction."""
         self_tensor = torch.randn(64, 64, device=GPU_TYPE)
         tensor1 = torch.randn(64, 64, device=GPU_TYPE)
@@ -19012,6 +23007,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled addcmul of s, t1 and t2 with value 2.0.
             return torch.addcmul(s, t1, t2, value=2.0)
 
         _, code = run_and_get_code(fn, self_tensor, tensor1, tensor2)
@@ -19021,6 +23017,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @xfail_if_triton_cpu
     @requires_cuda_and_triton
     def test_addcdiv_fma_bitwise_equal(self):
+        # [FUNCTION DOC] Compiled addcdiv matches eager bitwise for value 1 and value 2 (both
+        # branches of the lowering). Divisor kept away from zero. Expected failure on Triton CPU;
+        # CUDA only.
         """Compiled addcdiv matches eager bitwise for both value==1 and value!=1 branches."""
         s = torch.randn(64, 64, device=GPU_TYPE)
         t1 = torch.randn(64, 64, device=GPU_TYPE)
@@ -19030,6 +23029,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
             @torch.compile(fullgraph=True)
             def fn(s, t1, t2, v=value):
+                # [FUNCTION DOC] HELPER: Compiled addcdiv with the enclosing value bound as default
+                # argument v.
                 return torch.addcdiv(s, t1, t2, value=v)
 
             self.assertEqual(fn(s, t1, t2), torch.addcdiv(s, t1, t2, value=value))
@@ -19037,6 +23038,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @xfail_if_triton_cpu
     @requires_cuda_and_triton
     def test_addcdiv_fma_uses_fma_and_div_rn(self):
+        # [FUNCTION DOC] addcdiv re-fusion emits the fused multiply-add op and the round-to-nearest
+        # division op in the generated code; the inductor counter for addcdiv fusion is one (unless
+        # subprocess compile mode, where counters are not visible). Resets dynamo and counters
+        # first.
         """Test that addcdiv re-fusion emits tl.fma and triton.language.div_rn."""
         from torch._dynamo.utils import counters
 
@@ -19050,6 +23055,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile(fullgraph=True)
         def fn(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled addcdiv of s, t1 and t2 with value 2.0.
             return torch.addcdiv(s, t1, t2, value=2.0)
 
         _, code = run_and_get_code(fn, self_tensor, tensor1, tensor2)
@@ -19066,6 +23072,10 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_cuda_and_triton
     @config.patch({"emulate_precision_casts": True})
     def test_addcmul_type_promotion(self):
+        # [FUNCTION DOC] addcmul type promotion with precision emulation: int32 base with float32
+        # operands, float16 base with float32, all float16 with a value, a zero-dimensional float32
+        # scalar tensor operand, and a float64 scalar tensor operand with float32 tensors; compiled
+        # dtype and values equal eager in every case. CUDA and triton only.
         """Test that addcmul correctly promotes types when inputs have different dtypes."""
         # Test int + float promotion
         self_int = torch.randint(0, 10, (32, 32), device=GPU_TYPE, dtype=torch.int32)
@@ -19076,6 +23086,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled addcmul of s, t1 and t2.
             return torch.addcmul(s, t1, t2)
 
         compiled_result = fn(self_int, tensor1_float, tensor2_float)
@@ -19091,6 +23102,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn2(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled addcmul of s, t1 and t2.
             return torch.addcmul(s, t1, t2)
 
         compiled_result2 = fn2(self_fp16, tensor1_fp32, tensor2_fp32)
@@ -19108,6 +23120,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn3(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled addcmul of s, t1 and t2 with value 2.0.
             return torch.addcmul(s, t1, t2, value=2.0)
 
         compiled_result3 = fn3(self_fp16_2, tensor1_fp16, tensor2_fp16)
@@ -19123,6 +23136,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn4(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled addcmul of s, t1 and t2.
             return torch.addcmul(s, t1, t2)
 
         compiled_result4 = fn4(self_tensor, tensor1_scalar, tensor2_tensor)
@@ -19140,6 +23154,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
         @torch.compile
         def fn5(s, t1, t2):
+            # [FUNCTION DOC] HELPER: Compiled addcmul of s, t1 and t2 with value 0.5.
             return torch.addcmul(s, t1, t2, value=0.5)
 
         compiled_result5 = fn5(self_fp32, tensor1_fp64_scalar, tensor2_fp32)
@@ -19151,7 +23166,13 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @skipCUDAIf(not SM90OrLater or TEST_WITH_ROCM, "PDL requires NVIDIA sm90+")
     @config.patch({"triton.enable_pdl": True})
     def test_pdl_mutation(self):
+        # [FUNCTION DOC] Programmatic dependent launch (PDL) with a mutation: a kernel computing a
+        # power and a kernel copying into a buffer; the generated code must show launch PDL on both
+        # kernels, the first waiting before its loads and launching dependents before its store,
+        # and the second loading before waiting (no need to wait for mutated input). NVIDIA sm90 or
+        # newer only; CUDA and triton.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Copy c into b in place and return a squared plus b.
             b.copy_(c)  # second kernel
             return a**2 + b  # first kernel
 
@@ -19191,7 +23212,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     )
     @xfailIf(not IS_BIG_GPU)  # templates require big gpu
     def test_pdl_template_and_delay(self):
+        # [FUNCTION DOC] PDL with a template matmul and delayed launch: two normalization kernels
+        # then a matmul template then a pointwise op; checks launch PDL on the pointwise kernels
+        # with expected wait/launch/store ordering (different for dynamic and static shapes) and
+        # that the template has no PDL markers. Max autotune with Triton GEMM and coordinate
+        # descent; sm90+ CUDA only; expected failure on non-big GPUs.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Normalize a and b by their squared row sums, square each,
+            # matrix multiply them and square the product.
             a = (a / (a**2).sum(-1, keepdim=True)) ** 2  # first kernel
             b = (b / (b**2).sum(-1, keepdim=True)) ** 2  # second kernel
             c = a @ b  # fused-epilogue template
@@ -19247,8 +23275,14 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             ).run(code)
 
     def test_use_deterministic_algorithms(self):
+        # [FUNCTION DOC] Enabling deterministic algorithms inside a compiled function body must
+        # affect the scatter later in the same function: scattering three values to the same index
+        # gives the last written value (310) plus one in the deterministic path, and the other row
+        # is 1.
         @torch.compile(backend="inductor", fullgraph=True)
         def fn(src, index, base_tensor):
+            # [FUNCTION DOC] HELPER: Add 10 to src, enable deterministic algorithms, scatter src
+            # into base_tensor along dim 0 by index, and return the base plus 1.
             src = src + 10
             torch.use_deterministic_algorithms(True)
             base_tensor.scatter_(0, index, src)
@@ -19263,10 +23297,19 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
     @requires_gpu()
     def test_device_context_with_python_scalar(self):
+        # [FUNCTION DOC] A module compiled in its constructor and used under a device context for a
+        # CNN-like model whose scale is computed from Python scalars: two sessions with different
+        # parameters and sizes (the second causes a recompile) must output on the context device.
+        # GPU only.
         from torch.utils._device import DeviceContext
 
         class SimpleModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a convolution, ReLU, a Python-scalar derived scale
+            # and a learnable scalar; its forward is compiled when constructed.
             def __init__(self, x, y):
+                # [FUNCTION DOC] HELPER: Build the layers, compute the scale from the two integers
+                # by floor division raised to the power -0.5, and replace forward by a compiled
+                # version.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 16, kernel_size=3, padding=1)
                 self.scale = (x // y) ** -0.5
@@ -19275,11 +23318,15 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 self.forward = torch.compile(self.forward)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the convolution and ReLU, multiply by the scale,
+                # divide by the learnable scalar and return the square.
                 x = self.relu(self.conv(x)) * self.scale
                 x = x / self.tao
                 return x * x
 
         def run_session(x_param, y_param, size, device):
+            # [FUNCTION DOC] HELPER: Build the model on the device, create a random input of the
+            # given size and return the model output.
             model = SimpleModel(x_param, y_param).to(device)
             input_data = torch.randn(1, 3, size, size, device=device)
             return model(input_data)
@@ -19294,8 +23341,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(out2.device.type, self.device)
 
     def test_index_reduce_on_view_input(self):
+        # [FUNCTION DOC] Regression for issue 144846: in-place index_reduce with mean (excluding
+        # self) on a sliced view of a larger tensor; the compiled result equals eager.
         # Regression test for https://github.com/pytorch/pytorch/issues/144846
         def fn(x, index, source):
+            # [FUNCTION DOC] HELPER: Apply the in-place mean index reduction along dim 2 to x
+            # without including self values and return x.
             return x.index_reduce_(2, index, source, "mean", include_self=False)
 
         x_base = torch.randn(4, 34, 64, device=self.device)
@@ -19307,6 +23358,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(result, expected)
 
     def test_pad_after_gelu(self):
+        # [FUNCTION DOC] Regression for Voxtral compilation on MPS: GELU followed by constant
+        # padding of one element on the left, for float32, float16 and bfloat16 where supported.
         # Regression test for Voxtral compilation on MPS
         for dtype in [torch.float32, torch.float16, torch.bfloat16]:
             if not self.is_dtype_supported(dtype):
@@ -19320,7 +23373,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
     @requires_gpu()
     @skip_if_cpp_wrapper("cross-device shallow_copy_data_ not in AOTI shim")
     def test_tensor_set_data_cross_device(self):
+        # [FUNCTION DOC] Setting the data attribute of a CPU tensor to a copy on the accelerator
+        # device inside a compiled function: the output equals eager and the tensor ends on the
+        # same device in both runs. GPU only; skipped for cpp wrapper.
         def func(x):
+            # [FUNCTION DOC] HELPER: Replace the data of x by its device copy and return x plus
+            # one.
             x.data = x.data.to(self.device)
             return x + 1
 
@@ -19337,10 +23395,17 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertEqual(x_eager.device, x_compiled.device)
 
     def test_jvp_compile_backward(self):
+        # [FUNCTION DOC] Forward-mode derivative (jvp) inside a compiled function followed by
+        # backward through a three-layer network: compiled output and parameter gradients must
+        # equal eager ones.
         def jvp_fn(f, x):
+            # [FUNCTION DOC] HELPER: Compute the jvp of f at a clone of x with tangent ones and
+            # return the tangent output.
             return torch.func.jvp(f, (x.clone(),), (torch.ones_like(x),))[1]
 
         def compute(f, x):
+            # [FUNCTION DOC] HELPER: Split x into its first element and the rest, and compute the
+            # jvp of f with respect to the first element with the rest concatenated back.
             first, rest = x[..., :1], x[..., 1:]
             return jvp_fn(lambda X: f(torch.cat([X, rest])), first)
 
@@ -19370,6 +23435,9 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(eg, cg)
 
     def test_efficient_zero_tensor_avoids_oom(self):
+        # [FUNCTION DOC] CUDA only OOM regression: an efficient zero tensor of more elements than
+        # the device memory holds (total memory in float32 elements plus 1024) compiles and returns
+        # a zero tensor of the right size and stride without allocating.
         if self.device != "cuda":
             raise unittest.SkipTest("CUDA OOM regression test")
 
@@ -19380,6 +23448,8 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         numel += 1024
 
         def fn():
+            # [FUNCTION DOC] HELPER: Return the aten efficient zero tensor of the large number of
+            # elements.
             return torch.ops.aten._efficientzerotensor.default(
                 [numel],
                 dtype=torch.float32,
@@ -19394,7 +23464,12 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         self.assertTrue(out._is_zerotensor())
 
     def test_issue_190765_tiny_repro(self):
+        # [FUNCTION DOC] Tiny reproducer for issue 190765: flatten, repeat_interleave by 2 and flip
+        # of an adjusted 2 by 2 tensor, compiled with dynamic shapes and run four times; compiled
+        # equals eager.
         def fn(p):
+            # [FUNCTION DOC] HELPER: Flatten p plus 1, repeat each element twice and flip the
+            # result.
             return torch.flip(torch.repeat_interleave(torch.flatten(p + 1.0), 2), [0])
 
         torch.manual_seed(0)
@@ -19404,10 +23479,16 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(compiled(p), fn(p))
 
     def test_issue_190765_intermediate_graph(self):
+        # [FUNCTION DOC] Larger reproducer for issue 190765: two matmuls, transposes and an
+        # addition then the flatten, repeat_interleave and flip postprocessing; compiled with
+        # dynamic shapes, run four times, equal to eager.
         def postprocess(z):
+            # [FUNCTION DOC] HELPER: Flatten z, repeat each element twice and flip.
             return torch.flip(torch.repeat_interleave(torch.flatten(z), 2), [0])
 
         def fn(x, a, b):
+            # [FUNCTION DOC] HELPER: Compute transposed matmul results with a and b, add, transpose
+            # back and apply the postprocessing.
             left = (x @ a).transpose(0, 1)
             right = (x @ b).transpose(0, 1)
             return postprocess((left + right).transpose(0, 1))
@@ -19421,8 +23502,11 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(compiled(x, a, b), fn(x, a, b))
 
     def test_eye_uint16_index(self):
+        # [FUNCTION DOC] An identity matrix whose size (256) makes Inductor use 16-bit unsigned
+        # indices; the output stays float32.
         # Inductor uses uint16 indices for this size; the output remains float32.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return an identity matrix with the size of the last dim of x.
             return torch.eye(x.shape[-1], device=x.device)
 
         self.common(fn, (torch.zeros(10, 256, device=self.device),))
@@ -19432,12 +23516,22 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
 
 @dataclasses.dataclass
 class TestFailure:
+    # [CLASS DOC] Dataclass describing in which device suffixes a test should be skipped or
+    # expected to fail: suffixes is a tuple of backend suffix strings, is_skip chooses skip versus
+    # expected failure, and the test collection marker attribute is false so pytest does not
+    # collect it.
     suffixes: tuple[str, ...]
     is_skip: bool = False
     __test__: bool = False
 
 
 def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
+    # [FUNCTION DOC] Copy every test method named test_ from my_cls into other_cls with a suffix
+    # added to its name. Each copy is a new wrapper function (so skip decorators do not share
+    # state) carrying a deep copy of the original attribute dict; if xfail_prop is given and the
+    # original has that attribute it is marked as an expected failure; if test_failures has an
+    # entry for the test whose suffixes include this suffix it is wrapped in skip (is_skip) or
+    # expected failure. Also copies the dtype support helper to the target class when present.
     for name, value in my_cls.__dict__.items():
         if name.startswith("test_"):
             # You cannot copy functions in Python, so we use closures here to
@@ -19448,6 +23542,8 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
 
             @functools.wraps(value)
             def new_test(self, value=value):
+                # [FUNCTION DOC] HELPER: Wrapper test method that calls the original test function
+                # with the test instance; the original is bound by default argument.
                 return value(self)
 
             # Copy __dict__ which may contain test metadata
@@ -19475,6 +23571,9 @@ def copy_tests(my_cls, other_cls, suffix, test_failures=None, xfail_prop=None):
 def add_test_failures(
     test_failures: dict[str, TestFailure], added_test_failures: dict[str, TestFailure]
 ):
+    # [FUNCTION DOC] In-place merge of added failures into the test failures mapping: for names
+    # present in both the suffix tuples are unioned and the skip flags are or-ed; new names are
+    # inserted as they are.
     """
     In-place modifies the given dictionary of `test_failures` to add the
     contents of `added_test_failures` by unioning the test_failure.suffixes, and
@@ -19494,15 +23593,24 @@ def add_test_failures(
 if RUN_CPU:
 
     class SweepInputsCpuTest(SweepInputs2, TestCase):
+        # [CLASS DOC] CPU test class generated from the pairwise input sweep with a 10 by 10 CPU
+        # input generator.
         gen = InputGen(10, "cpu")
 
     SweepInputsCpuTest.populate()
 
     class CpuTests(TestCase):
+        # [CLASS DOC] CPU test class: uses check_model as the common checker and cpu as the device;
+        # test methods from CommonTemplate are copied into it below with the cpu suffix.
         common = check_model
         device = "cpu"
 
         def test_uint8_abs_codegen_issue_187018(self):
+            # [FUNCTION DOC] Checks the C++ code generated for the negation of absolute values of
+            # uint8 data (issue 187018) does not use std::abs or the vector abs, which would
+            # promote to signed integers and miscompile: compares compiled to eager for a small
+            # tensor (scalar codegen) and a 256 element tensor (vectorized codegen) and inspects
+            # the generated C++.
             """
             Ensures torch.compile does not emit std::abs or .abs() for unsigned integers,
             which causes implicit promotion to signed int and downstream miscompilation.
@@ -19511,6 +23619,8 @@ if RUN_CPU:
             from torch.testing import FileCheck
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Return the sum of the concatenation of the negated
+                # absolute values of x with itself.
                 y = -x.abs()
                 return torch.cat([y, y]).sum()
 
@@ -19537,16 +23647,24 @@ if RUN_CPU:
 if RUN_GPU or HAS_MPS:
 
     class SweepInputsGPUTest(SweepInputs2, TestCase):
+        # [CLASS DOC] GPU test class generated from the pairwise input sweep with a 10 by 10 input
+        # generator on the GPU device.
         gen = InputGen(10, GPU_TYPE)
 
     SweepInputsGPUTest.populate()
 
     class GPUTests(TestCase):
+        # [CLASS DOC] GPU test class: uses check_model_gpu as the common checker and the GPU type
+        # as the device; tests from CommonTemplate are copied into it below with the GPU suffix,
+        # and a few GPU-only tests are defined directly.
         common = check_model_gpu
         device = GPU_TYPE
 
         @requires_cuda_and_triton
         def test_special_bessel_inf_matches_eager(self):
+            # [FUNCTION DOC] Bessel functions of the first and second kind (orders 0 and 1) on
+            # infinities, NaN and 0.5 for float32 and float64: compiled equals eager (NaN equal)
+            # and the first three entries are NaN in both. CUDA and triton only.
             ops = (
                 ("bessel_j0", torch.special.bessel_j0),
                 ("bessel_j1", torch.special.bessel_j1),
@@ -19576,7 +23694,10 @@ if RUN_GPU or HAS_MPS:
 
         @requires_cuda_and_triton
         def test_signbit_negative_zero_cuda(self):
+            # [FUNCTION DOC] Sign bit of positive and negative zero in float32 and float64 on CUDA,
+            # with low precision check disabled.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Return signbit of x.
                 return torch.signbit(x)
 
             for dtype in (torch.float32, torch.float64):
@@ -19589,6 +23710,9 @@ if RUN_GPU or HAS_MPS:
 
         @requires_cuda_and_triton
         def test_modified_bessel_i_inf_matches_eager(self):
+            # [FUNCTION DOC] Modified Bessel functions i0 and i1 (both spellings) on infinities,
+            # NaN and 0.5 for float32 and float64: compiled equals eager (NaN equal) and the first
+            # three entries are NaN. CUDA and triton only.
             ops = (
                 ("i0", torch.special.i0),
                 ("modified_bessel_i0", torch.special.modified_bessel_i0),
@@ -19606,6 +23730,7 @@ if RUN_GPU or HAS_MPS:
                         )
 
                         def fn(x):
+                            # [FUNCTION DOC] HELPER: Apply the enclosing special function to x.
                             return op(x)
 
                         actual = torch.compile(fn, fullgraph=True)(x)
@@ -19615,7 +23740,12 @@ if RUN_GPU or HAS_MPS:
 
         @requires_cuda_and_triton
         def test_complex_view_as_complex_exact_stride_copy_cuda(self):
+            # [FUNCTION DOC] view_as_complex of a transposed and reshaped real tensor must copy
+            # with the same strides as eager (exact stride check), compiled with full graph. CUDA
+            # and triton only.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Transpose dims 1 and 2, reshape to (2, 8, 4, -1, 2) and
+                # view as complex.
                 y = x.transpose(1, 2)
                 z = y.reshape(2, 8, 4, -1, 2)
                 return torch.view_as_complex(z)
@@ -19628,7 +23758,10 @@ if RUN_GPU or HAS_MPS:
 
         @requires_cuda_and_triton
         def test_complex_view_as_complex_expanded_exact_stride_copy_cuda(self):
+            # [FUNCTION DOC] view_as_complex followed by expand must keep exact eager strides,
+            # compiled with full graph. CUDA and triton only.
             def fn(x):
+                # [FUNCTION DOC] HELPER: View x as complex and expand to 2 by 3 by 4.
                 y = torch.view_as_complex(x)
                 return y.expand(2, 3, 4)
 
@@ -19640,7 +23773,11 @@ if RUN_GPU or HAS_MPS:
 
         @requires_cuda_and_triton
         def test_complex_copy_strided_stride_order_copy_cuda(self):
+            # [FUNCTION DOC] The strided-copy prim applied to a complex view with a given stride
+            # order must produce the eager strides. CUDA and triton only.
             def fn(x):
+                # [FUNCTION DOC] HELPER: View x as complex and apply the strided copy prim with
+                # strides [1, 2].
                 y = torch.view_as_complex(x)
                 return torch.ops.prims.copy_strided.default(y, [1, 2])
 
@@ -19655,7 +23792,15 @@ if RUN_GPU or HAS_MPS:
             "CUDA eager ignores addmm input shape when beta=0",
         )
         def test_addmm_beta_zero_mismatched_bias_cuda(self):
+            # [FUNCTION DOC] On CUDA, addmm with beta zero and a bias whose shape does not match
+            # the matmul output (eager ignores the bias shape then): compiled equals eager for
+            # plain, relu-fused, decomposed, NaN and infinity biases, zero alpha with NaN operands,
+            # and NaN full-size bias; a bias with a different dtype raises RuntimeError in eager
+            # and an input dtype mismatch exception when compiled (including with native matmul);
+            # also checks with Triton max-autotune. Shape padding is disabled for these checks.
             def check(fn, args):
+                # [FUNCTION DOC] HELPER: Compute fn eagerly and compiled with full graph on the
+                # arguments and assert the results are equal.
                 expected = fn(*args)
                 actual = torch.compile(fn, fullgraph=True)(*args)
                 self.assertEqual(actual, expected)
@@ -19729,6 +23874,7 @@ if RUN_GPU or HAS_MPS:
             bad_weight = torch.randn(8, 13, device=self.device)
 
             def addmm_dtype_mismatch(bias, x, weight):
+                # [FUNCTION DOC] HELPER: Return addmm of bias, x and weight with beta 0.
                 return torch.addmm(bias, x, weight, beta=0.0)
 
             with self.assertRaisesRegex(RuntimeError, "must have the same dtype"):
@@ -19739,6 +23885,8 @@ if RUN_GPU or HAS_MPS:
             bad_decomp_weight = torch.randn(1, 5, device=self.device)
 
             def addmm_decomp_dtype_mismatch(bias, x, weight):
+                # [FUNCTION DOC] HELPER: Return addmm of bias, x and weight with beta 0 (used for
+                # the decomposition path).
                 return torch.addmm(bias, x, weight, beta=0.0)
 
             with self.assertRaisesRegex(RuntimeError, "must have the same dtype"):
@@ -19787,6 +23935,8 @@ if RUN_GPU or HAS_MPS:
 if RUN_TPU:
 
     class SweepInputsTpuTest(SweepInputs2, TestCase):
+        # [CLASS DOC] TPU test class generated from the pairwise input sweep with a 10 by 10 input
+        # generator on the TPU device.
         gen = InputGen(10, "tpu")
 
     SweepInputsTpuTest.populate()
@@ -19795,13 +23945,21 @@ if RUN_GPU:
 
     @instantiate_parametrized_tests
     class TritonCodeGenTests(TestCase):
+        # [CLASS DOC] Tests that inspect Triton code generation on GPU: they compile small
+        # functions and examine the generated kernels' metadata (divisibility specializations of
+        # arguments, index integer types, barriers) and code strings. Provides a no-op backend to
+        # capture aten graphs, and a helper that runs lowering to return the compiled autotuner
+        # kernels.
         from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
         device_type = GPU_TYPE
         device = GPU_TYPE
 
         class NoOpCompilerBackend:
+            # [CLASS DOC] HELPER: Compile backend that records an aten-level graph and fake example
+            # inputs without compiling; used to run lowering manually.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize the saved example arguments and model to None.
                 self.example_args = None
                 self.model = None
 
@@ -19810,6 +23968,10 @@ if RUN_GPU:
                 model_: torch.fx.GraphModule,
                 example_inputs_: list[torch.Tensor],
             ):
+                # [FUNCTION DOC] HELPER: Backend function: traces the incoming graph module with
+                # fake inputs and the Inductor decomposition table into an aten graph, stores graph
+                # and fake args, and returns a function that gives back the original example inputs
+                # (never run for real).
                 """
                 The Noop backend does not compile the fx graph it is given.
                 Instead, it transforms the fx graph so that its functions are
@@ -19822,6 +23984,8 @@ if RUN_GPU:
                 fake_mode = FakeTensorMode()
 
                 def interpret(*args, **kwargs):
+                    # [FUNCTION DOC] HELPER: Run the saved graph module with the given arguments
+                    # through an FX interpreter.
                     return Interpreter(model_).run(*args[0:], **kwargs)
 
                 fake_flat_tensor_args = [
@@ -19835,6 +23999,9 @@ if RUN_GPU:
                 return lambda x: example_inputs_
 
         def get_kernels(self, fn, args) -> list[CachingAutotuner]:
+            # [FUNCTION DOC] HELPER: Compile fn with the recording backend, lower the saved aten
+            # graph with a graph lowering object in a fresh debug context, compile it to a module,
+            # and return the list of cached autotuner kernels found in the module namespace.
             from torch._inductor.debug import DebugContext
             from torch._inductor.graph import GraphLowering
             from torch._inductor.virtualized import V
@@ -19856,9 +24023,14 @@ if RUN_GPU:
             return kernels
 
         def test_divisible_by_16_covers_numel_args(self):
+            # [FUNCTION DOC] For a full sum of a 256 by 256 tensor, checks which triton kernel
+            # arguments are marked divisible by 16 (including numel arguments): two kernels with
+            # expected index tuples, four with multi-kernel, or one with extra workspace arguments
+            # under cooperative reductions.
             torch._dynamo.reset()
 
             def fn(a: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return the sum of all elements of a.
                 return torch.sum(a)
 
             kernels = self.get_kernels(fn, [torch.randn([256, 256], device=GPU_TYPE)])
@@ -19897,7 +24069,12 @@ if RUN_GPU:
 
         @config.patch(assume_aligned_inputs=False)
         def test_codegen_config_option_dont_assume_alignment(self):
+            # [FUNCTION DOC] With the input alignment assumption disabled, tensors that are views
+            # with storage offsets 0..4 elements get a kernel whose alignment specialization on the
+            # input pointer is present only when the offset is a multiple of 4 elements; a fresh
+            # contiguous input always gets full alignment of arguments.
             def fn(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return sin of x plus cos of x.
                 return x.sin() + x.cos()
 
             # We want code that assumes alignment if the initial input is 16-byte aligned
@@ -19929,7 +24106,11 @@ if RUN_GPU:
             self.assertEqual(arguments_that_are_divisible_by_16, (0, 1, 2))
 
         def test_optimize_indexing_dtype(self):
+            # [FUNCTION DOC] Bilinear upsample generated triton code uses 32-bit index casts and no
+            # 64-bit casts (index dtype optimization); results equal eager.
             def fn(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return the aten bilinear upsample of x by a factor of 2
+                # with align corners.
                 return aten.upsample_bilinear2d.vec(x, None, True, [2.0, 2.0])
 
             fn_opt = torch.compile(fn, backend="inductor")
@@ -19941,9 +24122,14 @@ if RUN_GPU:
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
         def test_barrier_on_reduction_loop_readback(self):
+            # [FUNCTION DOC] A buffer stored in a reduction loop and then read back needs a thread
+            # barrier: generated code for a layer-norm style function contains the debug barrier,
+            # and results equal eager.
             # A buffer stored in a reduction loop and read back after it needs
             # a barrier, or one warp may read what another wrote.
             def fn(a, b, w, bias):
+                # [FUNCTION DOC] HELPER: Add a and b, normalize by the last dim mean and variance
+                # with scale w and shift bias, and return the sum and the normalized value.
                 y = a + b
                 mean = y.mean(-1, keepdim=True)
                 var = y.var(-1, keepdim=True, unbiased=False)
@@ -19964,7 +24150,10 @@ if RUN_GPU:
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
         def test_index_expr_pure_indexing_no_int64(self):
+            # [FUNCTION DOC] Pure indexing from an int64 arange expression (twice the index modulo
+            # 128) must not need int64 casts in the generated code; results equal eager.
             def fn(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Gather x at (arange times 2) modulo 128.
                 idx = torch.arange(0, 128, device=GPU_TYPE, dtype=torch.int64)
                 return x[(idx * 2) % 128]
 
@@ -19976,7 +24165,11 @@ if RUN_GPU:
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
         def test_value_expr_float_preserves_integer_intermediates(self):
+            # [FUNCTION DOC] A float16 value computed from an int64 arange plus 2048 modulo 2048
+            # must keep integer intermediates (not lose precision); compiled equals eager.
             def fn(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return the int64 arange of x's numel shifted modulo 2048,
+                # as float16.
                 idx = torch.arange(x.numel(), device=x.device, dtype=torch.int64)
                 return ((idx + 2048) % 2048).to(torch.float16)
 
@@ -19985,7 +24178,10 @@ if RUN_GPU:
             self.assertEqual(fn_opt(*inps), fn(*inps))
 
         def test_value_expr_dynamic_shape_bounds(self):
+            # [FUNCTION DOC] An int64 arange converted to float32 under dynamic shapes (size marked
+            # dynamic) gives correct values.
             def fn(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return an int64 arange of x's numel converted to float32.
                 idx = torch.arange(x.numel(), device=x.device, dtype=torch.int64)
                 return idx.to(torch.float32)
 
@@ -19995,7 +24191,11 @@ if RUN_GPU:
             self.assertEqual(fn_opt(x), fn(x))
 
         def test_searchsorted_boundary_index_no_int64_cast(self):
+            # [FUNCTION DOC] Searchsorted with int64 output on a 2-D boundary and value pair must
+            # not use int64 casts of boundary indices in generated code; compiled equals eager.
             def fn(boundaries: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return searchsorted of values in boundaries with int64
+                # output.
                 return torch.searchsorted(boundaries, values, out_int32=False)
 
             fn_opt = torch.compile(fn, backend="inductor")
@@ -20010,12 +24210,20 @@ if RUN_GPU:
 
         @config.patch({"fx_graph_remote_cache": False})
         def test_optimize_indexing_dtype_with_constraint(self):
+            # [FUNCTION DOC] Index dtype optimization respects shape constraints: with a torch
+            # check bounding a dynamic size in a range, the function uses 32-bit indices; the
+            # unconstrained version keeps 64-bit casts. Compiles the constrained one first to avoid
+            # a cache hit; remote FX cache is disabled.
             def fn1(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Build an arange of b's size, compute the integer of twice
+                # the index divided by 3, and gather rows of a with it.
                 x = torch.arange(0, b.shape[0], device=GPU_TYPE)
                 y = ((x + x) / 3).int()
                 return a[y.to(torch.int64)]
 
             def fn2(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Check b's first dim lies between 2 and 100 and run the
+                # unconstrained helper.
                 torch._check(b.shape[0] >= 2)
                 torch._check(b.shape[0] <= 100)
                 return fn1(a, b)
@@ -20045,9 +24253,17 @@ if RUN_GPU:
             self.assertEqual(fn2_opt(*inps2), fn1(*inps2))
 
         def test_constant_folding_deallocation(self):
+            # [FUNCTION DOC] Constant folding frees intermediates: traces a function that creates
+            # ten filled tensors each incremented by one, then runs the uniform value constant
+            # folder on the traced graph under a dispatch mode that records the maximum number of
+            # simultaneously live tensors (weak-key dictionary); the maximum must be 3 (a couple of
+            # extras come from the insertable tensor check), showing earlier constants are
+            # deallocated.
             import torch._inductor
 
             def fn():
+                # [FUNCTION DOC] HELPER: Return a list of ten constant tensors, each filled with
+                # its index plus one.
                 li = []
                 for i in range(10):
                     x = torch.full([100], i)
@@ -20062,7 +24278,13 @@ if RUN_GPU:
             max_live_tensors = 0
 
             class LiveTensors(TorchDispatchMode):
+                # [CLASS DOC] HELPER: Dispatch mode that tracks every tensor argument and output in
+                # a weak-key dictionary and records the largest number of tensors alive at once in
+                # an enclosing variable.
                 def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                    # [FUNCTION DOC] HELPER: Mark all tensor arguments as live, run the op, and, if
+                    # the output is a tensor, mark it live and update the maximum live count;
+                    # return the output.
                     nonlocal live_tensors
                     nonlocal max_live_tensors
 
@@ -20091,7 +24313,11 @@ if RUN_GPU:
         # See https://github.com/pytorch/pytorch/issues/100348
         @parametrize("backend", ["aot_eager", "inductor"])
         def test_inductor_detach_view(self, backend):
+            # [FUNCTION DOC] Parametrized over aot_eager and inductor backends: a function
+            # returning a tensor and its detach (issue 100348), run forward and backward on GPU;
+            # input gradients must equal eager.
             def fn(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Double x and return the result and its detached copy.
                 a = x * 2
                 return a, a.detach()
 
@@ -20110,8 +24336,14 @@ if RUN_GPU:
             "Does not support mem_eff_attention",
         )
         def test_sdpa_inference_mode_aot_compile(self):
+            # [FUNCTION DOC] AOT compile of scaled dot product attention with a boolean mask under
+            # inference mode, tracing with the export IR tracer; passes if no error occurs. GPU
+            # with memory efficient attention only.
             class TestSDPA(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module wrapping scaled dot product attention with a mask, no
+                # dropout and non-causal.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Call the parent constructor.
                     super().__init__()
 
                 def forward(
@@ -20121,6 +24353,8 @@ if RUN_GPU:
                     v: torch.Tensor,
                     attn_mask: torch.Tensor,
                 ):
+                    # [FUNCTION DOC] HELPER: Return scaled dot product attention of q, k and v with
+                    # the attention mask.
                     return torch.nn.functional.scaled_dot_product_attention(
                         q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
                     )
@@ -20151,6 +24385,11 @@ if RUN_GPU:
         @config.patch(implicit_fallbacks=True)
         @parametrize("backend", ["cublaslt", "cutlass"])
         def test_grouped_mm(self, backend):
+            # [FUNCTION DOC] Parametrized by the grouped GEMM backend (cublasLt or CUTLASS):
+            # compiled grouped matrix multiply with group offsets and bfloat16 output must match
+            # the uncompiled-style first run in forward and for both input gradients; sets the
+            # preferred backend flag and restores it on cleanup. Skips cublasLt unless CUDA 13.3 or
+            # later and SM 9 to 11. Needs sm90.
             if backend == "cublaslt":
                 if _get_torch_cuda_version() < (13, 3):
                     self.skipTest("cublaslt grouped gemm requires CUDA Toolkit >= 13.3")
@@ -20170,6 +24409,8 @@ if RUN_GPU:
 
             @torch.compile(fullgraph=True)
             def f(a, b, offs, out_dtype):
+                # [FUNCTION DOC] HELPER: Grouped matrix multiply of a with the transposed b using
+                # offsets and output dtype.
                 return F.grouped_mm(
                     a, b.transpose(-2, -1), offs=offs, out_dtype=out_dtype
                 )
@@ -20209,7 +24450,13 @@ if RUN_GPU:
             self.assertEqual(b_ref.grad, b_test.grad)
 
         def test_optimize_indexing_assert(self):
+            # [FUNCTION DOC] Checks bounds-check handling for indirect indexing in generated triton
+            # code: for a gather (static: no assert; dynamic: only an upper bound assert) and for
+            # an index_put with accumulate (indirect atomic add with both bounds asserted),
+            # comparing correctness to eager.
             def has_indirect(code, tl_fn: str):
+                # [FUNCTION DOC] HELPER: Assert the code contains the given triton function and
+                # every line using it has an indirect (temporary variable) index expression.
                 self.assertTrue(
                     tl_fn in code,
                     msg=lambda msg: f"{msg}\n{tl_fn} not present:\n{code}",
@@ -20224,6 +24471,9 @@ if RUN_GPU:
                         )
 
             def has_assert(code, lower: bool, upper: bool):
+                # [FUNCTION DOC] HELPER: Assert the code contains a device assertion and each
+                # assertion line has the lower bound check iff lower is set and the upper bound
+                # check iff upper is set.
                 self.assertIn(
                     "device_assert",
                     code,
@@ -20241,6 +24491,8 @@ if RUN_GPU:
                         )
 
             def fn(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Gather x at an arange index or-ed with 0 (so bounds are
+                # not provable).
                 s = torch.arange(x.shape[0], device=x.device) | 0
                 return x[s]
 
@@ -20262,6 +24514,8 @@ if RUN_GPU:
                     has_assert(code, lower=False, upper=True)
 
             def fn(a, z, b, idx0, idx1):
+                # [FUNCTION DOC] HELPER: Build an arange index and index_put (accumulating) b into
+                # a at the index tuple; return a.
                 idx2 = torch.arange(a.shape[-1], device=a.device)
                 a.index_put_((z, idx0, idx1, idx2), b, accumulate=True)
                 return a
@@ -20288,7 +24542,12 @@ if RUN_GPU:
                 has_assert(code, lower=True, upper=True)
 
         def test_not_materialize_pointwise_reduction(self):
+            # [FUNCTION DOC] A pointwise difference followed by a sum and an amax: the intermediate
+            # sum is not materialized, so the code has one store (two with multi-kernel) to the
+            # second output pointer only; results equal eager.
             def fn(a, b):
+                # [FUNCTION DOC] HELPER: Return the amax over the last dim of the last-dim sum of a
+                # minus b.
                 return (a - b).sum(dim=-1).amax(dim=-1)
 
             N = 16
@@ -20308,9 +24567,14 @@ if RUN_GPU:
 
         @config.patch("triton.coalesce_tiling_analysis", True)
         def test_reduction_hint_inner_with_high_tiling_ratio(self):
+            # [FUNCTION DOC] With coalescing-aware tiling analysis on, an inner reduction with a
+            # high tiling score ratio (large broadcast add on a transposed tensor) is hinted as
+            # inner in the generated code.
             """Test inner reduction hint with high tiling score ratio."""
 
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Return the keepdim row sum of x plus x added with y
+                # expanded on the last dim.
                 return x.sum(dim=-1, keepdim=True) + (x + y[..., None])
 
             x = torch.randn(2048, 128, 1024, device=GPU_TYPE)
@@ -20320,13 +24584,18 @@ if RUN_GPU:
             self.assertIn("ReductionHint.INNER", code)
 
         def test_numpy_on_gpu(self):
+            # [FUNCTION DOC] NumPy arrays under a GPU device context in a compiled function: the
+            # generated code uses the triton sine, the result is a NumPy array and matches NumPy.
             x = np.arange(10, dtype=np.float32)
 
             @torch.compile
             def fn(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning the NumPy sine of x.
                 return np.sin(x)
 
             def fn_gpu(x):
+                # [FUNCTION DOC] HELPER: Call the compiled function with the GPU device as the
+                # default device.
                 with torch.device(GPU_TYPE):
                     return fn(x)
 
@@ -20338,10 +24607,16 @@ if RUN_GPU:
 
         @config.patch(expand_dimension_for_pointwise_nodes=True)
         def test_rope_fusion(self):
+            # [FUNCTION DOC] Rotary position embedding on q (32 heads) and k (8 heads): compiled
+            # equals eager and with dimension expansion for pointwise nodes the whole embedding
+            # fuses into one kernel (one kernel launch in the code; counted by regular expression
+            # for cpp wrapper).
             batch_size, seq_length, hidden_dim = 8, 16, 128
             num_q_heads, num_kv_heads = 32, 8
 
             def prepare_input(batch_size, seq_length):
+                # [FUNCTION DOC] HELPER: Create random query, key, cos, sin tensors and position
+                # ids for the batch and sequence length on the GPU.
                 q = torch.randn(
                     (batch_size, num_q_heads, seq_length, hidden_dim), device=GPU_TYPE
                 )
@@ -20361,6 +24636,8 @@ if RUN_GPU:
                 return q, k, cos, sin, pos_ids
 
             def rotate_half(x):
+                # [FUNCTION DOC] HELPER: Rotate half the hidden dim: concatenate the negated second
+                # half with the first half.
                 """Rotates half the hidden dims of the input."""
                 x1 = x[..., : x.shape[-1] // 2]
                 x2 = x[..., x.shape[-1] // 2 :]
@@ -20369,6 +24646,8 @@ if RUN_GPU:
             def apply_rotary_pos_emb(
                 q, k, cos, sin, position_ids=None, unsqueeze_dim=1
             ):
+                # [FUNCTION DOC] HELPER: Apply rotary position embedding to q and k using cos and
+                # sin broadcast at the unsqueeze dim; return both embeddings.
                 cos = cos.unsqueeze(unsqueeze_dim)
                 sin = sin.unsqueeze(unsqueeze_dim)
                 q_embed = (q * cos) + (rotate_half(q) * sin)
@@ -20396,20 +24675,32 @@ if RUN_GPU:
                 self.assertEqual(code.count(".run("), 1)
 
         def test_numpy_autograd(self):
+            # [FUNCTION DOC] NumPy code wrapped for autograd: compares the forward output of the
+            # wrapped NumPy function (compiled, and the direct NumPy conversion version) with a
+            # torch implementation and checks gradients of the wrapped version and the conversion
+            # version.
             def my_torch(x):
+                # [FUNCTION DOC] HELPER: Torch reference: concatenate squared sines of x with the
+                # max of x and sum.
                 y = torch.cat([torch.sin(x) ** 2, torch.max(x)[None]])
                 return y.sum()
 
             def my_np(x):
+                # [FUNCTION DOC] HELPER: NumPy version: concatenate squared sines with the max, and
+                # sum.
                 y = np.concatenate([np.sin(x) ** 2, np.max(x)[None]])
                 return np.sum(y)
 
             @torch.compile
             def wrapper(x):
+                # [FUNCTION DOC] HELPER: Compiled wrapper applying the NumPy function through the
+                # numpy wrapper.
                 return torch.compiler.wrap_numpy(my_np)(x)
 
             @torch.compile
             def wrapper2(x):
+                # [FUNCTION DOC] HELPER: Compiled function converting x to NumPy, running the NumPy
+                # function and converting back to a tensor.
                 x = x.numpy()
                 y = my_np(x)
                 return torch.from_numpy(y)
@@ -20435,10 +24726,17 @@ if RUN_GPU:
         @patch.object(config, "constant_and_index_propagation", False)
         @patch.object(config, "joint_graph_constant_folding", False)
         def test_cant_optimize_compute(self):
+            # [FUNCTION DOC] With constant and index propagation and constant folding disabled (to
+            # isolate value range analysis): for expressions whose range is too large for 32 bits
+            # (large constant offset, big scaling, tensor and tensor-sum adds) the generated code
+            # still converts to int64. Compiled equals eager.
             def ones():
+                # [FUNCTION DOC] HELPER: Return a ones vector of 4 on the GPU.
                 return torch.ones([4], device=GPU_TYPE)
 
             def suffix(inp):
+                # [FUNCTION DOC] HELPER: Convert the input to int64, add one and convert to
+                # float64.
                 return (inp.to(torch.int64) + 1).to(torch.float64)
 
             ten = torch.rand([4], device=GPU_TYPE)
@@ -20451,6 +24749,8 @@ if RUN_GPU:
             ):
 
                 def fn():
+                    # [FUNCTION DOC] HELPER: Apply the enclosing expression to ones and the suffix
+                    # conversion.
                     return suffix(foo(ones()))
 
                 fn_opt = torch.compile(fn, backend="inductor")
@@ -20464,10 +24764,16 @@ if RUN_GPU:
         @patch.object(config, "constant_and_index_propagation", False)
         @patch.object(config, "joint_graph_constant_folding", False)
         def test_optimize_compute(self):
+            # [FUNCTION DOC] With constant and index propagation and constant folding disabled: for
+            # expressions with small value ranges (add 500, scale a where-selected value, divide by
+            # 30) the int64 conversion is optimized away and 32-bit is used. Compiled equals eager.
             def ones():
+                # [FUNCTION DOC] HELPER: Return a ones vector of 4 on the GPU.
                 return torch.ones([4], device=GPU_TYPE)
 
             def suffix(inp):
+                # [FUNCTION DOC] HELPER: Convert the input to int64, add one and convert to
+                # float64.
                 return (inp.to(torch.int64) + 1).to(torch.float64)
 
             for foo in (
@@ -20477,6 +24783,8 @@ if RUN_GPU:
             ):
 
                 def fn():
+                    # [FUNCTION DOC] HELPER: Apply the enclosing expression to ones and the suffix
+                    # conversion.
                     return suffix(foo(ones()))
 
                 fn_opt = torch.compile(fn, backend="inductor")
@@ -20490,8 +24798,14 @@ if RUN_GPU:
 
         # https://github.com/pytorch/pytorch/issues/130335
         def test_ctr_not_moved_to_cuda_when_used_in_index_put(self):
+            # [FUNCTION DOC] Regression for issue 130335: an index_put of negative infinity (a CPU
+            # scalar tensor constant) must stay on the CPU rather than be moved to the GPU by the
+            # constructor-move pass; the generated code must not allocate a scalar GPU empty
+            # tensor.
             @torch.compile
             def f(x, mask):
+                # [FUNCTION DOC] HELPER: Set columns selected by the mask to negative infinity in
+                # place and return x.
                 x[:, mask] = -math.inf
                 return x
 
@@ -20513,8 +24827,14 @@ if RUN_GPU:
         @config.patch("triton.coalesce_tiling_analysis", False)
         @config.patch("triton.use_block_ptr", False)
         def test_evict_last_non_coalesced_loads(self):
+            # [FUNCTION DOC] Eviction policy for non-coalesced loads of a reduction over
+            # differently permuted inputs, with coalescing analysis and block pointers off: the
+            # generated tl.load lines are compared with expected text showing evict_last for the
+            # first input and evict_first for the second (with extra lines for multi-kernel
+            # variants).
             @torch.compile
             def f(a, b):
+                # [FUNCTION DOC] HELPER: Return the last-dim sum of a times b.
                 return (a * b).sum(dim=-1)
 
             N = 512
@@ -20551,7 +24871,12 @@ if RUN_GPU:
             }
         )
         def test_evict_first_for_persistent_reduction_last_use(self):
+            # [FUNCTION DOC] Eviction policy for persistent reductions on the last use of a load,
+            # with persistent reductions on, multi-kernel and block pointers off, using strided
+            # inputs with zero stride broadcasts.
             def get_args():
+                # [FUNCTION DOC] HELPER: Build four random strided inputs of shape 128 by 512 by
+                # 64: two with transposed layout and two broadcast with zero strides.
                 shape = (128, 512, 64)
                 return (
                     rand_strided(shape, (32768, 1, 512), device=GPU_TYPE),
@@ -20562,6 +24887,9 @@ if RUN_GPU:
 
             @torch.compile
             def f(a0, a1, a2, a3):
+                # [FUNCTION DOC] HELPER: Compiled function computing a reduction of a product of
+                # a0, a relu-shifted a1 and a3 and a second reduction of a0 alone; returns both
+                # sums.
                 act0 = (a0 * (a1.relu() - a2) * a3).sum(dim=-1)
                 act1 = a0.sum(dim=-1)
                 return act0, act1
@@ -20590,8 +24918,14 @@ if RUN_GPU:
             }
         )
         def test_evict_last_for_reused_persistent_reduction_load(self):
+            # [FUNCTION DOC] A load that is reused within a persistent reduction (product of two
+            # overlapping slices of the same input) uses the evict_last policy for the first load
+            # line and evict_first for the second; code must contain the persistent reduction
+            # heuristic and exactly two loads.
             @torch.compile
             def f(x):
+                # [FUNCTION DOC] HELPER: Return the last-dim sum of the product of x without its
+                # last column and x without its first column.
                 return (x[:, :-1] * x[:, 1:]).sum(dim=-1)
 
             x = torch.randn(256, 129, device=GPU_TYPE)
@@ -20605,8 +24939,12 @@ if RUN_GPU:
 
         @config.patch("triton.skip_l1_cache", True)
         def test_skip_l1_cache(self):
+            # [FUNCTION DOC] With the skip L1 cache config, loads of a simple pointwise add use the
+            # cache modifier for bypassing L1 (cg); generated load lines compared with expected
+            # text.
             @torch.compile
             def f(a, b):
+                # [FUNCTION DOC] HELPER: Return a plus b.
                 return a + b
 
             N = 512
@@ -20622,10 +24960,17 @@ if RUN_GPU:
 
         @config.patch("triton.skip_l1_cache", True)
         def test_skip_l1_cache_buf_read_counts_guard(self):
+            # [FUNCTION DOC] Guard for missing buffer read counts: with the buffer read count
+            # method patched to return nothing for all buffers (including parameter buffers),
+            # generating triton code for a module multiplying by a parameter must still succeed and
+            # contain loads (used to raise a KeyError). The original method is restored afterwards.
             from torch._inductor.codegen import simd_kernel_features
 
             class M(nn.Module):
+                # [CLASS DOC] HELPER: Module with a learnable weight vector of length n; forward
+                # multiplies the input by it.
                 def __init__(self, n: int):
+                    # [FUNCTION DOC] HELPER: Create the weight parameter with random values.
                     super().__init__()
                     # nn.Parameter ensures we exercise the primals_* path.
                     # We move the module to GPU later, so we don't need to
@@ -20633,6 +24978,7 @@ if RUN_GPU:
                     self.weight = nn.Parameter(torch.randn(n))
 
                 def forward(self, x: torch.Tensor) -> torch.Tensor:
+                    # [FUNCTION DOC] HELPER: Return x times the weight.
                     return x * self.weight
 
             N = 512
@@ -20644,6 +24990,8 @@ if RUN_GPU:
             orig = simd_kernel_features.SIMDKernelFeatures.buffer_read_counts
 
             def fake_buffer_read_counts(self_inner):
+                # [FUNCTION DOC] HELPER: Replacement for the buffer read counts method returning an
+                # empty mapping.
                 return {}
 
             simd_kernel_features.SIMDKernelFeatures.buffer_read_counts = (
@@ -20662,8 +25010,13 @@ if RUN_GPU:
         @config.patch("triton.use_block_ptr", True)
         @config.patch("triton.coalesce_tiling_analysis", False)
         def test_evict_last_non_coalesced_loads_block_ptr(self):
+            # [FUNCTION DOC] Eviction policy for non-coalesced loads with block pointers on:
+            # expected load lines show evict_last for the first input (index based) and evict_first
+            # for the second input (block pointer), with extra persistent-variant lines under
+            # multi-kernel.
             @torch.compile
             def f(a, b):
+                # [FUNCTION DOC] HELPER: Return the last-dim sum of a times b.
                 return (a * b).sum(dim=-1)
 
             N = 512
@@ -20696,7 +25049,10 @@ if RUN_GPU:
         # Disable index propagation, so the indirect indexing isn't optimized away
         @patch.object(config, "constant_and_index_propagation", False)
         def test_computed_indirect_mask(self):
+            # [FUNCTION DOC] With index propagation disabled, an indirect load from an arange index
+            # keeps a temporary index and the load is masked by the x mask; compiled equals eager.
             def fn(x, n):
+                # [FUNCTION DOC] HELPER: Index x with an arange of n elements and add one.
                 tmp = torch.arange(n, device=x.device)
                 return x[tmp] + 1
 
@@ -20725,6 +25081,10 @@ if RUN_GPU:
             ],
         )
         def test_has_constant_mask(self, block_multiple, ynumel_exceed_ygrid_size):
+            # [FUNCTION DOC] Parametrized over whether sizes are block multiples and whether the y
+            # numel exceeds the maximum y grid: with 3 tiles and nd tiling, the generated code has
+            # a constant full mask for dims that are block multiples (and y only if it does not
+            # exceed the grid limit), else a computed index mask for both.
             from torch._inductor.runtime.hints import TRITON_MAX_BLOCK
             from torch._inductor.runtime.runtime_utils import get_max_y_grid
 
@@ -20760,9 +25120,14 @@ if RUN_GPU:
         )
         @config.patch("triton.persistent_reductions", True)
         def test_has_constant_mask_small_persistent_reduction(self, rnumel):
+            # [FUNCTION DOC] Parametrized over reduction length 16 and 32 for persistent
+            # reductions: when the reduction block (next power of two) is below the warp size the
+            # generated code must have a dynamic reduction mask, else a constant full mask;
+            # compiled equals eager.
             from torch._inductor.runtime.hints import get_warp_size
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Return the last-dim sum of x.
                 return x.sum(dim=-1)
 
             x = torch.randn(1024, rnumel, device=GPU_TYPE)
@@ -20791,12 +25156,18 @@ if RUN_GPU:
 
         @config.patch("triton.native_matmul", False)
         def test_kernel_names_descriptive(self):
+            # [FUNCTION DOC] Descriptive kernel names with native matmul disabled: checks fused
+            # kernel names for cos-sin, softmax after matmul and layer norm with relu in aten
+            # naming (default) and in module-style naming when the descriptive names option is set
+            # to torch.
             @torch.compile(backend="inductor")
             def fn1(x):
+                # [FUNCTION DOC] HELPER: Return sin of cos of x.
                 return x.cos().sin()
 
             @torch.compile(backend="inductor")
             def fn2(x):
+                # [FUNCTION DOC] HELPER: Square matrix product of x followed by softmax on dim 1.
                 x = torch.mm(x, x)
                 x = torch.softmax(x, dim=1)
                 return x
@@ -20809,6 +25180,8 @@ if RUN_GPU:
 
             @torch.compile(backend="inductor")
             def fn3(x):
+                # [FUNCTION DOC] HELPER: Apply the enclosing sequential module (linear, layer norm,
+                # relu) to x.
                 return mod(x)
 
             func_and_kernel_aten = [
@@ -20839,6 +25212,9 @@ if RUN_GPU:
             ]
 
             def test_funcs(func_and_kernel):
+                # [FUNCTION DOC] HELPER: For each function, input and expected kernel name, run
+                # under no-grad, print the code if the kernel name is missing, and assert the name
+                # is in the code.
                 with torch.no_grad():
                     for fn, kernel_name, inps in func_and_kernel:
                         code = run_and_get_triton_code(fn, *inps)
@@ -20856,8 +25232,12 @@ if RUN_GPU:
         )
         @patch.object(config, "profile_bandwidth", True)
         def test_bandwidth_profiler(self):
+            # [FUNCTION DOC] With bandwidth profiling on, generated code for a graph with pointwise
+            # and matmul ops contains the start and end graph profiling markers. Skipped for cpp
+            # wrapper.
             @torch.compile(backend="inductor")
             def fn(x):
+                # [FUNCTION DOC] HELPER: Apply cos twice, a matrix product, sin and relu.
                 x = x.cos()
                 x = x.cos()
                 x = torch.mm(x, x)
@@ -20872,8 +25252,13 @@ if RUN_GPU:
             self.assertTrue("end_graph" in code)
 
         def test_comment_graph_fragment(self):
+            # [FUNCTION DOC] Generated code comments a graph fragment of the FX nodes behind each
+            # kernel: for a sin then relu function, the code contains the fragment header and the
+            # node text of both nodes with shapes and device (for the cpp wrapper only the fused
+            # kernel name is checked).
             @torch.compile(backend="inductor")
             def fn(x):
+                # [FUNCTION DOC] HELPER: Return relu of sin of x.
                 x = x.sin()
                 x = x.relu()
                 return x
@@ -20895,7 +25280,11 @@ if RUN_GPU:
                 )
 
         def test_split_op_with_sym(self):
+            # [FUNCTION DOC] Splitting a tensor by a symbolic size and by half of it with static
+            # and dynamic shapes compiles and runs; results are not asserted.
             def fn(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return the tensor split into chunks of size equal to the
+                # first dim and into chunks of half that size.
                 # split(tensor, sympy.Integer), split(tensor, sympy.Expr)
                 return torch.split(x, x.shape[0]), torch.split(x, x.shape[0] // 2)
 
@@ -20911,6 +25300,10 @@ if RUN_GPU:
         @skipIfRocm
         @unittest.skipIf(IS_FBCODE, "fbcode system python does not provide torch")
         def test_indirect_device_assert(self):
+            # [FUNCTION DOC] Spawns a helper script in subprocesses for many indexing patterns
+            # (gather, store, cross entropy variants, upper and lower bound cases) with 2D and 3D
+            # inputs and static or dynamic shapes; each run must print an out of bounds error on
+            # stderr. Skipped on ROCm and in fbcode.
             dir_path = os.path.dirname(os.path.realpath(__file__))
             test_path = os.path.join(dir_path, "indirect_assert_helper.py")
             fns = (
@@ -20926,6 +25319,9 @@ if RUN_GPU:
             )
 
             def test(fn, ndims, dyn_shape, one_size=False):
+                # [FUNCTION DOC] HELPER: Run the helper script as a subprocess with the function
+                # name, number of dims, dynamic flag and one-size flag, then assert any stderr line
+                # contains the out of bounds message.
                 proc = subprocess.Popen(
                     [
                         sys.executable,
@@ -20961,8 +25357,15 @@ if RUN_GPU:
         @patch("torch._inductor.config.comment_origin", True)
         @patch("torch._functorch.config.max_dist_from_bw", 0)
         def test_inductor_sequence_nr(self):
+            # [FUNCTION DOC] With comment origins and zero distance from backward config, sequence
+            # numbers in comments of the generated backward code must be a subset of those in the
+            # forward code (a convolution, batch norm, relu, add, flatten and L1 loss model, GPU).
             class Model(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module of a 1x1 same-padded convolution, batch norm, ReLU and
+                # L1 loss; forward adds the input back, flattens and returns the loss in a tuple.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Create the convolution, batch norm, relu and loss
+                    # layers.
                     super().__init__()
                     self.conv1 = torch.nn.Conv2d(
                         in_channels=16,
@@ -20977,6 +25380,8 @@ if RUN_GPU:
                     self.loss_fn = torch.nn.L1Loss()
 
                 def forward(self, x, target):
+                    # [FUNCTION DOC] HELPER: Run the layers, add the original input, flatten,
+                    # compute the loss against the target and return it in a tuple.
                     y = x
                     x = self.conv1(x)
                     x = self.bn1(x)
@@ -20987,7 +25392,11 @@ if RUN_GPU:
                     return (output,)
 
             def get_triton_codegen(optimized_module, args):
+                # [FUNCTION DOC] HELPER: Run forward and backward of the optimized module and
+                # return the forward and backward generated codes.
                 def run_with_backward():
+                    # [FUNCTION DOC] HELPER: Call the module on the arguments, run backward on its
+                    # first output and return the result.
                     result = optimized_module(*args)
                     result[0].backward()
                     return result
@@ -21028,11 +25437,21 @@ if RUN_GPU:
             "Triton does not support fp8 on A100",
         )
         def test_red_followed_by_transposed_pointwise(self):
+            # [FUNCTION DOC] Reduction hint with pointwise consumers: a function computing silu
+            # times an input, two amax-normalized float8 copies (row and column) and two scaled
+            # matmuls must generate three non-persistent reduction kernels and no persistent
+            # reduction (the third reduction used to be wrongly persistent, hurting performance).
+            # Needs an fp8 capable GPU (not A100); coordinate descent tuning, unique kernel names
+            # and benchmark kernels enabled; skipped on ROCm and expected failure on XPU. With the
+            # performance flag it profiles 1000 runs.
             bs = 26624
             dim = 1024
 
             @torch.compile(dynamic=False)
             def f(in1, in2, a, b, scale_a, scale_b):
+                # [FUNCTION DOC] HELPER: Compiled static-shape function: silu of in1 times in2, row
+                # and column amax normalization converted to float8, layout setup, and two scaled
+                # matmuls with bfloat16 output; returns both products.
                 out = torch.nn.functional.silu(in1) * in2
                 out_row = (out / out.amax(dim=1, keepdim=True)).to(torch.float8_e4m3fn)
                 out_col = (out / out.amax(dim=0, keepdim=True)).to(torch.float8_e4m3fn)
@@ -21086,9 +25505,13 @@ if RUN_GPU:
                 print(p.key_averages().table(max_name_column_width=200))
 
         def test_non_blocking_copy_codegen(self):
+            # [FUNCTION DOC] The non-blocking flag of a device copy must appear in generated code
+            # (issue 136260), as the literal true for Python wrapper or the argument 1 in the AOTI
+            # copy call for cpp wrapper.
             # Checks non_blocking arg is present in codegen
             # (see https://github.com/pytorch/pytorch/issues/136260)
             def fn(x):
+                # [FUNCTION DOC] HELPER: Copy x to the test device with non_blocking enabled.
                 return x.to(device=self.device, non_blocking=True)
 
             inp = torch.randn(3, 4)
@@ -21102,6 +25525,9 @@ if RUN_GPU:
                 FileCheck().check("copy_").check_same("True").run(code)
 
         def test_layer_norm_inplaces_after_matmul(self):
+            # [FUNCTION DOC] Layer norm after a matmul (issue 132826) should reuse the matmul
+            # output buffer in place: generated triton code contains in_out pointer arguments;
+            # compiled equals eager.
             # https://github.com/pytorch/pytorch/issues/132826
             batch_size = 32
             seq_length = 50
@@ -21110,6 +25536,8 @@ if RUN_GPU:
             layer_norm = torch.nn.LayerNorm(hidden_size, device=GPU_TYPE)
 
             def fn(inp, weight):
+                # [FUNCTION DOC] HELPER: Matrix multiply inp by weight and apply the enclosing
+                # layer norm.
                 matmul_output = inp @ weight
                 final_output = layer_norm(matmul_output)
                 return final_output
@@ -21128,6 +25556,9 @@ if RUN_GPU:
         # layernorm backward.
         @torch._inductor.config.patch({"triton.mix_order_reduction": False})
         def test_donated_buffer_inplace(self):
+            # [FUNCTION DOC] With donated buffers enabled and mix order reductions off, the
+            # backward code of a matmul plus layer norm module updates donated buffers in place
+            # (in_out pointer arguments appear in the backward code).
             batch_size = 32
             seq_length = 50
             hidden_size = 512 if torch.version.hip is not None else 256
@@ -21146,6 +25577,8 @@ if RUN_GPU:
             layer_norm = torch.nn.LayerNorm(hidden_size, device=self.device)
 
             def fn(inp, weight):
+                # [FUNCTION DOC] HELPER: Matrix multiply inp by weight and apply the enclosing
+                # layer norm.
                 matmul_output = inp @ weight
                 final_output = layer_norm(matmul_output)
                 return final_output
@@ -21153,6 +25586,7 @@ if RUN_GPU:
             fn_opt = torch.compile(fn)
 
             def wrapper(inp, weight):
+                # [FUNCTION DOC] HELPER: Run the compiled function, sum, and call backward.
                 return fn_opt(inp, weight).sum().backward()
 
             _, code = run_and_get_code(wrapper, inp, weight)
@@ -21161,10 +25595,16 @@ if RUN_GPU:
         @torch._functorch.config.patch("donated_buffer", True)
         @torch._inductor.config.patch("force_shape_pad", True)
         def test_donated_buffer_inplace_gpt(self):
+            # [FUNCTION DOC] Donated buffer in place updates for a one-layer GPT-2 model (from
+            # llm.c) with forced shape padding, bfloat16 autocast, forward and backward: unless
+            # using cpp wrapper, the backward code must reuse a buffer of 1024 by 50257 elements
+            # through reinterpret. Defines the full model inside the test.
             # model implementation from llm.c:
             # https://github.com/karpathy/llm.c/blob/master/train_gpt2.py
             class NewGELU(nn.Module):
+                # [CLASS DOC] HELPER: Tanh approximation of the GELU activation as a module.
                 def forward(self, input):
+                    # [FUNCTION DOC] HELPER: Return the tanh approximation GELU of the input.
                     return (
                         0.5
                         * input
@@ -21178,7 +25618,13 @@ if RUN_GPU:
                     )
 
             class CausalSelfAttention(nn.Module):
+                # [CLASS DOC] HELPER: Multi-head causal self attention with a combined
+                # query/key/value linear layer, an output projection and a causal mask buffer;
+                # asserts the embedding size is divisible by the number of heads.
                 def __init__(self, config):
+                    # [FUNCTION DOC] HELPER: Create projection layers, store head counts and
+                    # register the lower triangular mask buffer; raises AssertionError if the
+                    # embedding size is not divisible by the number of heads.
                     super().__init__()
                     if config.n_embd % config.n_head != 0:
                         raise AssertionError(
@@ -21201,6 +25647,9 @@ if RUN_GPU:
                     )
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Project to query, key and value, split into heads, run
+                    # causal scaled dot product attention, merge heads and apply the output
+                    # projection.
                     (
                         B,
                         T,
@@ -21227,7 +25676,10 @@ if RUN_GPU:
                     return y
 
             class MLP(nn.Module):
+                # [CLASS DOC] HELPER: Transformer feed forward block: expansion linear, GELU,
+                # projection linear.
                 def __init__(self, config):
+                    # [FUNCTION DOC] HELPER: Create the linear layers and the GELU module.
                     super().__init__()
                     self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
                     self.gelu = NewGELU()
@@ -21235,13 +25687,18 @@ if RUN_GPU:
                     self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Apply expansion, activation and projection.
                     x = self.c_fc(x)
                     x = self.gelu(x)
                     x = self.c_proj(x)
                     return x
 
             class Block(nn.Module):
+                # [CLASS DOC] HELPER: Transformer block with two layer norms, attention and the
+                # feed forward network, using residual connections.
                 def __init__(self, config):
+                    # [FUNCTION DOC] HELPER: Create the layer norms, attention and feed forward
+                    # modules.
                     super().__init__()
                     self.ln_1 = nn.LayerNorm(config.n_embd)
                     self.attn = CausalSelfAttention(config)
@@ -21249,11 +25706,16 @@ if RUN_GPU:
                     self.mlp = MLP(config)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Add attention of the normalized input and then the
+                    # feed forward output of the normalized sum as residuals.
                     x = x + self.attn(self.ln_1(x))
                     x = x + self.mlp(self.ln_2(x))
                     return x
 
             class GPTConfig:
+                # [CLASS DOC] HELPER: Plain class holding the GPT model hyperparameters as class
+                # attributes (block size 1024, vocabulary 50257, one layer, 12 heads, embedding
+                # 768).
                 block_size: int = 1024
                 vocab_size: int = 50257
                 n_layer: int = 1
@@ -21261,7 +25723,13 @@ if RUN_GPU:
                 n_embd: int = 768
 
             class GPT(nn.Module):
+                # [CLASS DOC] HELPER: Small GPT language model: token and position embeddings, a
+                # list of blocks, a final layer norm and a language model head whose weights are
+                # tied to the token embedding.
                 def __init__(self, config):
+                    # [FUNCTION DOC] HELPER: Create the embedding, block list, layer norm and head
+                    # modules, mark the head to skip initialization and tie its weight to the token
+                    # embedding.
                     super().__init__()
                     self.config = config
 
@@ -21286,6 +25754,10 @@ if RUN_GPU:
                     )  # https://paperswithcode.com/method/weight-tying
 
                 def forward(self, idx, targets):
+                    # [FUNCTION DOC] HELPER: Embed tokens and positions, run all blocks and the
+                    # final layer norm, compute logits, and return the cross entropy loss against
+                    # the targets ignoring index -1; raises AssertionError if the sequence is
+                    # longer than the block size.
                     device = idx.device
                     b, t = idx.size()
                     if t > self.config.block_size:
@@ -21330,6 +25802,8 @@ if RUN_GPU:
             y = torch.randint(0, 50257, (B, T), dtype=torch.int64, device=GPU_TYPE)
 
             def wrapper(x, y):
+                # [FUNCTION DOC] HELPER: Compute the loss under the bfloat16 autocast context and
+                # call backward.
                 with ctx:
                     loss = model(x, y)
                 loss.backward()
@@ -21348,7 +25822,11 @@ if RUN_GPU:
             "Test only applies to newer triton versions",
         )
         def test_triton_attrs_dict_constexpr_signature(self):
+            # [FUNCTION DOC] With newer triton versions that use an attribute dictionary, the
+            # generated kernel metadata signature marks the block size as a constexpr. Skipped
+            # otherwise.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Return sin of x.
                 return x.sin()
 
             fn_c = torch.compile(fn)
@@ -21368,6 +25846,11 @@ if RUN_GPU:
             "no scaled_grouped_mm support",
         )
         def test_respect_scaled_grouped_mm_layout_tag(self):
+            # [FUNCTION DOC] The scaled grouped matmul op requires its second operand to be column
+            # major: builds a column-major batched weight, checks it is column major, then compiles
+            # a function that scales both operands, converts to float8 and calls the scaled grouped
+            # matmul; passes if it compiles and runs. Needs SM90 or ROCm FP8 support; skipped on
+            # ROCm 7.14 and later.
             # scaled_grouped_mm needs `mat2` to be column-major
             M, K, N = 128, 64, 32  # K and N must be divisible by 16
             num_groups = 2
@@ -21387,6 +25870,9 @@ if RUN_GPU:
 
             # Verify column-major layout
             def _is_column_major(x: torch.Tensor) -> bool:
+                # [FUNCTION DOC] HELPER: Return whether a 2-D or 3-D tensor has stride 1 on the
+                # second to last dim and a larger stride on the last dim; raises AssertionError for
+                # other ranks.
                 """Check if tensor is column-major (stride(-2) == 1 and stride(-1) > 1)"""
                 if not (x.ndim == 2 or x.ndim == 3):
                     raise AssertionError("input tensor must be 2D or 3D")
@@ -21399,6 +25885,9 @@ if RUN_GPU:
 
             @torch.compile
             def fn():
+                # [FUNCTION DOC] HELPER: Build per-row scales, scale and convert A to float8, scale
+                # and convert B to float8 column major, and call the scaled grouped matmul with
+                # reciprocal scales, offsets and bfloat16 output with fast accumulation.
                 A_scales = torch.ones(M, dtype=torch.float32, device=GPU_TYPE)
                 A_scaled = A.to(torch.float32) * A_scales.unsqueeze(-1)
                 A_fp8_row_major = A_scaled.to(e4m3_type)
@@ -21425,6 +25914,10 @@ if RUN_GPU:
         @config.patch(implicit_fallbacks=True)
         @torch._inductor.config.patch("graph_partition", True)
         def test_graph_partition_default_device_context(self):
+            # [FUNCTION DOC] Graph partition with an unsafe-for-cuda-graphs custom op: the
+            # partitioned code must contain exactly one default device guard for device 0 (the AOTI
+            # guard under cpp wrapper and the Python device guard otherwise) with reduce-overhead
+            # mode and implicit fallbacks.
             @torch.library.custom_op(
                 "mylib::cg_unsafe_op",
                 mutates_args=[],
@@ -21433,13 +25926,18 @@ if RUN_GPU:
                 tags=(torch._C.Tag.cudagraph_unsafe,),
             )
             def cg_unsafe_op(x) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Custom op implementation returning x plus one (tagged as
+                # unsafe for cuda graphs).
                 return x + 1
 
             @cg_unsafe_op.register_fake
             def _(x) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor like x.
                 return torch.empty_like(x)
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Add one to x in place, apply the custom op, add one to the
+                # result in place and return it.
                 x += 1
                 y = cg_unsafe_op(x)
                 y += 1
@@ -21463,7 +25961,11 @@ if RUN_GPU:
             not SM90OrLater, "uses bfloat16 atomic add instrs which requires SM >= 90"
         )
         def test_bf16_atomic_add(self):
+            # [FUNCTION DOC] bfloat16 index_put with accumulate uses an atomic add in triton code
+            # (not on XPU, where it falls back); result equals eager. Requires SM90 on CUDA.
             def fn(output, indices, values):
+                # [FUNCTION DOC] HELPER: Accumulate values into output rows at the indices in place
+                # and return output.
                 output.index_put_([indices], values, accumulate=True)
                 return output
 
@@ -21488,7 +25990,10 @@ if RUN_GPU:
 
         @parametrize("dtype", (torch.float32, torch.float64))
         def test_copysign(self, dtype):
+            # [FUNCTION DOC] Parametrized over float32 and float64: copysign with negative zero
+            # produces generated code with the sign bit constant and matches eager.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Return x with the sign of negative zero.
                 out = torch.copysign(x, -0.0)
                 return out
 
@@ -21499,6 +26004,10 @@ if RUN_GPU:
             torch.testing.assert_close(result, fn(inp))
 
         def test_3d_reductions_with_max_tiles_3(self):
+            # [FUNCTION DOC] A full sum of a 3-D strided tensor with up to three tiles and tiled
+            # reductions enabled must not tile in three dimensions (only two reduction ranges
+            # exist): the generated code has the point dimension size fixed at 1; result equals
+            # eager.
             # Inductor only supports at most two reduction iteration ranges, R0 and R1, which the
             # reduction component of the kernel can be tiled across.
             # When max_tiles>=3, SIMDScheduling.create_tiling would previously incorrectly allow the
@@ -21515,6 +26024,7 @@ if RUN_GPU:
             )
             @torch.compile
             def sum(x):
+                # [FUNCTION DOC] HELPER: Compiled function summing x over dims 0, 1 and 2.
                 return torch.sum(x, [0, 1, 2])
 
             shape = (2, 2, 4)
@@ -21540,10 +26050,14 @@ if RUN_GPU:
 
         @config.patch({"triton.decompose_sort_ops": True})
         def test_median_decompose_sort_ops(self):
+            # [FUNCTION DOC] Median (all elements and along dim 1) with sort decomposition on
+            # lowers to the triton sort code and matches eager.
             def fn_default(a):
+                # [FUNCTION DOC] HELPER: Return the median of all elements of a.
                 return torch.median(a)
 
             def fn_dim(a):
+                # [FUNCTION DOC] HELPER: Return the median of a along dim 1.
                 return torch.median(a, dim=1)
 
             inp = torch.randn(8, 16, device=GPU_TYPE)
@@ -21559,7 +26073,11 @@ if RUN_GPU:
 
         @config.patch({"triton.decompose_sort_ops": True})
         def test_mode_decompose_sort_ops(self):
+            # [FUNCTION DOC] Mode along dim 1 with sort decomposition on, using small integer
+            # values so ties are common (exercising the run-length logic): generated code uses the
+            # triton sort, and both values and indices match eager.
             def fn(a):
+                # [FUNCTION DOC] HELPER: Return the mode of a along dim 1.
                 return torch.mode(a, dim=1)
 
             # Use integers so ties are common, exercising run-length logic
@@ -21579,10 +26097,15 @@ if RUN_GPU:
 
         @config.patch({"triton.decompose_sort_ops": True})
         def test_topk_decompose_sort_ops(self):
+            # [FUNCTION DOC] Top three elements along the last dim, largest and smallest variants,
+            # with sort decomposition on: generated code uses the triton sort and values and
+            # indices match eager.
             def fn(a):
+                # [FUNCTION DOC] HELPER: Return the top 3 of a along the last dim.
                 return torch.topk(a, 3, dim=-1)
 
             def fn_largest_false(a):
+                # [FUNCTION DOC] HELPER: Return the 3 smallest elements of a along the last dim.
                 return torch.topk(a, 3, dim=-1, largest=False)
 
             inp = torch.randn(8, 16, device=GPU_TYPE)
@@ -21600,7 +26123,10 @@ if RUN_GPU:
 
         @config.patch({"triton.decompose_sort_ops": True})
         def test_kthvalue_decompose_sort_ops(self):
+            # [FUNCTION DOC] kthvalue (third smallest along the last dim) with sort decomposition
+            # on: generated code uses the triton sort and the results match eager.
             def fn(a):
+                # [FUNCTION DOC] HELPER: Return the third smallest value of a along the last dim.
                 return torch.kthvalue(a, 3, dim=-1)
 
             inp = torch.randn(8, 16, device=GPU_TYPE)
@@ -21616,8 +26142,12 @@ if RUN_GPU:
             torch.testing.assert_close(result[1], expected[1])
 
         def test_multinomial_lowering_no_graph_break(self):
+            # [FUNCTION DOC] Multinomial sampling with replacement of a scaled weight vector
+            # compiles without graph breaks (dynamo explanation reports zero) through a registered
+            # fallback lowering; the result has three samples in the valid index range.
             # aten.multinomial must be handled by a registered lowering (extern fallback)
             def fn(weights):
+                # [FUNCTION DOC] HELPER: Scale weights by 2 and draw 3 samples with replacement.
                 w = weights * 2.0
                 return torch.multinomial(w, num_samples=3, replacement=True)
 
@@ -21637,8 +26167,12 @@ if RUN_GPU:
             self.assertTrue(result.max() < 8)
 
         def test_bincount_lowering_no_graph_break(self):
+            # [FUNCTION DOC] Bincount with a registered fallback must compile with zero graph
+            # breaks and equal eager.
             # aten.bincount has a registered make_fallback; must compile graph-break-free.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Add one to x so it is in the graph and return bincount
+                # with minlength 10.
                 y = x + 1  # ensures x participates in the compiled graph
                 return torch.bincount(y, minlength=10)
 
@@ -21657,8 +26191,12 @@ if RUN_GPU:
             torch.testing.assert_close(result, expected)
 
         def test_unique_lowering_no_graph_break(self):
+            # [FUNCTION DOC] Unique (sorted, with inverse and counts) compiles without graph breaks
+            # and matches eager.
             # aten._unique2 has a registered make_fallback; must compile graph-break-free.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Double x and return its unique values, inverse indices and
+                # counts.
                 y = x * 2
                 vals, inverse, counts = torch.unique(
                     y, sorted=True, return_inverse=True, return_counts=True
@@ -21682,8 +26220,12 @@ if RUN_GPU:
             torch.testing.assert_close(result[2], expected[2])
 
         def test_unique_consecutive_lowering_no_graph_break(self):
+            # [FUNCTION DOC] Unique consecutive with inverse and counts compiles without graph
+            # breaks and matches eager.
             # aten.unique_consecutive has a registered make_fallback.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Take the absolute value of x and return its unique
+                # consecutive values, inverse indices and counts.
                 y = x.abs()
                 vals, inverse, counts = torch.unique_consecutive(
                     y, return_inverse=True, return_counts=True
@@ -21707,8 +26249,11 @@ if RUN_GPU:
             torch.testing.assert_close(result[2], expected[2])
 
         def test_unique_dim_lowering_no_graph_break(self):
+            # [FUNCTION DOC] Unique along dim 0 compiles without graph breaks and matches eager.
             # aten.unique_dim has a registered make_fallback.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Double x and return unique rows with inverse indices and
+                # counts.
                 y = x * 2
                 vals, inverse, counts = torch.unique(
                     y, dim=0, sorted=True, return_inverse=True, return_counts=True
@@ -21732,8 +26277,12 @@ if RUN_GPU:
             torch.testing.assert_close(result[2], expected[2])
 
         def test_unique_dim_consecutive_lowering_no_graph_break(self):
+            # [FUNCTION DOC] Unique consecutive along dim 0 compiles without graph breaks and
+            # matches eager.
             # aten.unique_dim_consecutive has a registered make_fallback.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Take the absolute value of x and return unique consecutive
+                # rows with inverse indices and counts.
                 y = x.abs()
                 vals, inverse, counts = torch.unique_consecutive(
                     y, dim=0, return_inverse=True, return_counts=True
@@ -21757,8 +26306,12 @@ if RUN_GPU:
             torch.testing.assert_close(result[2], expected[2])
 
         def test_amp_update_scale_lowering_no_graph_break(self):
+            # [FUNCTION DOC] The in-place amp scale update op compiles without graph breaks and its
+            # result equals eager.
             # aten._amp_update_scale_ has a registered make_fallback.
             def fn(scale, growth_tracker, found_inf):
+                # [FUNCTION DOC] HELPER: Scale the scale by 1.0 so it is inside the graph, then
+                # call the in-place amp scale update with factors 2.0 and 0.5 and interval 2000.
                 # scalar op before to ensure it's inside the compiled graph
                 s = scale * 1.0
                 return torch._amp_update_scale_(
@@ -21791,7 +26344,10 @@ if RUN_GPU:
             torch.testing.assert_close(result, expected)
 
         def test_sort_dynamic(self):
+            # [FUNCTION DOC] Stable sort along the last dim compiled with dynamic shapes matches
+            # eager for values and indices.
             def fn(a):
+                # [FUNCTION DOC] HELPER: Return the stable sort of a along the last dim.
                 return torch.sort(a, dim=-1, stable=True)
 
             inp = torch.randn(8, 16, device=GPU_TYPE)
@@ -21803,7 +26359,9 @@ if RUN_GPU:
             torch.testing.assert_close(result[1], expected[1])
 
         def test_median_dynamic(self):
+            # [FUNCTION DOC] Median along dim 1 compiled with dynamic shapes matches eager.
             def fn(a):
+                # [FUNCTION DOC] HELPER: Return the median of a along dim 1.
                 return torch.median(a, dim=1)
 
             inp = torch.randn(8, 16, device=GPU_TYPE)
@@ -21821,11 +26379,16 @@ if RUN_GPU:
             }
         )
         def test_tma_descriptor_no_x_dim_split_scan(self):
+            # [FUNCTION DOC] Regression: split scan kernels fix XBLOCK to 1, but tensor descriptors
+            # (TMA) need at least 16 bytes in the innermost block, so TMA must be rejected there; a
+            # cumulative sum of an add on a 1 by 129 by 64 input must compile and match eager with
+            # tensor descriptors enabled.
             # Regression test: split_scan kernels have no_x_dim=True (XBLOCK
             # hardcoded to 1). TMA descriptors require >= 16 bytes in the
             # innermost dimension, so TMA must be rejected when the innermost
             # block is XBLOCK and XBLOCK is fixed at 1.
             def fn(x, b):
+                # [FUNCTION DOC] HELPER: Return the cumulative sum along dim 1 of x plus b.
                 return torch.cumsum(x + b, dim=1)
 
             x = torch.randn(1, 129, 64, device=GPU_TYPE)
@@ -21842,12 +26405,19 @@ if RUN_GPU:
             }
         )
         def test_tma_descriptor_combo_kernel_shared_xblock(self):
+            # [FUNCTION DOC] Regression: in combo kernels XBLOCK is shared by sub-kernels, so one
+            # sub-kernel with a single x element forces XBLOCK to 1, which would break tensor
+            # descriptors in siblings; TMA must be rejected in that case. Four mean reductions of a
+            # small tensor compile and match eager with tensor descriptors and combo kernels
+            # enabled.
             # Regression test: in combo kernels without per_subkernel_blocks,
             # XBLOCK is shared across sub-kernels. If one sub-kernel has
             # xnumel=1 (forcing XBLOCK=1), tensor descriptors in sibling
             # sub-kernels with block_shape containing XBLOCK will violate
             # the TMA 16-byte minimum. TMA must be rejected for such cases.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Return four mean reductions of x (all, last dim, dim -2
+                # keepdim, dims 0 and 1).
                 return (
                     x.mean(),
                     x.mean(-1),
@@ -21862,17 +26432,24 @@ if RUN_GPU:
                 torch.testing.assert_close(a, e)
 
     class RNNTest(TestCase):
+        # [CLASS DOC] GPU test class for recurrent networks.
         device_type = GPU_TYPE
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a batch-first GRU with 16 input and hidden
+            # features.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the GRU layer.
                 super().__init__()
                 self.gru = torch.nn.GRU(16, 16, batch_first=True)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Run the GRU on x and return its outputs.
                 return self.gru(x)
 
         def test_rnn_compile_safe(self):
+            # [FUNCTION DOC] A GRU model compiled with the inductor backend runs on a GPU input
+            # without error.
             device = torch.device(GPU_TYPE)
             model = RNNTest.Model().to(device)
             model = torch.compile(model, backend="inductor")
@@ -21880,9 +26457,15 @@ if RUN_GPU:
             model(x)
 
     class NanCheckerTest(TestCase):
+        # [CLASS DOC] GPU test class for the NaN and infinity assertions that Inductor can insert
+        # into the generated wrapper code.
         @config.patch("nan_asserts", True)
         def test_nan_checker_pass(self):
+            # [FUNCTION DOC] With NaN assertions enabled, compiled softmax of a finite input equals
+            # eager and the generated code contains the input check comment and the loops asserting
+            # no NaN or infinity in return values (or the AOTI check call for cpp wrapper).
             def f(x):
+                # [FUNCTION DOC] HELPER: Return softmax of x over the last dim.
                 return torch.softmax(x, dim=-1)
 
             x = torch.randn(2, 1024, device=GPU_TYPE)
@@ -21903,7 +26486,10 @@ if RUN_GPU:
 
         @config.patch("nan_asserts", True)
         def test_nan_checker_fail(self):
+            # [FUNCTION DOC] With NaN assertions enabled, running a compiled softmax on an input
+            # containing NaN must raise AssertionError (RuntimeError for cpp wrapper).
             def f(x):
+                # [FUNCTION DOC] HELPER: Return softmax of x over the last dim.
                 return torch.softmax(x, dim=-1)
 
             x = torch.randn(2, 1024, device=GPU_TYPE)
@@ -21917,8 +26503,15 @@ if RUN_GPU:
 if RUN_CPU:
 
     class CheckModelStrideSemanticsTest(TestCase):
+        # [CLASS DOC] CPU tests for the stride comparison semantics of check_model and the
+        # significant stride assertion helper.
         def test_check_model_exact_stride_ignores_insignificant_strides(self):
+            # [FUNCTION DOC] check_model with exact stride checking must ignore strides of size-one
+            # dims: an integer einsum (batched matrix product) of arange tensors passes with exact
+            # strides and no float reference.
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Return the batched matrix product of x and y through
+                # einsum.
                 return torch.einsum("aij,ajk->aik", x, y)
 
             x = torch.arange(6, dtype=torch.int64).reshape(1, 2, 3)
@@ -21933,6 +26526,9 @@ if RUN_CPU:
             )
 
         def test_significant_stride_check_rejects_meaningful_stride_mismatch(self):
+            # [FUNCTION DOC] The significant stride helper accepts tensors that differ only in an
+            # insignificant stride (leading size one dim) and raises AssertionError with a message
+            # about significant strides mismatch when a stride on a larger dim differs.
             _assert_same_significant_strides(
                 self,
                 torch.empty_strided((1, 2, 4), (4, 4, 1)),
@@ -21947,7 +26543,11 @@ if RUN_CPU:
                 )
 
     class TestFull(TestCase):
+        # [CLASS DOC] CPU test class for the full factory op.
         def test_full_dtype(self):
+            # [FUNCTION DOC] torch.full with Python bool, int and float fill values for each of
+            # several dtypes (including no dtype): the compiled function under the Python
+            # dispatcher and no-grad returns values equal to eager.
             pytypes = (
                 bool,
                 int,
@@ -21968,6 +26568,9 @@ if RUN_CPU:
             )
 
             def fn(pytype, dtype):
+                # [FUNCTION DOC] HELPER: Pick a fill value from the Python type (True, 42 or 42.0),
+                # raising AssertionError for other types, and return a 4 by 6 full CPU tensor with
+                # the dtype.
                 if pytype is bool:
                     fill_value = True
                 elif pytype is int:
@@ -21992,6 +26595,8 @@ if RUN_CPU:
 
 
 def _strip_tmp_path(code: str) -> str:
+    # [FUNCTION DOC] HELPER: Replace temporary file paths in include directives of generated C++
+    # code with a fixed placeholder so code strings from different compiles can be compared.
     """
     Canonicalize things that look like a tmp path so they can be compared.
     """
@@ -22001,6 +26606,8 @@ def _strip_tmp_path(code: str) -> str:
 def _run_and_get_stripped_kernels(
     fn: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
 ) -> tuple[_T, list[str]]:
+    # [FUNCTION DOC] HELPER: Run fn through the kernel-extracting runner and return its result
+    # together with the list of kernel code strings with temporary paths normalized.
     result, codes = run_and_get_kernels(fn, *args, **kwargs)
     return result, [_strip_tmp_path(code) for code in codes]
 
