@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: jit"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests that scripted and lite-interpreter modules serialized with old operator
+# versions (fixture files for versions two, seven and eight, under the test directory) behave like
+# the current implementation: division (tensor, in-place, out, scalar, reciprocal, scalar-scalar),
+# linspace and logspace, with and without output arguments. Uses hypothesis to generate inputs for
+# the division tests; a missing fixture skips the test. Importing appends the test directory to
+# sys.path; direct execution redirects to test/test_jit.py.
 
 import io
 import os
@@ -22,8 +28,15 @@ from torch.testing._internal.jit_utils import JitTestCase
 
 
 class TestSaveLoadForOpVersion(JitTestCase):
+    # [CLASS DOC] Operator-version compatibility tests. Provides helpers to round-trip a module
+    # through the standard format or the lite-interpreter format, to capture an exception as a
+    # value, and to count graph nodes of a kind; each test compares a historic fixture module with
+    # a Python reimplementation of the old behavior and a freshly saved current module.
     # Helper that returns the module after saving and loading
     def _save_load_module(self, m):
+        # [FUNCTION DOC] HELPER: Instantiates the given module class, scripts it, saves it to an
+        # in-memory buffer, rewinds the buffer, and returns the module loaded back with the
+        # standard loader.
         scripted_module = torch.jit.script(m())
         buffer = io.BytesIO()
         torch.jit.save(scripted_module, buffer)
@@ -31,6 +44,9 @@ class TestSaveLoadForOpVersion(JitTestCase):
         return torch.jit.load(buffer)
 
     def _save_load_mobile_module(self, m):
+        # [FUNCTION DOC] HELPER: Instantiates the given module class, scripts it, serializes it
+        # for the lite interpreter into an in-memory buffer, and returns the module loaded with
+        # the lite-interpreter loader.
         scripted_module = torch.jit.script(m())
         buffer = io.BytesIO(scripted_module._save_to_buffer_for_lite_interpreter())
         buffer.seek(0)
@@ -39,15 +55,21 @@ class TestSaveLoadForOpVersion(JitTestCase):
     # Helper which returns the result of a function or the exception the
     #   function threw.
     def _try_fn(self, fn, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the function with the given arguments and returns its
+        # result, or returns the raised exception object instead of propagating it.
         try:
             return fn(*args, **kwargs)
         except Exception as e:
             return e
 
     def _verify_no(self, kind, m):
+        # [FUNCTION DOC] HELPER: Asserts that the module graph has no nodes of the given kind (a
+        # count of zero).
         self._verify_count(kind, m, 0)
 
     def _verify_count(self, kind, m, count):
+        # [FUNCTION DOC] HELPER: Counts how many times the kind text appears in the printed form
+        # of all nodes of the module graph and asserts the total equals the expected count.
         node_count = sum(str(n).count(kind) for n in m.graph.nodes())
         self.assertEqual(node_count, count)
 
@@ -70,14 +92,25 @@ class TestSaveLoadForOpVersion(JitTestCase):
     )  # Generate a pair (integer, float)
     @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
     def test_versioned_div_tensor(self, sample_input):
+        # [FUNCTION DOC] Division of two tensors by operator, function and method forms. Compares
+        # the version-two fixture against a reimplementation of historic division (true division
+        # if either input is floating point, otherwise truncated division) and the current module
+        # against the current division function. Hypothesis supplies pairs of an integer and a
+        # float (ten examples) plus one explicit example; every pair element is paired with every
+        # other. Skipped if the fixture cannot be loaded.
         def historic_div(self, other):
+            # [FUNCTION DOC] HELPER: Historic division semantics for two tensors: true division if
+            # either is floating point, otherwise truncating division.
             if self.is_floating_point() or other.is_floating_point():
                 return self.true_divide(other)
             return self.divide(other, rounding_mode="trunc")
 
         # Tensor x Tensor
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing division three ways and returning all results.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Divides with the operator, the function and the method
+                # form and returns the three results.
                 result_0 = a / b
                 result_1 = torch.div(a, b)
                 result_2 = a.div(b)
@@ -100,6 +133,9 @@ class TestSaveLoadForOpVersion(JitTestCase):
             b = torch.tensor((val_b,))
 
             def _helper(m, fn):
+                # [FUNCTION DOC] HELPER: Runs the module and the reference function on the shared
+                # inputs. If the module raised, asserts the reference also raised; otherwise
+                # asserts every module output equals the reference result.
                 m_results = self._try_fn(m, a, b)
                 fn_result = self._try_fn(fn, a, b)
 
@@ -123,13 +159,26 @@ class TestSaveLoadForOpVersion(JitTestCase):
     )  # Generate a pair (integer, float)
     @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
     def test_versioned_div_tensor_inplace(self, sample_input):
+        # [FUNCTION DOC] In-place division of tensors. Compares the version-two fixture with
+        # historic in-place division and the current module with the current in-place method,
+        # requiring equal results and that the module result equals the mutated input. Input a is
+        # recreated between the two comparisons because it is modified. Hypothesis supplies pairs
+        # of an integer and a float (ten examples) plus one explicit example; every pair element
+        # is paired with every other. Skipped if the fixture cannot be loaded.
+        # KNOWN ISSUE: the error branch uses assertTrue with the exception type as the message
+        # argument, so it only checks the earlier result is truthy, not that it is an exception.
         def historic_div_(self, other):
+            # [FUNCTION DOC] HELPER: Historic in-place division semantics: true division if either
+            # input is floating point, otherwise truncating division, in place.
             if self.is_floating_point() or other.is_floating_point():
                 return self.true_divide_(other)
             return self.divide_(other, rounding_mode="trunc")
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing its first argument in place by its second and
+            # returning it.
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Applies in-place division and returns the first argument.
                 a /= b
                 return a
 
@@ -148,6 +197,9 @@ class TestSaveLoadForOpVersion(JitTestCase):
             b = torch.tensor((val_b,))
 
             def _helper(m, fn):
+                # [FUNCTION DOC] HELPER: Runs the reference on a clone and the module on the
+                # original input, then compares results and, on success, checks the module result
+                # equals the mutated input.
                 fn_result = self._try_fn(fn, a.clone(), b)
                 m_result = self._try_fn(m, a, b)
                 if isinstance(m_result, Exception):
@@ -173,7 +225,18 @@ class TestSaveLoadForOpVersion(JitTestCase):
     )  # Generate a pair (integer, float)
     @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
     def test_versioned_div_tensor_out(self, sample_input):
+        # [FUNCTION DOC] Division with an output tensor, with a float and an integer output
+        # buffer. Compares the version-two fixture against historic out-variant semantics and the
+        # current module against torch.div, requiring equal results and that the result equals the
+        # output buffer. Hypothesis supplies pairs of an integer and a float (ten examples) plus
+        # one explicit example; every pair element is paired with every other. Skipped if the
+        # fixture cannot be loaded.
+        # KNOWN ISSUE: the error branch uses assertTrue with the exception type as the message
+        # argument, so it only checks the earlier result is truthy, not that it is an exception.
         def historic_div_out(self, other, out):
+            # [FUNCTION DOC] HELPER: Historic division semantics with an
+            # output argument: true division if any of the three tensors is
+            # floating point, otherwise truncating division.
             if (
                 self.is_floating_point()
                 or other.is_floating_point()
@@ -183,7 +246,9 @@ class TestSaveLoadForOpVersion(JitTestCase):
             return torch.divide(self, other, out=out, rounding_mode="trunc")
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing with an output argument.
             def forward(self, a, b, out):
+                # [FUNCTION DOC] HELPER: Divides a by b writing into out and returns the result.
                 return a.div(b, out=out)
 
         try:
@@ -203,6 +268,9 @@ class TestSaveLoadForOpVersion(JitTestCase):
             for out in (torch.empty((1,)), torch.empty((1,), dtype=torch.long)):
 
                 def _helper(m, fn):
+                    # [FUNCTION DOC] HELPER: Computes the reference result on a clone of the
+                    # output buffer (keyword for torch.div, positional otherwise), runs the module
+                    # on the real buffer, and compares results and the buffer.
                     fn_result = None
                     if fn is torch.div:
                         fn_result = self._try_fn(fn, a, b, out=out.clone())
@@ -230,20 +298,34 @@ class TestSaveLoadForOpVersion(JitTestCase):
     )  # Generate a pair (integer, float)
     @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
     def test_versioned_div_scalar(self, sample_input):
+        # [FUNCTION DOC] Division of a tensor by a Python scalar, float and integer cases. The
+        # float fixture module is compared with the current float module, the integer fixture with
+        # historic integer semantics, and current modules with torch.div. Hypothesis supplies
+        # pairs of an integer and a float (ten examples) plus one explicit example; every pair
+        # element is paired with every other. Skipped if the fixture cannot be loaded.
+        # KNOWN ISSUE: the error branch uses assertTrue with the exception type as the message
+        # argument, so it only checks the earlier result is truthy, not that it is an exception.
         def historic_div_scalar_float(self, other: float):
+            # [FUNCTION DOC] HELPER: Historic float scalar division: true division.
             return torch.true_divide(self, other)
 
         def historic_div_scalar_int(self, other: int):
+            # [FUNCTION DOC] HELPER: Historic integer scalar division: true division for floating
+            # tensors, otherwise truncating division.
             if self.is_floating_point():
                 return torch.true_divide(self, other)
             return torch.divide(self, other, rounding_mode="trunc")
 
         class MyModuleFloat(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing a tensor by a float.
             def forward(self, a, b: float):
+                # [FUNCTION DOC] HELPER: Returns a divided by b.
                 return a / b
 
         class MyModuleInt(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing a tensor by an integer.
             def forward(self, a, b: int):
+                # [FUNCTION DOC] HELPER: Returns a divided by b.
                 return a / b
 
         try:
@@ -266,6 +348,9 @@ class TestSaveLoadForOpVersion(JitTestCase):
             b = val_b
 
             def _helper(m, fn):
+                # [FUNCTION DOC] HELPER: Runs the module and reference on the same tensor and
+                # scalar; if the module raised, only checks the reference result is truthy,
+                # otherwise asserts equal results.
                 m_result = self._try_fn(m, a, b)
                 fn_result = self._try_fn(fn, a, b)
 
@@ -292,20 +377,34 @@ class TestSaveLoadForOpVersion(JitTestCase):
     )  # Generate a pair (integer, float)
     @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
     def test_versioned_div_scalar_reciprocal(self, sample_input):
+        # [FUNCTION DOC] Division of a Python scalar by a tensor (reciprocal form). Fixture
+        # modules for float and integer scalars are compared with current modules, and
+        # current modules are compared with torch.div with swapped arguments. For integer
+        # scalars against an integral tensor the comparison is skipped because the historic
+        # behavior differed. Hypothesis supplies pairs of an integer and a float (ten
+        # examples) plus one explicit example; every pair element is paired with every
+        # other. Skipped if the fixture cannot be loaded.
         def historic_div_scalar_float_reciprocal(self, other: float):
+            # [FUNCTION DOC] HELPER: Historic float reciprocal: the scalar divided by the tensor.
             return other / self
 
         def historic_div_scalar_int_reciprocal(self, other: int):
+            # [FUNCTION DOC] HELPER: Historic integer reciprocal: true division for floating
+            # tensors, otherwise truncating division of the scalar by the tensor.
             if self.is_floating_point():
                 return other / self
             return torch.divide(other, self, rounding_mode="trunc")
 
         class MyModuleFloat(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing a float by a tensor.
             def forward(self, a, b: float):
+                # [FUNCTION DOC] HELPER: Returns b divided by a.
                 return b / a
 
         class MyModuleInt(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing an integer by a tensor.
             def forward(self, a, b: int):
+                # [FUNCTION DOC] HELPER: Returns b divided by a.
                 return b / a
 
         try:
@@ -328,6 +427,10 @@ class TestSaveLoadForOpVersion(JitTestCase):
             b = val_b
 
             def _helper(m, fn):
+                # [FUNCTION DOC] HELPER: Runs the module and computes the reference
+                # (swapping argument order for torch.div); asserts equal results
+                # unless the reference is a non-division function on an integral
+                # tensor, in which case the comparison is skipped.
                 m_result = self._try_fn(m, a, b)
                 fn_result = None
                 # Reverses argument order for torch.div
@@ -363,22 +466,39 @@ class TestSaveLoadForOpVersion(JitTestCase):
     )  # Generate a pair (integer, float)
     @example((2, 3, 2.0, 3.0))  # Ensure this example will be covered
     def test_versioned_div_scalar_inplace(self, sample_input):
+        # [FUNCTION DOC] In-place division of a tensor by a scalar, using standard save/load
+        # modules (not lite interpreter) and the in-place division method as reference. The
+        # historic fixtures are loaded but only to skip the test when missing. Hypothesis supplies
+        # pairs of an integer and a float (ten examples) plus one explicit example; every pair
+        # element is paired with every other. Skipped if the fixture cannot be loaded.
+        # KNOWN ISSUE: the error branch uses assertTrue with the exception type as the message
+        # argument, so it only checks the earlier result is truthy, not that it is an exception.
+        # KNOWN ISSUE: the module and reference both mutate and return the same tensor, so the
+        # equality check is trivially true.
         def historic_div_scalar_float_inplace(self, other: float):
+            # [FUNCTION DOC] HELPER: Historic in-place float
+            # scalar division; unused by the checks.
             return self.true_divide_(other)
 
         def historic_div_scalar_int_inplace(self, other: int):
+            # [FUNCTION DOC] HELPER: Historic in-place integer
+            # scalar division; unused by the checks.
             if self.is_floating_point():
                 return self.true_divide_(other)
 
             return self.divide_(other, rounding_mode="trunc")
 
         class MyModuleFloat(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing a tensor in place by a float.
             def forward(self, a, b: float):
+                # [FUNCTION DOC] HELPER: Applies in-place division and returns the tensor.
                 a /= b
                 return a
 
         class MyModuleInt(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing a tensor in place by an integer.
             def forward(self, a, b: int):
+                # [FUNCTION DOC] HELPER: Applies in-place division and returns the tensor.
                 a /= b
                 return a
 
@@ -402,6 +522,8 @@ class TestSaveLoadForOpVersion(JitTestCase):
             b = val_b
 
             def _helper(m, fn):
+                # [FUNCTION DOC] HELPER: Runs the module and the reference in-place method on the
+                # same tensor and compares results.
                 m_result = self._try_fn(m, a, b)
                 fn_result = self._try_fn(fn, a, b)
 
@@ -418,8 +540,14 @@ class TestSaveLoadForOpVersion(JitTestCase):
     # NOTE: Scalar division was already true division in op version 3,
     #   so this test verifies the behavior is unchanged.
     def test_versioned_div_scalar_scalar(self):
+        # [FUNCTION DOC] Scalar by scalar division with mixed int and float operands: the
+        # version-two fixture and the current module must return the same four results. Scalar
+        # division was already true division in op version three, so behavior is unchanged.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing pairs of scalars and returning four quotients.
             def forward(self, a: float, b: int, c: float, d: int):
+                # [FUNCTION DOC] HELPER: Computes four quotients of
+                # the scalar inputs and returns them.
                 result_0 = a / b
                 result_1 = a / c
                 result_2 = b / c
@@ -437,6 +565,8 @@ class TestSaveLoadForOpVersion(JitTestCase):
         current_mobile_module = self._save_load_mobile_module(MyModule)
 
         def _helper(m, fn):
+            # [FUNCTION DOC] HELPER: Calls both modules with fixed scalar values and asserts every
+            # output of the first equals the matching output of the second.
             vals = (5.0, 3, 2.0, 7)
             m_result = m(*vals)
             fn_result = fn(*vals)
@@ -446,10 +576,18 @@ class TestSaveLoadForOpVersion(JitTestCase):
         _helper(v3_mobile_module, current_mobile_module)
 
     def test_versioned_linspace(self):
+        # [FUNCTION DOC] Loads the version-seven linspace fixture, converts it to a
+        # lite-interpreter module, and compares with a freshly saved current module on integer,
+        # negative, float and complex inputs. The results with five steps and with one hundred
+        # steps must have those lengths and equal the current results.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module producing linspace
+            # results with five and one hundred steps.
             def forward(
                 self, a: Union[int, float, complex], b: Union[int, float, complex]
             ):
+                # [FUNCTION DOC] HELPER: Returns linspace between a and b with five steps and with
+                # one hundred steps.
                 c = torch.linspace(a, b, steps=5)
                 d = torch.linspace(a, b, steps=100)
                 return c, d
@@ -476,13 +614,20 @@ class TestSaveLoadForOpVersion(JitTestCase):
             self.assertEqual(output_without_step, current_without_step)
 
     def test_versioned_linspace_out(self):
+        # [FUNCTION DOC] Like the linspace test but with an output tensor: loads the version-seven
+        # fixture and compares output with the current module for int, float and complex inputs,
+        # requiring length one hundred.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module writing linspace with one
+            # hundred steps into an output tensor.
             def forward(
                 self,
                 a: Union[int, float, complex],
                 b: Union[int, float, complex],
                 out: torch.Tensor,
             ):
+                # [FUNCTION DOC] HELPER: Returns linspace between a and b with one hundred steps
+                # written into out.
                 return torch.linspace(a, b, steps=100, out=out)
 
         model_path = (
@@ -529,10 +674,16 @@ class TestSaveLoadForOpVersion(JitTestCase):
             self.assertEqual(output, output_current)
 
     def test_versioned_logspace(self):
+        # [FUNCTION DOC] Same as the linspace test but for
+        # logspace, using the version-eight fixture.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module producing logspace
+            # results with five and one hundred steps.
             def forward(
                 self, a: Union[int, float, complex], b: Union[int, float, complex]
             ):
+                # [FUNCTION DOC] HELPER: Returns logspace between a and b with five steps and with
+                # one hundred steps.
                 c = torch.logspace(a, b, steps=5)
                 d = torch.logspace(a, b, steps=100)
                 return c, d
@@ -559,13 +710,19 @@ class TestSaveLoadForOpVersion(JitTestCase):
             self.assertEqual(output_without_step, current_without_step)
 
     def test_versioned_logspace_out(self):
+        # [FUNCTION DOC] Same as the linspace output test but for logspace, using the
+        # version-eight fixture.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module writing logspace with one
+            # hundred steps into an output tensor.
             def forward(
                 self,
                 a: Union[int, float, complex],
                 b: Union[int, float, complex],
                 out: torch.Tensor,
             ):
+                # [FUNCTION DOC] HELPER: Returns logspace between a and b with one hundred steps
+                # written into out.
                 return torch.logspace(a, b, steps=100, out=out)
 
         model_path = (
