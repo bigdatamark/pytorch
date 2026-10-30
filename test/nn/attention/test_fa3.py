@@ -1,4 +1,9 @@
 # Owner(s): ["module: sdpa"]
+# [MODULE DOC] Tests for the FlashAttention 3 (FA3) backend of scaled dot product attention.
+# Defines a CUDA-only test class built on the shared FlashAttentionTestMixin covering bf16/fp16
+# correctness against the math backend, kernel dispatch, compile behavior, FP8 quantized forward,
+# and varlen attention. Tests are skipped unless a Hopper (SM90) GPU and flash_attn_interface
+# exist. Import-time side effect: instantiates device-type tests for cuda only.
 
 import importlib
 import unittest
@@ -24,6 +29,9 @@ from torch.testing._internal.common_utils import (
 
 
 def _fa3_dependencies_available() -> bool:
+    # [FUNCTION DOC] HELPER: Report whether FA3 can run here. Returns False without CUDA, when
+    # the current device major compute capability is not 9 (Hopper), or when the
+    # flash_attn_interface module cannot be imported; otherwise True.
     if not torch.cuda.is_available():
         return False
     major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
@@ -37,6 +45,10 @@ def _fa3_dependencies_available() -> bool:
 
 
 class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
+    # [CLASS DOC] CUDA test case for the FA3 implementation, mixing in shared flash attention
+    # tests. Class attributes configure the mixin: impl_name FA3 and the kernel name patterns
+    # expected in forward and backward profiler traces. Adds FP8 and varlen tests specific to
+    # FA3.
     hw_classification = HardwareClassification.CUDA
 
     # Mixin configuration
@@ -46,6 +58,9 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: Class fixture. Runs the parent setup, then if FA3 dependencies
+        # are available activates the FA3 flash attention implementation globally (not undone
+        # afterwards).
         super().setUpClass()
         if not _fa3_dependencies_available():
             return
@@ -70,6 +85,9 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
     def test_flash_attention_matches_math(
         self, device, dtype, batch, seq_len, heads, head_dim, is_causal
     ):
+        # [FUNCTION DOC] Parametrized over dtype, batch, sequence length, heads, head dim and
+        # causality. Builds the shape and delegates to the mixin check that flash output matches
+        # the math backend, including the backward pass.
         shape = SdpaShape(batch, heads, seq_len, head_dim)
         self._assert_flash_matches_math(
             device,
@@ -82,16 +100,22 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
     @unittest.skipUnless(_fa3_dependencies_available(), "FA3 backend unavailable")
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_fa3_kernel_called(self, device, dtype):
+        # [FUNCTION DOC] Delegates to the mixin check that the FA3 forward kernel shows up in a
+        # profile for the given dtype.
         self._test_kernel_called(device, dtype)
 
     @unittest.skipUnless(_fa3_dependencies_available(), "FA3 backend unavailable")
     def test_multiple_activate(self):
+        # [FUNCTION DOC] Delegates to the mixin check that activating several implementations
+        # repeatedly behaves correctly.
         self._test_multiple_activate_impl()
 
     @unittest.skipUnless(_fa3_dependencies_available(), "FA3 backend unavailable")
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     @parametrize("is_causal", [False, True])
     def test_compiled_sdpa_fa3_metadata(self, device, dtype, is_causal):
+        # [FUNCTION DOC] Delegates to the mixin check that a compiled SDPA call preserves output
+        # shape, stride and dtype for the given dtype and causality.
         """Test that torch.compile preserves tensor metadata (shape, stride, dtype)."""
         self._test_compiled_sdpa_metadata(device, dtype, is_causal)
 
@@ -99,6 +123,8 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     @parametrize("is_causal", [False, True])
     def test_compiled_sdpa_fa3_matches_math(self, device, dtype, is_causal):
+        # [FUNCTION DOC] Delegates to the mixin check that compiled FA3 output matches the math
+        # backend.
         """Test compiled FA3 numerical correctness against math backend."""
         self._test_compiled_sdpa_matches_math(device, dtype, is_causal)
 
@@ -106,6 +132,9 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     @parametrize("is_causal", [False, True])
     def test_compiled_sdpa_fa3_backward_matches_math(self, device, dtype, is_causal):
+        # [FUNCTION DOC] Delegates to the mixin check that compiled FA3 gradients match the math
+        # backend at head dim 128, using a looser minimum absolute tolerance for bfloat16 than
+        # for float16.
         """Test compiled FA3 backward numerical correctness against math backend."""
         min_atol = 0.05 if dtype == torch.bfloat16 else 0.01
         self._test_compiled_sdpa_backward_matches_math(
@@ -114,6 +143,8 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
 
     @unittest.skipUnless(_fa3_dependencies_available(), "FA3 backend unavailable")
     def test_attention_preserves_query_layout(self, device):
+        # [FUNCTION DOC] Delegates to the mixin check that the attention output keeps the query
+        # memory layout.
         """Test that FA3 output has the same layout as the query tensor."""
         self._test_attention_preserves_query_layout(device)
 
@@ -126,6 +157,10 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
     @parametrize("head_dim", [64, 128])
     @parametrize("is_causal", [False, True])
     def test_fp8_forward_runs(self, device, batch, seq_len, heads, head_dim, is_causal):
+        # [FUNCTION DOC] Builds random bfloat16 q, k, v cast to float8 e4m3, with all-ones per-
+        # head float32 descale tensors, and runs the quantized SDPA under the flash backend
+        # without grad. Asserts the output has the input shape, is bfloat16, and contains only
+        # finite values.
         """Test that FP8 forward pass runs without errors."""
         shape = SdpaShape(batch, heads, seq_len, head_dim)
 
@@ -169,6 +204,9 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
     @unittest.skipUnless(_fa3_dependencies_available(), "FA3 backend unavailable")
     @parametrize("is_causal", [False, True])
     def test_fp8_forward_correctness(self, device, is_causal):
+        # [FUNCTION DOC] Compares the FP8 quantized flash output against ordinary flash attention
+        # on the same values dequantized to bfloat16 (identity descales). Asserts the maximum
+        # absolute difference is at most 0.25, a loose tolerance reflecting FP8 precision.
         """Test FP8 forward numerical correctness against bf16 reference."""
         shape = SdpaShape(2, 8, 512, 64)
 
@@ -226,6 +264,9 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
 
     @unittest.skipUnless(_fa3_dependencies_available(), "FA3 backend unavailable")
     def test_fp8_forward_with_descale(self, device):
+        # [FUNCTION DOC] Scales random bfloat16 inputs by 2, casts them to float8, and passes
+        # descale tensors filled with that factor to the quantized SDPA. Only checks output dtype
+        # is bfloat16 and all values are finite; it does not compare numerics.
         """Test FP8 forward with non-trivial descale values."""
         shape = SdpaShape(2, 4, 256, 64)
         batch, heads = shape.batch, shape.num_heads
@@ -274,6 +315,9 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
 
     @unittest.skipUnless(_fa3_dependencies_available(), "FA3 backend unavailable")
     def test_fp8_backward_not_supported(self, device):
+        # [FUNCTION DOC] Runs the quantized FP8 SDPA with a query requiring grad while recording
+        # warnings. Asserts at least one warning mentioning backward was issued. No backward is
+        # actually run.
         """Test that FP8 backward raises appropriate warning."""
         shape = SdpaShape(2, 4, 256, 64)
         batch, heads = shape.batch, shape.num_heads
@@ -324,6 +368,9 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
     @unittest.skipUnless(_fa3_dependencies_available(), "FA3 backend unavailable")
     @parametrize("is_causal", [False, True])
     def test_compiled_fp8_forward(self, device, is_causal):
+        # [FUNCTION DOC] Runs the quantized FP8 SDPA eagerly and via torch.compile with full
+        # graph on the same FP8 inputs and unit descales, under the flash backend and no grad.
+        # Asserts shape, stride and dtype match and the values are close.
         """Test that FP8 forward works with torch.compile."""
         shape = SdpaShape(2, 8, 512, 64)
         batch, heads = shape.batch, shape.num_heads
@@ -343,6 +390,9 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
         descale_v = torch.ones(batch, heads, dtype=torch.float32, device=device)
 
         def fp8_sdpa(q, k, v, dq, dk, dv):
+            # [FUNCTION DOC] HELPER: Nested wrapper that calls the quantized SDPA with per-head
+            # descale for q, k, v (passed as dq, dk, dv), using the enclosing test's causality flag.
+            # Returns the output.
             return _scaled_dot_product_attention_quantized(
                 q,
                 k,
@@ -382,6 +432,10 @@ class TestFlashAttentionFA3(FlashAttentionTestMixin, TestCase):
     @unittest.skipUnless(_fa3_dependencies_available(), "FA3 backend unavailable")
     @parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_varlen_basic_functionality(self, device, dtype):
+        # [FUNCTION DOC] Seeds the RNG, builds packed q, k, v of two sequences of 512 tokens with
+        # 16 heads and head dim 64 requiring grad, and runs varlen_attn with cumulative sequence
+        # offsets. Asserts the output shape, device and dtype, then computes gradients wrt q, k,
+        # v from an all-ones upstream gradient and asserts they match input shapes.
         torch.manual_seed(42)
 
         num_seqs = 2
