@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: mobile"]
+# [MODULE DOC] Tests for the XNNPACK mobile integration. Covers the prepacked linear, conv2d and
+# conv2d_transpose clamp ops compared against eager references, TorchScript save/load round
+# trips of prepacked modules, the graph rewrite passes (prepack insertion, prepack folding,
+# clamp fusion) and the conv1d to conv2d transform. Each test class is skipped when XNNPACK is
+# not built in or under TSAN. Import time has no side effects beyond imports and decorators;
+# run_tests is invoked under main.
 
 import io
 import itertools
@@ -30,6 +36,9 @@ from torch.utils.mobile_optimizer import optimize_for_mobile
     "TSAN fails with XNNPACK. Does not seem to have a good reason for failures.",
 )
 class TestXNNPACKOps(TestCase):
+    # [CLASS DOC] Hypothesis-driven eager tests of the prepacked XNNPACK ops. Each test builds
+    # random inputs and weights, runs the reference functional op and the prepack plus run pair,
+    # and checks closeness with loose float tolerances. No scripting is involved.
     @unittest.skip(
         "Fails on some platforms, see https://github.com/pytorch/pytorch/issues/73488"
     )
@@ -40,6 +49,10 @@ class TestXNNPACKOps(TestCase):
         use_bias=st.booleans(),
     )
     def test_linear(self, batch_size, data_shape, weight_output_dim, use_bias):
+        # [FUNCTION DOC] Skipped unconditionally (platform failures, issue 73488). Prepends the
+        # batch size to the generated shape, makes a random weight and optional bias, and
+        # compares the functional linear result with the linear_clamp_prepack then
+        # linear_clamp_run result using rtol 1e-2 and atol 1e-3.
         data_shape = [batch_size] + list(data_shape)
         input_data = torch.rand(data_shape)
         weight = torch.rand((weight_output_dim, data_shape[-1]))
@@ -62,6 +75,10 @@ class TestXNNPACKOps(TestCase):
         use_bias=st.booleans(),
     )
     def test_linear_1d_input(self, input_size, weight_output_dim, use_bias):
+        # [FUNCTION DOC] Same comparison as the batched linear test but for a one-dimensional
+        # input vector of the generated size. Reference is the functional linear; the candidate
+        # is linear_clamp_prepack followed by linear_clamp_run; closeness uses rtol 1e-2 and
+        # atol 1e-3.
         input_data = torch.rand(input_size)
         weight = torch.rand((weight_output_dim, input_data.shape[-1]))
         if use_bias:
@@ -114,6 +131,11 @@ class TestXNNPACKOps(TestCase):
         use_bias,
         format,
     ):
+        # [FUNCTION DOC] Compares functional conv2d with conv2d_clamp_prepack plus
+        # conv2d_clamp_run on random data. Channel counts are per-group sizes times groups;
+        # hypothesis assume filters out shapes where the padded input is smaller than the
+        # dilated kernel. The input may be converted to a chosen memory format (preserve,
+        # contiguous or channels last). Checks rtol 1e-2, atol 1e-3.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         kernels = (kernel_h, kernel_w)
@@ -185,6 +207,11 @@ class TestXNNPACKOps(TestCase):
         use_bias,
         format,
     ):
+        # [FUNCTION DOC] Compares functional conv_transpose2d with
+        # conv2d_transpose_clamp_prepack plus conv2d_transpose_clamp_run. Filters out shapes
+        # with too small padded input or with output padding not smaller than both stride and
+        # dilation. The weight has input channels first. Results are made contiguous before
+        # comparison (rtol 1e-2, atol 1e-3).
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         kernels = (kernel_h, kernel_w)
@@ -238,6 +265,9 @@ class TestXNNPACKOps(TestCase):
     "TSAN fails with XNNPACK. Does not seem to have a good reason for failures.",
 )
 class TestXNNPACKSerDes(TestCase):
+    # [CLASS DOC] Tests that eager and prepacked versions of small modules, once scripted with
+    # TorchScript, agree before and after being saved to an in-memory buffer and loaded back.
+    # Nested module classes inside each test define the plain and prepacked variants.
     @unittest.skip(
         "Fails on some platforms, see https://github.com/pytorch/pytorch/issues/73488"
     )
@@ -248,23 +278,39 @@ class TestXNNPACKSerDes(TestCase):
         use_bias=st.booleans(),
     )
     def test_linear(self, batch_size, data_shape, weight_output_dim, use_bias):
+        # [FUNCTION DOC] Skipped unconditionally (issue 73488). Scripts a plain linear module
+        # and a prepacked linear module, checks they agree on random input, then saves each to a
+        # BytesIO buffer, loads it back and checks agreement again with fresh input (rtol 1e-2,
+        # atol 1e-3).
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Plain module holding a weight and optional bias as attributes;
+            # forward applies functional linear. Reference model for the serialization test.
             def __init__(self, weight, bias=None):
+                # [FUNCTION DOC] HELPER: Stores the given weight and bias tensors as attributes
+                # (bias may be None).
                 super().__init__()
                 self.weight = weight
                 self.bias = bias
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the functional linear of the input with the
+                # stored weight and bias.
                 return F.linear(x, self.weight, self.bias)
 
         class LinearPrePacked(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that prepacks the weight and bias once at construction
+            # and runs the prepacked linear op in forward.
             def __init__(self, weight, bias=None):
+                # [FUNCTION DOC] HELPER: Calls linear_clamp_prepack on the weight and bias and
+                # keeps the packed object as an attribute.
                 super().__init__()
                 self.packed_weight_bias = torch.ops.prepacked.linear_clamp_prepack(
                     weight, bias
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs linear_clamp_run on the input with the stored
+                # packed weight and bias.
                 return torch.ops.prepacked.linear_clamp_run(x, self.packed_weight_bias)
 
         data_shape = [batch_size] + list(data_shape)
@@ -337,8 +383,16 @@ class TestXNNPACKSerDes(TestCase):
         use_bias,
         format,
     ):
+        # [FUNCTION DOC] Scripts a plain conv2d module and a prepacked conv2d module, compares
+        # outputs on random input in an optional memory format, then round trips both through
+        # save and load and compares again on new input (rtol 1e-2, atol 1e-3). Shape
+        # combinations that violate the dilated kernel size are discarded by assume.
         class Conv2D(torch.nn.Module):
+            # [CLASS DOC] HELPER: Plain conv2d module storing weight, bias, strides, paddings,
+            # dilations and groups; forward calls functional conv2d.
             def __init__(self, weight, bias, strides, paddings, dilations, groups):
+                # [FUNCTION DOC] HELPER: Stores the weight, bias and conv hyperparameters as
+                # attributes.
                 super().__init__()
                 self.weight = weight
                 self.bias = bias
@@ -348,6 +402,8 @@ class TestXNNPACKSerDes(TestCase):
                 self.groups = groups
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional conv2d to the input using the stored
+                # parameters.
                 return F.conv2d(
                     x,
                     self.weight,
@@ -359,13 +415,19 @@ class TestXNNPACKSerDes(TestCase):
                 )
 
         class Conv2DPrePacked(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that prepacks conv2d weights at construction and runs
+            # conv2d_clamp_run in forward.
             def __init__(self, weight, bias, strides, paddings, dilations, groups):
+                # [FUNCTION DOC] HELPER: Calls conv2d_clamp_prepack with weight, bias, strides,
+                # paddings, dilations and groups, storing the packed result.
                 super().__init__()
                 self.packed_weight_bias = torch.ops.prepacked.conv2d_clamp_prepack(
                     weight, bias, strides, paddings, dilations, groups
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs conv2d_clamp_run on the input with the stored
+                # packed parameters.
                 return torch.ops.prepacked.conv2d_clamp_run(x, self.packed_weight_bias)
 
         input_channels = input_channels_per_group * groups
@@ -454,7 +516,13 @@ class TestXNNPACKSerDes(TestCase):
         use_bias,
         format,
     ):
+        # [FUNCTION DOC] Same scripted comparison and save/load round trip as the conv2d test
+        # but for transposed convolution. Also discards combinations where output padding is not
+        # smaller than stride and dilation. Weight layout puts input channels first.
         class Conv2DT(torch.nn.Module):
+            # [CLASS DOC] HELPER: Plain transposed-conv module holding weight, bias and conv
+            # hyperparameters including output paddings; forward calls functional
+            # conv_transpose2d (groups before dilations).
             def __init__(
                 self,
                 weight,
@@ -465,6 +533,8 @@ class TestXNNPACKSerDes(TestCase):
                 dilations,
                 groups,
             ):
+                # [FUNCTION DOC] HELPER: Stores weight, bias, strides, paddings, output
+                # paddings, dilations and groups as attributes.
                 super().__init__()
                 self.weight = weight
                 self.bias = bias
@@ -475,6 +545,8 @@ class TestXNNPACKSerDes(TestCase):
                 self.groups = groups
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional conv_transpose2d to the input using
+                # the stored parameters.
                 return F.conv_transpose2d(
                     x,
                     self.weight,
@@ -487,6 +559,8 @@ class TestXNNPACKSerDes(TestCase):
                 )
 
         class Conv2DTPrePacked(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that prepacks transposed-conv parameters at
+            # construction and runs the prepacked op in forward.
             def __init__(
                 self,
                 weight,
@@ -497,6 +571,8 @@ class TestXNNPACKSerDes(TestCase):
                 dilations,
                 groups,
             ):
+                # [FUNCTION DOC] HELPER: Calls conv2d_transpose_clamp_prepack with the given
+                # parameters and stores the packed object.
                 super().__init__()
                 self.packed_weight_bias = (
                     torch.ops.prepacked.conv2d_transpose_clamp_prepack(
@@ -511,6 +587,8 @@ class TestXNNPACKSerDes(TestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs conv2d_transpose_clamp_run on the input with the
+                # stored packed parameters.
                 return torch.ops.prepacked.conv2d_transpose_clamp_run(
                     x, self.packed_weight_bias
                 )
@@ -607,7 +685,13 @@ class TestXNNPACKSerDes(TestCase):
         use_bias,
         format,
     ):
+        # [FUNCTION DOC] Skipped unconditionally (issue 73488). Scripts a conv2d, permute,
+        # linear, relu model and its prepacked equivalent, compares them on random input, then
+        # saves and loads both and compares again using a channels last input regardless of the
+        # generated format. Bias is used for both layers only if use_bias is set.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Plain model: conv2d, permute to channels last order, linear,
+            # then relu, all through functional ops with stored weights.
             def __init__(
                 self,
                 conv_weight,
@@ -619,6 +703,8 @@ class TestXNNPACKSerDes(TestCase):
                 dilations,
                 groups,
             ):
+                # [FUNCTION DOC] HELPER: Stores conv and linear weights and biases plus conv
+                # strides, paddings, dilations and groups.
                 super().__init__()
                 self.conv_weight = conv_weight
                 self.conv_bias = conv_bias
@@ -630,6 +716,9 @@ class TestXNNPACKSerDes(TestCase):
                 self.groups = groups
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs functional conv2d, permutes dimensions to batch,
+                # height, width, channels, applies functional linear and returns relu of the
+                # result.
                 o = F.conv2d(
                     x,
                     self.conv_weight,
@@ -644,6 +733,8 @@ class TestXNNPACKSerDes(TestCase):
                 return F.relu(o)
 
         class MPrePacked(torch.nn.Module):
+            # [CLASS DOC] HELPER: Prepacked counterpart of the plain model: both layers are
+            # prepacked at construction and run through the clamp run ops.
             def __init__(
                 self,
                 conv_weight,
@@ -655,6 +746,8 @@ class TestXNNPACKSerDes(TestCase):
                 dilations,
                 groups,
             ):
+                # [FUNCTION DOC] HELPER: Prepacks the conv and linear parameters, keeping each
+                # packed object as an attribute.
                 super().__init__()
                 self.conv2d_clamp_run_weight_bias = (
                     torch.ops.prepacked.conv2d_clamp_prepack(
@@ -666,6 +759,8 @@ class TestXNNPACKSerDes(TestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Same data flow as the plain model but through
+                # conv2d_clamp_run and linear_clamp_run, ending with relu.
                 o = torch.ops.prepacked.conv2d_clamp_run(
                     x, self.conv2d_clamp_run_weight_bias
                 )
@@ -752,6 +847,9 @@ class TestXNNPACKSerDes(TestCase):
     "TSAN fails with XNNPACK. Does not seem to have a good reason for failures.",
 )
 class TestXNNPACKRewritePass(TestCase):
+    # [CLASS DOC] Tests of the TorchScript rewrite passes that replace functional linear and
+    # conv ops with prepacked ops, fold prepacking and fuse clamp-like activations. Graphs are
+    # inspected with FileCheck pattern counts and outputs compared with the unmodified model.
     @staticmethod
     def validate_transformed_module(
         # To please flake
@@ -761,6 +859,13 @@ class TestXNNPACKRewritePass(TestCase):
         prepack_removal=False,
         fuse_clamping_ops=False,
     ):
+        # [FUNCTION DOC] HELPER: Shared checker. For both script and trace, builds the module,
+        # records a reference result, runs the insert prepacked ops pass, optionally freezes the
+        # module, fuses clamp ops and folds prepacking, then saves and loads it. Each pattern in
+        # the map is checked in the graph: zero means present, minus one means absent, other
+        # values mean exactly that many occurrences. Finally compares the output with the
+        # reference (rtol 1e-2, atol 1e-3). The first parameter named self is the module under
+        # test, not a test case.
         input_data = torch.normal(1, 20, size=data_shape)
 
         for jit_method in ["script", "trace"]:
@@ -798,12 +903,19 @@ class TestXNNPACKRewritePass(TestCase):
             torch.testing.assert_close(ref_result, xnnpack_result, rtol=1e-2, atol=1e-3)
 
     def test_linear(self):
+        # [FUNCTION DOC] Checks the rewrite for linear with and without bias, conv2d,
+        # conv_transpose2d, and a conv plus linear model with activations. Verifies prepack/run
+        # op counts, prepack removal, and clamp fusion for relu, in-place relu, hardtanh and in-
+        # place hardtanh, plus two hardtanh cases that must not fuse.
         data_shape = [2, 3, 32]
         weight_output_dim = 24
         weight_shape = (weight_output_dim, data_shape[-1])
 
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear module with frozen random weight and bias parameters.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates non-trainable weight and bias parameters from
+                # the enclosing shapes.
                 super().__init__()
                 self.weight = torch.nn.Parameter(
                     torch.rand(weight_shape), requires_grad=False
@@ -813,16 +925,21 @@ class TestXNNPACKRewritePass(TestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns functional linear of the input with weight and
+                # bias.
                 return F.linear(x, self.weight, self.bias)
 
         class LinearNoBias(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear module with a frozen weight and no bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates only the non-trainable weight parameter.
                 super().__init__()
                 self.weight = torch.nn.Parameter(
                     torch.rand(weight_shape), requires_grad=False
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns functional linear with a None bias.
                 return F.linear(x, self.weight, None)
 
         # Linear with bias pattern.
@@ -871,7 +988,11 @@ class TestXNNPACKRewritePass(TestCase):
         conv_bias_shape = output_channels
 
         class Conv2D(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv2d module with frozen weight and bias parameters and fixed
+            # strides, paddings, dilations and groups from the enclosing test.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the parameters and stores the conv
+                # hyperparameters.
                 super().__init__()
                 self.weight = torch.nn.Parameter(
                     torch.rand(conv_weight_shape), requires_grad=False
@@ -885,6 +1006,7 @@ class TestXNNPACKRewritePass(TestCase):
                 self.groups = groups
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional conv2d with the stored parameters.
                 return F.conv2d(
                     x,
                     self.weight,
@@ -896,7 +1018,11 @@ class TestXNNPACKRewritePass(TestCase):
                 )
 
         class Conv2DT(torch.nn.Module):
+            # [CLASS DOC] HELPER: Transposed conv module with frozen weight and bias and fixed
+            # hyperparameters including output paddings.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the parameters and stores the conv
+                # hyperparameters.
                 super().__init__()
                 self.weight = torch.nn.Parameter(
                     torch.rand(conv_transpose_weight_shape), requires_grad=False
@@ -911,6 +1037,8 @@ class TestXNNPACKRewritePass(TestCase):
                 self.groups = groups
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional conv_transpose2d with the stored
+                # parameters.
                 return F.conv_transpose2d(
                     x,
                     self.weight,
@@ -954,7 +1082,11 @@ class TestXNNPACKRewritePass(TestCase):
         linear_weight_shape = (weight_output_dim, linear_input_shape)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv, activation, permute, linear, activation model; the
+            # activation function is a constructor argument defaulting to relu.
             def __init__(self, activation_fn=F.relu):
+                # [FUNCTION DOC] HELPER: Creates frozen conv and linear parameters, stores
+                # hyperparameters and the activation callable.
                 super().__init__()
                 self.conv_weight = torch.nn.Parameter(
                     torch.rand(conv_weight_shape), requires_grad=False
@@ -975,6 +1107,8 @@ class TestXNNPACKRewritePass(TestCase):
                 self.activation_fn = activation_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs conv2d, the activation, a permute to channels last
+                # order, linear, and the activation again.
                 o = F.conv2d(
                     x,
                     self.conv_weight,
@@ -1095,7 +1229,11 @@ class TestXNNPACKRewritePass(TestCase):
         )
 
         class MFusionAntiPattern(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear followed by relu and then hardtanh. The relu can be
+            # fused into the prepacked linear but the trailing hardtanh cannot.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates frozen linear parameters and stores unused conv
+                # hyperparameters.
                 super().__init__()
                 self.linear_weight = torch.nn.Parameter(
                     torch.rand(linear_weight_shape), requires_grad=False
@@ -1109,6 +1247,7 @@ class TestXNNPACKRewritePass(TestCase):
                 self.groups = groups
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear, relu and hardtanh in sequence.
                 o = F.linear(x, self.linear_weight, self.linear_bias)
                 o = F.relu(o)
                 o = F.hardtanh(o)
@@ -1130,7 +1269,11 @@ class TestXNNPACKRewritePass(TestCase):
         )
 
         class MFusionAntiPatternParamMinMax(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear followed by hardtanh whose bounds are runtime tensors,
+            # so the hardtanh is not fusable.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates frozen linear parameters and stores unused conv
+                # hyperparameters.
                 super().__init__()
                 self.linear_weight = torch.nn.Parameter(
                     torch.rand(linear_weight_shape), requires_grad=False
@@ -1144,6 +1287,9 @@ class TestXNNPACKRewritePass(TestCase):
                 self.groups = groups
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Takes the first element of the input as the lower bound
+                # and that plus ten as the upper bound, applies linear, then hardtanh with those
+                # tensor bounds.
                 min = x[0, 0]
                 max = min + 10
                 o = F.linear(x, self.linear_weight, self.linear_bias)
@@ -1165,12 +1311,18 @@ class TestXNNPACKRewritePass(TestCase):
         )
 
     def test_decomposed_linear(self):
+        # [FUNCTION DOC] Checks that decomposed linear forms (transpose plus addmm, matmul plus
+        # in-place add, matmul alone) are all rewritten into a single prepacked linear prepack
+        # and run pair with no remaining function calls.
         data_shape = [2, 32]
         weight_output_dim = 24
         weight_shape = (weight_output_dim, data_shape[-1])
 
         class DecomposedLinearAddmm(torch.nn.Module):
+            # [CLASS DOC] HELPER: Decomposed linear using a transposed weight and addmm with the
+            # bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates frozen weight and bias parameters.
                 super().__init__()
                 self.weight = torch.nn.Parameter(
                     torch.rand(weight_shape), requires_grad=False
@@ -1180,11 +1332,16 @@ class TestXNNPACKRewritePass(TestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Transposes the weight and returns addmm of bias, input
+                # and transposed weight.
                 weight_t = self.weight.t()
                 return torch.addmm(self.bias, x, weight_t)
 
         class DecomposedLinearMatmulAdd(torch.nn.Module):
+            # [CLASS DOC] HELPER: Decomposed linear using matmul followed by an in-place add of
+            # the bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates frozen weight and bias parameters.
                 super().__init__()
                 self.weight = torch.nn.Parameter(
                     torch.rand(weight_shape), requires_grad=False
@@ -1194,13 +1351,19 @@ class TestXNNPACKRewritePass(TestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Matmul with the transposed weight, then adds the bias
+                # in place and returns it.
                 weight_t = self.weight.t()
                 y = torch.matmul(x, weight_t)
                 res = y.add_(self.bias)
                 return res
 
         class DecomposedLinearMatmul(torch.nn.Module):
+            # [CLASS DOC] HELPER: Decomposed linear using matmul with the transposed weight and
+            # no bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates frozen weight and bias parameters (the bias is
+                # unused in forward).
                 super().__init__()
                 self.weight = torch.nn.Parameter(
                     torch.rand(weight_shape), requires_grad=False
@@ -1210,6 +1373,7 @@ class TestXNNPACKRewritePass(TestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns matmul of the input with the transposed weight.
                 weight_t = self.weight.t()
                 res = torch.matmul(x, weight_t)
                 return res
@@ -1240,10 +1404,18 @@ class TestXNNPACKRewritePass(TestCase):
     "TSAN is not fork-safe since we're forking in a multi-threaded environment",
 )
 class TestXNNPACKConv1dTransformPass(TestCase):
+    # [CLASS DOC] Tests of the pass that rewrites conv1d to conv2d, followed by mobile
+    # optimization that prepacks the resulting conv2d. Skipped when XNNPACK is off or under
+    # TSAN.
     @staticmethod
     def validate_transform_conv1d_to_conv2d(
         self, pattern_count_transformed_map, pattern_count_optimized_map, data_shape
     ):
+        # [FUNCTION DOC] Shared checker. For both script and trace, runs the conv1d to conv2d
+        # pass, also produces an optimize_for_mobile version, saves and loads both, and checks
+        # graph patterns (zero present, minus one absent, otherwise exact count) and output
+        # closeness to the reference result (rtol 1e-2, atol 1e-3). The first parameter named
+        # self is the module under test.
         input_data = torch.normal(1, 20, size=data_shape)
 
         for jit_method in ["script", "trace"]:
@@ -1301,6 +1473,10 @@ class TestXNNPACKConv1dTransformPass(TestCase):
 
     @unittest.skipIf(IS_FBCODE, "T137513244")
     def test_conv1d_basic(self):
+        # [FUNCTION DOC] Skipped in FBCODE. Iterates over a product of batch size, channel,
+        # width, group, kernel, stride, padding and dilation values, builds a conv1d module for
+        # each and checks that conv1d is replaced by conv2d, and after mobile optimization only
+        # the prepacked conv2d run remains.
         batch_size_list = range(1, 3)
         input_channels_per_group_list = range(10, 12)
         width_list = range(10, 12)
@@ -1340,7 +1516,12 @@ class TestXNNPACKConv1dTransformPass(TestCase):
             conv_bias_shape = output_channels
 
             class Conv1D(torch.nn.Module):
+                # [CLASS DOC] HELPER: Conv1d module with frozen weight and bias parameters and
+                # scalar stride, padding, dilation and groups taken from the current loop
+                # iteration.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the parameters and stores the
+                    # hyperparameters.
                     super().__init__()
                     self.weight = torch.nn.Parameter(
                         torch.rand(conv_weight_shape), requires_grad=False
@@ -1354,6 +1535,8 @@ class TestXNNPACKConv1dTransformPass(TestCase):
                     self.groups = groups
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies functional conv1d with the stored
+                    # parameters.
                     return F.conv1d(
                         x,
                         self.weight,
@@ -1386,6 +1569,9 @@ class TestXNNPACKConv1dTransformPass(TestCase):
     # See https://github.com/pytorch/pytorch/issues/46066
     @slowTest
     def test_conv1d_with_relu_fc(self):
+        # [FUNCTION DOC] Marked slow. Same pattern checks as the basic test but over an extra
+        # output feature count, with a model of conv1d, relu, flatten and linear (see issue
+        # 46066). Fully connected size derives from the computed conv output width.
         batch_size_list = range(1, 3)
         input_channels_per_group_list = range(10, 12)
         width_list = range(10, 12)
@@ -1433,7 +1619,11 @@ class TestXNNPACKConv1dTransformPass(TestCase):
             fc_bias_shape = output_features
 
             class Net(torch.nn.Module):
+                # [CLASS DOC] HELPER: Conv1d, relu, flatten view, linear model with frozen
+                # parameters sized from the current loop iteration.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates frozen conv and fully connected parameters
+                    # and stores the hyperparameters.
                     super().__init__()
                     self.conv_weight = torch.nn.Parameter(
                         torch.rand(conv_weight_shape), requires_grad=False
@@ -1454,6 +1644,8 @@ class TestXNNPACKConv1dTransformPass(TestCase):
                     )
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies conv1d and relu, reshapes to batch by
+                    # features, then applies linear and returns it.
                     x = F.conv1d(
                         x,
                         self.conv_weight,
