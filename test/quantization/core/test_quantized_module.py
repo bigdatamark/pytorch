@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] API-level tests for the user-facing quantized module wrappers. Three test
+# classes: static quantized modules (linear, conv, pooling, norm, activations, embedding,
+# intrinsic fused variants), dynamic quantized modules (conv, linear, LSTM, GRU, cells) and
+# reference quantized modules (rnn cells, rnn, embeddings, decomposed linear). The tests check
+# that wrappers call the quantized operators correctly and that state_dict, pickle, copy,
+# torch.package and scripting round trips work; they are not operator numerics tests. Importing
+# disables hypothesis deadlines through a helper call. Running the file directly is rejected and
+# redirects to the main quantization test entry point.
 
 import torch
 import torch.nn as nn
@@ -51,7 +59,16 @@ test please see `test/quantization/test_quantized_op.py`.
 """
 
 class TestStaticQuantizedModule(QuantizationTestCase):
+    # [CLASS DOC] Tests for statically quantized module wrappers (nnq and nniq namespaces).
+    # Stateless; each test builds float and quantized modules and compares outputs, usually
+    # after a serialization or copy round trip. Shared checkers: the linear and conv
+    # implementation helpers, which many tests parametrize over module class, shape and
+    # quantization options.
     def test_relu(self):
+        # [FUNCTION DOC] Checks quantized ReLU and ReLU6 modules on a qint32 quantized ramp from
+        # -10 to 10. Outputs are dequantized and compared to the float relu and relu6 results
+        # using the default scale of one and zero point of zero. Fails through assertEqual if
+        # either mismatches.
         relu_module = nn.ReLU()
         relu6_module = nnq.ReLU6()
 
@@ -70,6 +87,10 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_linear(self):
+        # [FUNCTION DOC] Runs the linear implementation checker for nnq.Linear over the product
+        # of batch size 1 or 5, in features 16 or 32, out features 4 or 8, bias on or off and
+        # per-tensor or per-channel weights. Runs once per available quantization engine
+        # (override_qengines).
         """test API functionality for nn.quantized.linear"""
         options = itertools.product(
             [1, 5],
@@ -84,6 +105,8 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_linear_relu(self):
+        # [FUNCTION DOC] Same sweep as test_linear but for the fused nniq.LinearReLU module and
+        # the quantized linear_relu operator. Runs once per available quantization engine.
         """test API functionality for nn.intrinsic.quantized.linear_relu"""
         options = itertools.product(
             [1, 5],
@@ -99,6 +122,15 @@ class TestStaticQuantizedModule(QuantizationTestCase):
     def _test_linear_api_impl(self, qlinear_module, module_name, qlinear_op,
                               batch_size, in_features, out_features, use_bias,
                               per_channel, **post_ops_kwargs):
+        # [FUNCTION DOC] HELPER: Shared end-to-end check of a quantized linear style module.
+        # Args: module class, expected name substring in its repr, reference quantized op,
+        # sizes, use_bias, per_channel, plus extra keyword arguments forwarded to constructor
+        # and op (for example a negative slope). Per-channel is forced off under qnnpack, and
+        # weight zero point is zero under onednn. Verifies scriptability, weight round trip,
+        # equality with the direct op call, state_dict save and load (weights_only true and
+        # false), whole-module pickle, torch.package round trip, copy and deepcopy, and
+        # conversion of the float and non-dynamically-quantizable linear classes through prepare
+        # and convert. Raises AssertionError on any mismatch; no return value.
         if torch.backends.quantized.engine == 'qnnpack':
             per_channel = False
 
@@ -254,6 +286,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
             self.assertTrue('QuantizedLinear' in str(quantized_float_linear))
 
     def test_quant_dequant_api(self):
+        # [FUNCTION DOC] Checks nnq.Quantize against per-tensor quantization of a 2x2 float
+        # tensor (scale 1, zero point 2, qint8) and nnq.DeQuantize against dequantizing the
+        # quantized result.
         r = torch.tensor([[1., -1.], [1., -1.]], dtype=torch.float)
         scale, zero_point, dtype = 1.0, 2, torch.qint8
         # testing Quantize API
@@ -273,6 +308,16 @@ class TestStaticQuantizedModule(QuantizationTestCase):
             groups, kernel_size, stride, padding, padding_mode, dilation,
             X_scale, X_zero_point, W_scale, W_zero_point, Y_scale, Y_zero_point,
             use_bias, post_op, use_channelwise, X2_scale=1.0, X2_zero_point=0):
+        # [FUNCTION DOC] HELPER: Shared end-to-end check of quantized conv modules (plain, relu,
+        # add, add_relu). Args: expected module name, quantized module, float reference module,
+        # tensor geometry, quantization params for input, weight, output and an optional second
+        # add input, bias and channelwise flags, and post_op string selecting how the float
+        # reference is unwrapped. Uses hypothesis assume to skip geometries where the kernel
+        # does not fit. Sets weight and bias, scale and zero point on the quantized module,
+        # compares its output to the quantized float reference output (tolerating off-by-one
+        # rounding), then checks state_dict reload, pickle, copy, deepcopy, scriptability and
+        # conversion of a fused float module through convert with a mapping that substitutes the
+        # tested quantized class. Raises AssertionError on mismatch; no return value.
         for i in range(len(kernel_size)):
             assume(input_feature_map_size[i] + 2 * padding[i]
                    >= dilation[i] * (kernel_size[i] - 1) + 1)
@@ -406,8 +451,12 @@ class TestStaticQuantizedModule(QuantizationTestCase):
             check_save_load=True)
 
         class _FusedModule_two_input_args(torch.ao.nn.intrinsic._FusedModule):
+            # [CLASS DOC] HELPER: Fused module subclass accepting two inputs, used for the add
+            # variants of conv because the base fused module only forwards a single argument.
             # Help Module for ConvAdd2d since torch.ao.nn.intrinsic._FusedModule only support one input arg
             def forward(self, x1, x2):
+                # [FUNCTION DOC] HELPER: Forwards both inputs to the first wrapped child module and
+                # returns its result.
                 input = self[0](x1, x2)
                 return input
 
@@ -433,6 +482,10 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_conv1d_api(self):
+        # [FUNCTION DOC] Sweeps zeros and reflect padding, bias and channelwise weights for
+        # nnq.Conv1d with fixed small geometry (2 batches, 3 groups, kernel 3, stride 2, pad 1)
+        # through the conv checker. Channelwise is disabled under qnnpack. Runs for every
+        # quantization engine.
         options = itertools.product(
             ["zeros", "reflect"],  # pad_mode
             [True, False],  # use_bias
@@ -487,6 +540,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_conv1d_relu_api(self):
+        # [FUNCTION DOC] Same as the conv1d test but for fused nniq.ConvReLU1d built from a
+        # float Conv1d and ReLU wrapped in nni.ConvReLU1d, with post op relu. Runs for every
+        # quantization engine.
         options = itertools.product(
             ["zeros", "reflect"],  # pad_mode
             [True, False],  # use_bias
@@ -541,6 +597,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_conv2d_api(self):
+        # [FUNCTION DOC] Sweeps padding mode, bias and channelwise weights for nnq.Conv2d with
+        # an 8 by 8 input, 3 groups, kernel 3, stride 2, pad 1 through the conv checker.
+        # Channelwise is disabled under qnnpack. Runs for every quantization engine.
         options = itertools.product(
             ["zeros", "reflect"],  # pad_mode
             [True, False],  # use_bias
@@ -597,6 +656,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_conv2d_relu_api(self):
+        # [FUNCTION DOC] Same as the conv2d test but for fused nniq.ConvReLU2d with post op
+        # relu. Geometry is built once outside the loop; channelwise is disabled under qnnpack
+        # inside it.
         options = itertools.product(
             ["zeros", "reflect"],  # pad_mode
             [True, False],  # use_bias
@@ -655,6 +717,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_conv3d_api(self):
+        # [FUNCTION DOC] Sweeps bias and channelwise weights for nnq.Conv3d on an 8 cube input.
+        # Zeros padding only because 3d conv has no reflect padding. Skipped without fbgemm and
+        # each case runs under a temporary override to the fbgemm engine.
         options = itertools.product(
             [True, False],  # use_bias
             [True, False],  # use_channelwise
@@ -717,6 +782,8 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_conv3d_relu_api(self):
+        # [FUNCTION DOC] Same as the conv3d test but for fused nniq.ConvReLU3d with post op
+        # relu. Skipped without fbgemm; each case runs with the fbgemm engine selected.
         options = itertools.product(
             [True, False],  # use_bias
             [True, False],  # use_channelwise
@@ -781,6 +848,10 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @skipIfNoONEDNN
     def test_conv2d_add(self):
+        # [FUNCTION DOC] Checks nniq.ConvAdd2d against a float conv fused with an elementwise
+        # add, with a second input quantized by its own scale and zero point. Skipped without
+        # onednn; runs with that engine selected and sweeps padding mode, bias and channelwise
+        # weights.
         """test API functionality for nn.intrinsic.quantized.ConvAdd2d"""
         with override_quantized_engine('onednn'):
             options = itertools.product(
@@ -840,6 +911,10 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @skipIfNoONEDNN
     def test_conv2d_add_relu(self):
+        # [FUNCTION DOC] Checks nniq.ConvAddReLU2d against a float conv fused with add and ReLU,
+        # using post op add_relu and a second quantized input. Skipped without onednn; runs with
+        # that engine.
+        # KNOWN ISSUE: the existing docstring names ConvAdd2d, but the code tests ConvAddReLU2d.
         """test API functionality for nn.intrinsic.quantized.ConvAdd2d"""
         with override_quantized_engine('onednn'):
             options = itertools.product(
@@ -898,6 +973,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                     Y_scale, Y_zero_point, use_bias, "add_relu", use_channelwise, X2_scale, X2_zero_point)
 
     def test_pool_api(self):
+        # [FUNCTION DOC] Compares nnq MaxPool2d on a random quantized 10x10x10x3 tensor against
+        # the functional max_pool2d on the same quantized tensor, then checks scriptability of
+        # the module (on the float input).
         """Tests the correctness of the pool module.
         The correctness is defined against the functional implementation.
         """
@@ -924,6 +1002,8 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         self.checkScriptable(pool_under_test, [[X]])
 
     def test_dropout(self):
+        # [FUNCTION DOC] Checks nnq.Dropout on a quantized tensor equals quantizing the output
+        # of a float Dropout set to evaluation behavior; integer representations are compared.
         """Tests the correctness of the dropout module.
         The correctness is defined against the functional implementation.
         """
@@ -942,6 +1022,11 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                          msg="Dropout module API failed")
 
     def _test_dropout_serialization(self, get_model, data1, data2):
+        # [FUNCTION DOC] HELPER: Builds a model with the factory, prepares it with the default
+        # qconfig, calibrates on the first data, converts it and records its output on the
+        # second data. A second model is prepared and converted without calibration, loads the
+        # first quantized state_dict, and must give the same output (allclose). Shows quantized
+        # dropout state survives state_dict serialization.
         m1 = get_model()
         m1.qconfig = torch.ao.quantization.default_qconfig
         mp1 = torch.ao.quantization.prepare(m1)
@@ -960,10 +1045,14 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         self.assertTrue(torch.allclose(ref1, ref2))
 
     def test_dropout_serialization(self):
+        # [FUNCTION DOC] Runs the dropout serialization helper with a model made of a quant
+        # stub, Dropout and a dequant stub in evaluation mode, using two random 4d float inputs.
         data1 = torch.randn(2, 4, 6, 8)
         data2 = torch.randn(2, 4, 6, 8)
 
         def _get_model():
+            # [FUNCTION DOC] HELPER: Model factory returning an evaluation mode sequence of
+            # QuantStub, Dropout with probability one half, and DeQuantStub.
             return nn.Sequential(
                 torch.ao.quantization.QuantStub(),
                 nn.Dropout(p=0.5),
@@ -975,6 +1064,8 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
 
     def test_batch_norm2d(self):
+        # [FUNCTION DOC] Checks nnq.BatchNorm2d on a quantized tensor against quantizing the
+        # output of a float BatchNorm2d in evaluation state, comparing integer representations.
         """Tests the correctness of the batchnorm2d module.
         The correctness is defined against the functional implementation.
         """
@@ -993,6 +1084,8 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                          msg="BatchNorm2d module API failed")
 
     def test_batch_norm3d(self):
+        # [FUNCTION DOC] Checks nnq.BatchNorm3d on a quantized 5d tensor against quantizing the
+        # output of a float BatchNorm3d in evaluation state, comparing integer representations.
         """Tests the correctness of the batchnorm3d module.
         The correctness is defined against the functional implementation.
         """
@@ -1011,6 +1104,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                          msg="BatchNorm3d module API failed")
 
     def _test_batch_norm_serialization(self, get_model, data1, data2):
+        # [FUNCTION DOC] HELPER: Same procedure as the dropout serialization helper: convert a
+        # calibrated model, load its state_dict into a freshly converted model and require equal
+        # outputs. Used for batch norm models.
         m1 = get_model()
         m1.qconfig = torch.ao.quantization.default_qconfig
         mp1 = torch.ao.quantization.prepare(m1)
@@ -1029,10 +1125,14 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         self.assertTrue(torch.allclose(ref1, ref2))
 
     def test_batch_norm2d_serialization(self):
+        # [FUNCTION DOC] Runs the batch norm serialization helper with a quant stub, BatchNorm2d
+        # over 4 channels and a dequant stub in evaluation mode.
         data1 = torch.randn(2, 4, 6, 8)
         data2 = torch.randn(2, 4, 6, 8)
 
         def _get_model():
+            # [FUNCTION DOC] HELPER: Model factory returning an evaluation mode sequence of
+            # QuantStub, BatchNorm2d with 4 channels, and DeQuantStub.
             return nn.Sequential(
                 torch.ao.quantization.QuantStub(),
                 nn.BatchNorm2d(4),
@@ -1042,10 +1142,15 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         self._test_batch_norm_serialization(_get_model, data1, data2)
 
     def test_batch_norm3d_serialization(self):
+        # [FUNCTION DOC] Runs the batch norm serialization helper with a quant stub, BatchNorm3d
+        # over 4 channels and a dequant stub in evaluation mode, on inputs with trailing size
+        # one.
         data1 = torch.randn(2, 4, 6, 8, 1)
         data2 = torch.randn(2, 4, 6, 8, 1)
 
         def _get_model():
+            # [FUNCTION DOC] HELPER: Model factory returning an evaluation mode sequence of
+            # QuantStub, BatchNorm3d with 4 channels, and DeQuantStub.
             return nn.Sequential(
                 torch.ao.quantization.QuantStub(),
                 nn.BatchNorm3d(4),
@@ -1055,6 +1160,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         self._test_batch_norm_serialization(_get_model, data1, data2)
 
     def test_layer_norm(self):
+        # [FUNCTION DOC] Checks nnq.LayerNorm with random affine weight and bias against a float
+        # LayerNorm applied to the dequantized input then requantized with the output scale and
+        # zero point.
         """Tests the correctness of the layernorm module.
         The correctness is defined against the functional implementation.
         """
@@ -1085,6 +1193,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                          msg=f"LayerNorm module API failed, qY_ref\n{qY_ref} vs qY\n{qY}")
 
     def test_group_norm(self):
+        # [FUNCTION DOC] Checks nnq.GroupNorm with random affine weight and bias against a float
+        # GroupNorm of 2 groups over 4 channels applied to the dequantized input, then
+        # requantized with the output scale and zero point.
         """Tests the correctness of the groupnorm module.
         The correctness is defined against the functional implementation.
         """
@@ -1115,6 +1226,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                          msg=f"GroupNorm module API failed, qY_ref\n{qY_ref} vs qY\n{qY}")
 
     def test_instance_norm(self):
+        # [FUNCTION DOC] Checks nnq InstanceNorm1d, 2d and 3d with random affine weight and bias
+        # against the matching float modules on the dequantized input, requantized with the
+        # output params.
         """Tests the correctness of the instancenorm{n}d modules.
         The correctness is defined against the functional implementation.
         """
@@ -1155,6 +1269,12 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                 msg=f"InstanceNorm module API failed, qY_ref\n{qY_ref} vs qY\n{qY}")
 
     def _test_activation_module_impl(self, name, float_module_class, quantized_module_class, extra_kwargs):
+        # [FUNCTION DOC] HELPER: Compares a quantized activation module against its float
+        # counterpart run on the dequantized input and requantized with the output scale and
+        # zero point. Args: display name for failure messages, float class, quantized class,
+        # keyword arguments given to both (the quantized class also takes output scale and zero
+        # point first).
+        # KNOWN ISSUE: the existing docstring says it tests ELU but this helper is generic.
         """Tests the correctness of the ELU module.
         The correctness is defined against the functional implementation.
         """
@@ -1181,6 +1301,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                          msg=f"{name} module API failed, qY_ref\n{qY_ref} vs qY\n{qY}")
 
     def _test_leaky_relu_serialization(self):
+        # [FUNCTION DOC] HELPER: Creates a quantized LeakyReLU, loads its state_dict into a
+        # second instance with different scale and zero point, and asserts scale and zero point
+        # were overwritten.
         scale_original = 10.0 / 256
         zero_point_original = 1.0
 
@@ -1196,19 +1319,26 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         self.assertEqual(quant_mod_original.zero_point, quant_mod_new.zero_point)
 
     def test_elu(self):
+        # [FUNCTION DOC] Runs the activation helper for ELU with alpha 1.5.
         """Tests the correctness of the ELU module.
         The correctness is defined against the functional implementation.
         """
         self._test_activation_module_impl("ELU", nn.ELU, nnq.ELU, {"alpha": 1.5})
 
     def test_leaky_relu(self):
+        # [FUNCTION DOC] Runs the activation helper for LeakyReLU with negative slope 0.2, then
+        # the LeakyReLU state_dict serialization check.
         self._test_activation_module_impl("LeakyReLU", nn.LeakyReLU, nnq.LeakyReLU, {"negative_slope": 0.2})
         self._test_leaky_relu_serialization()
 
     def test_sigmoid(self):
+        # [FUNCTION DOC] Runs the activation helper for Sigmoid with no extra arguments.
         self._test_activation_module_impl("Sigmoid", nn.Sigmoid, nnq.Sigmoid, {})
 
     def _test_hard_swish_serialization(self):
+        # [FUNCTION DOC] HELPER: Creates a quantized Hardswish, loads its state_dict into a
+        # second instance with different scale and zero point, and asserts scale and zero point
+        # were overwritten.
         scale_original = 10.0 / 256
         zero_point_original = 1.0
 
@@ -1224,6 +1354,8 @@ class TestStaticQuantizedModule(QuantizationTestCase):
         self.assertEqual(quant_mod_original.zero_point, quant_mod_new.zero_point)
 
     def test_hard_swish(self):
+        # [FUNCTION DOC] Runs the activation helper for Hardswish, then the Hardswish
+        # serialization check.
         self._test_activation_module_impl("Hardswish", nn.Hardswish, nnq.Hardswish, {})
         self._test_hard_swish_serialization()
 
@@ -1234,6 +1366,12 @@ class TestStaticQuantizedModule(QuantizationTestCase):
     )
     @skipIfNoFBGEMM
     def test_embedding_api(self, num_embeddings, embedding_dim, set_qconfig):
+        # [FUNCTION DOC] Hypothesis driven check of nnq.Embedding for 4-bit and 8-bit weights.
+        # Skipped without fbgemm. Builds random lookup indices and positive float weights,
+        # calibrates qparams with the float qparams observer, quantizes per channel, sets the
+        # weight on the module and compares its output to the direct embedding_4bit or
+        # embedding_byte op, then runs the embedding serialization checker. The set_qconfig
+        # argument is accepted but not used (the serialization call is passed false).
         num_lengths = np.random.randint(1, 6)
         lengths = np.random.randint(0, 21, size=num_lengths).astype(np.int32)
         num_indices = np.sum(lengths)
@@ -1273,6 +1411,11 @@ class TestStaticQuantizedModule(QuantizationTestCase):
     )
     @skipIfNoFBGEMM
     def test_embedding_bag_api(self, num_embeddings, embedding_dim, num_offsets, set_qconfig):
+        # [FUNCTION DOC] Hypothesis driven check of nnq.EmbeddingBag for 8-bit and 4-bit
+        # weights. Skipped without fbgemm. Quantizes random weights per channel with float
+        # qparams, builds the module from them (sum mode, last offset included), compares output
+        # to the direct embedding_bag byte or 4bit op, then runs the embedding serialization
+        # checker with the given set_qconfig. The num_offsets argument is unused.
         r"""Test execution and serialization for dynamic quantized embedding_bag modules on int8
         """
 
@@ -1318,6 +1461,10 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                                              offsets, set_qconfig, is_emb_bag=True, dtype=qdtype)
 
     def test_prelu(self):
+        # [FUNCTION DOC] For one to nine PReLU parameters, converts a float PReLU with observers
+        # to nnq.PReLU via from_float, checks the quantized weight equals the observed per-
+        # tensor quantization of the float weight, then compares the quantized output with the
+        # float output on the dequantized input using loose tolerance.
         for num_parameters in range(1, 10):
             x = torch.randn(4, num_parameters, 4)
             qx = torch.quantize_per_tensor_dynamic(x, dtype=torch.quint8, reduce_range=False)
@@ -1352,6 +1499,11 @@ class TestStaticQuantizedModule(QuantizationTestCase):
             self.assertEqual(qy, qy_ref, atol=.1, rtol=.1)
 
     def test_channel_shuffle(self):
+        # [FUNCTION DOC] Checks ChannelShuffle with 2 groups on a quantized 4d tensor against
+        # the float module applied to the dequantized input, requantized with the same scale and
+        # zero point.
+        # KNOWN ISSUE: the module under test is the same float torch.nn.ChannelShuffle on both
+        #     sides.
         """Tests the correctness of the ChannelShuffle module.
         """
         x_scale = 10.0 / 256
@@ -1379,6 +1531,9 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @skipIfNoONEDNN
     def test_linear_leaky_relu(self):
+        # [FUNCTION DOC] Sweeps sizes, bias, per-channel and negative slope 0.01 or 0.05 for the
+        # fused nniq.LinearLeakyReLU through the linear checker. Skipped without onednn; uses
+        # that engine.
         """test API functionality for nn.intrinsic.quantized.linear_leaky_relu"""
         with override_quantized_engine('onednn'):
             options = itertools.product(
@@ -1398,6 +1553,8 @@ class TestStaticQuantizedModule(QuantizationTestCase):
 
     @skipIfNoONEDNN
     def test_linear_tanh(self):
+        # [FUNCTION DOC] Sweeps sizes, bias and per-channel flag for the fused nniq.LinearTanh
+        # through the linear checker. Skipped without onednn; uses that engine.
         """test API functionality for nn.intrinsic.quantized.linear_tanh"""
         with override_quantized_engine('onednn'):
             options = itertools.product(
@@ -1415,7 +1572,15 @@ class TestStaticQuantizedModule(QuantizationTestCase):
                     per_channel)
 
 class TestDynamicQuantizedModule(QuantizationTestCase):
+    # [CLASS DOC] Tests for dynamically quantized module wrappers (nnqd namespace): conv, conv
+    # transpose, linear, LSTM, GRU and RNN cells. Stateless test container.
     def _test_qconv_impl(self, q_mod, dq_mod, dim, dtype, bias):
+        # [FUNCTION DOC] HELPER: Shared check of dynamic conv and conv transpose modules. Args:
+        # quantized module class, dynamic module class, input rank, dtype, bias flag. Builds
+        # both with the same weights, compares dynamic output on dequantized input with the
+        # dequantized static output (reduce_range is false only for qnnpack), then checks
+        # state_dict reload, pickle, copy, deepcopy, scriptability and from_float conversion
+        # through dynamic prepare. Raises AssertionError on mismatch; no return value.
         in_channels = 3
         out_channels = 10
         kernel_size = 2
@@ -1534,6 +1699,8 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_dynamic_conv1d(self):
+        # [FUNCTION DOC] Runs the dynamic conv check for Conv1d with rank 3 input and quint8,
+        # with and without bias, for every quantization engine.
         q_mod = torch.ao.nn.quantized.Conv1d
         dq_mod = torch.ao.nn.quantized.dynamic.Conv1d
         dim = 3
@@ -1544,6 +1711,8 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_dynamic_conv2d(self):
+        # [FUNCTION DOC] Runs the dynamic conv check for Conv2d with rank 4 input and quint8,
+        # with and without bias, for every quantization engine.
         q_mod = torch.ao.nn.quantized.Conv2d
         dq_mod = torch.ao.nn.quantized.dynamic.Conv2d
         dim = 4
@@ -1554,6 +1723,8 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_dynamic_conv3d(self):
+        # [FUNCTION DOC] Runs the dynamic conv check for Conv3d with rank 5 input, with and
+        # without bias. Returns early under qnnpack, which cannot unpack 3d conv.
         q_mod = torch.ao.nn.quantized.Conv3d
         dq_mod = torch.ao.nn.quantized.dynamic.Conv3d
         dim = 5
@@ -1566,6 +1737,8 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_dynamic_convtranspose1d(self):
+        # [FUNCTION DOC] Runs the dynamic conv check for ConvTranspose1d with rank 3 input and
+        # quint8, with and without bias, for every quantization engine.
         q_mod = torch.ao.nn.quantized.ConvTranspose1d
         dq_mod = torch.ao.nn.quantized.dynamic.ConvTranspose1d
         dim = 3
@@ -1576,6 +1749,8 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_dynamic_convtranspose2d(self):
+        # [FUNCTION DOC] Runs the dynamic conv check for ConvTranspose2d with rank 4 input and
+        # quint8, with and without bias, for every quantization engine.
         q_mod = torch.ao.nn.quantized.ConvTranspose2d
         dq_mod = torch.ao.nn.quantized.dynamic.ConvTranspose2d
         dim = 4
@@ -1586,6 +1761,8 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_dynamic_convtranspose3d(self):
+        # [FUNCTION DOC] Runs the dynamic conv check for ConvTranspose3d with rank 5 input, with
+        # and without bias. Returns early under qnnpack, which cannot unpack 3d conv.
         q_mod = torch.ao.nn.quantized.ConvTranspose3d
         dq_mod = torch.ao.nn.quantized.dynamic.ConvTranspose3d
         dim = 5
@@ -1597,6 +1774,9 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
             self._test_qconv_impl(q_mod, dq_mod, dim, dtype, bias)
 
     def test_convtranspose_invalid_out_channels(self):
+        # [FUNCTION DOC] Asserts that quantized ConvTranspose1d, 2d and 3d constructors raise
+        # ValueError with the message that out_channels must be greater than 0 when out_channels
+        # is zero.
         """Test that ConvTranspose modules raise ValueError for out_channels <= 0"""
         for module_class in [
             torch.ao.nn.quantized.ConvTranspose1d,
@@ -1615,6 +1795,12 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
     )
     @override_qengines
     def test_linear_api(self, batch_size, in_features, out_features, use_bias, use_default_observer):
+        # [FUNCTION DOC] Hypothesis driven end-to-end check of nnqd.Linear for every
+        # quantization engine. Quantizes a random weight (symmetric for onednn), sets weight and
+        # bias, compares output to the direct linear_dynamic op with reduce_range, then checks
+        # state_dict reload (weights only true and false), whole-module pickle, scriptability
+        # and from_float conversion for the plain and non-dynamically-quantizable float linear
+        # classes, using the default dynamic qconfig only when use_default_observer is true.
         """test API functionality for nn.quantized.dynamic.Linear"""
         W = torch.rand(out_features, in_features).float()
         qscheme = torch.per_tensor_symmetric if qengine_is_onednn() else torch.per_tensor_affine
@@ -1709,6 +1895,11 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
     )
     @override_qengines
     def test_lstm_api(self, dtype, bidirectional):
+        # [FUNCTION DOC] Hypothesis driven check of dynamic LSTM for qint8 or float16 and uni or
+        # bidirectional setups, on every engine. Skipped silently for float16 under qnnpack or
+        # onednn. Compares module output and states with the direct quantized_lstm op using the
+        # module weights, then runs eager serialization and weight/bias API checkers with
+        # generated parameter names.
         r"""Test execution and serialization for dynamic quantized lstm modules on int8 and fp16
         """
         # Check that module matches the numerics of the op and ensure that module can be
@@ -1779,6 +1970,9 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
 
     @override_qengines
     def test_gru_api(self):
+        # [FUNCTION DOC] Checks dynamic GRU for qint8 and float16 (float16 skipped under qnnpack
+        # and onednn) on every engine: module output and hidden state must equal the direct
+        # quantized_gru op result using the module's packed weights.
         r"""Test execution and serialization for dynamic quantized lstm modules on int8 and fp16
         """
         # Check that module matches the numerics of the op and ensure that module can be
@@ -1831,6 +2025,10 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
     )
     @override_qengines
     def test_cell_api(self, dtype):
+        # [FUNCTION DOC] Hypothesis driven check of dynamic LSTMCell, GRUCell and RNNCell with
+        # tanh and relu for qint8 or float16 (float16 skipped under qnnpack and onednn).
+        # Compares module output against the matching dynamic cell op on packed weights, then
+        # runs eager serialization and weight/bias API checkers.
         r"""Test execution and serialization for dynamic quantized lstm modules on int8 and fp16
         """
         # Check that module matches the numerics of the op and ensure that module can be
@@ -1879,7 +2077,13 @@ class TestDynamicQuantizedModule(QuantizationTestCase):
                 self.check_weight_bias_api(cell_dq, weight_keys, bias_keys)
 
 class TestReferenceQuantizedModule(QuantizationTestCase):
+    # [CLASS DOC] Tests for reference quantized modules (nnqr): numerics are checked against
+    # float modules whose weights were quantized and dequantized with the same parameters.
     def _quant_dequant_weight(self, weight, weight_qparams):
+        # [FUNCTION DOC] HELPER: Quantizes then dequantizes a weight using a qparams mapping
+        # with qscheme, scale, zero point, dtype and, for per-channel, an axis. Per-tensor
+        # affine is used when the qscheme matches; otherwise per-channel quantization is
+        # assumed. Returns a float tensor.
         qscheme = weight_qparams["qscheme"]
         scale = weight_qparams["scale"]
         zero_point = weight_qparams["zero_point"]
@@ -1895,6 +2099,10 @@ class TestReferenceQuantizedModule(QuantizationTestCase):
 
     # TODO: add tests for conv and linear
     def test_rnn_cell(self):
+        # [FUNCTION DOC] Checks reference LSTMCell, GRUCell and RNNCell (tanh and relu) with
+        # per-tensor weight qparams: the reference cell takes the float cell weights and biases,
+        # the float cell's weights are quantized and dequantized, and both outputs must be
+        # equal.
         """ Checks the rnn cell reference quantized modules has correct numerics
         This includes LSTMCell, GRUCell, RNNCell
         """
@@ -1960,6 +2168,9 @@ class TestReferenceQuantizedModule(QuantizationTestCase):
             self.assertEqual(ref_res[1], fp_res[1], msg="RNNCell module API failed")
 
     def test_rnn(self):
+        # [FUNCTION DOC] Checks the reference LSTM for bidirectional and unidirectional cases:
+        # the reference copies the float LSTM weights, the float LSTM weights get quantize-
+        # dequantize applied, and the outputs of both must match.
         """ Checks the rnn reference quantized modules has correct numerics
         This includes LSTM
         """
@@ -2019,6 +2230,10 @@ class TestReferenceQuantizedModule(QuantizationTestCase):
             self.assertEqual(fp32_res, ref_res)
 
     def test_sparse(self):
+        # [FUNCTION DOC] Checks reference Embedding and EmbeddingBag with per-tensor and per-
+        # channel weight qparams against float modules with quantized-dequantized weights. The
+        # 4-bit float qparams case is skipped because per-channel quantization lacks support for
+        # it.
         """ Embedding and EmbeddingBag
         """
         num_embeddings = 10
@@ -2085,6 +2300,10 @@ class TestReferenceQuantizedModule(QuantizationTestCase):
             self.assertEqual(fp32_res, ref_res)
 
     def test_linear_decomposed_weight_custom_qmin_qmax(self):
+        # [FUNCTION DOC] Checks that the reference Linear in decomposed mode takes quant min and
+        # max of minus 127 and 127 from the symmetric qnnpack observer: symbolically traces the
+        # module and verifies that exactly two decomposed quantize/dequantize per tensor nodes
+        # exist, both carrying those bounds.
         """Verify that reference Linear respects custom qmin/qmax for weight
         """
         linear_fp32 = torch.nn.Linear(2, 2)
