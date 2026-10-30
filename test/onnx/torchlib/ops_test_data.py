@@ -1,4 +1,10 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] Registry of the torchlib operators covered by the numerical OpInfo tests. Builds a
+# deep-copied OpInfo database, defines the TorchLibOpInfo record and the input wrangler functions,
+# lists the tested ops, duplicates OpInfos for overloads and prims ops, and derives lookup tables
+# (nondeterministic ops, shape-only outputs, complex ops, skip and xfail lists). Import-time side
+# effects: extends and mutates the database and raises AssertionError if a tested op is missing
+# from it.
 """Test op correctness by comparing with PyTorch results.
 
 ## Usage
@@ -63,6 +69,10 @@ OPS_DB.extend(opinfo_definitions.signal.op_db)
 
 @dataclasses.dataclass
 class TorchLibOpInfo:
+    # [CLASS DOC] Test configuration for one torchlib op: OpInfo name, the ONNX function, an
+    # optional input wrangler, nondeterminism flag, output indices compared by shape only, complex
+    # flag, minimum opset, per-dtype tolerances and a list of skip or xfail records. The skip and
+    # xfail methods append records and return the instance so calls can be chained.
     """A dataclass to store the information to test an torchlib op."""
 
     # The name of the op_info, e.g. "add"
@@ -99,6 +109,8 @@ class TorchLibOpInfo:
     )
 
     def get_tolerance(self, dtype: torch.dtype) -> tuple[float | None, float | None]:
+        # [FUNCTION DOC] Returns the tolerance pair for the dtype from the tolerance mapping, or a
+        # pair of None values (use torch defaults) when the dtype has no entry.
         """Returns the (rtol, atol) tolerance for the given dtype."""
         if (tolerance := self.tolerance.get(dtype)) is not None:
             return tolerance
@@ -118,6 +130,8 @@ class TorchLibOpInfo:
         enabled_if: bool = True,
         test_class_name: str | None = None,
     ) -> Self:
+        # [FUNCTION DOC] Appends a skip record for this op, built with the module's skip factory
+        # from the op name and the given arguments, to skips_or_fails. Returns self for chaining.
         """Skips an OpInfo test.
 
         Args:
@@ -156,6 +170,8 @@ class TorchLibOpInfo:
         enabled_if: bool = True,
         test_class_name: str | None = None,
     ) -> Self:
+        # [FUNCTION DOC] Appends an expected-failure record for this op, built with the module's
+        # xfail factory from the op name and the given arguments, to skips_or_fails. Returns self.
         """Expects an OpInfo test to fail.
 
         Args:
@@ -190,6 +206,9 @@ class TorchLibOpInfo:
 def _amin_amax_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Ensures the dim keyword is an int64 array: an empty
+    # array when absent, otherwise the given dims flattened to one dimension. Mutates and returns
+    # args and kwargs.
     if "dim" not in kwargs:
         # Supply an empty dim to match the aten signature
         kwargs["dim"] = np.array([], dtype=np.int64)
@@ -202,6 +221,10 @@ def _amin_amax_input_wrangler(
 def _avg_pool_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. For the aten pooling signature (when dim is not a
+    # keyword), moves the positional arguments from index 1 up to 6 into keywords kernel_size,
+    # stride, padding, ceil_mode, count_include_pad and divisor_override, turning arrays into
+    # lists. Mutates and returns both.
     if "dim" not in kwargs:
         if len(args) > 6:
             kwargs["divisor_override"] = args.pop(6)
@@ -230,6 +253,8 @@ def _avg_pool_input_wrangler(
 def _cross_entropy_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Replaces a string reduction keyword with its index in
+    # the order none, mean, sum. Raises ValueError for an unknown string. Returns args and kwargs.
     if "reduction" in kwargs:
         reduction_vals = ["none", "mean", "sum"]
         value = kwargs["reduction"]
@@ -241,6 +266,8 @@ def _cross_entropy_input_wrangler(
 def _dropout_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Renames the training keyword to train, if present.
+    # Returns args and kwargs.
     if "training" in kwargs:
         kwargs["train"] = kwargs["training"]
         kwargs.pop("training")
@@ -250,6 +277,8 @@ def _dropout_input_wrangler(
 def _einsum_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Swaps the first two positional arguments to undo the
+    # OpInfo ordering of equation and tensors. Returns a new args list and the kwargs unchanged.
     # Swap the equation and tensors to revert the special handling in the OpInfo
     return [args[1], args[0]], kwargs
 
@@ -257,6 +286,8 @@ def _einsum_input_wrangler(
 def _embedding_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Drops the max_norm and norm_type keywords, which the
+    # aten op does not take.
     """Remove arguments not present in the aten op signature."""
     kwargs.pop("max_norm", None)
     kwargs.pop("norm_type", None)
@@ -266,6 +297,8 @@ def _embedding_input_wrangler(
 def _empty_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Drops the requires_grad keyword, which the aten op
+    # does not take.
     """Remove arguments not present in the aten op signature."""
     kwargs.pop("requires_grad", None)
     return args, kwargs
@@ -274,6 +307,9 @@ def _empty_input_wrangler(
 def _grid_sample_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Appends the interpolation mode, padding mode (both
+    # mapped to ints) and align_corners values to the positional arguments, then clears all
+    # keywords. Raises KeyError for an unknown mode string.
     # Convert string attribute to int as input
     inter_mode_options = {"bilinear": 0, "nearest": 1, "bicubic": 2}
     padding_mode_options = {"zeros": 0, "border": 1, "reflection": 2}
@@ -287,6 +323,9 @@ def _grid_sample_input_wrangler(
 def _im2col_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Moves kernel_size, and when five args are present
+    # also dilation, padding and stride, from the end of the positional list into keywords,
+    # converting arrays to lists.
     # Move kernel_size, dilation, padding and stride from args to kwargs
     if len(args) == 5:
         # Handle stride
@@ -316,6 +355,8 @@ def _im2col_input_wrangler(
 def _index_put_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Converts the list of index tensors (second argument)
+    # to a list of numpy arrays.
     args[1] = [np.array(elem) for elem in args[1]]
     return args, kwargs
 
@@ -323,6 +364,8 @@ def _index_put_input_wrangler(
 def _max_pool_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Drops the return_indices keyword, which the op does
+    # not accept.
     # Remove return_indices argument because this op doesn't accept it
     kwargs.pop("return_indices", None)
     return args, kwargs
@@ -331,6 +374,8 @@ def _max_pool_input_wrangler(
 def _mean_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Converts the dim keyword, if present, to an
+    # int64 array.
     # Make the dims as tensor
     if "dim" in kwargs:
         kwargs["dim"] = np.array(kwargs["dim"], dtype=np.int64)
@@ -340,6 +385,8 @@ def _mean_input_wrangler(
 def _mse_loss_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Replaces a string reduction keyword with its index in
+    # the order none, mean, sum. Raises ValueError for an unknown string. Returns args and kwargs.
     if "reduction" in kwargs:
         reduction_vals = ["none", "mean", "sum"]  # [0,1,2], default=1
         value = kwargs["reduction"]
@@ -351,6 +398,9 @@ def _mse_loss_input_wrangler(
 def _nll_loss_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Replaces a string reduction keyword with its integer
+    # index (none, mean, sum), as the aten op takes an integer. Raises ValueError for an
+    # unknown string.
     if "reduction" in kwargs:
         # aten_nll_loss can only accept integer argument instead of string
         reduction_vals = ["none", "mean", "sum"]
@@ -362,6 +412,8 @@ def _nll_loss_input_wrangler(
 def _nonzero_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Drops the as_tuple keyword, which this op does
+    # not take.
     kwargs.pop("as_tuple", None)
     return args, kwargs
 
@@ -369,6 +421,8 @@ def _nonzero_input_wrangler(
 def _reflection_pad2d_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Removes the third positional argument (the padding
+    # mode name).
     args.pop(2)  # remove 'reflect' arg
     return args, kwargs
 
@@ -376,6 +430,8 @@ def _reflection_pad2d_input_wrangler(
 def _replication_pad2d_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Removes the third positional argument (the padding
+    # mode name).
     args.pop(2)  # remove 'replicate' arg
     return args, kwargs
 
@@ -383,6 +439,8 @@ def _replication_pad2d_input_wrangler(
 def _replication_pad3d_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Removes the third positional argument (the padding
+    # mode name).
     args.pop(2)  # remove 'replicate' arg
     return args, kwargs
 
@@ -390,6 +448,9 @@ def _replication_pad3d_input_wrangler(
 def _roll_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Moves the dims (third) and shifts (second) positional
+    # arguments into keywords as lists, accepting numpy arrays or plain ints. Mutates args and
+    # kwargs and returns them.
     if len(args) >= 3:
         if isinstance(args[2], np.ndarray):  # convert dims to list[int]
             # Change dims from args to kwargs to keep tuple/list type
@@ -413,6 +474,8 @@ def _roll_input_wrangler(
 def _scalar_tensor_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Drops the requires_grad keyword, which the op does
+    # not take.
     kwargs.pop("requires_grad", None)
     return args, kwargs
 
@@ -420,6 +483,8 @@ def _scalar_tensor_input_wrangler(
 def _scatter_reduce_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Moves the fifth positional argument (the reduce
+    # string) into the reduce keyword so the full-graph mode can find it.
     # Put the string into kwargs, otherwise FullGraph mode could not find get 'reduce' argument
     kwargs["reduce"] = args.pop(4)
     return args, kwargs
@@ -428,6 +493,8 @@ def _scatter_reduce_input_wrangler(
 def _sum_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Converts the dim keyword to an int64 array when it is
+    # present and not None.
     if kwargs.get("dim") is not None:
         kwargs["dim"] = np.array(kwargs["dim"], dtype=np.int64)
     return args, kwargs
@@ -436,6 +503,8 @@ def _sum_input_wrangler(
 def _unflatten_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Converts the second positional argument (sizes) to an
+    # int64 array.
     args[1] = np.array(args[1], dtype=np.int64)
     return args, kwargs
 
@@ -443,6 +512,8 @@ def _unflatten_input_wrangler(
 def _where_input_wrangler(
     args: list[Any], kwargs: dict[str, Any]
 ) -> tuple[list[Any], dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Input wrangler. Swaps the first two positional arguments, because the
+    # aten where op takes condition first while the OpInfo puts the input first.
     # The aten::where op takes condition, x, y as inputs
     # Swap the first two inputs
     args[0], args[1] = args[1], args[0]

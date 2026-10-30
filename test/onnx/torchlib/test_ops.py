@@ -1,4 +1,8 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] pytest entry point comparing torchlib ONNX functions with PyTorch eager results
+# over OpInfo samples. Defines the tested dtypes, a skip/xfail sample lookup, the shared
+# comparison routine and a test class instantiated for cpu only. Import-time side effect:
+# instantiate_device_type_tests generates the device-specific test classes in this namespace.
 """Test op correctness by comparing with PyTorch results.
 
 Usage:
@@ -68,6 +72,7 @@ COMPLEX_TYPES = (torch.complex64,)
 
 
 def dtypes_except(*dtypes: torch.dtype) -> Sequence[torch.dtype]:
+    # [FUNCTION DOC] Returns a tuple of the tested dtypes with the given dtypes removed.
     """Returns all dtypes except the ones specified."""
     return tuple(dtype for dtype in TESTED_DTYPES if dtype not in dtypes)
 
@@ -75,6 +80,10 @@ def dtypes_except(*dtypes: torch.dtype) -> Sequence[torch.dtype]:
 def _should_skip_xfail_test_sample(
     op_name: str, sample, dtype: torch.dtype, device_type: str
 ) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC] HELPER: Looks up a sample-level skip or xfail. Scans the subtest rules of the
+    # op, ignoring disabled rules and rules not matching the dtype or device type, and returns the
+    # behavior and reason of the first rule whose matcher accepts the sample, otherwise a pair of
+    # None values. Raises AssertionError if a rule for the op has no matcher.
     """Returns a reason if a test sample should be skipped."""
     if op_name not in ops_test_data.OP_WITH_SKIPPED_XFAIL_SUBTESTS:
         return None, None
@@ -101,6 +110,8 @@ def _should_skip_xfail_test_sample(
 
 
 class TestFunctionValidity(common_utils.TestCase):
+    # [CLASS DOC] Checks that every tested torchlib function that is an OnnxFunction produces a
+    # valid ONNX function proto.
     @parameterized.parameterized.expand(
         [
             (info.op.name, info)
@@ -112,6 +123,8 @@ class TestFunctionValidity(common_utils.TestCase):
     def test_script_function_passes_checker(
         self, _, torchlib_op_info: ops_test_data.TorchLibOpInfo
     ):
+        # [FUNCTION DOC] Parameterized over tested ops; converts the op to a function proto and
+        # runs the ONNX function checker on it, which raises if the proto is invalid.
         function_proto = torchlib_op_info.op.to_function_proto()
         onnx.checker.check_function(function_proto)  # type: ignore[attr-defined]
 
@@ -127,6 +140,14 @@ def run_test_output_match(
         ops_test_data.TorchLibOpInfo,
     ],
 ):
+    # [FUNCTION DOC] Shared body of the output consistency tests. Generates samples for the
+    # OpInfo, skips the test if the dtype is not allowed by the function schema (unless complex),
+    # then per sample applies any skip or xfail, wrangles inputs, runs eager PyTorch and the ONNX
+    # function through function_executor, and compares flattened outputs with assert_close using
+    # the op tolerance. Nondeterministic ops and selected outputs compare only shape and dtype.
+    # Raises AssertionError on mismatch or output count difference; with
+    # CREATE_REPRODUCTION_REPORT set it writes a mismatch report. Complex outputs are viewed as
+    # real pairs.
     """Base test method for testing each opset, used by instantiate_device_type_tests.
 
     Args:
@@ -292,12 +313,17 @@ def run_test_output_match(
 
 
 class TestOutputConsistencyFullGraph(common_utils.TestCase):
+    # [CLASS DOC] Device-generic test class running each tested op as a full ONNX graph and
+    # comparing with eager PyTorch. The test methods are decorated so skip and xfail rules from
+    # the test data are attached to OpInfos, and are expanded per op and dtype at instantiation.
     """Test output consistency between exported ONNX op run as a graph and PyTorch eager mode.
 
     This is a parameterized test suite.
     """
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Seeds torch, numpy and ONNX Runtime random generators with 42 before each
+        # test for reproducibility.
         torch.manual_seed(42)
         np.random.seed(42)
         ort.set_seed(42)
@@ -319,6 +345,8 @@ class TestOutputConsistencyFullGraph(common_utils.TestCase):
     def test_output_match_opinfo_(
         self, device: str, dtype: torch.dtype, op: opinfo_core.OpInfo
     ):
+        # [FUNCTION DOC] Test for non-complex tested ops: delegates to the shared comparison
+        # routine with the graph executor and the mapping of tested ops.
         # Base test method for testing each op by running the full ONNX graph.
         run_test_output_match(
             self,
@@ -346,6 +374,9 @@ class TestOutputConsistencyFullGraph(common_utils.TestCase):
     def test_complex_output_match_opinfo_(
         self, device: str, dtype: torch.dtype, op: opinfo_core.OpInfo
     ):
+        # [FUNCTION DOC] Test for ops registered as complex functions (complex64 inputs only):
+        # delegates to the shared comparison routine with the graph executor and the mapping of
+        # complex functions.
         """Base test method for testing each op by running the full ONNX graph."""
         run_test_output_match(
             self,

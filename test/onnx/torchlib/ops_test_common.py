@@ -1,4 +1,9 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] Shared helpers for the torchlib ONNX operator tests. Defines dtype tuples, the test
+# opset constant, skip/xfail metadata (DecorateMeta) and helpers that attach it to OpInfo
+# decorators, utilities to duplicate OpInfos, conversion of torch values to numpy/ONNX, and an
+# executor that traces an onnxscript function into an ONNX graph and runs it in ONNX Runtime.
+# Importing it has no side effects beyond imports and building the dtype mapping table.
 """Common utils for testing operators."""
 
 from __future__ import annotations
@@ -60,6 +65,10 @@ IS_WINDOWS = os.name == "nt"
 
 @dataclasses.dataclass
 class DecorateMeta:
+    # [CLASS DOC] Plain record describing one skip or xfail rule for an OpInfo test: operator
+    # name, variant name, the unittest decorator to apply, optional dtype and device filters, the
+    # reason, the behavior label (skip or xfail), an optional sample matcher, an enabled flag and
+    # an optional test class restriction. Created by the xfail and skip factory functions.
     """A dataclass for storing information about a test case to skip or xfail.
 
     Adapted from functorch: functorch/test/common_utils.py
@@ -90,6 +99,9 @@ def xfail(
     enabled_if: bool = True,
     test_class_name: str | None = None,
 ) -> DecorateMeta:
+    # [FUNCTION DOC] Builds a DecorateMeta that expects the matching OpInfo test to fail, using
+    # the unittest expected-failure decorator and the behavior label xfail. All arguments are just
+    # stored; the reason is required and keyword-only. Returns the new record, no side effects.
     """Expects an OpInfo test to fail.
 
     Args:
@@ -129,6 +141,9 @@ def skip(
     enabled_if: bool = True,
     test_class_name: str | None = None,
 ) -> DecorateMeta:
+    # [FUNCTION DOC] Builds a DecorateMeta that skips the matching OpInfo test, using a unittest
+    # skip decorator whose message is the reason prefixed with Skip. The behavior label is skip.
+    # Other arguments are stored unchanged. Returns the new record, no side effects.
     """Skips an OpInfo test.
 
     Args:
@@ -163,6 +178,12 @@ def add_decorate_info(
     base_test_name: str,
     skip_or_xfails: Iterable[DecorateMeta],
 ) -> Callable[[T], T]:
+    # [FUNCTION DOC] Registers each DecorateMeta as an extra decorator on the OpInfo with the same
+    # op name and variant name found in all_opinfos. The decorator targets the metadata's own test
+    # class if set, else test_class_name, and the given base test name. Mutates the matching
+    # OpInfo decorators tuple. A missing OpInfo is ignored when the entry is disabled, otherwise
+    # an AssertionError is raised. Returns an identity decorator that leaves the test function
+    # unchanged.
     """Decorates OpInfo tests with decorators based on the skip_or_xfails list."""
     ops_mapping = {(info.name, info.variant_test_name): info for info in all_opinfos}
     for decorate_meta in skip_or_xfails:
@@ -189,6 +210,7 @@ def add_decorate_info(
 
     # This decorator doesn't modify fn in any way
     def wrapped(fn):
+        # [FUNCTION DOC] HELPER: Identity decorator from add_decorate_info; returns fn as is.
         return fn
 
     return wrapped
@@ -197,6 +219,9 @@ def add_decorate_info(
 def duplicate_opinfo(
     opinfos: list[opinfo_core.OpInfo], name: str, new_names: tuple[str, ...]
 ):
+    # [FUNCTION DOC] For every OpInfo in the list whose name equals name, appends a deep copy
+    # renamed to each entry of new_names. Names already present in the list produce a warning and
+    # are skipped. Mutates the list in place after the scan; if name is absent nothing happens.
     """Duplicate an opinfo in the opinfo database and give it a new name."""
     duplicated = []
     all_info_names = {opinfo.name for opinfo in opinfos}
@@ -220,6 +245,10 @@ def duplicate_opinfo(
 def duplicate_opinfo_for_prims(
     opinfos: list[opinfo_core.OpInfo], name: str, prims_name: str | None = None
 ):
+    # [FUNCTION DOC] Finds the OpInfo called name, deep copies it, names the copy with the prims_
+    # prefix plus prims_name (default: name) and points its op at the matching function in the
+    # prims op namespace. Appends it to the list and returns. If the new name already exists a
+    # warning is emitted and nothing is added. Raises RuntimeError if no OpInfo has that name.
     """Duplicate an opinfo in the opinfo database for a prims op.
 
     The function sets the new OpInfo to use the variation torch.ops.prims.
@@ -253,6 +282,11 @@ def duplicate_opinfo_for_prims(
 
 
 def convert_tensor_to_numpy(input: Any) -> Any:
+    # [FUNCTION DOC] Converts a test input to something usable by the ONNX path. Tensors are
+    # detached, moved to cpu and turned into numpy arrays; complex tensors and complex scalars are
+    # first viewed as real pairs. An empty list becomes an empty int64 array, a list holding
+    # tensors is converted element by element, and lists of bool, int or float become numpy arrays
+    # (int64 for ints, bool dtype for bools). Anything else is returned unchanged.
     if isinstance(input, torch.Tensor):
         if torch.is_complex(input):
             # from complex to real representation
@@ -279,6 +313,9 @@ def convert_tensor_to_numpy(input: Any) -> Any:
 
 
 def convert_kwargs_for_onnx(kwargs: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] Returns a new kwargs mapping suited for the ONNX call: the device key is
+    # dropped, the dtype value is mapped through the torch to ONNX dtype table (a missing dtype
+    # raises KeyError), tensor values become numpy arrays, other values are copied unchanged.
     """Converts kwargs to be compatible with ONNX Runtime."""
     new_kwargs = {}
     for key, value in kwargs.items():
@@ -293,10 +330,15 @@ def convert_kwargs_for_onnx(kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 class OrtAbortedError(RuntimeError):
+    # [CLASS DOC] Runtime error raised when the ONNX Runtime subprocess died without reporting a
+    # result (for example because of a crash or abort). Carries no extra state.
     """ONNX Runtime Aborted."""
 
 
 def _ort_session_run(serialized_model: bytes, ort_inputs: Mapping[str, Any]):
+    # [FUNCTION DOC] HELPER: Runs a serialized ONNX model on the cpu provider of ONNX Runtime with
+    # all graph optimizations disabled and returns the list of output arrays. Errors from session
+    # creation or execution propagate to the caller.
     """Run a model with ONNX Runtime."""
 
     # Disable all ORT optimizations
@@ -313,6 +355,9 @@ def _ort_session_run(serialized_model: bytes, ort_inputs: Mapping[str, Any]):
 def _ort_session_run_return_dict(
     serialized_model: bytes, ort_inputs: Mapping[str, Any], return_dict
 ) -> None:
+    # [FUNCTION DOC] HELPER: Process target that runs the model through the plain session helper
+    # and stores the outputs under the results key of the shared mapping, with the error key set
+    # to None. On any exception results is set to None and the exception goes under the error key.
     """Run a model with ONNX Runtime and store the results in return_dict."""
 
     try:
@@ -324,6 +369,10 @@ def _ort_session_run_return_dict(
 
 
 def _safe_ort_session_run(serialized_model: bytes, ort_inputs: Mapping[str, Any]):
+    # [FUNCTION DOC] HELPER: Runs the model in a separate process so an ONNX Runtime crash cannot
+    # kill the test run. Uses a multiprocessing manager mapping to receive results. Returns the
+    # outputs; re-raises the exception reported by the child; raises OrtAbortedError when the
+    # child left the mapping empty.
     """Run a model with ONNX Runtime in a separate process.
 
     Args:
@@ -353,6 +402,8 @@ def _safe_ort_session_run(serialized_model: bytes, ort_inputs: Mapping[str, Any]
 
 
 def _format_model_and_input_information(onnx_model, inputs):
+    # [FUNCTION DOC] HELPER: Builds a diagnostic string with the pretty-printed inputs followed by
+    # the textual form of the ONNX model, used in error messages.
     return (
         f"Inputs:\n{pprint.pformat(inputs)}\nModel:\n{onnx.printer.to_text(onnx_model)}"
     )
@@ -382,6 +433,11 @@ _TORCH_DTYPE_TO_ONNX_TYPE = {
 
 
 def dtype_op_schema_compatible(dtype: torch.dtype, schema) -> bool:
+    # [FUNCTION DOC] Decides whether a torch dtype can be used to test an ONNX function. Returns
+    # True when the schema has no inputs or its first input is not named self or input. Otherwise
+    # returns whether the ONNX equivalent of dtype is among the dtypes allowed by the type
+    # constraint of the first input. Raises AssertionError if that input has no type constraint,
+    # and KeyError for a torch dtype missing from the mapping table.
     """Checks if the dtype is compatible with the schema.
 
     When a dtype is "compatible" with the schema, it means we can use the dtype
@@ -452,11 +508,23 @@ def graph_executor(
     outputs: Sequence[Any],
     opset_version: int = TEST_OPSET_VERSION,
 ) -> Callable[[Callable[..., Any], tuple[Any], dict[str, Any]], None]:
+    # [FUNCTION DOC] Returns an executor closure for a test: the closure traces an onnxscript
+    # function into a graph and runs it. outputs gives the expected torch outputs, used only to
+    # set the shapes and types of graph outputs; opset_version is the ONNX opset of the model.
     """Eagerly executes a function."""
 
     def _capture_graph_and_evaluate_torch_script_evaluator(
         function: Callable, args, kwargs
     ) -> tuple[Any, onnx.ModelProto]:
+        # [FUNCTION DOC] HELPER: Executor returned by graph_executor. Turns numpy arguments (and
+        # numpy items inside lists or tuples) and keyword arguments into symbolic graph inputs,
+        # calls the function under a tracing evaluator, sets output shapes and dtypes from
+        # expected outputs, assembles an ONNX model with the recorded nodes and functions,
+        # validates it with the ONNX checker, infers shapes and runs it in ONNX Runtime. Returns
+        # the pair of outputs and model proto. Raises AssertionError for an invalid model,
+        # RuntimeError for ONNX Runtime errors, and OrtAbortedError on aborts. If
+        # CATCH_ORT_SEGFAULT or CREATE_REPRODUCTION_REPORT is 1, it runs in a subprocess; with the
+        # latter it also writes a reproduction report on failure.
         """Captures the graph of a function and evaluates it using TorchScriptEvaluator."""
 
         # Initialize the ONNX graph
@@ -632,6 +700,10 @@ def graph_executor(
 def normal_xfail_skip_test_behaviors(
     test_behavior: str | None = None, reason: str | None = None
 ):
+    # [FUNCTION DOC] Context manager applying the skip or xfail behavior to a test body. For skip
+    # it calls pytest skip immediately without running the body. For xfail an exception in the
+    # body becomes a pytest xfail with the reason, while a body that succeeds fails the test as an
+    # unexpected pass. With no behavior, exceptions propagate unchanged.
     """This context manager is used to handle the different behaviors of xfail and skip.
 
     Args:
