@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the ROCm-only Origami integration in Inductor GEMM autotuning, where
+# Origami picks the top-k Triton matmul configs instead of benchmarking the full space.
+# Import-time effects: reads the DO_PERF_TEST environment variable, logs an info message when
+# perf tests are off, defines tuning constants, detects ROCm, and tries to import the optional
+# origami package (setting a flag and a None placeholder on failure). Module-level fixtures
+# save and restore the float32 matmul precision. The main block runs tests only on GPU+Triton
+# ROCm builds.
 import logging
 import os
 import unittest
@@ -46,6 +53,9 @@ _PRIOR_FP32_MATMUL_PRECISION: str | None = None
 
 
 def setUpModule():
+    # [FUNCTION DOC] HELPER: Module fixture. Saves the current float32 matmul precision in a
+    # module global and, on ROCm only, sets the precision to highest so numerics comparisons
+    # are stable.
     global _PRIOR_FP32_MATMUL_PRECISION
     _PRIOR_FP32_MATMUL_PRECISION = torch.get_float32_matmul_precision()
     if IS_ROCM:
@@ -53,6 +63,8 @@ def setUpModule():
 
 
 def tearDownModule():
+    # [FUNCTION DOC] HELPER: Module fixture. If a precision was saved by the setup fixture,
+    # restores it as the float32 matmul precision and clears the saved global.
     global _PRIOR_FP32_MATMUL_PRECISION
     if _PRIOR_FP32_MATMUL_PRECISION is not None:
         torch.set_float32_matmul_precision(_PRIOR_FP32_MATMUL_PRECISION)
@@ -68,9 +80,18 @@ def tearDownModule():
     "Set TORCHINDUCTOR_MAX_AUTOTUNE=1 TORCHINDUCTOR_ORIGAMI=1 to run.",
 )
 class TestOrigami(TestCase):
+    # [CLASS DOC] Tests Origami config selection in max-autotune GEMM lowering for mm, addmm
+    # and bmm. Skipped unless GPU with Triton, ROCm, the origami package, and max_autotune
+    # plus the rocm origami config are all enabled when the module loads. Helper methods build
+    # inputs and config dictionaries and compile under a patched config, recording benchmark
+    # and top-k call counts.
     def _make_fn_and_inputs(
         self, op_name: str, size: int
     ) -> tuple[Callable[..., torch.Tensor], tuple[torch.Tensor, ...]]:
+        # [FUNCTION DOC] HELPER: Seeds the RNG and returns a callable and its argument tuple
+        # for the named op (mm, addmm or bmm) on float16 GPU tensors. Matrices are square of
+        # the given size; bmm uses a batch of 4 and addmm adds a same-shaped bias as the first
+        # argument. Raises AssertionError for any other op name.
         torch.manual_seed(0)
 
         if op_name == "bmm":
@@ -79,6 +100,7 @@ class TestOrigami(TestCase):
             b = torch.randn(batch, size, size, device=GPU_TYPE, dtype=torch.float16)
 
             def fn(x, y):
+            # [FUNCTION DOC] HELPER: Batched matrix multiply of the two arguments.
                 return torch.bmm(x, y)
 
             return fn, (a, b)
@@ -89,6 +111,7 @@ class TestOrigami(TestCase):
         if op_name == "mm":
 
             def fn(x, y):
+            # [FUNCTION DOC] HELPER: Matrix multiply of the two arguments.
                 return torch.mm(x, y)
 
             return fn, (a, b)
@@ -97,6 +120,8 @@ class TestOrigami(TestCase):
             bias = torch.randn(size, size, device=GPU_TYPE, dtype=torch.float16)
 
             def fn(inp, x, y):
+            # [FUNCTION DOC] HELPER: Adds a bias-shaped input to the matrix product of the
+            # other two.
                 return torch.addmm(inp, x, y)
 
             return fn, (bias, a, b)
@@ -104,6 +129,9 @@ class TestOrigami(TestCase):
         raise AssertionError(f"Unsupported op {op_name}")
 
     def _benchmark_gpu_call_count(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the sum of all inductor counter values whose name
+        # contains the text benchmark_gpu, as a count of GPU benchmarking events since
+        # counters were cleared.
         return sum(
             value
             for name, value in counters["inductor"].items()
@@ -117,6 +145,13 @@ class TestOrigami(TestCase):
         *,
         size: int,
     ) -> dict[str, object]:
+        # [FUNCTION DOC] HELPER: Builds the function and inputs for an op, computes the eager
+        # result, then resets dynamo and clears counters. Under a fresh cache, the patched
+        # inductor config and a wrapping mock around the origami top-k selection function,
+        # compiles with static shapes and runs it. Asserts the result is close to eager
+        # (tolerance 5e-2). Returns a mapping with the compiled function, the arguments, the
+        # benchmark_gpu counter total and the number of top-k selection calls. Side effects:
+        # mutates global counters and dynamo state.
         fn, args = self._make_fn_and_inputs(op_name, size)
         expected = fn(*args)
 
@@ -143,6 +178,10 @@ class TestOrigami(TestCase):
         }
 
     def _origami_default_config(self, topk: int) -> dict[str, object]:
+        # [FUNCTION DOC] HELPER: Returns a config mapping that enables max autotune GEMM with
+        # Origami on, the given top-k, the default search space, Triton as the only GEMM
+        # backend, a test filter restricting choices to Triton mm/bmm templates, and native
+        # matmul disabled.
         return {
             "max_autotune": True,
             "max_autotune_gemm": True,
@@ -155,6 +194,9 @@ class TestOrigami(TestCase):
         }
 
     def _origami_exhaustive_config(self) -> dict[str, object]:
+        # [FUNCTION DOC] HELPER: Same as the default Origami config but with the first
+        # constant top-k value and the exhaustive GEMM search space, in which Origami
+        # selection is not expected to run.
         return {
             "max_autotune": True,
             "max_autotune_gemm": True,
@@ -167,6 +209,9 @@ class TestOrigami(TestCase):
         }
 
     def _max_autotune_default_config(self) -> dict[str, object]:
+        # [FUNCTION DOC] HELPER: Returns a config mapping for the baseline: max_autotune off,
+        # GEMM autotune on, Origami off, default search space, Triton backend, matching test
+        # filter and native matmul disabled.
         return {
             "max_autotune": False,
             "max_autotune_gemm": True,
@@ -178,6 +223,10 @@ class TestOrigami(TestCase):
         }
 
     def test_origami_respects_gemm_search_space(self):
+        # [FUNCTION DOC] For each of mm, addmm and bmm (as subtests), compiles with the
+        # default search space and asserts the Origami top-k selection was called at least
+        # once, then compiles with the exhaustive search space and asserts it was never
+        # called.
         for op_name in ("mm", "addmm", "bmm"):
             with self.subTest(op_name=op_name, search_space="DEFAULT"):
                 default_case = self._compile_with_config(
@@ -196,6 +245,10 @@ class TestOrigami(TestCase):
                 self.assertEqual(exhaustive_case["topk_calls"], 0)
 
     def test_origami_reduces_compile_work_vs_regular_max_autotune(self):
+        # [FUNCTION DOC] For each op, compiles with Origami (top-k of the compile constant)
+        # and with baseline autotune settings, and asserts Origami triggered strictly fewer
+        # GPU benchmark counter events. Uses counter counts rather than wall-clock time to
+        # avoid flakiness.
         """Test that origami reduces compile work (GPU benchmarking calls) vs regular max_autotune.
 
         Uses benchmark_gpu_calls count instead of wall-clock timing to avoid flakiness
@@ -226,6 +279,11 @@ class TestOrigami(TestCase):
         "Perf test not enabled; set DO_PERF_TEST=1 to enable runtime perf benchmarks",
     )
     def test_origami_runtime_matches_regular_max_autotune(self):
+        # [FUNCTION DOC] Perf test, skipped unless DO_PERF_TEST is set to 1. For each op, size
+        # (8192, 16384) and top-k value, compiles with Origami and with baseline autotune,
+        # benchmarks both with 50 warmup and 200 repetitions, emits a structured trace record
+        # with runtimes, ratio and pass flag, and asserts the Origami runtime is within the
+        # slowdown tolerance (5 percent) of the baseline.
         for op_name in ("mm", "addmm", "bmm"):
             for size in (8192, 16384):
                 for topk in ORIGAMI_TOPK_VALUES:
@@ -287,6 +345,14 @@ class TestOrigami(TestCase):
                         )
 
     def test_origami_topk_edge_cases(self):
+        # [FUNCTION DOC] Exercises the Origami top-k config value as subtests on the mm op:
+        # zero, one, 1000, negative, 3, and several normal values. Zero, one, large and normal
+        # values must compile without exception (an exception fails the subtest); a negative
+        # value may either compile or raise a value, type or runtime error whose message
+        # mentions topk; 3 must compile.
+        # KNOWN ISSUE: the normal-value check on the top-k call count is vacuous because the
+        #     count is always at least zero, and the broad exception handling turns errors
+        #     into plain failures.
         """Test edge cases for origami_topk parameter.
 
         This test validates:
@@ -392,6 +458,13 @@ class TestOrigami(TestCase):
                     self.fail(f"Compilation failed with valid topk={topk_val}: {e}")
 
     def test_origami_configs_use_device_specific_values(self):
+        # [FUNCTION DOC] Compiles a matmul on the first GPU with Origami enabled (top-k of 2,
+        # reduce overhead mode), asserts a result was produced and the device reports a
+        # positive multiprocessor count, then emits a structured trace record of device name,
+        # multiprocessor count and warp size.
+        # KNOWN ISSUE: the docstring says it verifies architecture-specific stage and warp
+        #     counts, but the code never inspects the chosen configs; it only checks that
+        #     compilation works.
         """Verify that origami configs use architecture-specific num_stages and num_warps.
 
         Tests that configurations are derived from device properties (MI300 vs MI350X)
@@ -435,6 +508,11 @@ class TestOrigami(TestCase):
         )
 
     def test_origami_fallback_when_disabled(self):
+        # [FUNCTION DOC] For each op, compiles under the Origami config while replacing the
+        # cached origami module reference in the Triton template heuristics with None,
+        # simulating an unavailable package. Asserts the compiled result still matches eager
+        # within tolerance, i.e. the regular config generator is the fallback. Resets dynamo
+        # and counters beforehand.
         """Test that compilation succeeds when origami import fails or is disabled.
 
         Verifies that:
@@ -473,6 +551,11 @@ class TestOrigami(TestCase):
                 self.assertIsNotNone(compiled)
 
     def test_origami_module_gate_when_env_var_disabled(self):
+        # [FUNCTION DOC] Spawns a fresh Python subprocess with the Origami environment
+        # variable set to 0 and a code snippet that asserts the origami attribute of the
+        # Triton template heuristics module is None, even after patching the config knobs on
+        # within the process. Asserts exit code zero and that the output contains OK; the
+        # failure message includes captured output. The subprocess has a 120 second timeout.
         """Verify origami is not imported/used when TORCHINDUCTOR_ORIGAMI=0.
 
         rocm.origami is a load-time-only knob (env-var driven). origami is on by
@@ -523,6 +606,9 @@ class TestOrigami(TestCase):
     HAS_GPU_AND_TRITON and IS_ROCM, "Skipped on ROCm where origami is available"
 )
 class TestOrigamiSkippedOnNonROCm(TestCase):
+    # [CLASS DOC] CPU-based tests that Origami is not used outside ROCm GPU builds. Skipped on
+    # ROCm with GPU and Triton. Each test compiles a CPU matmul under max autotune and checks
+    # the result and, when origami is installed, that its top-k selection is never called.
     """Test that origami is properly skipped on non-ROCm devices (CUDA/CPU).
 
     These tests verify that:
@@ -533,6 +619,10 @@ class TestOrigamiSkippedOnNonROCm(TestCase):
     """
 
     def test_origami_skipped_on_non_rocm(self):
+        # [FUNCTION DOC] Compiles a float32 CPU matmul with max autotune and Origami config
+        # flags turned on. If origami is installed, wraps its top-k selection in a mock and
+        # asserts the result matches eager and the mock was not called; otherwise asserts only
+        # the result matches eager.
         """Verify that origami is properly skipped on non-ROCm devices.
 
         Tests that origami gracefully handles non-ROCm environments without
@@ -546,6 +636,7 @@ class TestOrigamiSkippedOnNonROCm(TestCase):
         b = torch.randn(size, size, device="cpu", dtype=torch.float32)
 
         def test_fn(x, y):
+        # [FUNCTION DOC] HELPER: Matrix multiply of the two arguments.
             return torch.mm(x, y)
 
         expected = test_fn(a, b)
@@ -589,6 +680,10 @@ class TestOrigamiSkippedOnNonROCm(TestCase):
                 torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
 
     def test_origami_disabled_uses_regular_config(self):
+        # [FUNCTION DOC] Same CPU matmul check as the non-ROCm test but with the Origami
+        # config flag explicitly off. With origami installed, asserts the result matches eager
+        # and the top-k selection mock was never called; otherwise asserts only the result
+        # matches eager.
         """Verify regular config generator is used when origami is explicitly disabled."""
         torch.manual_seed(0)
 
@@ -597,6 +692,7 @@ class TestOrigamiSkippedOnNonROCm(TestCase):
         b = torch.randn(size, size, device="cpu", dtype=torch.float32)
 
         def test_fn(x, y):
+        # [FUNCTION DOC] HELPER: Matrix multiply of the two arguments.
             return torch.mm(x, y)
 
         expected = test_fn(a, b)
