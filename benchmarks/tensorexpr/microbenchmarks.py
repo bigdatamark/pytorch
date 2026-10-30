@@ -1,3 +1,9 @@
+# [MODULE DOC] Standalone script comparing NNC (tensor expression, LLVM codegen) kernels
+# against eager PyTorch for many unary, binary and custom elementwise ops over square sizes.
+# Module-level code builds the op tables and the combined benchmark list at import time
+# (importing matplotlib, pandas, seaborn and the tensor expression bindings). Run as a script,
+# it benchmarks every op, prints timings and saves a heatmap image of the PyTorch to NNC time
+# ratio in the current directory.
 import argparse
 import operator
 import time
@@ -12,10 +18,17 @@ import torch._C._te as te
 
 
 class kernel_arena_scope:
+    # [CLASS DOC] Context manager that creates a tensor expression kernel scope on entry and
+    # drops the reference on exit. Keeps the scope in an attribute; exceptions are not
+    # suppressed.
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Creates a tensor expression kernel scope and stores it on the
+        # instance. Returns nothing.
         self.scope = te.KernelScope()
 
     def __exit__(self, typ, val, traceback):
+        # [FUNCTION DOC] HELPER: Releases the stored kernel scope by clearing the attribute.
+        # Ignores the exception arguments and returns nothing, so exceptions propagate.
         self.scope = None
 
 
@@ -54,8 +67,16 @@ unary_ops = [
 
 
 def gen_unary_nnc_fun(nnc_name):
+    # [FUNCTION DOC] HELPER: Builds the NNC compute-function factory for a unary op: the
+    # returned function takes two placeholders and returns a per-element function that loads
+    # the first placeholder at the index pair and calls the method with the given name on the
+    # loaded expression. The second placeholder is ignored.
     def nnc_fun(A, B):
+        # [FUNCTION DOC] HELPER: Receives the input placeholders and returns the per-element
+        # compute function for the captured op name.
         def compute(i, j):
+            # [FUNCTION DOC] HELPER: Per-element body: loads the first placeholder at the row
+            # and column index and applies the named expression method to it.
             return getattr(A.load([i, j]), nnc_name)()
 
         return compute
@@ -64,8 +85,15 @@ def gen_unary_nnc_fun(nnc_name):
 
 
 def gen_unary_torch_fun(torch_op):
+    # [FUNCTION DOC] HELPER: Builds the eager-side factory for a unary torch op: the returned
+    # function binds the input and the preallocated output tensor and yields a callable that
+    # runs the op writing into the output.
     def torch_fun(a, b, out):
+        # [FUNCTION DOC] HELPER: Binds the first tensor and the output tensor and returns a
+        # zero-argument callable. The second tensor is ignored.
         def fun():
+            # [FUNCTION DOC] HELPER: Runs the captured torch op on the bound input, writing
+            # into the bound output tensor, and returns the result.
             return torch_op(a, out=out)
 
         return fun
@@ -74,8 +102,15 @@ def gen_unary_torch_fun(torch_op):
 
 
 def gen_binary_nnc_fun(fn):
+    # [FUNCTION DOC] HELPER: Builds the NNC compute-function factory for a binary op given as
+    # a callable on expressions: the returned function takes two placeholders and yields a
+    # per-element function applying the callable to the loads of both at the index pair.
     def nnc_fun(A, B):
+        # [FUNCTION DOC] HELPER: Receives the two input placeholders and returns the per-
+        # element compute function for the captured binary callable.
         def compute(i, j):
+            # [FUNCTION DOC] HELPER: Per-element body: loads both placeholders at the row and
+            # column index and returns the captured callable applied to the two values.
             return fn(A.load([i, j]), B.load([i, j]))
 
         return compute
@@ -84,8 +119,15 @@ def gen_binary_nnc_fun(fn):
 
 
 def gen_binary_torch_fun(fn):
+    # [FUNCTION DOC] HELPER: Builds the eager-side factory for a binary torch op: the returned
+    # function binds both inputs and the output tensor and yields a callable that runs the op
+    # with the output argument set.
     def pt_fun(a, b, out):
+        # [FUNCTION DOC] HELPER: Binds the two input tensors and the output tensor and returns
+        # a zero-argument callable.
         def fun():
+            # [FUNCTION DOC] HELPER: Runs the captured torch op on the two bound inputs,
+            # writing into the bound output tensor, and returns the result.
             return fn(a, b, out=out)
 
         return fun
@@ -94,6 +136,9 @@ def gen_binary_torch_fun(fn):
 
 
 def gen_int_comparison_tensors(N, M):
+    # [FUNCTION DOC] HELPER: Creates the tensors for integer comparison ops: two random
+    # integer matrices with values in zero to two of shape N by M, and an uninitialized
+    # boolean matrix for the result. Returns them as a tuple.
     return (
         torch.randint(0, 3, (N, M)),
         torch.randint(0, 3, (N, M)),
@@ -102,6 +147,9 @@ def gen_int_comparison_tensors(N, M):
 
 
 def gen_float_comparison_tensors(N, M):
+    # [FUNCTION DOC] HELPER: Creates the tensors for float comparison ops: two uniform random
+    # float matrices of shape N by M and an uninitialized boolean result matrix. Returns them
+    # as a tuple.
     return (torch.rand(N, M), torch.rand(N, M), torch.empty((N, M), dtype=torch.bool))
 
 
@@ -147,7 +195,12 @@ binary_ops = [
 
 
 def nnc_relu(A, B):
+    # [FUNCTION DOC] HELPER: NNC compute-function factory for relu: returns a per-element
+    # function that selects zero where the loaded value is below zero and the value otherwise,
+    # using the if-then-else expression. The second placeholder is ignored.
     def f(i, j):
+        # [FUNCTION DOC] HELPER: Per-element body: loads the first placeholder at the row and
+        # column index and returns the conditional relu expression for it.
         return torch._C._te.ifThenElse(
             A.load([i, j]) < torch._C._te.ExprHandle.float(0),
             torch._C._te.ExprHandle.float(0),
@@ -158,6 +211,8 @@ def nnc_relu(A, B):
 
 
 def pt_relu(a, b, c):
+    # [FUNCTION DOC] HELPER: Eager-side relu used for the custom op table: applies relu to the
+    # first tensor and returns it; the other two arguments are unused.
     return torch.relu(a)
 
 
@@ -169,8 +224,15 @@ custom_ops = [
 
 
 def gen_custom_torch_fun(fn):
+    # [FUNCTION DOC] HELPER: Wraps a custom torch function that takes three tensors into the
+    # same factory shape as the other generators: the returned function binds the tensors and
+    # yields a zero-argument callable.
     def pt_fun(a, b, out):
+        # [FUNCTION DOC] HELPER: Binds the two inputs and the output tensor and returns a
+        # zero-argument callable.
         def fun():
+            # [FUNCTION DOC] HELPER: Calls the captured custom function with the three bound
+            # tensors and returns its result.
             return fn(a, b, out)
 
         return fun
@@ -179,6 +241,9 @@ def gen_custom_torch_fun(fn):
 
 
 def normalize_benchmarks(ops):
+    # [FUNCTION DOC] HELPER: Pads benchmark table entries to a uniform shape: any three-field
+    # entry gets a trailing missing shape generator, while four-field entries are kept.
+    # Returns a new list.
     return [i + (None,) if len(i) == 3 else i for i in ops]
 
 
@@ -209,6 +274,16 @@ benchmarks = list(zip(names, nnc_fns, pt_fns, shape_fns))
 
 
 def run_benchmarks(benchmarks, sizes):
+    # [FUNCTION DOC] Runs every benchmark over every size pair with gradients disabled and
+    # returns a pandas table of results. For each case it makes input tensors (random, clamped
+    # away from the edges, or from the shape generator), defines the NNC kernel via a tensor
+    # expression compute over the matrix, lowers it with the LLVM codegen, times a size-
+    # dependent number of calls after a warmup of ten, times the eager function the same way,
+    # and appends one row with both times and their ratio. The iteration count scales
+    # inversely with size. Prints progress and verifies that the NNC and eager outputs are
+    # close, raising an AssertionError otherwise.
+    # KNOWN ISSUE: the results are accumulated with the frame append method, which was removed
+    # in recent pandas versions, so this raises an error there.
     df = pd.DataFrame(columns=["name", "N", "M", "nnc_time", "torch_time", "ratio"])
     with torch.no_grad():
         for name, nnc_fun, torch_fun, shape_fn in benchmarks:
@@ -225,6 +300,9 @@ def run_benchmarks(benchmarks, sizes):
                         tR = tX.clone()
 
                     def get_nnc_type(dtype):
+                        # [FUNCTION DOC] HELPER: Maps a torch dtype to the matching tensor
+                        # expression dtype for float and long; returns nothing (None) for any
+                        # other dtype.
                         if dtype == torch.float:
                             return torch._C._te.Dtype.Float
                         elif dtype == torch.long:
@@ -285,6 +363,9 @@ def run_benchmarks(benchmarks, sizes):
                     print()
 
                     def check_correctness(a, b):
+                        # [FUNCTION DOC] HELPER: Compares the two arrays with a tolerance
+                        # check; if they differ it prints the op name and raises an
+                        # AssertionError naming it.
                         if not np.allclose(a, b):
                             print(name)
                             raise AssertionError(f"Arrays not close for {name}")
@@ -294,6 +375,10 @@ def run_benchmarks(benchmarks, sizes):
 
 
 def dump_plot(df, sizes):
+    # [FUNCTION DOC] Builds and saves a heatmap of the PyTorch to NNC time ratios. It keeps
+    # only rows where the two sizes are equal, collects op names and ratios, reshapes the
+    # ratios to one row per op and one column per size, and writes the image file nnc.png in
+    # the current directory. Takes the result table and the size list; returns nothing.
     keys = []
     vals = []
     indexed = df[df["N"] == df["M"]]

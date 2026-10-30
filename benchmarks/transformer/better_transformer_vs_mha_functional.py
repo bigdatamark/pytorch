@@ -1,3 +1,9 @@
+# [MODULE DOC] Benchmark script for the fast path of the built-in multi-head attention (nested
+# tensor inputs, flash attention) versus the slow path with padded inputs and a key padding
+# mask, on CUDA with half precision. Sweeps batch size, sequence length, embedding size, head
+# count and a beta distribution parameter that controls padding, prints a table and optionally
+# writes a CSV file of results and a JSON file of mismatch counts. Import-time side effects:
+# suppresses all warnings and creates the global mismatch counter.
 """
 Tests the performance of torch.nn.MultiheadAttention's fast path (BetterTransformer)
 vs the slow path (torch.nn.functional.multi_head_attention)
@@ -30,6 +36,10 @@ error_dict = defaultdict(int)
 
 
 def benchmark_torch_function(iters, f, *args, **kwargs):
+    # [FUNCTION DOC] Times a callable on the GPU: calls it twice as warmup, synchronizes,
+    # records CUDA events around the given number of calls, synchronizes again and computes
+    # the average time per call in microseconds. Returns a tuple of that average followed by
+    # the outputs of one more call (which must be iterable).
     f(*args, **kwargs)
     f(*args, **kwargs)
     torch.cuda.synchronize()
@@ -58,6 +68,17 @@ def run(
     block_size: int,
     seed,
 ):
+    # [FUNCTION DOC] Runs one comparison. Seeds the random generators, draws per-row sequence
+    # lengths from a beta distribution rounded to multiples of the block size (at least one
+    # block), forces one random row to the full length, builds a nested random query and a
+    # native multi-head attention module with shared projection weights, and builds a boolean
+    # query mask on the GPU. Returns None if the mask has zero length. Times the nested fast
+    # path (inference mode, flash enabled) and the padded path with a key padding mask,
+    # converts both outputs to masked padded form, checks they are close (mismatches are
+    # counted in the global error counter and printed), and returns an ordered mapping of
+    # dtype, sizes, both times, the speedup of slow over fast and the padding fraction.
+    # KNOWN ISSUE: the mask is always moved to the default CUDA device regardless of the
+    # device argument.
     random.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -159,6 +180,13 @@ def run(
 
 
 def main(save_path: Path | None, error_path: Path | None):
+    # [FUNCTION DOC] Runs the full sweep over batch sizes, sequence lengths, embedding sizes,
+    # head counts and beta parameters with a progress bar, calling the single comparison with
+    # fixed settings (CUDA, float16, fixed seed). Skips combinations that return nothing,
+    # builds a results table with column names from the first entry, prints it and the
+    # mismatch counter, writes the table as CSV to the save path when given, prints the total
+    # error count and writes the mismatch counter as JSON to the error path when given.
+    # Requires CUDA.
     table = PrettyTable()
     entries = defaultdict(list)
 

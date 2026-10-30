@@ -1,3 +1,7 @@
+# [MODULE DOC] Helpers for reading benchmark configuration: parsing a head-count pair string,
+# loading a configuration file written as JSON or a simple YAML subset (with no external YAML
+# dependency), and printing the default configuration template. Defines the default
+# configuration mapping at import time.
 """Configuration utilities for parsing JSON and YAML config files."""
 
 import json
@@ -5,6 +9,9 @@ import re
 
 
 def heads_input_type(s: str) -> tuple[int, int]:
+    # [FUNCTION DOC] Parses a string holding two comma separated integers (query heads and
+    # key-value heads) and returns them as a pair. Raises ValueError with a fixed message if
+    # the string cannot be split into exactly two integers.
     """Convert string format 'Hq,Hkv' to tuple (Hq, Hkv)."""
     try:
         hq, hkv = map(int, s.split(","))
@@ -34,6 +41,13 @@ default_config = {
 
 
 def load_config_file(config_path: str) -> dict:
+    # [FUNCTION DOC] Reads the file at the path, tries to parse it as JSON and falls back to
+    # the simple YAML parser on a decode error. If the heads entry exists and is a list,
+    # converts every string item to a head-count pair and leaves other items unchanged.
+    # Returns the configuration mapping. Raises FileNotFoundError if the file is missing.
+    # KNOWN ISSUE: the docstring says ValueError is raised for an invalid format, but the
+    # fallback parser never raises for malformed content; only a bad head-count string raises
+    # ValueError.
     """Load configuration from JSON or YAML file.
 
     Automatically converts 'nh' field from strings to tuples.
@@ -68,6 +82,13 @@ def load_config_file(config_path: str) -> dict:
 
 
 def _parse_simple_yaml(yaml_str: str) -> dict:
+    # [FUNCTION DOC] HELPER: Parses a minimal YAML subset line by line: strips text after a
+    # hash sign, skips lines without a colon, and splits at the first colon. Values become
+    # booleans, None (for null, none or empty), a list (bracketed items, quoted or bare,
+    # converted to integers when possible), a quoted string with quotes stripped, or an
+    # integer, float or plain string in that order of preference. Returns the mapping.
+    # KNOWN ISSUE: comment stripping cuts at the first hash sign even inside quoted strings,
+    # and bare list items are only converted to integers, never floats.
     """Simple YAML parser for basic configs (without external dependencies).
 
     Supports:
@@ -136,6 +157,9 @@ def _parse_simple_yaml(yaml_str: str) -> dict:
 
 
 def print_default_config(output_format: str) -> None:
+    # [FUNCTION DOC] Prints the default configuration to standard output: as indented JSON
+    # when the format is json, otherwise (any other value) as simple YAML-like key lines with
+    # null for missing values, lowercase booleans, quoted strings and JSON lists.
     """Print a default configuration template in JSON or YAML format.
 
     Args:
