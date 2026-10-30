@@ -1,4 +1,9 @@
 # Owner(s): ["module: dsl-native-ops"]
+# [MODULE DOC] Tests for the torch._native DSL ops framework: consistent public interface of the
+# triton, cutedsl and helion utility modules, import hygiene (no DSL runtimes or external packaging
+# pulled in by importing torch), environment variable switches for disabling native JIT and
+# skipping version checks, version parsing, registry library caching, deregistration, DSL registry
+# caching and protocol validation. Several checks run in fresh subprocesses.
 
 import importlib.util
 import os
@@ -18,6 +23,11 @@ from torch.testing._internal.common_utils import (
 
 
 def _subprocess_lastline(script, env=None):
+    # [FUNCTION DOC] HELPER: Run the given script text in a new Python interpreter, with the
+    # directory of this test file as working directory, and return the last line of its standard
+    # output (stripped of surrounding whitespace). Raises CalledProcessError on a nonzero exit.
+    # KNOWN ISSUE: the env argument is accepted but never used, so no custom environment is
+    # applied.
     """Run script in a fresh interpreter and return the last line of stdout."""
     result = subprocess.check_output(
         [sys.executable, "-c", script],
@@ -28,6 +38,10 @@ def _subprocess_lastline(script, env=None):
 
 
 def _import_module_directly(module_name, file_name):
+    # [FUNCTION DOC] HELPER: Import a file from the torch/_native directory of the repository under
+    # the given module name without running the package initializers. Builds a spec from the file
+    # location, creates the module, registers it in the module table (a side effect that replaces
+    # any existing entry), executes it and returns the module.
     """Import a module directly without triggering package imports."""
     test_dir = os.path.dirname(os.path.abspath(__file__))
     pytorch_root = os.path.dirname(os.path.dirname(test_dir))
@@ -41,9 +55,14 @@ def _import_module_directly(module_name, file_name):
 
 
 class TestNativeDSLOps(TestCase):
+    # [CLASS DOC] Test case for the native DSL ops framework. setUp clears cached environment and
+    # version check functions of the common and per-DSL utility modules so each test sees fresh
+    # environment variable state. Parametrized tests are instantiated at the end of the module.
     """Tests for the torch._native DSL ops framework."""
 
     def setUp(self):
+        # [FUNCTION DOC] Call the parent setUp, record which modules and cached functions need
+        # clearing (common, triton, cutedsl and helion utilities), then clear them.
         """Clear all caches before each test to ensure test isolation."""
         super().setUp()
         self._cache_functions_to_clear = [
@@ -79,6 +98,8 @@ class TestNativeDSLOps(TestCase):
         self._clear_function_caches()
 
     def _clear_function_caches(self):
+        # [FUNCTION DOC] HELPER: For each recorded module, import it and call cache_clear on each
+        # listed function that exists; import or attribute errors are silently ignored.
         """Helper method to clear function caches with error handling."""
         for module_name, function_names in self._cache_functions_to_clear:
             try:
@@ -91,6 +112,11 @@ class TestNativeDSLOps(TestCase):
                 pass
 
     def test_consistent_helper_interface(self):
+        # [FUNCTION DOC] Discovers the registered DSL names (falling back to triton, cutedsl and
+        # helion), imports each utility module directly and asserts each exposes the four required
+        # public functions (availability, version, register and deregister overrides), all
+        # callable, and that all modules have identical public name sets. Also checks that
+        # availability returns a bool and version returns None or a Version. Uses subtests.
         """Test all registered DSL utils expose consistent public APIs."""
         from torch.testing._internal.common_utils import get_all_dsls
 
@@ -156,6 +182,9 @@ class TestNativeDSLOps(TestCase):
                     self.assertIsInstance(ver, Version)
 
     def test_no_dsl_imports_after_import_torch(self):
+        # [FUNCTION DOC] Runs a fresh interpreter that imports torch and prints which of triton,
+        # cutlass, tvm_ffi and helion are already in the module table; asserts the printed list is
+        # empty.
         """import torch must not transitively import DSL runtimes.
 
         Note: cuda.bindings may appear because importlib.util.find_spec on
@@ -177,6 +206,9 @@ class TestNativeDSLOps(TestCase):
         )
 
     def test_no_external_packaging_dependency(self):
+        # [FUNCTION DOC] Runs a fresh interpreter that removes and blocks the external packaging
+        # package with an import hook, then imports torch and prints OK; asserts the output is OK,
+        # so torch._native relies on the vendored copy only.
         """torch._native must not import the external `packaging` package.
 
         It should use the vendored copy at torch._vendor.packaging instead.
@@ -207,6 +239,10 @@ class TestNativeDSLOps(TestCase):
 
     @parametrize("env_value, expected", [(None, False), ("1", True)])
     def test_check_native_jit_disabled_environment_variable(self, env_value, expected):
+        # [FUNCTION DOC] Parametrized over an unset variable (expect False) and the value 1 (expect
+        # True). Sets or removes the native JIT disable variable in the real environment, clears
+        # the cache of the check function, asserts its result, and always removes the variable
+        # afterwards.
         """Test TORCH_DISABLE_NATIVE_JIT environment variable behavior."""
         from torch._native.common_utils import check_native_jit_disabled
 
@@ -224,6 +260,8 @@ class TestNativeDSLOps(TestCase):
             os.environ.pop("TORCH_DISABLE_NATIVE_JIT", None)
 
     def test_unavailable_reason_missing(self):
+        # [FUNCTION DOC] Asserts the unavailable-reason helper returns a non-None string mentioning
+        # the package name when given a nonexistent package.
         """Nonexistent package -> _unavailable_reason returns a string."""
         common_utils = _import_module_directly(
             "torch._native.common_utils", "common_utils.py"
@@ -235,6 +273,10 @@ class TestNativeDSLOps(TestCase):
         self.assertIn("nonexistent_pkg_xyz", reason)
 
     def test_available_version_parsing(self):
+        # [FUNCTION DOC] Asserts the available-version helper returns a Version for a real package
+        # and, with the metadata version lookup patched, parses pre-release, post-release, alpha
+        # and standard strings into equal Version objects and gives None for an invalid string.
+        # Uses subtests.
         """Test _available_version parses various version formats and handles invalid ones."""
         from torch._vendor.packaging.version import Version
 
@@ -266,6 +308,10 @@ class TestNativeDSLOps(TestCase):
                     )
 
     def test_registry_mechanics(self):
+        # [FUNCTION DOC] Saves the registry library cache and filter state, removes the CPU and
+        # CUDA entries, then asserts the get-or-create library helper returns a Library, the same
+        # object for repeated CPU requests and a different object for CUDA. Restores the saved
+        # cache and filter state in a finally block.
         """_get_or_create_library caches Library instances per dispatch_key."""
         import torch._native.registry as registry
         import torch.library
@@ -311,6 +357,9 @@ class TestNativeDSLOps(TestCase):
             filter_state._dispatch_keys.update(original_filter_state[2])
 
     def test_deregister_op_overrides_functionality(self):
+        # [FUNCTION DOC] For the triton, cutedsl and helion utility modules (imported directly),
+        # asserts a callable deregister function exists and that calling it with no overrides
+        # registered raises nothing. The registry filter state is saved and restored afterwards.
         """Test deregister_op_overrides methods exist, are callable, and work correctly."""
         modules_to_test = [
             ("triton_utils.py", "torch._native.triton_utils"),
@@ -353,6 +402,10 @@ class TestNativeDSLOps(TestCase):
             _filter_state._dispatch_keys.update(original_filter_state[2])
 
     def test_register_op_skips_when_jit_disabled(self):
+        # [FUNCTION DOC] With the disable-native-JIT variable patched to 1 and caches cleared,
+        # asserts the disable check is true, then registers an override through each of the three
+        # utility modules with the internal implementation functions mocked and asserts none was
+        # called.
         """register_op_override does not call through when TORCH_DISABLE_NATIVE_JIT=1."""
         from torch._native import cutedsl_utils, helion_utils, triton_utils
 
@@ -395,6 +448,10 @@ class TestNativeDSLOps(TestCase):
                 self.assertEqual(helion_mock.call_count, 0)
 
     def test_helion_availability_requires_supported_backend_and_version(self):
+        # [FUNCTION DOC] Checks helion availability: with the backend variable set to metal the
+        # runtime is not available; with the runtime check patched to report available and version
+        # 1.2.0, runtime is available and version sufficient; with version 1.0.0, the runtime is
+        # available but the version is not sufficient. Caches are cleared between cases.
         from torch._native import helion_utils
         from torch._vendor.packaging.version import Version
 
@@ -424,6 +481,9 @@ class TestNativeDSLOps(TestCase):
             self.assertFalse(helion_utils._version_is_sufficient())
 
     def test_version_skip_env_var_overrides(self):
+        # [FUNCTION DOC] With the skip-version-check variable set to 1 and caches cleared, for each
+        # DSL utility module patches the runtime check to return a fake old version and the impl
+        # function with a mock, registers an override and asserts the impl was called once.
         """TORCH_NATIVE_SKIP_VERSION_CHECK=1 allows non-blessed versions."""
         from torch._vendor.packaging.version import Version
 
@@ -467,6 +527,9 @@ class TestNativeDSLOps(TestCase):
 
     @parametrize("env_value, expected", [(None, False), ("1", True)])
     def test_check_native_version_skip_environment_variable(self, env_value, expected):
+        # [FUNCTION DOC] Parametrized over an unset variable (expect False) and the value 1 (expect
+        # True). Sets or removes the skip-version-check variable, clears the cache, asserts the
+        # result and always removes the variable afterwards.
         """Test TORCH_NATIVE_SKIP_VERSION_CHECK environment variable behavior."""
         from torch._native.common_utils import check_native_version_skip
 
@@ -484,6 +547,9 @@ class TestNativeDSLOps(TestCase):
             os.environ.pop("TORCH_NATIVE_SKIP_VERSION_CHECK", None)
 
     def test_dsl_registry_functionality(self):
+        # [FUNCTION DOC] Asserts the common_utils DSL query helpers: the list of all DSLs is a list
+        # containing triton, cutedsl and helion, the available list is a list of members of it, and
+        # the availability query returns a bool that is true for every DSL in the available list.
         """Test that DSL registry works correctly"""
         from torch.testing._internal.common_utils import (
             get_all_dsls,
@@ -513,6 +579,9 @@ class TestNativeDSLOps(TestCase):
                 self.assertTrue(availability)
 
     def test_dsl_test_helpers(self):
+        # [FUNCTION DOC] Asserts the DSL skip decorators from common_utils are callable and that
+        # the two dynamic decorator factories can be called with a DSL name and return callables;
+        # fails the test with the error message if they raise.
         """Test that DSL test helper decorators work"""
         from torch.testing._internal.common_utils import (
             skipIfDSLUnavailable,
@@ -538,6 +607,10 @@ class TestNativeDSLOps(TestCase):
             self.fail(f"Dynamic DSL decorators failed: {e}")
 
     def test_cache_invalidation_after_re_registration(self):
+        # [FUNCTION DOC] Uses a fresh registry and two mock DSLs, the first unavailable and the
+        # second available. Registers the first, queries availability and the available list
+        # (unavailable, not listed), re-registers the name with the second and asserts the cached
+        # results were invalidated: now available and listed.
         """Test that caches are properly invalidated when DSLs are re-registered"""
         from unittest.mock import Mock
 
@@ -580,6 +653,9 @@ class TestNativeDSLOps(TestCase):
         )
 
     def test_incomplete_protocol_implementation(self):
+        # [FUNCTION DOC] Registering an object lacking required protocol methods raises TypeError
+        # whose message mentions missing required methods and names runtime_version and
+        # register_op_override; asserts the DSL is not listed afterwards. Uses a fresh registry.
         """Test that registration fails when module doesn't implement required protocol methods"""
         from torch._native.dsl_registry import DSLRegistry
 
@@ -588,7 +664,10 @@ class TestNativeDSLOps(TestCase):
 
         # Create an object missing required protocol methods (not using Mock)
         class IncompleteModule:
+            # [CLASS DOC] HELPER: Deliberately incomplete DSL module that only provides the
+            # availability method; used to trigger the registry protocol check.
             def runtime_available(self):
+                # [FUNCTION DOC] HELPER: Always reports the runtime as available by returning True.
                 return True
 
             # Missing: runtime_version, register_op_override, deregister_op_overrides

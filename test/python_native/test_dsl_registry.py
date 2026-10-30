@@ -1,4 +1,9 @@
 # Owner(s): ["module: dsl-native-ops"]
+# [MODULE DOC] Unit tests for the DSL registry in torch._native.dsl_registry. A single
+# TestCase builds an isolated registry per test and mock DSL modules (with availability,
+# version, register and deregister members) to check registration, duplicate handling,
+# version and availability queries, name validation, error tolerance, protocol conformance
+# of real registered DSLs, common_utils wrappers and the skip decorators.
 
 from unittest.mock import Mock
 
@@ -7,9 +12,16 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestDSLRegistry(TestCase):
+    # [CLASS DOC] Test case for DSL registry behavior. setUp saves the global registry module
+    # table (original_registry, original_modules, both None-like if unavailable) and creates
+    # an isolated registry (test_registry); tearDown restores the global table and clears
+    # cached query results. Provides helpers that build valid or deliberately broken mocks.
     """Comprehensive tests for DSL registry functionality."""
 
     def setUp(self):
+        # [FUNCTION DOC] Prepare state: call parent setUp, import the registry class, try to
+        # import the global registry and copy its module table (ignoring import failure), and
+        # create a fresh isolated registry in test_registry.
         """Set up clean registry state for each test"""
         super().setUp()
         # Import registry here to avoid import-time side effects
@@ -29,6 +41,9 @@ class TestDSLRegistry(TestCase):
         self.test_registry = DSLRegistry()
 
     def tearDown(self):
+        # [FUNCTION DOC] Restore the global registry if it was captured: clear its module table
+        # and refill it from the saved copy, then clear the caches of its availability, version
+        # and list-available query functions where they have a cache clearing method.
         """Restore original registry state"""
         if self.original_registry is not None:
             # Restore original DSL modules
@@ -44,6 +59,10 @@ class TestDSLRegistry(TestCase):
                 self.original_registry.list_available_dsls.cache_clear()
 
     def create_valid_mock_dsl(self, name="test_dsl", available=True, version="1.0.0"):
+        # [FUNCTION DOC] HELPER: Build a mock DSL module. Its availability call returns the
+        # given flag, its version call returns a parsed Version (or None for a falsy version
+        # string), and it has mock register and deregister override members. The name
+        # argument is unused.
         """Helper to create valid mock DSL for testing"""
         mock = Mock()
         mock.runtime_available.return_value = available
@@ -53,6 +72,9 @@ class TestDSLRegistry(TestCase):
         return mock
 
     def create_broken_mock_dsl(
+        # [FUNCTION DOC] HELPER: Build a valid mock and make one named method (default the
+        # availability check) raise the given exception type with a simulated error message
+        # when called. Returns the mock.
         self, break_method="runtime_available", error=ImportError
     ):
         """Helper to create mock DSL with broken methods for error testing"""
@@ -63,6 +85,8 @@ class TestDSLRegistry(TestCase):
     # Phase 1: Basic Registry Operations (4 methods)
 
     def test_register_dsl_basic(self):
+        # [FUNCTION DOC] Register one valid mock and assert it is listed, reported available,
+        # and that exactly one DSL is listed.
         """Test basic DSL registration functionality"""
         mock_dsl = self.create_valid_mock_dsl()
         self.test_registry.register_dsl("test_dsl", mock_dsl)
@@ -75,6 +99,9 @@ class TestDSLRegistry(TestCase):
         self.assertEqual(len(self.test_registry.list_all_dsls()), 1)
 
     def test_register_dsl_duplicates(self):
+        # [FUNCTION DOC] For same-module and different-module re-registration of a name, asserts
+        # the debug log from the registry module contains a re-registered message and that the
+        # name stays registered. Uses subtests.
         """Test duplicate DSL registration scenarios"""
         scenarios = [
             ("same_module", "re-registered with same module"),
@@ -108,6 +135,8 @@ class TestDSLRegistry(TestCase):
                 self.assertIn(dsl_name, self.test_registry.list_all_dsls())
 
     def test_get_dsl_version(self):
+        # [FUNCTION DOC] Checks version lookup in subtests: a valid version yields an equal
+        # Version object, a None version and a version call raising RuntimeError both yield None.
         """Test DSL version querying with various conditions"""
         test_cases = [("1.2.3", Version), (None, type(None)), ("error", type(None))]
 
@@ -130,6 +159,8 @@ class TestDSLRegistry(TestCase):
                     self.assertEqual(result, Version("1.2.3"))
 
     def test_list_dsls_operations(self):
+        # [FUNCTION DOC] Registers an available and an unavailable mock; asserts the all-list
+        # has both names, the available-list has only the available one and is a subset.
         """Test list_all_dsls and list_available_dsls"""
         # Register mix of available/unavailable DSLs
         available_dsl = self.create_valid_mock_dsl("available", available=True)
@@ -152,6 +183,8 @@ class TestDSLRegistry(TestCase):
     # Phase 2: Input Validation (2 methods)
 
     def test_register_dsl_invalid_names(self):
+        # [FUNCTION DOC] Asserts registering a non-string name (None, number, list, mapping)
+        # raises TypeError and an empty or whitespace-only string raises ValueError.
         """Test registration with invalid name inputs"""
         test_cases = [
             (None, TypeError),
@@ -171,6 +204,8 @@ class TestDSLRegistry(TestCase):
                     self.test_registry.register_dsl(invalid_name, mock_dsl)
 
     def test_register_dsl_valid_names(self):
+        # [FUNCTION DOC] Registers mocks under several plain identifier names and asserts each
+        # appears in the all-DSLs list.
         """Test registration with valid name formats"""
         valid_names = ["triton", "cutedsl", "my_dsl", "dsl_v2", "a", "test_dsl_123"]
 
@@ -183,6 +218,8 @@ class TestDSLRegistry(TestCase):
     # Phase 3: Error Handling (3 methods)
 
     def test_is_dsl_available_errors(self):
+        # [FUNCTION DOC] For several exception types raised by the availability check, asserts
+        # the registry reports the DSL as unavailable (False) instead of propagating. Subtests.
         """Test is_dsl_available when runtime_available() raises errors"""
         error_types = [ImportError, ModuleNotFoundError, RuntimeError, AttributeError]
 
@@ -196,6 +233,8 @@ class TestDSLRegistry(TestCase):
                 self.assertEqual(result, False)  # All errors should result in False
 
     def test_get_dsl_version_errors(self):
+        # [FUNCTION DOC] For several exception types raised by the version check, asserts the
+        # registry returns None instead of propagating. Subtests.
         """Test get_dsl_version when runtime_version() raises errors"""
         error_types = [ImportError, RuntimeError, AttributeError, TypeError]
 
@@ -209,6 +248,8 @@ class TestDSLRegistry(TestCase):
                 self.assertIsNone(result)
 
     def test_nonexistent_dsl_queries(self):
+        # [FUNCTION DOC] Asserts that on an empty registry and with one registered DSL, unknown
+        # names are reported unavailable with no version, and the empty registry lists nothing.
         """Test querying non-existent DSLs returns appropriate defaults"""
         # Test with empty registry
         self.assertFalse(self.test_registry.is_dsl_available("nonexistent"))
@@ -226,6 +267,9 @@ class TestDSLRegistry(TestCase):
     # Phase 4: Protocol & Integration (4 methods)
 
     def test_dsl_protocol_interface(self):
+        # [FUNCTION DOC] For every DSL in the global registry, asserts its module has the four
+        # protocol members (availability, version, deregister and register override) and each
+        # is callable. Does nothing if the global registry could not be imported.
         """Test DSL modules implement complete protocol"""
         # Test with actual registered DSLs from the global registry
         if self.original_registry:
@@ -255,6 +299,9 @@ class TestDSLRegistry(TestCase):
                         )
 
     def test_real_dsl_integration(self):
+        # [FUNCTION DOC] Integration check on the global registry for triton and cutedsl (skips
+        # the subtest or test if absent): availability is a bool, version is None or a Version,
+        # an available DSL appears in the available list, and every DSL is in the all list.
         """Test integration with actual DSL modules"""
         if not self.original_registry:
             self.skipTest("Original registry not available")
@@ -285,6 +332,8 @@ class TestDSLRegistry(TestCase):
                 self.assertIn(dsl_name, self.original_registry.list_all_dsls())
 
     def test_common_utils_wrappers(self):
+        # [FUNCTION DOC] Asserts the common_utils helpers for listing all and available DSLs
+        # return the same lists as the global registry (skipped silently if no registry).
         """Test common_utils wrapper functions work correctly"""
         from torch.testing._internal.common_utils import (
             get_all_dsls,
@@ -299,6 +348,8 @@ class TestDSLRegistry(TestCase):
             )
 
     def test_skip_decorators(self):
+        # [FUNCTION DOC] Asserts the two DSL skip decorator factories from common_utils are
+        # callable and that calling them with a DSL name returns a callable decorator.
         """Test DSL skip decorators work with registry"""
         from torch.testing._internal.common_utils import (
             skipIfDSLUnavailable,
@@ -319,6 +370,8 @@ class TestDSLRegistry(TestCase):
     # Phase 5: Test Infrastructure (2 methods)
 
     def test_registry_isolation(self):
+        # [FUNCTION DOC] Asserts the isolated registry starts empty, accepts a registration, and
+        # that this registration does not appear in the global registry's list.
         """Test registry state can be saved and restored"""
         # Verify we start with clean test registry
         self.assertEqual(self.test_registry.list_all_dsls(), [])
@@ -336,6 +389,9 @@ class TestDSLRegistry(TestCase):
             self.assertNotIn("isolation_test", original_dsls)
 
     def test_mock_dsl_helpers(self):
+        # [FUNCTION DOC] Checks the mock helpers: the valid mock has callable members and its
+        # availability and version return True and the expected Version; the broken mock raises
+        # ImportError on its availability call while its version call still returns a Version.
         """Test mock DSL creation utilities work correctly"""
         # Test create_valid_mock_dsl
         valid_mock = self.create_valid_mock_dsl("test", available=True, version="2.1.0")

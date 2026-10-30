@@ -8,6 +8,12 @@
 #   cutlass/examples/python/CuTeDSL/ampere/elementwise_add.py  (BSD-3)
 #   cutlass/examples/python/CuTeDSL/ampere/sgemm.py            (BSD-3)
 #   cutlass/examples/python/CuTeDSL/hopper/cta_norm.py         (BSD-3)
+# [MODULE DOC] Smoke tests for the cuteDSL (CUTLASS Python DSL) API surface on CUDA GPUs.
+# Contains builder functions that lazily import cutlass and define kernels (elementwise add,
+# FP32 SIMT matrix multiply, CTA-level layer norm and RMS norm), plus two test classes that
+# compile, run and compare the kernels with PyTorch references, and check that
+# ReadOnlyTensorWrapper exports through the const DLPack exchange API without materializing
+# copy-on-write tensors. Import-time: optionally imports the cuda driver bindings, else None.
 
 import math
 import unittest
@@ -31,12 +37,21 @@ except ImportError:
 #       make_identity_tensor, elem_less, make_copy_atom
 # ---------------------------------------------------------------------------
 def _build_elementwise_add():
+    # [FUNCTION DOC] HELPER: Lazily import cutlass and define the elementwise-add kernel and
+    # its jit host function. Returns a pair: the host function (taking three tensors and an
+    # optional copy width in bits, default 128) and the from_dlpack converter. Importing
+    # cutlass here means an ImportError surfaces only when called.
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack
 
     @cute.kernel
     def _kernel(gA, gB, gC, cC, shape, thr_layout, val_layout):
+        # [FUNCTION DOC] HELPER: Device kernel computing the output tile as the sum of two input
+        # tiles. Each thread block handles one tile of the divided tensors using a tiled copy,
+        # loads both inputs into register fragments guarded by a predicate built from an
+        # identity coordinate tensor compared against the shape, adds them and stores the
+        # result back with the same predicate. Writes to the output tensor; returns nothing.
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
@@ -84,6 +99,10 @@ def _build_elementwise_add():
 
     @cute.jit
     def _host(mA, mB, mC, copy_bits: cutlass.Constexpr = 128):
+        # [FUNCTION DOC] HELPER: Jit host function for elementwise add. Derives the vector size
+        # from the copy width and element bit width, builds thread and value layouts (4 by 32
+        # threads, 4 by vector values), tiles the three tensors and an identity tensor, then
+        # launches the kernel with one block per tile and one thread per thread-layout entry.
         dtype = mA.element_type
         vector_size = copy_bits // dtype.width
         thr_layout = cute.make_ordered_layout((4, 32), order=(1, 0))
@@ -112,6 +131,9 @@ def _build_elementwise_add():
 #       local_tile, domain_offset, make_composed_layout, autovec_copy
 # ---------------------------------------------------------------------------
 def _build_sgemm():
+    # [FUNCTION DOC] HELPER: Lazily import cutlass and define the SGemm class, an FP32 SIMT GEMM
+    # using asynchronous global to shared copies and a multi-stage pipeline. Returns the pair
+    # of the SGemm class and the from_dlpack converter.
     import cutlass
     import cutlass.cute as cute
     import cutlass.pipeline as pipeline
@@ -119,7 +141,15 @@ def _build_sgemm():
     from cutlass.cute.runtime import from_dlpack
 
     class SGemm:
+        # [CLASS DOC] HELPER: Configurable SIMT matrix multiply kernel builder. Stores the CTA
+        # tile shape (M, N, K), the number of pipeline stages, the thread count and a named
+        # barrier used to synchronize the CTA. The jit call builds shared-memory and copy
+        # layouts depending on the row/column major mode of each operand, builds the tiled MMA
+        # and launches the kernel; the kernel does the pipelined main loop and the epilogue.
         def __init__(self, cta_tiler=(128, 128, 8), num_stages=3, num_threads=256):
+            # [FUNCTION DOC] HELPER: Store the tile shape, stage count and thread count, split
+            # the tile into its M, N and K sizes and create a named barrier (id 1) over all
+            # threads of the CTA.
             self._cta_tiler = cta_tiler
             self._num_stages = num_stages
             self._num_threads = num_threads
@@ -139,6 +169,13 @@ def _build_sgemm():
                 cuda.CUstream_flags.CU_STREAM_DEFAULT
             ),
         ):
+            # [FUNCTION DOC] HELPER: Jit entry point computing C from A and B with an optional
+            # element-wise epilogue (default identity) on a CUDA stream (default stream).
+            # Records the major mode of each operand, picks shared memory layouts with padding
+            # for row-major inputs, picks copy atoms and thread layouts (vectorized 4-element
+            # copies for column-major operands whose alignment allows it), builds the tiled MMA
+            # from a float32 universal op, and launches the kernel with a grid covering C in
+            # tiles. Sets attributes on self; returns nothing.
             self.a_major_mode = utils.LayoutEnum.from_tensor(mA)
             self.b_major_mode = utils.LayoutEnum.from_tensor(mB)
             self.c_major_mode = utils.LayoutEnum.from_tensor(mC)
@@ -252,6 +289,13 @@ def _build_sgemm():
             tiled_mma,
             epilogue_op: cutlass.Constexpr = lambda x: x,
         ):
+            # [FUNCTION DOC] HELPER: Device kernel for one CTA tile. Partitions global tensors,
+            # allocates shared memory for A and B stages, builds predicate tensors for the
+            # bounds and for the K residue, prefetches the first pipeline stages with async
+            # copies, then runs the main loop: for each K tile and K block, loads the next
+            # fragments from shared memory, issues global to shared copies for upcoming stages,
+            # and accumulates with the MMA. Epilogue applies the epilogue op to the accumulator
+            # and stores it to C guarded by a predicate on the remaining M and N extents.
             tidx, tidy, tidz = cute.arch.thread_idx()
             bidx, bidy, bidz = cute.arch.block_idx()
             tiler_coord = (bidx, bidy, None)
@@ -519,13 +563,24 @@ def _build_sgemm():
 #       load/store, cute.rsqrt, predication, autovec_copy
 # ---------------------------------------------------------------------------
 def _build_cta_norm():
+    # [FUNCTION DOC] HELPER: Lazily import cutlass and define the CtaNorm class implementing
+    # layer norm and RMS norm with one CTA per row. Returns the CtaNorm class, the from_dlpack
+    # converter and the cutlass torch helper module.
     import cutlass
     import cutlass.cute as cute
     import cutlass.torch as cutlass_torch
     from cutlass.cute.runtime import from_dlpack
 
     class CtaNorm:
+        # [CLASS DOC] HELPER: CTA-level normalization over rows of a two-dimensional tensor.
+        # Attributes: N (row length), norm_type (layer or rms), elems_per_thread (8), warp
+        # size (32), threads per CTA and warps per CTA. One thread block normalizes one row
+        # using vectorized 128-bit loads, warp shuffle reductions and a shared memory
+        # accumulator, then writes the scaled (and for layer norm biased) result.
         def __init__(self, N, norm_type, threads_per_cta=None):
+            # [FUNCTION DOC] HELPER: Store the row length and norm type, fix elements per
+            # thread at 8 and warp size at 32, use the given threads per CTA or else the
+            # heuristic value, and compute the warp count by rounding the threads up to warps.
             self.N = N
             self.norm_type = norm_type
             self.elems_per_thread = 8
@@ -534,6 +589,9 @@ def _build_cta_norm():
             self.warps_per_cta = (self.threads_per_cta + 31) // self.warp_size
 
         def _heuristic_threads(self):
+            # [FUNCTION DOC] HELPER: Choose a thread count for the row length: number of warps
+            # needed to cover the row at 8 elements per thread, divided by 4 (integer division),
+            # at least 1, rounded up to an even number, times 32. Returns that thread count.
             elems_per_warp = self.elems_per_thread * self.warp_size
             heu_warps = (self.N + elems_per_warp - 1) // elems_per_warp // 4
             heu_warps = max(heu_warps, 1)
@@ -542,6 +600,10 @@ def _build_cta_norm():
 
         @cute.jit
         def __call__(self, mY, mX, mWeight, mBias, eps: cutlass.Float32 = 1e-6):
+            # [FUNCTION DOC] HELPER: Jit entry point. Output, input, weight and bias tensors plus
+            # a float32 epsilon (default 1e-6). Builds a 128-bit copy atom and a tiled copy over
+            # the threads and per-thread elements, then launches the kernel with one block per
+            # input row and one thread per warps-times-warp-size.
             M, _ = mX.shape
             atom_copy = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
@@ -558,6 +620,11 @@ def _build_cta_norm():
 
         @cute.kernel
         def kernel(self, mY, mX, mWeight, mBias, tiled_copy, eps):
+            # [FUNCTION DOC] HELPER: Device kernel normalizing one row per block. Builds a
+            # predicate marking in-range vector chunks, loads input, weight and (for layer norm)
+            # bias fragments into registers, zero-filling the input first, calls the layer norm
+            # or RMS norm helper depending on the norm type, and stores the result back to the
+            # output row for in-range chunks.
             tidx, _, _ = cute.arch.thread_idx()
             bidx, _, _ = cute.arch.block_idx()
             thr_copy = tiled_copy.get_slice(tidx)
@@ -600,6 +667,9 @@ def _build_cta_norm():
 
         @cute.jit
         def warp_reduce(self, val, reduce_size=32):
+            # [FUNCTION DOC] HELPER: Butterfly warp reduction. Adds the value across lanes over
+            # log2(reduce_size) rounds using shuffle exchange with doubling offset; returns the
+            # sum (every lane holds the total for a full warp).
             iters = int(math.log2(reduce_size))
             for i in range(iters):
                 val = val + cute.arch.shuffle_sync_bfly(val, offset=1 << i)
@@ -607,6 +677,10 @@ def _build_cta_norm():
 
         @cute.jit
         def cta_reduce(self, val, acc, tidx):
+            # [FUNCTION DOC] HELPER: CTA-wide sum. Lane 0 of each warp writes its warp value to
+            # a shared accumulator, after a barrier the first warp reduces the per-warp values
+            # (zero for lanes beyond the warp count) and stores the total in the extra slot,
+            # and after another barrier every thread returns that total.
             warp_id = tidx >> 5
             lane_id = tidx & 31
             if lane_id == 0:
@@ -624,6 +698,10 @@ def _build_cta_norm():
 
         @cute.jit
         def apply_layernorm(self, x, weight, bias, eps, tidx, pred):
+            # [FUNCTION DOC] HELPER: Layer norm of one thread's fragment. Computes the row mean
+            # from CTA reductions of the sums, then the variance sum over in-range chunks, the
+            # reciprocal square root of variance plus eps, and returns a new fragment holding
+            # (x minus mean) times factor times weight plus bias, cast to the input element type.
             smem = cutlass.utils.SmemAllocator()
             acc = smem.allocate_tensor(cutlass.Float32, self.warps_per_cta + 1)
             val = cute.Float32(0.0)
@@ -648,6 +726,10 @@ def _build_cta_norm():
 
         @cute.jit
         def apply_rmsnorm(self, x, weight, eps, tidx, pred):
+            # [FUNCTION DOC] HELPER: RMS norm of one thread's fragment. Reduces the sum of
+            # squares over in-range chunks across the CTA, takes the reciprocal square root of
+            # the mean square plus eps, and returns a new fragment of x times that factor times
+            # weight in the input element type. Uses shared memory for the reduction.
             smem = cutlass.utils.SmemAllocator()
             acc = smem.allocate_tensor(cutlass.Float32, self.warps_per_cta + 1)
             val = cute.Float32(0.0)
@@ -674,6 +756,8 @@ def _build_cta_norm():
 @skipIfNoCuteDSL
 @unittest.skipIf(not TEST_CUDA, "CUDA required")
 class TestCuteDSLSmoketest(TestCase):
+    # [CLASS DOC] Test case running the cuteDSL kernel smoke tests. Only runs when cuteDSL is
+    # installed and CUDA is available; each test additionally needs SM80 or later. Stateless.
     """Smoke tests that compile, run, and verify cuteDSL kernels.
 
     Run before bumping cuteDSL version pins in torch/_native/cutedsl_utils.py.
@@ -681,6 +765,8 @@ class TestCuteDSLSmoketest(TestCase):
 
     @unittest.skipIf(not SM80OrLater, "SM80+ required")
     def test_elementwise_add(self):
+        # [FUNCTION DOC] Compile the elementwise add kernel for 128 by 128 float32 CUDA tensors
+        # (dynamic layouts), run it and assert the output equals the sum of the two inputs.
         _host, from_dlpack = _build_elementwise_add()
         import cutlass.cute as cute
 
@@ -701,6 +787,9 @@ class TestCuteDSLSmoketest(TestCase):
 
     @unittest.skipIf(not SM80OrLater, "SM80+ required")
     def test_sgemm(self):
+        # [FUNCTION DOC] Compile and run SGemm on 256 cubed integer-valued float32 matrices
+        # (permuted views with 16-byte alignment) using the current CUDA stream, then compare
+        # the result moved to CPU against the einsum reference with absolute tolerance 1e-3.
         SGemm, from_dlpack = _build_sgemm()
         import cutlass.cute as cute
 
@@ -742,6 +831,9 @@ class TestCuteDSLSmoketest(TestCase):
 
     @unittest.skipIf(not SM80OrLater, "SM80+ required")
     def test_cta_rmsnorm(self):
+        # [FUNCTION DOC] Compile CtaNorm in RMS mode with tvm-ffi enabled for float16 data
+        # (32 rows by 256), run it with no bias and compare to the torch RMS norm reference
+        # with eps 1e-6 and tolerances of 1e-3.
         CtaNorm, from_dlpack, cutlass_torch = _build_cta_norm()
         import cutlass
         import cutlass.cute as cute
@@ -769,6 +861,9 @@ class TestCuteDSLSmoketest(TestCase):
 
     @unittest.skipIf(not SM80OrLater, "SM80+ required")
     def test_cta_layernorm(self):
+        # [FUNCTION DOC] Compile CtaNorm in layer norm mode with tvm-ffi enabled for float16
+        # data (32 by 256) with weight and bias, run it and compare to the torch layer norm
+        # reference with eps 1e-6 and tolerances of 1e-3.
         CtaNorm, from_dlpack, cutlass_torch = _build_cta_norm()
         import cutlass
         import cutlass.cute as cute
@@ -800,6 +895,8 @@ class TestCuteDSLSmoketest(TestCase):
 @skipIfNoCuteDSL
 @unittest.skipIf(not TEST_CUDA, "CUDA required")
 class TestCuteDSLReadOnlyWrapper(TestCase):
+    # [CLASS DOC] Test case for ReadOnlyTensorWrapper interop with cuteDSL via the tvm-ffi
+    # exchange path. Requires cuteDSL, CUDA and SM80 or later for its tests. Stateless.
     """ReadOnlyTensorWrapper interop with cuteDSL.
 
     The tvm-ffi exchange path is the supported route: it goes through the const
@@ -809,6 +906,10 @@ class TestCuteDSLReadOnlyWrapper(TestCase):
 
     @unittest.skipIf(not SM80OrLater, "SM80+ required")
     def test_readonly_wrapper_tvm_ffi_kernel(self):
+        # [FUNCTION DOC] Wrap lazily cloned (copy-on-write) inputs in ReadOnlyTensorWrapper,
+        # convert via from_dlpack with tvm-ffi, and run the elementwise add kernel. Asserts the
+        # inputs are still copy-on-write with unchanged const data pointers both after
+        # wrapping and after the launch, and that the output equals the sum of the originals.
         _host, from_dlpack = _build_elementwise_add()
         import cutlass.cute as cute
 
@@ -856,6 +957,9 @@ class TestCuteDSLReadOnlyWrapper(TestCase):
 
     @unittest.skipIf(not SM80OrLater, "SM80+ required")
     def test_readonly_wrapper_routes_to_const_exchange_api(self):
+        # [FUNCTION DOC] Uses ctypes to extract the pointers from the capsules and asserts the
+        # wrapper class exchange API attribute is the same as the const DLPack exchange API and
+        # differs from the default one.
         # tvm-ffi / cuteDSL discover __dlpack_c_exchange_api__ on the type. The
         # wrapper must expose the const (read-only) API rather than the default.
         import ctypes
@@ -865,6 +969,9 @@ class TestCuteDSLReadOnlyWrapper(TestCase):
         get.argtypes = [ctypes.py_object, ctypes.c_char_p]
 
         def _ptr(capsule):
+            # [FUNCTION DOC] HELPER: Return the raw pointer stored in a capsule named
+            # dlpack_exchange_api, using the Python C API through ctypes; the pointer is
+            # returned as an integer.
             return get(capsule, b"dlpack_exchange_api")
 
         self.assertEqual(
@@ -890,6 +997,10 @@ class TestCuteDSLReadOnlyWrapper(TestCase):
     # through the C exchange API rather than parsing a capsule.
     @unittest.skipIf(not SM80OrLater, "SM80+ required")
     def test_readonly_wrapper_bare_capsule_is_valid(self):
+        # [FUNCTION DOC] Checks, without giving it to cuteDSL, that the bare capsule export of a
+        # read-only wrapper over a lazily cloned tensor is valid: importing it with from_dlpack
+        # leaves the source copy-on-write with an unchanged const pointer and the imported
+        # tensor equals the original values.
         # Verify the wrapper's bare (non-tvm-ffi) capsule is a well-formed,
         # read-only, copy-on-write-preserving export -- the thing cuteDSL's bare
         # path *would* receive -- without handing it to cuteDSL.

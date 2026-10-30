@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Test for the XPU scope profiler (per-kernel hardware metrics via XPUPTI).
+# Defines one TestCase that profiles a few XPU ops with metric names requested through the
+# fine-grained activity dict, exports a chrome trace, and validates the JSON structure and
+# metric counts. Also checks that activity-type-only filters do not enable the scope profiler.
+# Import-time side effects: none beyond imports and a module-level Verbose debug flag.
 
 import json
 import os
@@ -15,7 +20,15 @@ Verbose = False
 
 
 class XpuScopeProfilerTest(TestCase):
+    # [CLASS DOC] Test case holding the XPU scope profiler checks. The attribute metrics_names
+    # lists the six hardware metric names that are requested and later expected in the trace.
+    # Helper methods validate trace events and environment prerequisites (Level Zero metrics
+    # flag and perf paranoid sysfs settings); the test methods need an XPU device.
     def __init__(self, arg):
+        # [FUNCTION DOC] HELPER: Standard TestCase constructor taking the test method name;
+        # forwards it to the parent and sets metrics_names to the six metric names
+        # (GpuTime, GpuCoreClocks, AvgGpuCoreFrequencyMHz, an ALU utilization counter,
+        # XVE_ACTIVE and XVE_STALL).
         super().__init__(arg)
 
         self.metrics_names = [
@@ -28,6 +41,10 @@ class XpuScopeProfilerTest(TestCase):
         ]
 
     def count_metrics(self, event, counter):
+        # [FUNCTION DOC] HELPER: Validate one trace event and tally its metric names.
+        # Asserts the event has an args entry that is a mapping, then increments, for each key
+        # of that mapping, the count stored under that key in the supplied counter mapping
+        # (mutated in place). Returns nothing.
         self.assertTrue("args" in event)
         self.assertTrue(isinstance(event["args"], dict))
 
@@ -35,6 +52,12 @@ class XpuScopeProfilerTest(TestCase):
             counter[arg] += 1
 
     def check_metrics(self, counter):
+        # [FUNCTION DOC] HELPER: Check that every expected metric appears equally often.
+        # Walks the counter mapping of metric key to occurrence count; a key matches a metric
+        # name if equal to it or prefixed by the name plus a double colon or a space and
+        # bracket (unit suffix forms). Asserts each key matches at most one name, groups
+        # matching keys by their count, then asserts only one distinct count exists and that
+        # exactly as many keys matched as there are metric names. Prints debug info if Verbose.
         rev_counter = defaultdict(int)
 
         for metric_name_in_json in counter:
@@ -62,6 +85,13 @@ class XpuScopeProfilerTest(TestCase):
         self.assertEqual(first_value, len(self.metrics_names))
 
     def gen_and_check_json(self, p, json_file):
+        # [FUNCTION DOC] HELPER: Export the profiler trace to a file and validate it.
+        # Args: p is a finished profiler, json_file the output path. Loads the JSON and asserts
+        # a non-empty list of trace events, each with phase and name. Complete ("X") events
+        # must have a category; names and categories are counted, and events named with the
+        # metrics prefix feed the X-metric counter, while counter ("C") events feed the
+        # C-metric counter. Asserts at least one metrics event exists, that the xpu_runtime and
+        # kernel categories are present, and runs check_metrics on both counters.
         p.export_chrome_trace(json_file)
 
         with open(json_file) as f:
@@ -109,12 +139,17 @@ class XpuScopeProfilerTest(TestCase):
             self.check_metrics(count_c_metrics)
 
     def required_env_setting(self):
+        # [FUNCTION DOC] HELPER: Return True only if the ZET_ENABLE_METRICS environment
+        # variable equals the string 1 (Level Zero metrics enabled). Prints it if Verbose.
         zet_enable_metrics = os.environ.get("ZET_ENABLE_METRICS", "unset")
         if Verbose:
             print(f"ZET_ENABLE_METRICS={zet_enable_metrics}")
         return zet_enable_metrics == "1"
 
     def required_paranoid_setting(self, paranoid_path):
+        # [FUNCTION DOC] HELPER: Return True if the given sysfs paranoid file exists and its
+        # stripped content is the string 0. A missing file yields False. Prints debug info if
+        # Verbose.
         try:
             paranoid_content = Path(paranoid_path).read_text().strip()
             if Verbose:
@@ -127,6 +162,8 @@ class XpuScopeProfilerTest(TestCase):
             return False
 
     def required_paranoid_settings(self):
+        # [FUNCTION DOC] HELPER: Return True if either the xe observation paranoid file or the
+        # i915 perf stream paranoid file permits profiling (content 0), checking both paths.
         return any(
             self.required_paranoid_setting(paranoid)
             for paranoid in [
@@ -137,6 +174,11 @@ class XpuScopeProfilerTest(TestCase):
 
     @unittest.skipIf(not TEST_XPU, "test requires XPU")
     def test_scope_profiler(self):
+        # [FUNCTION DOC] End-to-end scope profiler test; skipped unless an XPU is available,
+        # ZET_ENABLE_METRICS is 1 and a paranoid setting is 0. Runs matmul, add and abs on XPU
+        # under a profiler with CPU activity plus an XPU entry listing the metric names, then
+        # exports the trace (to the JSON_FILE environment path if set, else a temp file) and
+        # validates it. Finally asserts the key averages contain at least one metrics event.
         if not self.required_env_setting():
             self.skipTest("ZET_ENABLE_METRICS not set")
 
@@ -178,6 +220,10 @@ class XpuScopeProfilerTest(TestCase):
 
     @unittest.skipIf(not TEST_XPU, "test requires XPU")
     def test_activity_type_filter_does_not_enable_scope_profiler(self):
+        # [FUNCTION DOC] Verifies that an XPU activity dict listing only an activity type name
+        # (a kernel type, not a hardware metric) does not enable the scope profiler. Profiles a
+        # matmul on XPU, then asserts the result is non-empty and that zero key-average events
+        # carry the metrics prefix. Needs XPU but no metrics hardware; skipped without XPU.
         """A fine-grained XPU dict that lists only activity type names (no
         hardware metric names) filters activities as in #176351 and must not
         turn on the per-kernel scope profiler. Needs no metrics hardware."""
