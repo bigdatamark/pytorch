@@ -1,4 +1,9 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for pooling layers and functionals: average, max, adaptive, fractional and
+# LP pooling plus max-unpooling, covering numerics against reference computations, channels-last
+# memory formats, empty/zero-size inputs, overflow with large tensors, indices, NaN/inf handling
+# and error messages. Device-generic classes are instantiated per device at the bottom of the
+# file; no import-time side effects beyond that.
 import contextlib
 import itertools
 import math
@@ -53,13 +58,22 @@ from torch.testing._internal.common_utils import (
 
 
 class TestAvgPool(TestCase):
+    # [CLASS DOC] CPU tests comparing average-pooling functionals on double tensors against
+    # reference implementations built from unfold and sums; no instance state.
     def _sum_pool2d(self, x, kernel_size):
+        # [FUNCTION DOC] HELPER: Reference sum-pooling for a 2D input. Unfolds the input into
+        # non-overlapping windows (stride equals kernel size) and returns the sum over the window
+        # dimension, giving one summed value per window.
         windows = torch.nn.functional.unfold(
             x, kernel_size=kernel_size, stride=kernel_size
         )
         return torch.sum(windows, dim=1)
 
     def _sum_pool3d(self, x, kernel_size):
+        # [FUNCTION DOC] HELPER: Reference sum-pooling for a 3D tensor given kernel sizes. Splits
+        # the tensor along the first axis into full chunks of the first kernel size (dropping a
+        # partial tail), sums each chunk, applies the 2D reference to each result and
+        # concatenates; returns a tensor of shape one by number of outputs.
         # Because unfold does not support 3D sliding window we will split tensor to multiple tensors and calculate sum
         h = kernel_size[0]
         splited_x = [t.sum(0) for t in x.split(h) if t.size(0) == h]
@@ -72,14 +86,21 @@ class TestAvgPool(TestCase):
         return joined_x.view(1, joined_x.numel())
 
     def _avg_pool2d(self, x, kernel_size):
+        # [FUNCTION DOC] HELPER: Reference 2D average pooling: the 2D window sum divided by the
+        # product of the kernel sizes.
         size = reduce(operator.mul, kernel_size)
         return self._sum_pool2d(x, kernel_size) / size
 
     def _avg_pool3d(self, x, kernel_size):
+        # [FUNCTION DOC] HELPER: Reference 3D average pooling: the 3D window sum divided by the
+        # product of the kernel sizes.
         size = reduce(operator.mul, kernel_size)
         return self._sum_pool3d(x, kernel_size) / size
 
     def test_doubletensor_avg_pool2d(self):
+        # [FUNCTION DOC] Compares the 2D average pooling functional on a random double tensor
+        # with the reference for every kernel height and width up to the input size, flattening
+        # outputs, using absolute tolerance 1e-5 and zero relative tolerance.
         n, m = 5, 8
         input = torch.rand(1, 1, n, m, dtype=torch.double)
         for i in range(1, n + 1):
@@ -90,6 +111,9 @@ class TestAvgPool(TestCase):
                 self.assertEqual(actual, expected, rtol=0, atol=1e-5)
 
     def test_doubletensor_avg_pool2d_with_divisor(self):
+        # [FUNCTION DOC] Same sweep as the plain 2D test but passes a divisor override of
+        # one, seven or the kernel area and compares with the reference window sum divided by
+        # that divisor.
         n, m = 3, 3
         input = torch.rand(1, 1, n, m, dtype=torch.double)
         for i in range(1, n + 1):
@@ -101,6 +125,8 @@ class TestAvgPool(TestCase):
                     self.assertEqual(actual, expected, rtol=0, atol=1e-5)
 
     def test_doubletensor_avg_pool3d(self):
+        # [FUNCTION DOC] Compares the 3D average pooling functional on a random double tensor
+        # with the 3D reference for every kernel size up to the input extent in each dimension.
         h, w, d = 5, 6, 7
         input = torch.rand(h, w, d, dtype=torch.double)
         for i in range(1, h + 1):
@@ -114,6 +140,9 @@ class TestAvgPool(TestCase):
                     self.assertEqual(actual, expected, rtol=0, atol=1e-5)
 
     def test_doubletensor_avg_pool3d_with_divisor(self):
+        # [FUNCTION DOC] Sweeps all 3D kernel sizes with divisor overrides of one, seven or the
+        # product of the first two kernel sizes and compares against the reference sum divided by
+        # the divisor.
         h, w, d = 6, 5, 7
         input = torch.rand(h, w, d, dtype=torch.double)
         for i in range(1, h + 1):
@@ -129,7 +158,10 @@ class TestAvgPool(TestCase):
 
 
 class TestAvgPoolDeviceType(TestCase):
+    # [CLASS DOC] Device-generic average-pooling regression tests; no instance state.
     def test_avg_pool1d_ceil_mode(self, device):
+        # [FUNCTION DOC] Regression test for gh-36977: 1D average pooling with ceil mode, count
+        # of padding included, kernel 1 and stride 2 must not produce NaN values.
         # Regression test for gh-36977
         x = 10 * torch.randn((1, 16, 4), device=device)
         y = torch.nn.functional.avg_pool1d(
@@ -138,6 +170,8 @@ class TestAvgPoolDeviceType(TestCase):
         self.assertTrue(not torch.isnan(y).any())
 
     def test_avg_pool2d_ceil_mode(self, device):
+        # [FUNCTION DOC] Regression test for gh-36977: 2D average pooling with ceil mode, padding
+        # and a non-square kernel must not produce NaN values.
         # Regression test for gh-36977
         x = 10 * torch.randn((1, 16, 4, 4), device=device)
         y = torch.nn.functional.avg_pool2d(
@@ -151,6 +185,8 @@ class TestAvgPoolDeviceType(TestCase):
         self.assertTrue(not torch.isnan(y).any())
 
     def test_avg_pool3d_ceil_mode(self, device):
+        # [FUNCTION DOC] Regression test for gh-36977: 3D average pooling with ceil mode and a
+        # non-cubic kernel must not produce NaN values.
         # Regression test for gh-36977
         x = 10 * torch.randn((1, 16, 4, 4, 4), device=device)
         y = torch.nn.functional.avg_pool3d(
@@ -160,10 +196,16 @@ class TestAvgPoolDeviceType(TestCase):
 
 
 class TestPoolingNN(NNTestCase):
+    # [CLASS DOC] CPU-only tests of pooling modules and functionals (adaptive, unpool,
+    # quantized max pool). Class flags enable the CUDA memory leak check and running on a
+    # non-default CUDA stream.
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
 
     def test_adaptive_pooling_size_none(self):
+        # [FUNCTION DOC] For 2D and 3D adaptive max and average pooling modules, builds a module
+        # whose last output size is None and checks that dimension keeps the input size (4) while
+        # the others become 2.
         for numel in (2, 3):
             for pool_type in ("Max", "Avg"):
                 cls_name = f"Adaptive{pool_type}Pool{numel}d"
@@ -177,6 +219,9 @@ class TestPoolingNN(NNTestCase):
 
     @unittest.skipIf(TEST_WITH_UBSAN, "signed integer overflow error with UBSAN")
     def test_adaptive_pooling_size_overflow(self):
+        # [FUNCTION DOC] Checks that an adaptive max pool 1D with an enormous output size whose
+        # element count overflows int64 raises a RuntimeError instead of allocating. Skipped
+        # under UBSAN.
         # 0x0x3fffffffffffffff * 2 * 2 = 0xfffffffffffffffc = -4 as int64_t
         # Tensor::numel() return int64_t, so following check that negative allocs are correctly handled
         self.assertRaises(
@@ -187,9 +232,17 @@ class TestPoolingNN(NNTestCase):
         )
 
     def test_adaptive_pooling_lower_precision(self):
+        # [FUNCTION DOC] Checks adaptive average and max pooling 2D on CPU in bfloat16 and
+        # float16, for contiguous and channels-last layouts, against the float32 result of the
+        # same random integer data.
         def _test_adaptive_pooling_lower_precision(
             self, device, dtype, mod, memory_format
         ):
+            # [FUNCTION DOC] HELPER: Runs forward and backward of the given adaptive pooling
+            # module class (output 7x7) on float32 input and on a copy cast to the lower dtype.
+            # Asserts the lower-precision output keeps the requested memory format, output and
+            # input gradient have that dtype, and values match the float32 results within
+            # absolute tolerance 0.1.
             input = torch.randint(1, 10, (3, 19, 8, 8), dtype=torch.float32)
             input = input.to(device).to(memory_format=memory_format).requires_grad_()
             pool = mod((7, 7)).to(device)
@@ -232,6 +285,10 @@ class TestPoolingNN(NNTestCase):
                 )
 
     def test_MaxUnpool2d_output_size(self):
+        # [FUNCTION DOC] Tests max unpool 2D output_size handling. Unpooling a pool result whose
+        # indices exceed the default output must raise RuntimeError. For a smaller input, output
+        # sizes with both extents from 4 to 6 are accepted (a size of 6 is padded with leading
+        # batch and channel dims) and any other size raises ValueError.
         m = nn.MaxPool2d(3, stride=2, return_indices=True)
         mu = nn.MaxUnpool2d(3, stride=2)
         big_t = torch.rand(1, 1, 6, 6)
@@ -258,6 +315,9 @@ class TestPoolingNN(NNTestCase):
                     )
 
     def test_max_unpool2d_nhwc_cpu(self):
+        # [FUNCTION DOC] Checks max unpool 2D on CPU with a channels-last input matches a
+        # contiguous reference: output memory format, forward values and the gradient of the
+        # pooled input after backward with the same gradient.
         input = torch.randn(2, 10, 9, 9).float().cpu()
         input = input.contiguous(memory_format=torch.channels_last)
         ref_input = input.clone().contiguous()
@@ -289,6 +349,10 @@ class TestPoolingNN(NNTestCase):
         self.assertTrue(torch.allclose(out.grad, ref_out.grad))
 
     def test_max_unpool(self):
+        # [FUNCTION DOC] Tests max unpool in 1D, 2D and 3D under default dtype double. Verifies
+        # that an omitted stride equals an explicit stride equal to the kernel, that output_size
+        # given as a shape or a size object give equal results, and runs gradcheck with
+        # forward-mode checking for each dimensionality.
         with set_default_dtype(torch.double):
             # Test 1D
             output, indices = F.max_pool1d(
@@ -335,6 +399,11 @@ class TestPoolingNN(NNTestCase):
             gradcheck(F.max_unpool3d, (output, indices, 2), check_forward_ad=True)
 
     def test_max_unpool_invalid_output_size(self):
+        # [FUNCTION DOC] Tests that max unpool rejects parameter combinations that would give
+        # negative spatial output dims with ValueError (functional, module, explicit negative
+        # output_size, 1D and 3D), accepts zero and one sized explicit output sizes with matching
+        # result shape, and that compiled versions (aot_eager, dynamic shapes) of the module and
+        # the raw ATen op raise RuntimeError with the same message.
         x = torch.randn(1, 1, 2, 2)
         idx = torch.zeros(1, 1, 2, 2, dtype=torch.long)
 
@@ -371,6 +440,8 @@ class TestPoolingNN(NNTestCase):
             F.max_unpool3d(x3d, idx3d, 1, stride=5, padding=4)
 
         def call_func(kernel_size, stride, x, idx, padding):
+            # [FUNCTION DOC] HELPER: Builds a 2D max-unpool module from kernel size, stride and
+            # padding and applies it to the input and indices; returns the result.
             return torch.nn.MaxUnpool2d(kernel_size, stride, padding)(x, idx)
 
         compiled_call_func = torch.compile(call_func, backend="aot_eager", dynamic=True)
@@ -378,6 +449,9 @@ class TestPoolingNN(NNTestCase):
             compiled_call_func([1, 1], 5, x, idx, [3, 4])
 
         def aten_call(x, idx):
+            # [FUNCTION DOC] HELPER: Calls the ATen 2D max unpool op on the input and
+            # indices with a fixed output size containing a zero and a negative value;
+            # returns the result.
             return torch.ops.aten.max_unpool2d.default(x, idx, [0, -2])
 
         compiled_aten_call = torch.compile(aten_call, backend="aot_eager", dynamic=True)
@@ -385,11 +459,15 @@ class TestPoolingNN(NNTestCase):
             compiled_aten_call(x, idx)
 
     def test_max_unpool3d_input_check(self):
+        # [FUNCTION DOC] Checks that 3D max unpool with a kernel list of the wrong length and
+        # index tensor of shape matching the input raises RuntimeError.
         x = torch.ones(1, 3, 1, 1, 1)
         with self.assertRaises(RuntimeError):
             F.max_unpool3d(x, torch.zeros(x.shape, dtype=int), [1, 1])
 
     def test_quantized_max_pool1d_empty_kernel(self):
+        # [FUNCTION DOC] Regression test for issue 116323: quantized max pool 1D with an empty
+        # kernel size list must raise RuntimeError rather than segfault.
         # This used to segfault when called with an empty kernel
         # see https://github.com/pytorch/pytorch/issues/116323
         base = torch.randn(1)
@@ -398,6 +476,8 @@ class TestPoolingNN(NNTestCase):
             torch.quantized_max_pool1d(temp_tensor, [])
 
     def test_quantized_max_pool3d(self):
+        # [FUNCTION DOC] Regression test for issue 136716: quantized max pool 3D with a negative
+        # dilation must raise RuntimeError mentioning that dilation must be at least 1.
         # This used to segfault when called with a negative dilation
         # see https://github.com/pytorch/pytorch/issues/136716
         input = torch.randn([1, 1, 1, 1, 1])
@@ -409,8 +489,14 @@ class TestPoolingNN(NNTestCase):
 
 
 class TestPoolingNNDeviceType(NNTestCase):
+    # [CLASS DOC] Device-generic tests of pooling modules and functionals, instantiated per
+    # device type; many test methods are marked expected-failure on MPS or restricted to CPU
+    # or accelerators.
     @expectedFailureMPS  # MPS adaptive avg pool requires divisible input/output sizes
     def test_adaptive_pooling_avg_nhwc(self, device):
+        # [FUNCTION DOC] Checks adaptive average pool 2D to 7x7 on a channels-last input: forward
+        # output stays channels-last, and output and input gradient equal those of a contiguous
+        # reference copy.
         input = torch.randint(1, 10, (4, 8, 8, 8), dtype=torch.float32).to(device)
         input = input.contiguous(memory_format=torch.channels_last).requires_grad_()
         grad = torch.randint(1, 10, (4, 8, 7, 7), dtype=torch.float32).to(device)
@@ -432,6 +518,8 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @expectedFailureMPS  # MPS adaptive avg pool requires divisible input/output sizes
     def test_adaptive_pooling_avg_nhwc_non_contiguous(self, device):
+        # [FUNCTION DOC] Same as the channels-last adaptive average pool test but the input and
+        # gradient are non-contiguous channel-strided views (every second channel).
         input = torch.randint(1, 10, (4, 8, 8, 8), dtype=torch.float32).to(device)
         input = input.contiguous(memory_format=torch.channels_last)
         input = input[:, ::2, :, :].requires_grad_()
@@ -457,6 +545,10 @@ class TestPoolingNNDeviceType(NNTestCase):
     @expectedFailureMPS  # MPS adaptive avg pool requires divisible input/output sizes
     @largeTensorTest("12GB")
     def test_adaptive_pooling_avg_nhwc_launch_config_backward(self, device):
+        # [FUNCTION DOC] Accelerator-only large-memory test (12GB): adaptive average pool
+        # backward on a channels-last input with a very tall height exceeding 2 to the 17th,
+        # comparing output and input gradient to a contiguous reference to exercise kernel
+        # launch limits.
         input = torch.randint(
             1, 10, (1, 32, 2**17 + 1, 32), dtype=torch.float32, device=device
         )
@@ -483,6 +575,9 @@ class TestPoolingNNDeviceType(NNTestCase):
     @expectedFailureMPS  # MPS adaptive avg pool requires divisible input/output sizes
     @largeTensorTest("12GB")
     def test_adaptive_pooling_avg_nhwc_launch_config_forward(self, device):
+        # [FUNCTION DOC] Accelerator-only large-memory test (12GB): adaptive average pool forward
+        # producing more than 2 to the 17th output rows from a channels-last input, compared to a
+        # contiguous reference.
         input = torch.randint(
             1, 10, (1, 32, 16, 16), dtype=torch.float32, device=device
         )
@@ -501,6 +596,9 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @onlyAccelerator
     def test_adaptive_avg_pooling_overflow(self, device):
+        # [FUNCTION DOC] Accelerator-only: adaptive average pool to 2x2 over a large
+        # half-precision input must produce no inf or NaN values (accumulation must
+        # not overflow).
         input = torch.randint(
             -256, 256, (20, 32, 256, 256), dtype=torch.half, device=device
         )
@@ -511,6 +609,8 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @onlyAccelerator
     def test_adaptive_avg_pooling_nhwc_overflow(self, device):
+        # [FUNCTION DOC] Same overflow check as the contiguous test but with a channels-last
+        # half-precision input.
         input = torch.randint(
             -256, 256, (20, 32, 256, 256), dtype=torch.half, device=device
         )
@@ -523,6 +623,10 @@ class TestPoolingNNDeviceType(NNTestCase):
     @onlyCUDA
     @largeTensorTest("10GB", device="cuda")
     def test_adaptive_avg_pool2d_backward_large_index_offsets(self, device):
+        # [FUNCTION DOC] CUDA-only large-memory test (10GB): builds a stride-zero expanded input
+        # with more than int32 max elements and runs the adaptive average pool 2D backward ATen
+        # op with a ones gradient. Samples a few gradient positions and checks they equal the
+        # inverse of the window width, validating 64-bit index offsets.
         height = 32769
         width = 65536
         channels = 2
@@ -550,6 +654,8 @@ class TestPoolingNNDeviceType(NNTestCase):
     @expectedFailureMPS  # No double, float shape prop does not work
     @dtypes(torch.float, torch.double)
     def test_adaptive_pooling_zero_batch(self, dtype, device):
+        # [FUNCTION DOC] Checks adaptive average pooling 1D, 2D and 3D modules accept inputs with
+        # zero batch size via the shared empty-input helper, without checking output size.
         inp = torch.ones(0, 10, dtype=dtype, device=device)
         mod = torch.nn.AdaptiveAvgPool1d(5).to(device)
         _test_module_empty_input(self, mod, inp, check_size=False)
@@ -570,6 +676,10 @@ class TestPoolingNNDeviceType(NNTestCase):
     @dtypes(torch.float32, torch.float64)
     @dtypesIfCUDA(torch.float32, torch.float64, torch.bfloat16, torch.float16)
     def test_adaptive_pooling_empty_output_size(self, dtype, device):
+        # [FUNCTION DOC] Verifies that adaptive average/max pooling (1D, 2D, 3D functionals) with
+        # output size 0 raise RuntimeError on backward with the message about grad_output needing
+        # non-zero size in non-batch dimensions. Written separately because error-input infra
+        # does not support backward calls (issue 78868).
         error_msg = (
             "Expected grad_output to have non-zero size for non-batch dimensions"
         )
@@ -601,6 +711,9 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @expectedFailureMPS  # Error message does not match
     def test_adaptive_avg_pooling_backward_fails(self, device):
+        # [FUNCTION DOC] Checks the ATen adaptive average pool backward ops for 2D and 3D raise
+        # RuntimeError (message about expected dimensions) when grad_output and input have
+        # mismatched ranks.
         grad_output = torch.randn(1, 2, 7, device=device)
         input = torch.randn(1, 2, 3, 3, device=device)
         with self.assertRaisesRegex(RuntimeError, "Expected dimensions"):
@@ -612,6 +725,9 @@ class TestPoolingNNDeviceType(NNTestCase):
             torch.ops.aten._adaptive_avg_pool3d_backward(grad_output, input)
 
     def test_adaptive_max_pooling_backward_fails(self, device):
+        # [FUNCTION DOC] Checks the ATen adaptive max pool backward ops raise RuntimeError when
+        # the indices shape disagrees with grad_output in 2D (message about expected sizes) or
+        # the dimensions mismatch in 3D (message about expected dimensions).
         grad_output = torch.randn(1, 2, 7, 7, device=device)
         input = torch.randn(1, 2, 7, 7, device=device)
         indices = torch.ones(1, 2, 3, 3, dtype=torch.long, device=device)
@@ -626,6 +742,8 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @expectedFailureMPS  # Op not implemented
     def test_FractionalMaxPool2d_zero_batch(self, device):
+        # [FUNCTION DOC] Fractional max pool 2D accepts a zero-batch input; an input with zero
+        # channels raises RuntimeError mentioning expected input.
         mod = nn.FractionalMaxPool2d(3, output_ratio=(0.5, 0.5))
         inp = torch.ones(0, 16, 50, 32, device=device)
         _test_module_empty_input(self, mod, inp, check_size=False)
@@ -636,6 +754,8 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @expectedFailureMPS  # Op not implemented
     def test_FractionalMaxPool3d_zero_batch(self, device):
+        # [FUNCTION DOC] Fractional max pool 3D accepts a zero-batch input; an input with zero
+        # channels raises RuntimeError mentioning expected input.
         mod = nn.FractionalMaxPool3d(3, output_ratio=(0.5, 0.5, 0.5)).to(device)
         inp = torch.ones(0, 16, 50, 32, 32, device=device)
         _test_module_empty_input(self, mod, inp, check_size=False)
@@ -646,6 +766,8 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @expectedFailureMPS  # Op not implemented
     def test_FractionalMaxPool2d_zero_out_size(self, device):
+        # [FUNCTION DOC] Fractional max pool 2D with an output size containing 0 yields an empty
+        # tensor of the corresponding shape.
         mod = nn.FractionalMaxPool2d([2, 2], output_size=[0, 1])
         inp = torch.rand([16, 50, 32, 32], device=device)
         out = mod(inp)
@@ -653,6 +775,8 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @expectedFailureMPS  # Op not implemented
     def test_FractionalMaxPool3d_zero_out_size(self, device):
+        # [FUNCTION DOC] Fractional max pool 3D with an output size containing 0 yields an empty
+        # tensor of the corresponding shape.
         mod = nn.FractionalMaxPool3d([3, 2, 2], output_size=[0, 1, 1])
         inp = torch.rand([16, 50, 32, 32], device=device)
         out = mod(inp)
@@ -660,6 +784,9 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @expectedFailureMPS  # Op not implemented
     def test_FractionalMaxPool2d_zero_samples(self, device):
+        # [FUNCTION DOC] Fractional max pool 2D given an empty random samples tensor: a
+        # zero-batch input yields an empty output of shape zero by 16 by 1 by 1, while a batch of
+        # one input raises RuntimeError saying the random samples were expected to match.
         samples = torch.rand([0, 16, 2], device=device)
         mod = nn.FractionalMaxPool2d(
             [2, 2], output_size=[1, 1], _random_samples=samples
@@ -674,6 +801,10 @@ class TestPoolingNNDeviceType(NNTestCase):
 
     @expectedFailureMPS  # Op not implemented
     def test_FractionalMaxPool3d_zero_samples(self, device):
+        # [FUNCTION DOC] Fractional max pool 3D given an empty random samples tensor: a
+        # zero-batch input yields an empty output of shape zero by 16 by 1 by 1 by 1, while
+        # a batch of one input raises RuntimeError saying the random samples were expected
+        # to match.
         samples = torch.rand([0, 16, 3], device=device)
         mod = nn.FractionalMaxPool3d(
             [3, 2, 2], output_size=[1, 1, 1], _random_samples=samples
@@ -687,6 +818,9 @@ class TestPoolingNNDeviceType(NNTestCase):
             mod(inp1)
 
     def test_FractionalMaxPool3d_errors(self, device):
+        # [FUNCTION DOC] Checks fractional max pool 3D argument validation: zero or negative
+        # kernel sizes raise ValueError, and an absurdly large kernel size raises RuntimeError
+        # that it is too large relative to the input.
         samples = torch.rand([0, 16, 3], device=device)
         with self.assertRaisesRegex(ValueError, "kernel_size must be greater than 0"):
             nn.FractionalMaxPool3d(0, output_size=[1, 1, 1], _random_samples=samples)
@@ -707,6 +841,9 @@ class TestPoolingNNDeviceType(NNTestCase):
             )(samples)
 
     def test_MaxPool3d_errors(self, device):
+        # [FUNCTION DOC] Checks max pool 3D rejects a kernel size too large for the index type
+        # (RuntimeError, conversion message) and a negative kernel size (RuntimeError, must be
+        # greater than zero) when applied to a CPU tensor.
         samples = torch.randn(1, 3, 10, 10, 10)
         with self.assertRaisesRegex(RuntimeError, "value cannot be converted to type"):
             nn.MaxPool3d(
@@ -720,6 +857,9 @@ class TestPoolingNNDeviceType(NNTestCase):
             )(samples)
 
     def test_MaxPool_zero_batch_dim(self, device):
+        # [FUNCTION DOC] Checks max pool 1D, 2D and 3D modules accept zero-batch inputs via the
+        # shared helper, and that 2D and 3D modules raise RuntimeError for inputs with a zero
+        # channel dimension.
         inp = torch.randn(0, 16, 50, device=device)
         mod = torch.nn.MaxPool1d(3, stride=2).to(device)
         _test_module_empty_input(self, mod, inp, check_size=False)
@@ -744,6 +884,9 @@ class TestPoolingNNDeviceType(NNTestCase):
             mod(inp)
 
     def test_MaxUnpool_zero_batch_dim(self, device):
+        # [FUNCTION DOC] For 1D, 2D and 3D max pool with indices followed by max unpool on
+        # zero-batch inputs, checks the unpooled output is empty-zero and, after backward of the
+        # sum, the input gradient is zeros of the input shape.
         pool = torch.nn.MaxPool1d(2, stride=2, return_indices=True).to(device)
         unpool = torch.nn.MaxUnpool1d(2, stride=2).to(device)
         inp = torch.randn(0, 10, 10, requires_grad=True, device=device)
@@ -838,6 +981,13 @@ class TestPoolingNNDeviceType(NNTestCase):
     def test_MaxUnpool_index_errors(
         self, device, module_name, module_size, output_size, test_index, should_error
     ):
+        # [FUNCTION DOC] Parametrized (slow) test of out-of-range max unpool indices. A tensor
+        # of zero indices has its first element set to the given test index. On CUDA, runs a
+        # child Python process (device asserts would poison the parent) and, when an error is
+        # expected, requires the assert text or a HIP launch failure message in its output,
+        # otherwise requires no error text. On other devices, builds the module and expects a
+        # RuntimeError about an invalid max index when an error is expected (syncing on MPS),
+        # else the call succeeds.
         # NOTE: CUDA tests need to be run in a subprocess because they cause device asserts
         if torch.device(device).type == "cuda":
             error_msgs = {
@@ -897,6 +1047,9 @@ torch.cuda.synchronize()
 
     # https://github.com/pytorch/pytorch/issues/163409
     def test_MaxUnpool_invalid_output_size(self, device):
+        # [FUNCTION DOC] Regression test for issue 163409: max unpool 2D and 3D modules built
+        # with an empty kernel size raise RuntimeError saying exactly some number of values
+        # are required.
         input2d = torch.randn(1, 1, 1)
         input3d = torch.randn(1, 1, 1, 1, 1)
         unpool2d = torch.nn.MaxUnpool2d(())
@@ -910,6 +1063,8 @@ torch.cuda.synchronize()
 
     @expectedFailureMPS
     def test_AdaptiveMaxPool_zero_batch_dim(self, device):
+        # [FUNCTION DOC] Adaptive max pool 1D, 2D and 3D modules accept zero-batch inputs via the
+        # shared helper, and raise RuntimeError for inputs with a zero channel dimension.
         inp = torch.randn(0, 16, 50, device=device)
         mod = torch.nn.AdaptiveMaxPool1d(3).to(device)
         _test_module_empty_input(self, mod, inp, check_size=False)
@@ -936,6 +1091,8 @@ torch.cuda.synchronize()
 
     @onlyCPU
     def test_LPPool1d_kernel_size_overflow_large(self, device):
+        # [FUNCTION DOC] CPU-only: LP pool 1D with extreme norm type and huge stride raises
+        # RuntimeError about a value that cannot be converted to the needed type.
         avgpool = torch.nn.LPPool1d(
             -1.38119e150, 7879455037536781369, ceil_mode=True
         ).to(device)
@@ -945,6 +1102,8 @@ torch.cuda.synchronize()
             avgpool(inp)
 
     def test_lp_pool_norm_type_zero(self, device):
+        # [FUNCTION DOC] Checks that LP pool functionals and modules in 1D, 2D and 3D reject a
+        # norm type of zero with ValueError.
         err = "norm_type must be a non-zero value"
         x1 = torch.randn(1, 4, 8, device=device)
         x2 = torch.randn(1, 4, 8, 8, device=device)
@@ -963,6 +1122,9 @@ torch.cuda.synchronize()
             torch.nn.LPPool3d(norm_type=0, kernel_size=3)
 
     def test_AvgPool2d_empty(self, device):
+        # [FUNCTION DOC] Checks the average pool 2D module on zero-batch inputs, in contiguous
+        # and channels-last layouts, via the shared helper, and that a zero channel dimension
+        # raises RuntimeError mentioning 3D or 4D input.
         avgpool = torch.nn.AvgPool2d(3, stride=2).to(device)
         inp = torch.randn(0, 16, 20, 32, device=device)
         _test_module_empty_input(self, avgpool, inp, check_size=False)
@@ -980,6 +1142,10 @@ torch.cuda.synchronize()
     @parametrize_test("kernel", ["max", "avg"])
     @parametrize_test("pooling_dims", [1, 2, 3])
     def test_pooling_shape(self, device, kernel, pooling_dims):
+        # [FUNCTION DOC] Parametrized over max/avg kernels and 1-3 spatial dims: runs functional
+        # pooling with several kernel/stride/padding/ceil-mode settings and checks the output
+        # shape matches the expected one, plus a regression case from issue 45357. Skipped for
+        # max 1D (process aborts).
         """Test the output shape calculation for pooling functions"""
 
         if kernel == "max" and pooling_dims == 1:
@@ -988,6 +1154,10 @@ torch.cuda.synchronize()
 
         # Checks output shape against expected for 1D, 2D and 3D
         def check(expected_out_shape, sizes, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Builds a random tensor from the leading entries of the
+            # sizes, calls the selected pooling functional with the extra arguments and asserts
+            # the output shape equals the leading entries of the expected shape. Does nothing if
+            # the functional is missing.
             if hasattr(torch.nn.functional, f"{kernel}_pool{pooling_dims}d"):
                 op = getattr(torch.nn.functional, f"{kernel}_pool{pooling_dims}d")
                 t = torch.randn(sizes[: pooling_dims + 2], device=device)
@@ -1028,7 +1198,15 @@ torch.cuda.synchronize()
         self.assertEqual(y.size(), (1, 1, 3, 4))
 
     def test_adaptive_avg_pool2d_output_size_one(self, device):
+        # [FUNCTION DOC] Checks adaptive average pool 2D to a 1x1 output for contiguous,
+        # channels-last and non-contiguous strided inputs: result equals the mean over spatial
+        # dims, backward does not crash, and the output layout/strides are channels-last style or
+        # standard contiguous.
         def helper(size, memory_format):
+            # [FUNCTION DOC] HELPER: Builds a random integer-valued float input of the given size
+            # requiring grad, converts it to the memory format (or takes a strided slice for the
+            # non-contiguous marker), pools to 1x1, compares with the reference mean, runs
+            # backward and asserts the expected output contiguity and strides.
             x = torch.randint(
                 1, 10, size, dtype=torch.float, device=device, requires_grad=True
             )
@@ -1057,6 +1235,9 @@ torch.cuda.synchronize()
             helper((2, 3, 6, 6), mf)
 
     def test_adaptive_avg_pool3d_output_size_one(self, device):
+        # [FUNCTION DOC] Checks adaptive average pool 3D with output size 1 on a random input
+        # equals the mean over the three spatial dims, backward runs, and the output is
+        # contiguous with the standard strides.
         x = torch.randn(
             (2, 3, 6, 6, 6), dtype=torch.float, device=device, requires_grad=True
         )
@@ -1075,6 +1256,9 @@ torch.cuda.synchronize()
     @expectedFailureMeta  # Runtime Error not raised for meta
     @dtypes(torch.uint8, torch.int8, torch.short, torch.int, torch.long)
     def test_adaptive_pooling_no_suppot_input(self, device, dtype):
+        # [FUNCTION DOC] Integer input dtypes to adaptive max/avg pool 2D and 3D must raise
+        # RuntimeError saying the op is not (currently) implemented; on MPS the 2D case is
+        # allowed to succeed. Expected failure on the meta device, where no error is raised.
         for numel in (2, 3):
             for pool_type in ("Max", "Avg"):
                 cls_name = f"Adaptive{pool_type}Pool{numel}d"
@@ -1096,6 +1280,8 @@ torch.cuda.synchronize()
     @onlyMPS
     @dtypes(torch.uint8, torch.int8, torch.short, torch.int, torch.long)
     def test_adaptive_max_pool2d_int_input_mps(self, device, dtype):
+        # [FUNCTION DOC] MPS-only: adaptive max pool 2D to 2x2 on integer inputs must equal the
+        # maximum over non-overlapping 2x2 windows computed through unfold; seeds the global RNG.
         torch.manual_seed(0)
         inp = torch.randint(0, 16, (3, 4, 4), dtype=dtype, device=device)
         out = nn.AdaptiveMaxPool2d((2, 2))(inp)
@@ -1107,6 +1293,9 @@ torch.cuda.synchronize()
     @dtypes(torch.float, torch.double)
     @dtypesIfCUDA(torch.half, torch.float, torch.double)
     def test_avg_pool2d_nhwc(self, device, dtype):
+        # [FUNCTION DOC] Compares average pool 2D on channels-last inputs with a contiguous
+        # reference across kernel, stride, padding, include-pad and divisor override settings,
+        # including large shapes. Frees the CUDA cache before the large case under ROCm CUDA.
         def helper(
             n,
             c,
@@ -1118,6 +1307,10 @@ torch.cuda.synchronize()
             divisor_override=None,
             padding=0,
         ):
+            # [FUNCTION DOC] HELPER: Runs forward and backward of an average pool 2D module on a
+            # channels-last random input and on a contiguous clone with the same gradient (stride
+            # defaults to the kernel size). Asserts the output is channels-last, the reference is
+            # contiguous, and outputs and input gradients are equal.
             if stride is None:
                 stride = kernel_size
             input = torch.randn(n, c, h, w, dtype=dtype, device=device)
@@ -1178,6 +1371,8 @@ torch.cuda.synchronize()
     @dtypesIfCUDA(torch.half, torch.float, torch.double)
     @dtypesIfMPS(torch.float)
     def test_avg_pool3d_nhwc(self, device, dtype):
+        # [FUNCTION DOC] Compares average pool 3D on channels-last-3d inputs with a contiguous
+        # reference over several kernel, stride, padding, include-pad and divisor settings.
         def helper(
             n,
             c,
@@ -1190,6 +1385,9 @@ torch.cuda.synchronize()
             divisor_override=None,
             padding=0,
         ):
+            # [FUNCTION DOC] HELPER: Runs forward and backward of an average pool 3D module on a
+            # channels-last-3d input and on a contiguous clone; asserts equal outputs and equal
+            # input gradients (looser tolerances for half precision).
             if stride is None:
                 stride = kernel_size
             input = torch.randn(n, c, d, h, w, dtype=dtype, device=device)
@@ -1250,7 +1448,12 @@ torch.cuda.synchronize()
     @onlyCPU
     @dtypes(torch.float, torch.double)
     def test_max_pool1d_corner_cases(self, device, dtype):
+        # [FUNCTION DOC] CPU-only corner cases for max pool 1D, including padding with dilation
+        # producing negative infinity outputs, and ceil mode.
         def check(x, args, expected):
+            # [FUNCTION DOC] HELPER: Builds a max pool 1D module from the argument tuple,
+            # converts list inputs and expected values to tensors of the test dtype and device,
+            # and asserts the module output equals the expected tensor.
             model = torch.nn.MaxPool1d(*args)
             if isinstance(x, list):
                 x = torch.tensor(x, device=device, dtype=dtype)
@@ -1271,7 +1474,14 @@ torch.cuda.synchronize()
     @onlyCPU
     @dtypes(torch.float16, torch.float32)
     def test_max_pool_indices_corner_cases(self, device, dtype):
+        # [FUNCTION DOC] CPU-only: checks the returned indices of adaptive max pool 1D, 2D and 3D
+        # select the last element on very long inputs (above 2049 for half, above 2 to the 24th
+        # for float32 where indices exceed exact float integer range); the unit value is the
+        # final entry.
         def check_indices(x, args, expected, op):
+            # [FUNCTION DOC] HELPER: Builds the pooling module with indices returned, converts
+            # list inputs and expected values to tensors (indices as int64), and asserts the
+            # module returned indices equal the expected ones.
             model = op(*args, return_indices=True)
             if isinstance(x, list):
                 x = torch.tensor(x, device=device, dtype=dtype)
@@ -1317,8 +1527,14 @@ torch.cuda.synchronize()
     @onlyCPU
     @dtypes(torch.float, torch.double)
     def test_max_pool1d(self, device, dtype):
+        # [FUNCTION DOC] CPU-only: compares max pool 1D without indices to the same module with
+        # indices for random sizes, kernels, strides, dilations, paddings and ceil modes, and for
+        # non-contiguous and transposed inputs.
         # FIXME For now compare against max_pool1d with indices
         def check(x, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Builds a max pool 1D module with the given arguments plus
+            # one that also returns indices, and asserts the plain output equals the first output
+            # of the second.
             model = torch.nn.MaxPool1d(*args, **kwargs)
             ref_model = torch.nn.MaxPool1d(*args, **kwargs, return_indices=True)
             self.assertEqual(model(x), ref_model(x)[0])
@@ -1350,7 +1566,13 @@ torch.cuda.synchronize()
     @onlyAccelerator
     @gcIfJetson
     def test_max_pool2d(self, device):
+        # [FUNCTION DOC] Accelerator-only: max pool 2D forward and backward on the device matches
+        # the CPU result for the same random input, including a very large channel count and a
+        # degenerate height-one case.
         def helper(n, c, h, w, ks):
+            # [FUNCTION DOC] HELPER: Pools a random float tensor on the device and its CPU copy
+            # with the given kernel size, runs backward of the sums, and asserts outputs and
+            # input gradients agree.
             x = torch.randn(
                 n, c, h, w, device=device, dtype=torch.float, requires_grad=True
             )
@@ -1376,7 +1598,14 @@ torch.cuda.synchronize()
     @dtypesIfCUDA(torch.half, torch.float, torch.double)
     @gcIfJetson
     def test_max_pool2d_nhwc(self, device, dtype):
+        # [FUNCTION DOC] Compares max pool 2D with indices on channels-last inputs to a
+        # contiguous reference over several shapes and strides, checking output and indices
+        # layout, values, indices and input gradient.
         def helper(n, c, h, w, kernel_size, stride=None):
+            # [FUNCTION DOC] HELPER: Runs forward and backward of a max pool 2D module with
+            # indices on a channels-last input and on a contiguous clone; asserts output and
+            # indices memory formats, equal outputs, equal indices and equal input gradients
+            # (stride defaults to kernel size).
             if stride is None:
                 stride = kernel_size
             input = torch.randn(n, c, h, w, dtype=dtype, device=device)
@@ -1421,7 +1650,13 @@ torch.cuda.synchronize()
     @onlyCPU
     @dtypes(torch.int32, torch.int64)
     def test_max_pool2d_corner_cases(self, device, dtype):
+        # [FUNCTION DOC] CPU-only integer-dtype corner case of max pool 2D with padding, dilation
+        # and ceil mode: an input of all negative numbers must give the minimum everywhere, in
+        # both contiguous and channels-last layouts.
         def check(x, args, expected, memory_format):
+            # [FUNCTION DOC] HELPER: Builds a max pool 2D module from the argument tuple,
+            # converts list inputs and expected values to tensors in the given memory format and
+            # asserts the output equals the expected tensor.
             model = torch.nn.MaxPool2d(*args)
             if isinstance(x, list):
                 x = torch.tensor(x, device=device, dtype=dtype).to(
@@ -1451,7 +1686,15 @@ torch.cuda.synchronize()
     @dtypesIfCUDA(torch.half, torch.float, torch.double)
     @gcIfJetson
     def test_max_pool3d_ndhwc(self, device, dtype):
+        # [FUNCTION DOC] Compares max pool 3D with indices on channels-last-3d inputs against a
+        # contiguous reference across cubic and non-cubic kernels, strides and batch sizes,
+        # including a batch of zero meaning an unbatched 4D input.
         def helper(n, c, h, w, d, kernel_size, stride=None):
+            # [FUNCTION DOC] HELPER: Builds a channels-last-3d input (unbatched when the batch
+            # size is zero), expands integer kernel and stride to three values, runs forward and
+            # backward of max pool 3D with indices on it and on a contiguous clone, and asserts
+            # layouts of output and indices, equal values and indices, and equal input gradients
+            # (looser for half).
             batch = n
             if not batch:
                 batch = 1
@@ -1529,7 +1772,14 @@ torch.cuda.synchronize()
     @onlyCPU
     @dtypes(torch.half, torch.bfloat16)
     def test_max_pool_bfloat16_half(self, device, dtype):
+        # [FUNCTION DOC] CPU-only: for half and bfloat16 inputs, max pool 2D and 3D with indices
+        # in contiguous and channels-last layouts must keep dtype and memory format and match the
+        # float32 computation (outputs, indices and gradients) over a set of shapes.
         def helper(shape, kernel_size, stride, memory_format, dtype):
+            # [FUNCTION DOC] HELPER: Pools a reduced-precision input (module chosen by input
+            # rank) and a float32 copy, runs backward of the sums, and asserts layout and dtype
+            # of output and gradient, and equality with the float32 results cast back,
+            # including indices.
             input = torch.randn(shape, dtype=dtype, device=device)
             input = input.to(memory_format=memory_format).requires_grad_()
             if len(shape) == 4:
@@ -1569,7 +1819,12 @@ torch.cuda.synchronize()
     @onlyAccelerator
     @gcIfJetson
     def test_max_pool2d_indices(self, device):
+        # [FUNCTION DOC] Accelerator-only: max pool 2D with indices on the device equals the CPU
+        # result for outputs, indices and input gradients, for batched and unbatched inputs.
         def helper(n, c, h, w, ks):
+            # [FUNCTION DOC] HELPER: Builds a random input (batch dimension omitted when n is
+            # None), pools it and its CPU copy with indices, runs backward of the sums, and
+            # asserts equal outputs, indices and input gradients.
             if n is None:
                 x = torch.randn(
                     c, h, w, device=device, dtype=torch.float, requires_grad=True
@@ -1599,6 +1854,9 @@ torch.cuda.synchronize()
         helper(None, 3, 50, 50, ks=5)
 
     def test_max_pool2d_with_indices_backward_fails(self, device):
+        # [FUNCTION DOC] Checks the ATen max pool 2D with indices backward op raises RuntimeError
+        # (message about the expected tensor dimension) when the indices tensor shape is
+        # inconsistent with the grad output.
         grad_output = torch.randn(1, 2, 7, 7, device=device)
         input = torch.randn(1, 2, 7, 7, device=device)
         indices = torch.ones(1, 2, 3, 3, dtype=torch.long, device=device)
@@ -1622,7 +1880,13 @@ torch.cuda.synchronize()
     @onlyCPU
     @dtypes(torch.half, torch.bfloat16)
     def test_avg_pool2d_reduced_floating(self, device, dtype):
+        # [FUNCTION DOC] CPU-only: average pool 2D on half/bfloat16 inputs in contiguous
+        # and channels-last layouts keeps dtype and memory format, and matches the
+        # float32 computation.
         def helper(n, c, h, w, kernel_size, stride, memory_format):
+            # [FUNCTION DOC] HELPER: Pools a reduced-precision input and a float32 copy, runs
+            # backward of the sums, asserts output layout and dtypes, and equality of outputs and
+            # input gradients with the float32 results cast down.
             input = torch.randn(n, c, h, w, dtype=torch.float32, device=device).to(
                 dtype=dtype
             )
@@ -1651,7 +1915,15 @@ torch.cuda.synchronize()
     @dtypesIfMPS(torch.float)
     @expectedFailureMPS  # test_adaptive_pooling_max_nhwc currently fails on MPS - ISSUE#
     def test_adaptive_pooling_max_nhwc(self, device, dtype):
+        # [FUNCTION DOC] Compares adaptive max pool 2D and 3D with indices on channels-last
+        # inputs, both contiguous and channel-strided, against a contiguous reference for
+        # several sizes.
         def helper(input_size, output_plane_size, contig):
+            # [FUNCTION DOC] HELPER: Picks the 2D or 3D module and channels-last format from the
+            # number of output plane dims, builds integer-valued input and grad (optionally every
+            # second channel), runs forward/backward against a contiguous clone and asserts
+            # values, indices and gradient (layout asserted only for 2D since the 3D path does
+            # not return channels-last-3d).
             n_plane_dims = len(output_plane_size)
             mod = (
                 torch.nn.AdaptiveMaxPool2d
@@ -1704,7 +1976,14 @@ torch.cuda.synchronize()
     @dtypesIfMPS(torch.float)
     @expectedFailureMPS  # test_pooling_max_nhwc currently fails on MPS - ISSUE#
     def test_pooling_max_nhwc(self, device, dtype):
+        # [FUNCTION DOC] Compares max pool 2D with indices on channels-last inputs (contiguous
+        # and channel-strided) against a contiguous reference for several kernel, stride, padding
+        # and dilation settings.
         def helper(n, c, h, w, kernel_size, stride, padding, dilation, contig, device):
+            # [FUNCTION DOC] HELPER: Computes the expected output extent from the pooling
+            # formula, creates integer-valued channels-last input and grad (optionally strided),
+            # runs forward and backward on it and a contiguous clone, and asserts output/indices
+            # layouts, values, indices and input gradient.
             output_height = math.floor(
                 (h + 2 * padding[0] - dilation[0] * (kernel_size[0] - 1) - 1)
                 / stride[0]
@@ -1766,6 +2045,9 @@ torch.cuda.synchronize()
 
     @onlyAccelerator
     def test_pool3d_size_one_feature_dim(self, device):
+        # [FUNCTION DOC] Accelerator-only: 3D max and average pooling over an input whose
+        # size-one feature dimension has unusual strides must not crash and must match the
+        # CPU result.
         # Tests crazy strides for feature dim of size 1
         x = torch.randn(7, 1, 5, 3, 2, device=device)
         strange_strides = [30, 1234, 6, 2, 1]
@@ -1787,6 +2069,9 @@ torch.cuda.synchronize()
     @largeTensorTest("18GB")
     @largeTensorTest("180GB", "cpu")
     def test_pool3d_large_size_int64(self, device):
+        # [FUNCTION DOC] Accelerator-only large-memory regression for issue 52822: max pool 3D
+        # with kernel 5 on a huge half tensor (index math must use 64 bits); forward and backward
+        # on the device are compared with a float32 CPU reference without exact dtype matching.
         # See https://github.com/pytorch/pytorch/issues/52822
         x = torch.randn(
             70, 32, 100, 100, 100, dtype=torch.half, device=device, requires_grad=True
@@ -1808,6 +2093,10 @@ torch.cuda.synchronize()
 
     @onlyAccelerator
     def test_AvgPool3d_backward_after_cat_dim1_device(self, device):
+        # [FUNCTION DOC] Accelerator-only: backward of average pool 3D on a batch-of-one input
+        # where the gradient has an enlarged stride in the batch dim yet is still contiguous;
+        # raises an AssertionError if the gradient is unexpectedly not contiguous, then just
+        # runs backward.
         # x has to have batch_size 1 to test contiguous checks
         x = torch.randn(1, 3, 4, 4, 4, device=device, requires_grad=True)
         y = F.avg_pool3d(x, kernel_size=3, padding=1, stride=2)
@@ -1825,13 +2114,24 @@ torch.cuda.synchronize()
     def _test_maxpool_indices(
         self, num_dim, adaptive=False, device="cpu", dtype=torch.float
     ):
+        # [FUNCTION DOC] HELPER: Shared body for the max pool indices tests. For 1, 2 or 3
+        # spatial dims and either the regular or the adaptive pooling module, builds a small
+        # known input, checks the returned indices, the output and the input gradient against
+        # expected values built by the nested functions, on given device and dtype.
         def expected_indices(dim, dtype):
+            # [FUNCTION DOC] HELPER: Returns the expected max pool indices (flattened within each
+            # channel) for the known arange input, for one or two spatial dims, repeated for the
+            # two batch and two channel entries; implicitly returns nothing for other dims.
             if dim == 1:
                 return torch.tensor([1, 3], dtype=dtype).repeat(2, 2, 1)
             if dim == 2:
                 return torch.tensor([[5, 7], [13, 15]], dtype=dtype).repeat(2, 2, 1, 1)
 
         def expected_grad(dim, dtype):
+            # [FUNCTION DOC] HELPER: Recursively builds the expected input gradient for a ones
+            # grad of the pooled output: one-dimensional pattern with ones at odd positions,
+            # and for higher dims stacks zero and the lower-dim gradient alternately along a
+            # new axis.
             if dim == 1:
                 return torch.tensor([0, 1, 0, 1], dtype=dtype).repeat(2, 2, 1)
             grad = expected_grad(dim - 1, dtype=dtype)
@@ -1839,6 +2139,9 @@ torch.cuda.synchronize()
             return torch.stack((zero, grad, zero, grad), 2)
 
         def expected_output(dim, dtype):
+            # [FUNCTION DOC] HELPER: Returns the expected pooled maximum values for the
+            # known arange input for one or two spatial dims; implicitly returns nothing for
+            # other dims.
             if dim == 1:
                 return torch.arange(2, 17, 2, dtype=dtype).view(2, 2, 2)
             if dim == 2:
@@ -1902,38 +2205,50 @@ torch.cuda.synchronize()
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @dtypes(torch.float)
     def test_MaxPool1d_indices(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared max pool indices check for the 1D max pool module.
         self._test_maxpool_indices(1, device=device, dtype=dtype)
 
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @dtypes(torch.float)
     def test_MaxPool2d_indices(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared max pool indices check for the 2D max pool module.
         self._test_maxpool_indices(2, device=device, dtype=dtype)
 
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @dtypes(torch.float)
     def test_MaxPool3d_indices(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared max pool indices check for the 3D max pool module.
         self._test_maxpool_indices(3, device=device, dtype=dtype)
 
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @dtypes(torch.float)
     def test_AdaptiveMaxPool1d_indices(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared max pool indices check for the 1D adaptive max
+        # pool module.
         self._test_maxpool_indices(1, adaptive=True, device=device, dtype=dtype)
 
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @dtypes(torch.float)
     def test_AdaptiveMaxPool2d_indices(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared max pool indices check for the 2D adaptive max
+        # pool module.
         self._test_maxpool_indices(2, adaptive=True, device=device, dtype=dtype)
 
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @expectedFailureMPS
     @dtypes(torch.float)
     def test_AdaptiveMaxPool3d_indices(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared max pool indices check for the 3D adaptive max pool
+        # module (expected failure on MPS).
         self._test_maxpool_indices(3, adaptive=True, device=device, dtype=dtype)
 
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @expectedFailureMPS
     @dtypes(torch.float)
     def test_maxpool_indices_no_batch_dim(self, device, dtype):
+        # [FUNCTION DOC] For 1D to 3D max pool and adaptive max pool modules with indices, checks
+        # that indices computed on an unbatched input equal those of the same input with a batch
+        # of one, squeezed. Expected failure on MPS.
         """Check that indices with no batch dim is consistent with a single batch."""
         max_pool_cases = [
             (
@@ -1973,6 +2288,9 @@ torch.cuda.synchronize()
     @expectedFailureXLA
     @gcIfJetson
     def test_max_pool_nan_inf(self, device, dtype):
+        # [FUNCTION DOC] For regular and adaptive max pool functionals in 1D, 2D and 3D, a window
+        # of all NaN gives NaN and all negative infinity gives infinity-valued output, both when
+        # requiring grad (backward is also run) and without. Expected failure on MPS and XLA.
         for adaptive in ["", "adaptive_"]:
             for num_dim in [1, 2, 3]:
                 fn_name = f"{adaptive}max_pool{num_dim}d"
@@ -2009,11 +2327,19 @@ torch.cuda.synchronize()
     @expectedFailureMPS  # float64
     @expectedFailureMeta  # RuntimeError: Unrecognized tensor type ID: Meta
     def test_fractional_max_pool2d(self, device):
+        # [FUNCTION DOC] Fractional max pool 2D functional with fixed random samples under
+        # default dtype double: checks output shape for batched and unbatched input, runs
+        # gradcheck and gradgradcheck (skipped for unbatched on CUDA, issue 52427), and expects
+        # RuntimeError for wrong-length kernel sizes, oversized output sizes (height or width)
+        # and malformed output sizes.
         with set_default_dtype(torch.double):
             x = torch.randn(1, 2, 7, 7, requires_grad=True, device=device)
             samples = x.new(1, 2, 2).uniform_()
 
             def func(x):
+                # [FUNCTION DOC] HELPER: Applies fractional max pool 2D with kernel 2x2, output
+                # 3x3 and the shared fixed random samples to the input; used for shape and
+                # gradient checks.
                 return F.fractional_max_pool2d(
                     x, (2, 2), output_size=(3, 3), _random_samples=samples
                 )
@@ -2056,6 +2382,9 @@ torch.cuda.synchronize()
                     )
 
     def test_fractional_max_pool2d_backward_fails(self, device):
+        # [FUNCTION DOC] Checks the ATen fractional max pool 2D backward op raises RuntimeError
+        # (message that the grad output sizes are unexpected) when grad_output has an extra
+        # dimension relative to the input and indices.
         grad_output = torch.randn(1, 1, 2, 3, 3, device=device)
         input = torch.randn(1, 2, 7, 7, device=device)
         kernel_size = (2, 2)
@@ -2069,6 +2398,8 @@ torch.cuda.synchronize()
 
     @onlyNativeDeviceTypes
     def test_fractional_max_pool_invalid_kernel_size(self, device):
+        # [FUNCTION DOC] For native device types: ATen fractional max pool 2D and 3D with zero or
+        # negative kernel size entries raise RuntimeError saying sizes must be greater than zero.
         x = torch.randn(1, 2, 7, 7, device=device)
         samples = x.new(1, 2, 2).uniform_()
         for kernel_size in [(-1, 2), (0, 2)]:
@@ -2084,11 +2415,18 @@ torch.cuda.synchronize()
     @expectedFailureMPS  # float64
     @expectedFailureMeta  # RuntimeError: Unrecognized tensor type ID: Meta
     def test_fractional_max_pool3d(self, device):
+        # [FUNCTION DOC] Fractional max pool 3D functional with fixed random samples under
+        # default dtype double: checks output shape for batched and unbatched input, gradcheck
+        # and gradgradcheck, and RuntimeError for wrong-length kernel sizes, oversized output
+        # sizes along time, height or width and malformed output sizes.
         with set_default_dtype(torch.double):
             x = torch.randn(1, 2, 7, 7, 7, requires_grad=True, device=device)
             samples = x.new(1, 2, 3).uniform_()
 
             def func(x):
+                # [FUNCTION DOC] HELPER: Applies fractional max pool 3D with kernel 2x2x2, output
+                # 3x3x3 and the shared fixed random samples to the input; used for shape and
+                # gradient checks.
                 return F.fractional_max_pool3d(
                     x, (2, 2, 2), output_size=(3, 3, 3), _random_samples=samples
                 )
@@ -2133,6 +2471,9 @@ torch.cuda.synchronize()
     @dtypes(torch.float)
     @expectedFailureXLA
     def test_fractional_max_pool_nan_inf(self, device, dtype):
+        # [FUNCTION DOC] For fractional max pool modules in 2D and 3D, an all-NaN input gives NaN
+        # output and an all negative infinity input gives infinite output, with backward run for
+        # both. Expected failure on MPS and XLA.
         for num_dim in [2, 3]:
             fn_name = f"FractionalMaxPool{num_dim}d"
             fn = getattr(nn, fn_name)(kernel_size=2, output_size=1)
@@ -2160,6 +2501,9 @@ torch.cuda.synchronize()
 
     @expectedFailureXLA
     def test_pooling_zero_stride(self, device):
+        # [FUNCTION DOC] For max and average pooling functionals and modules in 1D to 3D, a
+        # stride of zero must raise RuntimeError stating the stride must not be zero or must be
+        # positive. Expected failure on XLA.
         for op in ("max", "avg"):
             for num_dim in [1, 2, 3]:
                 fn_name = f"{op}_pool{num_dim}d"
@@ -2182,6 +2526,9 @@ torch.cuda.synchronize()
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @dtypes(torch.float)
     def test_pool_large_size(self, device, dtype):
+        # [FUNCTION DOC] For max and average pooling functionals in 1D to 3D, pools a tensor with
+        # 16777217 elements along one axis (first integer not exactly representable in float32)
+        # using kernel one and checks the output length equals the input length.
         for op in ("max", "avg"):
             for num_dim in [1, 2, 3]:
                 fn_name = f"{op}_pool{num_dim}d"
@@ -2198,7 +2545,13 @@ torch.cuda.synchronize()
     @expectedFailureMPS  # Not implemented
     @largeTensorTest("6GB")
     def test_pooling_large(self, device):
+        # [FUNCTION DOC] Accelerator-only large-memory test (6GB): runs max, average, fractional
+        # max and adaptive max/avg pool 2D modules on a half tensor with more than int32 max
+        # elements and checks they complete without error. Expected failure on MPS.
         def helper(pool):
+            # [FUNCTION DOC] HELPER: Pools a random half tensor with more than 2 to the 31st
+            # elements using the given module, synchronizes the accelerator to surface any
+            # asynchronous errors.
             inp = torch.randn(
                 2**7 + 10, 2**8, 2**8, 2**8, dtype=torch.half, device=device
             )
@@ -2215,6 +2568,10 @@ torch.cuda.synchronize()
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @dtypes(torch.float)
     def test_pool_invalid_size(self, device, dtype):
+        # [FUNCTION DOC] For max and average functionals in 1D to 3D, uses an input and settings
+        # that make the output size zero only if floor division is applied correctly, and expects
+        # RuntimeError mentioning the input is too small; falls back to a larger kernel without
+        # dilation when the functional lacks a dilation argument.
         for op in ("max", "avg"):
             for num_dim in [1, 2, 3]:
                 fn_name = f"{op}_pool{num_dim}d"
@@ -2236,6 +2593,9 @@ torch.cuda.synchronize()
     @onlyAccelerator
     @expectedFailureMPS  # MPS adaptive avg pool requires divisible input/output sizes
     def test_pooling_bfloat16(self, device):
+        # [FUNCTION DOC] Accelerator-only: runs the shared bfloat16 comparison helper on average
+        # pool 1D/2D/3D and adaptive average pool 1D/2D/3D modules with tolerance 0.05. Expected
+        # failure on MPS.
         _test_bfloat16_ops(
             self,
             torch.nn.AvgPool1d(3, stride=2),
@@ -2276,6 +2636,9 @@ torch.cuda.synchronize()
         )
 
     def test_maxpool3d_non_square_backward(self, device):
+        # [FUNCTION DOC] Regression check for a CUDA backward launch-grid bug in max pool 3D: for
+        # inputs where a different one of the three trailing dims is long, a unit kernel pool
+        # backward must give a gradient of ones everywhere.
         # previous CUDA routine of this backward calculates kernel launch grid size
         # with last two dimensions interchanged, so the tailing along the longer dim
         # get ignored. Here we test whether every position gets gradient.
@@ -2287,6 +2650,9 @@ torch.cuda.synchronize()
 
     @slowTest
     def test_adaptive_pool_odd_size(self, device):
+        # [FUNCTION DOC] Slow smoke test for issue 81409: adaptive average and max pooling 2D and
+        # 3D on large inputs with odd, non-divisible sizes must run without errors; results are
+        # not checked.
         # See https://github.com/pytorch/pytorch/issues/81409
         Ih, Iw, Oh, Ow = 5873, 3693, 3527, 2219
         imgs = torch.randint(low=0, high=256, size=(11, Ih, Iw), dtype=torch.float)

@@ -1,4 +1,9 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for the pruning utilities in the nn utils prune module: amount validation,
+# mask computation for random, L1, Ln, custom and global pruning, the pruning container,
+# reparametrization bookkeeping (original parameter, mask buffer, removal), rollback on failure,
+# pickling and state dict serialization, and RNN weight handling. Registers the parametrized test
+# class at import time and runs the tests when executed as a script.
 import pickle
 import unittest
 import unittest.mock as mock
@@ -17,6 +22,9 @@ from torch.testing._internal.common_utils import (
 
 
 class TestPruningNN(NNTestCase):
+    # [CLASS DOC] Test case for pruning behavior; declares a generic hardware classification and
+    # enables the CUDA memory leak check and non-default CUDA stream mode. Each test builds its
+    # own small modules, so there is no shared state.
     hw_classification = HardwareClassification.GENERIC
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
@@ -24,6 +32,10 @@ class TestPruningNN(NNTestCase):
     # torch/nn/utils/prune.py
     @unittest.skipIf(not TEST_NUMPY, "numpy not found")
     def test_validate_pruning_amount_init(self):
+        # [FUNCTION DOC] Checks the init-time amount validation helper: a non-number raises
+        # TypeError, a fraction outside zero to one or a negative integer raises ValueError,
+        # and assorted valid fractions and non-negative integers raise nothing. Skipped
+        # without numpy.
         r"""Test the first util function that validates the pruning
         amount requested by the user the moment the pruning method
         is initialized. This test checks that the expected errors are
@@ -58,6 +70,9 @@ class TestPruningNN(NNTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "numpy not found")
     def test_validate_pruning_amount(self):
+        # [FUNCTION DOC] Checks the size-aware amount validation helper: an integer amount larger
+        # than the tensor size raises ValueError, while fractional amounts and amounts that fit
+        # pass. Skipped without numpy.
         r"""Tests the second util function that validates the pruning
         amount requested by the user, this time with respect to the size
         of the tensor to prune. The rationale is that if the pruning amount,
@@ -80,6 +95,9 @@ class TestPruningNN(NNTestCase):
 
     @unittest.skipIf(not TEST_NUMPY, "numpy not found")
     def test_compute_nparams_to_prune(self):
+        # [FUNCTION DOC] Checks conversion of an amount into a number of units to prune: integers
+        # are taken as counts, a float is a fraction of the tensor size (rounded, for example
+        # forty percent of seventeen gives seven), zero gives zero. Skipped without numpy.
         r"""Test that requested pruning `amount` gets translated into the
         correct absolute number of units to prune.
         """
@@ -92,6 +110,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(prune._compute_nparams_toprune(amount=0.4, tensor_size=17), 7)
 
     def test_random_pruning_sizes(self):
+        # [FUNCTION DOC] For linear and 3D convolution modules and for weight and bias, applies
+        # random unstructured pruning and checks the mask, original copy and pruned tensor all
+        # have the size of the original tensor.
         r"""Test that the new parameters and buffers created by the pruning
         method have the same size as the input tensor to prune. These, in
         fact, correspond to the pruned version of the tensor itself, its
@@ -120,6 +141,9 @@ class TestPruningNN(NNTestCase):
                     self.assertEqual(original_tensor.size(), getattr(m, name).size())
 
     def test_random_pruning_orig(self):
+        # [FUNCTION DOC] After random unstructured pruning of weight and bias of a linear
+        # and a 3D convolution module, the stored original-parameter copy equals the
+        # pre-pruning tensor.
         r"""Test that original tensor is correctly stored in 'orig'
         after pruning is applied. Important to make sure we don't
         lose info about the original unpruned parameter.
@@ -138,6 +162,8 @@ class TestPruningNN(NNTestCase):
                     self.assertEqual(original_tensor, getattr(m, name + "_orig"))
 
     def test_random_pruning_new_weight(self):
+        # [FUNCTION DOC] After random pruning the module attribute must equal the stored original
+        # parameter multiplied by the mask cast to the tensor dtype.
         r"""Test that module.name now contains a pruned version of
         the original tensor obtained from multiplying it by the mask.
         """
@@ -160,6 +186,9 @@ class TestPruningNN(NNTestCase):
                     )
 
     def test_identity_pruning(self):
+        # [FUNCTION DOC] Checks that the identity pruning method (all-ones mask) leaves forward
+        # output, weight and bias gradients unchanged compared with the unpruned module, and that
+        # two forward calls in a row agree. Gradients land on the original weight parameter.
         r"""Test that a mask of 1s does not change forward or backward."""
         input_ = torch.ones(1, 5)
         m = nn.Linear(5, 2)
@@ -193,6 +222,11 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(y1, y2)
 
     def test_random_pruning_0perc(self):
+        # [FUNCTION DOC] Same invariants as the identity test but gets the all-ones mask by
+        # patching the random pruning method's mask computation to return ones, so the requested
+        # amount is ignored; checks outputs, gradients and repeated forward consistency.
+        # KNOWN ISSUE: the docstring is copied from the identity pruning test and does not
+        # mention the mock.
         r"""Test that a mask of 1s does not change forward or backward."""
         input_ = torch.ones(1, 5)
         m = nn.Linear(5, 2)
@@ -232,6 +266,10 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(y1, y2)
 
     def test_random_pruning(self):
+        # [FUNCTION DOC] Patches the random pruning mask computation to a hand-made mask with
+        # two zeros; checks the original weight gradient equals that mask, the bias gradient is
+        # ones, and after a manual gradient step the masked entries of the original weight do
+        # not change.
         input_ = torch.ones(1, 5)
         m = nn.Linear(5, 2)
 
@@ -264,6 +302,8 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(old_weight_orig[0, 3], m.weight_orig[0, 3])
 
     def test_random_pruning_forward(self):
+        # [FUNCTION DOC] Patches the mask to keep only two weight entries and checks each output
+        # of a linear layer on a ones input equals the single kept original weight plus the bias.
         r"""check forward with mask (by hand)."""
         input_ = torch.ones(1, 5)
         m = nn.Linear(5, 2)
@@ -284,6 +324,8 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(yhat[0, 1], m.weight_orig[1, 0] + m.bias[1])
 
     def test_remove_pruning_forward(self):
+        # [FUNCTION DOC] Prunes with a patched hand-made mask, then removes the pruning and
+        # checks the forward output stays the same as in the pruned state.
         r"""Remove pruning and check forward is unchanged from previous
         pruned state.
         """
@@ -310,6 +352,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(y_postpruning, y_postremoval)
 
     def test_pruning_id_consistency(self):
+        # [FUNCTION DOC] Checks that pruning and then removing pruning keeps the identity of
+        # the first parameter object unchanged, so existing optimizers still reference the
+        # right parameter.
         r"""Test that pruning doesn't change the id of the parameters, which
         would otherwise introduce issues with pre-existing optimizers that
         point to old parameters.
@@ -325,6 +370,8 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(tensor_id, id(next(iter(m.parameters()))))
 
     def test_random_pruning_pickle(self):
+        # [FUNCTION DOC] Prunes weight and bias of a linear and a 3D convolution module, then
+        # pickles and unpickles the module and checks the copy has the same type.
         modules = [nn.Linear(5, 7), nn.Conv3d(2, 2, 2)]
         names = ["weight", "bias"]
 
@@ -336,6 +383,10 @@ class TestPruningNN(NNTestCase):
                     self.assertIsInstance(m_new, type(m))
 
     def test_multiple_pruning_calls(self):
+        # [FUNCTION DOC] Applies L1 unstructured then Ln structured pruning on the same weight
+        # and checks the forward hook becomes a pruning container of length two with the right
+        # tensor name, entries in order, and a mask that keeps earlier zeros; prunes a third time
+        # with an infinity norm and checks the container tensor name again.
         # if you call pruning twice, the hook becomes a PruningContainer
         m = nn.Conv3d(2, 2, 2)
         prune.l1_unstructured(m, name="weight", amount=0.1)
@@ -370,6 +421,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(hook._tensor_name, "weight")
 
     def test_pruning_container(self):
+        # [FUNCTION DOC] Checks pruning container method addition: an added method with the same
+        # tensor name works; one with a different tensor name raises ValueError; adding a non
+        # pruning method object (a number or a string) raises TypeError.
         # create an empty container
         container = prune.PruningContainer()
         container._tensor_name = "test"
@@ -395,6 +449,9 @@ class TestPruningNN(NNTestCase):
             container.add_pruning_method("ugh")
 
     def test_pruning_container_compute_mask(self):
+        # [FUNCTION DOC] Checks the container mask computation with a known tensor and prior
+        # mask: after an unstructured L1 step, then adding a structured pruning of one row, then
+        # of one column, the computed mask equals the hand-derived expected masks each time.
         r"""Test `compute_mask` of pruning container with a known `t` and
         `default_mask`. Indirectly checks that Ln structured pruning is
         acting on the right axis.
@@ -441,6 +498,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(expected_mask, computed_mask)
 
     def test_l1_unstructured_pruning(self):
+        # [FUNCTION DOC] Checks L1 unstructured pruning removes the two smallest magnitude
+        # weights of a hand-set weight matrix, and a second call prunes the next two while
+        # keeping the earlier mask.
         r"""Test that l1 unstructured pruning actually removes the lowest
         entries by l1 norm (by hand). It also checks that applying l1
         unstructured pruning more than once respects the previous mask.
@@ -465,6 +525,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(expected_weight, m.weight)
 
     def test_l1_unstructured_pruning_with_importance_scores(self):
+        # [FUNCTION DOC] Same as the L1 test but selection uses a supplied importance
+        # scores tensor instead of the weight magnitudes; compares weights after two
+        # successive prunings.
         r"""Test that l1 unstructured pruning actually removes the lowest
         entries of importance scores and not the parameter by l1 norm (by hand).
         It also checks that applying l1 unstructured pruning more than once
@@ -498,6 +561,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(expected_weight, m.weight)
 
     def test_unstructured_pruning_same_magnitude(self):
+        # [FUNCTION DOC] With a tensor containing many equal magnitudes, checks L1 unstructured
+        # pruning removes exactly the requested count of entries (bottom fraction) rather than
+        # everything at the threshold value.
         r"""Since it may happen that the tensor to prune has entries with the
         same exact magnitude, it is important to check that pruning happens
         consistently based on the bottom % of weights, and not by threshold,
@@ -514,6 +580,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(nparams_toprune, nparams_pruned)
 
     def test_random_structured_pruning_amount(self):
+        # [FUNCTION DOC] Checks random structured pruning of a given amount along the last axis
+        # of a three-dimensional tensor zeroes exactly one whole slice of twenty entries and
+        # leaves the rest intact; raises AssertionError otherwise.
         AMOUNT = 0.6
         AXIS = 2
         p = prune.RandomStructured(amount=AMOUNT, dim=AXIS)
@@ -529,6 +598,9 @@ class TestPruningNN(NNTestCase):
             )
 
     def test_ln_structured_pruning(self):
+        # [FUNCTION DOC] Checks Ln structured pruning by hand on a convolution weight: first
+        # removes one of three channels by L2 norm, then one of two columns along the last axis
+        # by L1 norm, comparing against expected masks.
         r"""Check Ln structured pruning by hand."""
         m = nn.Conv2d(3, 1, 2)
         m.weight.data = torch.tensor(
@@ -555,6 +627,8 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(expected_mask_axis3, m.weight_mask)
 
     def test_ln_structured_pruning_importance_scores(self):
+        # [FUNCTION DOC] Same as the Ln structured test but the channel and column to remove are
+        # chosen by a supplied importance scores tensor instead of the weight values.
         r"""Check Ln structured pruning by hand."""
         m = nn.Conv2d(3, 1, 2)
         m.weight.data = torch.tensor(
@@ -594,6 +668,10 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(expected_mask_axis3, m.weight_mask)
 
     def test_remove_pruning(self):
+        # [FUNCTION DOC] For linear and 3D convolution modules, after pruning the module has the
+        # original parameter and mask buffer and not a plain parameter; after removing pruning
+        # the plain parameter returns, the extra ones are gone, and the final tensor equals the
+        # pruned one.
         r"""`prune.remove` removes the hook and the reparametrization
         and makes the pruning final in the original parameter.
         """
@@ -621,6 +699,10 @@ class TestPruningNN(NNTestCase):
                     self.assertEqual(pruned_t, final_t)
 
     def test_remove_pruning_exception(self):
+        # [FUNCTION DOC] Checks that removing pruning from modules never pruned raises
+        # ValueError, and that the pruned-state query reports false first.
+        # KNOWN ISSUE: the docstring says an assertion error is thrown but the test
+        # expects ValueError.
         r"""Removing from an unpruned tensor throws an assertion error"""
         modules = [nn.Linear(5, 7), nn.Conv3d(2, 2, 2)]
         names = ["weight", "bias"]
@@ -635,6 +717,9 @@ class TestPruningNN(NNTestCase):
                         prune.remove(m, name)
 
     def test_global_pruning(self):
+        # [FUNCTION DOC] Checks global L1 unstructured pruning across two linear weights removes
+        # the four smallest magnitude weights globally, comparing both resulting weights with
+        # expected values.
         r"""Test that global l1 unstructured pruning over 2 parameters removes
         the `amount=4` smallest global weights across the 2 parameters.
         """
@@ -667,6 +752,8 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(expected_nweight, n.weight)
 
     def test_global_pruning_importance_scores(self):
+        # [FUNCTION DOC] Same as the global pruning test but selection uses a mapping from each
+        # parameter pair to a supplied importance scores tensor; compares both resulting weights.
         r"""Test that global l1 unstructured pruning over 2 parameters removes
         the `amount=4` smallest global weights across the 2 parameters.
         """
@@ -710,6 +797,8 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(expected_n_weight, n.weight)
 
     def test_custom_from_mask_pruning(self):
+        # [FUNCTION DOC] Checks the custom-from-mask method combines a given mask with the
+        # previous default mask (an elementwise product) when computing the new mask.
         r"""Test that the CustomFromMask is capable of receiving
         as input at instantiation time a custom mask, and combining it with
         the previous default mask to generate the correct final mask.
@@ -732,6 +821,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(computed_mask, expected_mask)
 
     def test_pruning_rollback(self):
+        # [FUNCTION DOC] With the L1 mask computation patched to raise an exception, pruning must
+        # raise, and the module must be left unchanged: parameter still present, no mask buffer
+        # and no original-parameter entry.
         r"""Test that if something fails when the we try to compute the mask,
         then the model isn't left in some intermediate half-pruned state.
         The try/except statement in `apply` should handle rolling back
@@ -755,6 +847,9 @@ class TestPruningNN(NNTestCase):
                         self.assertFalse(name + "_orig" in dict(m.named_parameters()))
 
     def test_pruning_serialization_model(self):
+        # [FUNCTION DOC] Prunes one layer of a sequential model, checks state dict keys change to
+        # the original weight and mask, saves the whole model to a temporary file and loads it
+        # back (full unpickling), then checks keys and pruned weight values survive.
         # create a model
         model = torch.nn.Sequential(
             torch.nn.Linear(10, 10),
@@ -791,6 +886,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(pruned_weight, new_model[0].weight)
 
     def test_pruning_serialization_state_dict(self):
+        # [FUNCTION DOC] Prunes then removes pruning on one layer, saves only the state dict to a
+        # temporary file, loads it into a fresh model, and checks no original/mask keys exist and
+        # the weight equals the pruned weight.
         # create a model
         model = torch.nn.Sequential(
             torch.nn.Linear(10, 10),
@@ -841,6 +939,9 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(pruned_weight, new_model[0].weight)
 
     def test_prune(self):
+        # [FUNCTION DOC] Checks the prune method of an L1 method with a prior mask returns the
+        # tensor multiplied by the expected mask (two lowest magnitude units zeroed among
+        # unmasked ones).
         # create a new pruning method
         p = prune.L1Unstructured(amount=2)
         # create tensor to be pruned
@@ -854,6 +955,8 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(t * expected_mask, pruned_tensor)
 
     def test_prune_importance_scores(self):
+        # [FUNCTION DOC] Same as the prune method test but unit selection follows a supplied
+        # importance scores tensor rather than the tensor values.
         # create a new pruning method
         p = prune.L1Unstructured(amount=2)
         # create tensor to be pruned
@@ -870,6 +973,8 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(t * expected_mask, pruned_tensor)
 
     def test_prune_importance_scores_mimic_default(self):
+        # [FUNCTION DOC] Checks that passing the tensor itself as importance scores gives the
+        # same pruned tensor as omitting scores, and that it matches the expected masked result.
         # create a new pruning method
         p = prune.L1Unstructured(amount=2)
         # create tensor to be pruned
@@ -890,6 +995,10 @@ class TestPruningNN(NNTestCase):
         self.assertEqual(t * expected_mask, pruned_tensor_without_importance_scores)
 
     def test_rnn_pruning(self):
+        # [FUNCTION DOC] Prunes one weight of an LSTM and checks only three of the four flat
+        # weights are parameters, removes the pruning and checks four parameters again with the
+        # original name restored in the parameter dictionary and the reparametrization part gone;
+        # raises AssertionError on any mismatch.
         l = torch.nn.LSTM(32, 32)
         # This Module has 4 parameters called:
         # 'weight_ih_l0', 'weight_hh_l0', 'bias_ih_l0', 'bias_hh_l0'
