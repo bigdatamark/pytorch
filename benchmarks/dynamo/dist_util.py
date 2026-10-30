@@ -1,3 +1,7 @@
+# [MODULE DOC] Helpers for the distributed (DDP/FSDP) dynamo benchmark driver. Provides
+# process-group setup/teardown, toy models, a torchbench model loader, a train-step function,
+# and FSDP wrapping with optional activation checkpointing. Imports torchbench helper with a
+# relative-then-absolute fallback; no other import-time side effects.
 import argparse
 import functools
 import importlib
@@ -23,6 +27,9 @@ except ImportError:
 
 
 def setup(rank, world_size):
+    # [FUNCTION DOC] Initialize the NCCL process group. Fills MASTER_ADDR, MASTER_PORT, RANK
+    # and WORLD_SIZE in the environment with defaults (localhost, 12355, 0, 1) when unset.
+    # The rank and world_size arguments are ignored; values come only from the environment.
     os.environ["MASTER_ADDR"] = os.getenv("MASTER_ADDR", "localhost")
     os.environ["MASTER_PORT"] = os.getenv("MASTER_PORT", "12355")
     os.environ["RANK"] = os.getenv("RANK", "0")
@@ -31,20 +38,28 @@ def setup(rank, world_size):
 
 
 def cleanup():
+    # [FUNCTION DOC] Destroy the default distributed process group.
     dist.destroy_process_group()
 
 
 class CustomLinear(torch.nn.Module):
+    # [CLASS DOC] Module holding a single learnable matrix parameter of shape (a, b), applied
+    # to the input by matrix multiplication. Not used elsewhere in this file.
     def __init__(self, a, b):
+        # [FUNCTION DOC] Create a randomly initialized weight parameter with a rows and b columns.
         super().__init__()
         self.weight = nn.Parameter(torch.randn(a, b))
 
     def forward(self, x):
+        # [FUNCTION DOC] Return the matrix product of input x with the weight parameter.
         return torch.mm(x, self.weight)
 
 
 class MyModule(torch.nn.Module):
+    # [CLASS DOC] Block of a linear layer (a to b features) followed by ReLU; used as the FSDP
+    # wrapping unit for the toy model.
     def __init__(self, a, b):
+        # [FUNCTION DOC] Build the sequential linear + ReLU network for sizes a and b.
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(a, b),
@@ -52,11 +67,15 @@ class MyModule(torch.nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] Apply the linear + ReLU network to x and return the result.
         return self.net(x)
 
 
 class ToyModel(nn.Module):
+    # [CLASS DOC] Large toy network: a stack of wide linear/ReLU layers and MyModule blocks
+    # (widths 10 -> 10000 -> 1000), ending in a 5-way linear. Takes inputs with 10 features.
     def __init__(self):
+        # [FUNCTION DOC] Build the fixed sequential stack of layers; no arguments.
         super().__init__()
         self.net = nn.Sequential(
             *[nn.Linear(10, 10000), nn.ReLU()]
@@ -74,10 +93,13 @@ class ToyModel(nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] Run x through the sequential stack and return the output.
         return self.net(x)
 
 
 def model_iter_fn(model, example_inputs, collect_outputs=False):
+    # [FUNCTION DOC] One training iteration: forward pass, reduce outputs to a scalar loss,
+    # and backward pass. Returns the outputs only if collect_outputs is true, else None.
     outputs = model(*example_inputs)
     loss = reduce_to_scalar_loss(outputs)
     loss.backward()
@@ -86,6 +108,10 @@ def model_iter_fn(model, example_inputs, collect_outputs=False):
 
 
 def get_model(args):
+    # [FUNCTION DOC] Build the (model, example_inputs) pair from parsed args. With a torchbench
+    # model name, changes to the torchbench directory, imports that model, and instantiates it
+    # in train mode with the given device and batch size. With the toy flag, builds the toy model
+    # with a random input of shape 20 by 10. Otherwise raises argparse.ArgumentError.
     if args.torchbench_model:
         setup_torchbench_cwd()
         module = importlib.import_module(
@@ -106,6 +132,8 @@ def get_model(args):
 
 
 def fsdp_checkpointing_base(model, blocks):
+    # [FUNCTION DOC] Apply non-reentrant activation checkpointing (no CPU offload) in place to
+    # every submodule that is an instance of the given block types. Returns None.
     """apply activation checkpointing to model
     returns None as model is updated directly
     """
@@ -116,6 +144,7 @@ def fsdp_checkpointing_base(model, blocks):
     )
 
     def check_fn(submodule):
+        # [FUNCTION DOC] HELPER: Predicate for checkpointing: true if submodule is one of blocks.
         return isinstance(submodule, blocks)
 
     apply_activation_checkpointing(
@@ -129,6 +158,11 @@ MODEL_FSDP_WRAP = {
 
 
 def apply_fsdp(args, model, use_checkpointing=False, use_wrap_policy=True):
+    # [FUNCTION DOC] Wrap the model in FSDP with original parameters kept. Block types come from
+    # the wrap table, keyed by toy model if the model is the toy class, else by the torchbench
+    # model name in args (raises KeyError if absent). Uses a module wrap policy over those
+    # blocks when use_wrap_policy is true. Optionally applies activation checkpointing.
+    # Returns the wrapped model.
     wrap_policy = None
     blocks = MODEL_FSDP_WRAP[
         "toy_model" if model.__class__ is ToyModel else args.torchbench_model

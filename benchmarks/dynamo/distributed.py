@@ -1,3 +1,8 @@
+# [MODULE DOC] Command-line driver that times a training step of a torchbench or toy model
+# under eager or dynamo, optionally with DDP or FSDP, torchviz graph dump, or profiler trace.
+# Meant to be launched once per rank (rank/world size come from the environment). Imports
+# helpers with a relative-then-absolute fallback; running as a script parses arguments and
+# prints the mean latency.
 import argparse
 import logging
 import os
@@ -22,6 +27,9 @@ log = logging.getLogger(__name__)
 
 
 def torchviz_model(args, model, inputs, rank):
+    # [FUNCTION DOC] Run one forward pass, build an autograd graph with torchviz (imported
+    # lazily) showing attrs and saved tensors, and on rank 0 render it to a file named
+    # torchviz.dot. The args parameter is unused.
     from torchviz import make_dot
 
     outputs = model(*inputs)
@@ -33,6 +41,8 @@ def torchviz_model(args, model, inputs, rank):
 
 
 def profile_model(args, model, inputs, rank):
+    # [FUNCTION DOC] Profile args.repeat forward+backward iterations on CPU and CUDA, with
+    # labeled Forward and Backward regions. On rank 0 export a chrome trace to args.trace_file.
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         for i in range(args.repeat):
             with record_function("Forward"):
@@ -45,6 +55,13 @@ def profile_model(args, model, inputs, rank):
 
 
 def run_model(args, model, inputs, key):
+    # [FUNCTION DOC] Benchmark one model in this process. Reads rank and world size from the
+    # environment, initializes the process group, moves model and tensor inputs to the device
+    # of this rank, wraps with FSDP or DDP if requested, and optionally compiles with dynamo
+    # (backend name from args.dynamo; "print" prints each captured graph). Resets dynamo,
+    # may change dynamo config, and disables inductor cudagraphs when combined with FSDP.
+    # Runs 3 warmup iterations then args.repeat timed ones, optionally dumps torchviz/profile
+    # output, destroys the process group and returns the total time. The key argument is unused.
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
     # result_q = []
@@ -58,6 +75,8 @@ def run_model(args, model, inputs, key):
     model = model.to(dev_rank)
 
     def move_tensor(maybe_tensor):
+        # [FUNCTION DOC] HELPER: Move a value to this rank's device if it is a tensor, else
+        # return it unchanged.
         if torch.is_tensor(maybe_tensor):
             return maybe_tensor.to(dev_rank)
         return maybe_tensor
@@ -89,6 +108,8 @@ def run_model(args, model, inputs, key):
             log.warning("disabling inductor cudagraphs for compatibility with FSDP")
 
         def print_compile(gm, ex):
+            # [FUNCTION DOC] HELPER: Debug dynamo backend: print the captured graph and return the
+            # graph module unchanged (example inputs unused).
             print(
                 f"print_compile:\n{str(gm.graph)}\n-----------------------------------------"
             )

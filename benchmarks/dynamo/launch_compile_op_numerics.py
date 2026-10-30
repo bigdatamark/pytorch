@@ -1,3 +1,12 @@
+# [MODULE DOC] Multi-machine harness comparing numerics of eager and compiled PyTorch ops on
+# GPUs. Roles, chosen by command line flags: launcher (reserves remote GPU machines, copies this
+# script, runs the worker remotely, pulls results and renders html), worker (builds a python
+# environment per configured PyTorch / CUDA pair and runs the runner for each execution mode),
+# runner (creates or loads golden inputs and outputs and spawns one test subprocess per
+# combination of dtype, op category, function and pass type) and test (runs one case and prints
+# a json result line with ulp error statistics and hashes). Also holds the tables of modes,
+# dtypes, op categories and pass types. Import-time side effects: optional torch import and
+# creation of asyncio locks and a concurrency semaphore. Remote paths assume a /workspace dir.
 import argparse
 import asyncio
 import datetime
@@ -57,6 +66,9 @@ PYTHON_VERSION = "3.11"
 
 @dataclass
 class Mode:
+    # [CLASS DOC] Dataclass describing how to run a function: eager (no compile) or compiled with
+    # an optional backend, mode string, inductor options mapping and extra environment variables
+    # for the test subprocess. Calling an instance on a function applies the mode to it.
     compile: bool
     backend: str | None = None
     mode: str | None = None
@@ -64,6 +76,10 @@ class Mode:
     env: dict = field(default_factory=dict)
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Apply the mode to a function. When compiling, calls torch compile with
+        # the backend and mode if set, and the options restricted to those that inductor
+        # lists as valid. When not compiling, raises AssertionError if backend, mode or options
+        # were set, otherwise returns the function unchanged.
         if self.compile:
             kwargs = {}
             if self.backend is not None:
@@ -107,6 +123,12 @@ DTYPES = ["float32", "float16", "bfloat16"]
 
 
 async def run(command, capture_output=True, capture_stderr=True, stderr=None, **kwargs):
+    # [FUNCTION DOC] HELPER: Run a shell command asynchronously (split into arguments, no shell,
+    # stdin closed) and wait for it. With capture_output, returns the decoded stdout, with
+    # stderr merged into it unless capture_stderr is false, in which case the given stderr
+    # target is used. Without capture_output, returns None. Logs the command and return code.
+    # Extra keyword arguments (env, cwd, ...) go to the subprocess. A nonzero exit is not
+    # raised.
     log.info("Running command: %s", command)
     proc = await asyncio.create_subprocess_exec(
         *shlex.split(command),
@@ -128,14 +150,20 @@ async def run(command, capture_output=True, capture_stderr=True, stderr=None, **
 
 
 async def copy_file_to_remote(hostname, source, destination):
+    # [FUNCTION DOC] HELPER: Copy a local file to a path on a remote host using scp.
     await run(f"scp {source} {hostname}:{destination}")
 
 
 async def execute_on_remote(hostname, command):
+    # [FUNCTION DOC] HELPER: Run a command on a remote host over ssh, without capturing output.
     await run(f"ssh {hostname} {command}", capture_output=False)
 
 
 async def copy_results_from_remote(hostname, run_id):
+    # [FUNCTION DOC] HELPER: Fetch results of a run from a remote host into a local results
+    # directory named after the run id: the result jsonl files and a logs archive, which is
+    # unpacked; tlparse is run on each trace directory in parallel; then the archive, raw log
+    # files and raw tlparse outputs are removed.
     await run(f"mkdir -p results_{run_id}/logs")
     await run(f"scp {hostname}:/workspace/result_*.jsonl results_{run_id}/")
     await run(
@@ -155,12 +183,19 @@ async def copy_results_from_remote(hostname, run_id):
 
 
 async def do_numerics_test(args, hostname, gpu, run_id):
+    # [FUNCTION DOC] HELPER: Per-machine job: copy this script to the remote host, run it there
+    # in worker mode for the given gpu type, then copy back the results. The args value is
+    # unused.
     await copy_file_to_remote(hostname, __file__, "/workspace/run.py")
     await execute_on_remote(hostname, f"python3 /workspace/run.py --worker --gpu {gpu}")
     await copy_results_from_remote(hostname, run_id)
 
 
 async def reserve_gpu(gpu):
+    # [FUNCTION DOC] HELPER: Reserve one GPU of the given type for 24 hours with the gpu-dev
+    # tool and parse the ssh hostname from its output. Returns (hostname, reservation id) where
+    # the id is the hostname without its gpu-dev prefix. Raises AttributeError if the output has
+    # no ssh command line.
     stdout = await run(
         f"gpu-dev reserve -g 1 -h 24 -t {gpu} --ignore-no-persist --disk none"
     )
@@ -176,10 +211,13 @@ async def reserve_gpu(gpu):
 
 
 async def cancel_reservation(reservation_id):
+    # [FUNCTION DOC] HELPER: Cancel a GPU reservation using the gpu-dev tool.
     await run(f"gpu-dev cancel {reservation_id}")
 
 
 async def run_on_gpu(gpu, command):
+    # [FUNCTION DOC] HELPER: Reserve a GPU, await the given command callable with the reserved
+    # hostname, log (not re-raise) any exception, and always cancel the reservation.
     log.info("Reserving GPU %s", gpu)
     hostname, reservation_id = await reserve_gpu(gpu)
     try:
@@ -193,6 +231,9 @@ async def run_on_gpu(gpu, command):
 
 
 async def launcher(args):
+    # [FUNCTION DOC] Launcher role: create a timestamp run id, concurrently run the numerics job
+    # on a reserved machine for each requested gpu type, then run this script locally in html
+    # mode to render the pulled results.
     run_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     await asyncio.gather(
         *[
@@ -207,6 +248,12 @@ async def launcher(args):
 
 
 def format_results_to_html(run_id):
+    # [FUNCTION DOC] Render every result jsonl file in the results directory for a run id into
+    # an html file beside it. The page has checkbox filters per key (such as dtype, function,
+    # pass type and match flags), a column visibility filter (some columns hidden by default),
+    # and a table with one row per result, links to the log and trace, and an expandable
+    # sample of mismatching values. Row visibility is driven by css rules using the checkboxes.
+    # Prints the list of columns. Raises IndexError for an empty file.
     results_dir = Path(f"results_{run_id}")
     for f in results_dir.glob("*.jsonl"):
         html_file = f.with_suffix(".html")
@@ -358,6 +405,10 @@ numerics_test_lock = asyncio.Lock()
 
 
 async def create_results(args, config):
+    # [FUNCTION DOC] HELPER: Create results for one (PyTorch version, CUDA version) config by
+    # running these steps in order, each guarded by its own lock so that the same step is never
+    # done concurrently across configs: global tools setup, CUDA install, virtual env creation,
+    # PyTorch build, numerics test.
     pytorch_version, cuda_version = config
     async with global_utils_lock:
         await ensure_global_utils()
@@ -372,6 +423,10 @@ async def create_results(args, config):
 
 
 async def ensure_global_utils():
+    # [FUNCTION DOC] HELPER: One-time machine setup, skipped if an environment flag says it is
+    # done. Creates a global bin dir and puts it on the path, installs uv, installs a gitcache
+    # binary as the git command, installs ccache and git-lfs with apt, and sets cache, compiler
+    # launcher and parallel build environment variables. Sets the done flag.
     if os.environ.get("HAS_GLOBAL_UTILS", "0") == "1":
         return
     await run("mkdir global_bin")
@@ -409,6 +464,10 @@ async def ensure_global_utils():
 
 
 async def ensure_cuda(args, cuda_version):
+    # [FUNCTION DOC] HELPER: Install the CUDA toolkit with apt for the given version unless a
+    # workspace dir for that version exists. The args value is unused.
+    # KNOWN ISSUE: the existence check looks in the workspace dir while the venv step uses CUDA
+    # under the system local dir, so the check does not reflect where the toolkit is installed.
     if os.path.exists(f"/workspace/cuda-{cuda_version}"):
         return
     await run("sudo apt-get update")
@@ -418,6 +477,10 @@ async def ensure_cuda(args, cuda_version):
 
 
 async def create_venv(args, config):
+    # [FUNCTION DOC] HELPER: Create a uv virtual env for the config under the workspace, with
+    # environment variables pointing at the CUDA install, then install pip and numpy and, for
+    # nightly or a release version, torch from the matching CUDA wheel index (nothing for git
+    # configs). Returns a mapping with the environment and working directory for later runs.
     pytorch_version, cuda_version = config
     env = os.environ.copy()
     # cuda_home = f"/usr/local/cuda-{cuda_version}"
@@ -453,6 +516,8 @@ async def create_venv(args, config):
 
 
 async def maybe_build_pytorch(args, config, venv):
+    # [FUNCTION DOC] HELPER: Placeholder build step. Raises NotImplementedError for git configs
+    # and does nothing otherwise.
     pytorch_version, cuda_version = config
     if pytorch_version.startswith("git:"):
         raise NotImplementedError("Building PyTorch from git is not supported yet")
@@ -460,6 +525,9 @@ async def maybe_build_pytorch(args, config, venv):
 
 
 async def run_numerics_test(args, config, venv):
+    # [FUNCTION DOC] HELPER: For each execution mode in order, run this script in runner mode
+    # inside the config environment for the first requested gpu. Only the first mode gets the
+    # create-golden flag, when it was requested.
     pytorch_version, cuda_version = config
     golden_flag = ""
     if args.create_golden:
@@ -477,6 +545,9 @@ async def run_numerics_test(args, config, venv):
 
 
 def sortable_config_key(config):
+    # [FUNCTION DOC] HELPER: Sort key for a (PyTorch version, CUDA version) config: versions are
+    # integer tuples, with nightly sorting as lowest-but-one and git configs lowest, so the
+    # largest key is the newest release.
     pytorch_version, cuda_version = config
     cuda_version = tuple(map(int, cuda_version.split(".")))
 
@@ -491,6 +562,10 @@ def sortable_config_key(config):
 
 
 async def worker(args):
+    # [FUNCTION DOC] Worker role on one machine. Requires exactly one gpu (raises
+    # AssertionError otherwise). Creates the logs dir, produces golden results with the config
+    # that sorts last (the newest), then concurrently runs all other enabled configs, and finally
+    # archives the logs. Temporarily mutates the create-golden flag on args.
     if len(args.gpu) != 1:
         raise AssertionError(f"expected exactly one gpu, got {len(args.gpu)}")
     # find golden task
@@ -561,7 +636,10 @@ PASSES = {}
 
 
 def register_pass(pass_type):
+    # [FUNCTION DOC] HELPER: Return a decorator that registers a function in the global pass
+    # table under the given pass type and returns it unchanged.
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Register the function in the pass table and return it.
         PASSES[pass_type] = func
         return func
 
@@ -570,7 +648,10 @@ def register_pass(pass_type):
 
 @register_pass("fwd")
 def pass_fwd(callable):
+    # [FUNCTION DOC] HELPER: Forward pass wrapper factory, registered as the forward pass type:
+    # returns a function that calls the given callable on its arguments.
     def wrapper(*args):
+        # [FUNCTION DOC] HELPER: Call the wrapped callable and return its output.
         return callable(*args)
 
     return wrapper
@@ -578,7 +659,12 @@ def pass_fwd(callable):
 
 @register_pass("bwd_0")
 def pass_bwd_0(callable):
+    # [FUNCTION DOC] HELPER: Backward wrapper factory, registered as the first-argument backward
+    # pass type. The returned function detaches all arguments, makes only the first require
+    # grad, sums the callable output, runs backward and returns the first argument gradient.
     def wrapper(*args):
+        # [FUNCTION DOC] HELPER: Run the callable and backward as described and return the
+        # detached gradient of the first argument.
         args = [arg.detach().requires_grad_(idx == 0) for idx, arg in enumerate(args)]
         output = callable(*args)
         output.sum().backward()
@@ -589,7 +675,12 @@ def pass_bwd_0(callable):
 
 @register_pass("bwd_1")
 def pass_bwd_1(callable):
+    # [FUNCTION DOC] HELPER: Backward wrapper factory, registered as the second-argument backward
+    # pass type. Same as the first-argument version but the second argument requires grad and
+    # its gradient is returned.
     def wrapper(*args):
+        # [FUNCTION DOC] HELPER: Run the callable and backward and return the detached gradient
+        # of the second argument.
         args = [arg.detach().requires_grad_(idx == 1) for idx, arg in enumerate(args)]
         output = callable(*args)
         output.sum().backward()
@@ -599,14 +690,22 @@ def pass_bwd_1(callable):
 
 
 def filter_nan(a):
+    # [FUNCTION DOC] HELPER: Replace NaN entries of a tensor with zero.
     return torch.where(torch.isnan(a), 0, a)
 
 
 def mantissa_bits(dtype) -> int:
+    # [FUNCTION DOC] HELPER: Return the mantissa bit count used for float32 (23), bfloat16 (5)
+    # and float16 (10). Raises KeyError for other dtypes.
+    # KNOWN ISSUE: bfloat16 has 7 explicit mantissa bits; 5 is used here (the comment in the
+    # float32 generator calls it a 5-bit mantissa format), which affects how many random low
+    # bits are added when extending bfloat16 values to float32.
     return {torch.float32: 23, torch.bfloat16: 5, torch.float16: 10}[dtype]
 
 
 def float_to_int_type(dtype):
+    # [FUNCTION DOC] HELPER: Map a float dtype to the unsigned integer dtype of equal width.
+    # Raises KeyError for other dtypes. Not called within this file.
     return {
         torch.float32: torch.uint32,
         torch.bfloat16: torch.uint16,
@@ -615,6 +714,10 @@ def float_to_int_type(dtype):
 
 
 def generate_test_tensor(dtype, slow=False):
+    # [FUNCTION DOC] HELPER: Build a CUDA tensor of test values for a dtype with NaNs replaced by
+    # zero. For 16-bit floats, every one of the 65536 bit patterns. For float32, either all 2**32
+    # bit patterns when slow is true, or a sample: the values of both 16-bit formats widened to
+    # float32, each once exact and once with the extra low mantissa bits filled with random bits.
     if dtype in [torch.float16, torch.bfloat16]:
         return filter_nan(
             torch.arange(0, 2**16, dtype=torch.int32, device="cuda")
@@ -647,6 +750,10 @@ def generate_test_tensor(dtype, slow=False):
 
 
 def make_input(dtype, category):
+    # [FUNCTION DOC] HELPER: Create the CUDA inputs for a category and dtype name, as a tuple.
+    # Matrix: two 1024 by 1024 random tensors. Normalization: such a matrix and a vector of 1024.
+    # Reduction: one matrix. Binary: two independent random permutations of the test value
+    # tensor. Others (activation, elementary): the test value tensor.
     dtype = getattr(torch, dtype)
     from torch.testing import make_tensor
 
@@ -671,6 +778,10 @@ def make_input(dtype, category):
 
 
 def make_function(function, category):
+    # [FUNCTION DOC] HELPER: Build a callable for a dotted function name and category by
+    # evaluating a generated source string: reduction over the last dimension, binary or matrix
+    # with two inputs, normalization with the last dimension as shape and eps 1e-5, or a unary
+    # call. Raises ValueError for an unknown category.
     if category == "reduction":
         return eval(f"lambda x: {function}(x, dim=-1)")
     elif category == "matrix":
@@ -688,10 +799,22 @@ def make_function(function, category):
 
 
 def rel_err_ulp(a, b, dtype):
+    # [FUNCTION DOC] HELPER: Elementwise absolute error between a and b in units of the dtype
+    # epsilon relative to the magnitude of b (with the smallest normal value added to avoid
+    # dividing by zero).
     return (a - b).abs() / (b.abs() * torch.finfo(dtype).eps + torch.finfo(dtype).tiny)
 
 
 def evaluate_output(input, output, golden_output):
+    # [FUNCTION DOC] Compare an output with the golden output and return a mapping of results:
+    # short sha256 hashes of the full output and of the output with subnormal and non-finite
+    # entries zeroed, maximum and mean ulp-style error on the flushed values, counts of
+    # unequal entries (with and without subnormal positions ignored), total count, boolean
+    # match flags and a mismatch sample. Inputs are flattened and only those with the output
+    # shape take part in the subnormal mask; NaNs in both count as equal. The sample holds up
+    # to five worst-error entries and five random entries among mismatches, each with position,
+    # input values, output, golden and error.
+    # KNOWN ISSUE: a comment above the return was cut off mid-sentence in the source.
     # todo: how to make sure this handles denormals in the input well?
     # for now, only handle it if the inputs have the same shape, otherwise assume there are none
     # handle more than one input
@@ -773,6 +896,9 @@ def evaluate_output(input, output, golden_output):
 
 
 def create_golden(args):
+    # [FUNCTION DOC] Compute golden data for the current mode. Returns (inputs, outputs): inputs
+    # nested by dtype name then category, outputs nested by dtype, category, function and pass
+    # type, each obtained by applying the mode and pass wrapper to the function on those inputs.
     golden_inputs = {
         dtype: {category: make_input(dtype, category) for category in CATEGORIES}
         for dtype in DTYPES
@@ -796,6 +922,9 @@ def create_golden(args):
 
 
 def get_metadata(args, dtype, category, function, pass_type):
+    # [FUNCTION DOC] Build the mapping describing one test case (gpu, versions, mode, golden
+    # flag, dtype, function, pass type, category) and add an identifier made from the first
+    # eight hex digits of a sha256 hash of its json form.
     metadata = {
         "gpu": args.gpu[0],
         "pytorch_version": args.pytorch_version,
@@ -813,6 +942,9 @@ def get_metadata(args, dtype, category, function, pass_type):
 
 
 def run_test_case(args):
+    # [FUNCTION DOC] Test role: load the golden inputs and outputs, run the selected case (the
+    # function wrapped by its pass type and mode) on the golden inputs, evaluate against the
+    # golden output, and print (and log) one json line with metadata and evaluation merged.
     golden = torch.load(args.golden)
     golden_inputs, golden_outputs = golden
     metadata = get_metadata(
@@ -837,6 +969,11 @@ test_concurrency = asyncio.Semaphore(16)
 
 
 async def launch_test_case(args, dtype, category, function, pass_type):
+    # [FUNCTION DOC] HELPER: Run one test case in a subprocess of this script in test mode, at
+    # most sixteen at a time. Sets trace and log environment variables, a per-case trace dir,
+    # disables inductor caches and forces triton recompiles, and sends stderr to a per-case log
+    # file. Returns the subprocess stdout (the json result line).
+    # KNOWN ISSUE: the log file handle is opened and never explicitly closed.
     async with test_concurrency:
         env = os.environ | MODES[args.mode].env
         metadata = get_metadata(args, dtype, category, function, pass_type)
@@ -869,6 +1006,10 @@ async def launch_test_case(args, dtype, category, function, pass_type):
 
 
 async def runner(args):
+    # [FUNCTION DOC] Runner role: if creating golden, compute and save it to the golden path.
+    # Then concurrently run every combination of dtype, category, function and pass type
+    # as test subprocesses and append all their output lines to a per-gpu-and-version jsonl
+    # file in the workspace.
     log.info("Runner called! %s", args)
 
     if args.create_golden:
@@ -899,6 +1040,11 @@ async def runner(args):
 
 
 def main():
+    # [FUNCTION DOC] Entry point: parse command line options (launcher, worker, runner, test,
+    # gpu list defaulting to one type, html run id, golden path, create-golden, dtype,
+    # category, function, pass type, versions, mode) and run the selected roles in order runner,
+    # worker, launcher, test, html. The runner sets cuda as the default device. Roles configure
+    # logging with a role-specific format. A keyboard interrupt in launcher mode is logged.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--launcher",

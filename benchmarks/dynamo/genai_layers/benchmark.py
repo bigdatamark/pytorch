@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line runner for the genai kernel benchmarks. Holds a registry mapping
+# benchmark names to kernel benchmark classes (cross entropy, softmax, rmsnorm, layernorm, each
+# forward and backward) and functions to list, run one, or run all. Import-time side effects:
+# imports the sibling kernels module, turns off automatic dynamic shapes in dynamo and raises
+# the dynamo recompile limit to a very large value.
 """
 Benchmark runner for various kernel implementations.
 
@@ -44,6 +49,7 @@ BENCHMARK_REGISTRY: dict[str, type[BenchmarkKernel]] = {
 
 
 def show_environment_info():
+    # [FUNCTION DOC] Print Python, PyTorch and CUDA version information to stdout.
     """Show environment information."""
     print("Environment information:")
     print(f"  Python version: {sys.version}")
@@ -52,6 +58,7 @@ def show_environment_info():
 
 
 def list_benchmarks():
+    # [FUNCTION DOC] Print the names of all registered benchmarks to stdout.
     """List all available benchmarks."""
     print(f"Available benchmarks: {list(BENCHMARK_REGISTRY.keys())}")
 
@@ -60,6 +67,9 @@ def _run_benchmark(
     benchmark_cls,
     script_args,
 ):
+    # [FUNCTION DOC] HELPER: Instantiate one benchmark class with the parsed script arguments,
+    # run it, and report the geomean speedup. Optionally prints the raw profiling results
+    # (print_benchmark_result) and plots results (visualize). Returns None.
     benchmark = benchmark_cls(script_args)
     benchmark.benchmark()
     benchmark.report_geomean_speedup()
@@ -74,6 +84,9 @@ def run_benchmark(
     benchmark_name: str,
     script_args,
 ):
+    # [FUNCTION DOC] Run the registry benchmark with the given name. If the name is not
+    # registered, prints an error hint and returns False without raising. Otherwise prints the
+    # compile mode, runs the benchmark and returns True.
     """Run a specific benchmark."""
     if benchmark_name not in BENCHMARK_REGISTRY:
         print(f"Error: Unknown benchmark '{benchmark_name}'")
@@ -91,6 +104,8 @@ def run_benchmark(
 
 
 def run_all_benchmarks(script_args):
+    # [FUNCTION DOC] Run every registered benchmark in registry order with the given parsed
+    # arguments, printing a header per benchmark. Returns None.
     """Run all available benchmarks."""
     print("Running all benchmarks...")
     print(f"Torch compile mode: {script_args.compile_mode}")
@@ -103,6 +118,14 @@ def run_all_benchmarks(script_args):
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Prints environment info, parses the command line (benchmark
+    # names, list, all, visualize, compile mode, tolerance, exit-on-accuracy-failure, print
+    # result, custom compile name and options), and dispatches. The custom options are parsed
+    # as a JSON string; raises RuntimeError if invalid, empty, or lacking a custom name. List
+    # prints names and returns; all runs every benchmark; with no benchmark names it prints
+    # help and exits with status 1. Return values of single runs (unknown names) are ignored.
+    # KNOWN ISSUE: the compile-mode help text claims the default is "default" but the actual
+    # default is the max-autotune-no-cudagraphs mode.
     show_environment_info()
 
     parser = argparse.ArgumentParser(

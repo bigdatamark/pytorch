@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # flake8: noqa: F821
+# [MODULE DOC] Dynamo benchmark suite driver for HuggingFace Transformers models. Defines the
+# HuggingfaceRunner (model loading, input generation, tolerance policy, forward / backward
+# passes), the table of extra non-registry models, and an entry point that runs the common
+# benchmark main. Import-time side effects: enables inductor FX graph cache and autograd cache
+# unless the matching environment variables are set; installs transformers with pip if it or
+# any needed class is missing; executes imports of the needed transformers classes into module
+# globals; downloads several model configs from the hub when building the extra models table;
+# reads huggingface_models_list.txt (model name and batch size per line, optionally filtered
+# by an environment variable) and raises AssertionError if the file is missing or yields no
+# models.
 
 import importlib
 import logging
@@ -45,6 +55,8 @@ if "TORCHINDUCTOR_AUTOGRAD_CACHE" not in os.environ:
 
 
 def pip_install(package):
+    # [FUNCTION DOC] HELPER: Install a package into the current interpreter with pip. Raises
+    # CalledProcessError if the install fails.
     subprocess.check_call([sys.executable, "-m", "pip", "install", package])
 
 
@@ -81,6 +93,9 @@ imports = [
 
 
 def process_hf_reformer_output(out):
+    # [FUNCTION DOC] HELPER: Drop the second element of the Reformer output list, which is
+    # unstable between runs, and return the remaining elements. Raises AssertionError if the
+    # output is not a list. Not called within this file.
     if not isinstance(out, list):
         raise AssertionError(f"expected out to be a list, got {type(out)}")
     # second output is unstable
@@ -137,6 +152,9 @@ except ImportError:
 
 
 def get_module_cls_by_model_name(model_cls_name):
+    # [FUNCTION DOC] Resolve a transformers model class from its name. Two decoder classes are
+    # looked up in their specific submodules, everything else in the top-level package. Raises
+    # ImportError or AttributeError if the module or class is missing.
     _module_by_model_name = {
         "Speech2Text2Decoder": "transformers.models.speech_to_text_2.modeling_speech_to_text_2",
         "TrOCRDecoder": "transformers.models.trocr.modeling_trocr",
@@ -147,6 +165,11 @@ def get_module_cls_by_model_name(model_cls_name):
 
 
 def get_sequence_length(model_cls, model_name):
+    # [FUNCTION DOC] Choose the sequence length for the generated inputs from the model name
+    # via prefix and name rules (128 to 4096, 10000 for Wav2Vec2); unknown names log at info
+    # level and get 128. The model_cls argument is unused.
+    # KNOWN ISSUE: the branch for the TrOCR causal LM model tests membership in a plain string
+    # (not a one-element tuple), so it is a substring test, not an equality test.
     if model_name.startswith(("Blenderbot",)):
         seq_length = 128
     elif model_name.startswith(("GPT2", "Bart", "T5", "PLBart", "MBart")):
@@ -190,6 +213,15 @@ def get_sequence_length(model_cls, model_name):
 def generate_inputs_for_model(
     model_cls, model, model_name, bs, device, include_loss_args=False
 ):
+    # [FUNCTION DOC] Build the keyword inputs for a model as a mapping of name to tensor.
+    # Token ids are random integers (vocab size from the model config); Wav2Vec2 gets float
+    # waveform values, an attention mask and labels. Adds decoder ids for encoder-decoder
+    # families, visual features for Lxmert, and, if include_loss_args is true, labels of a form
+    # that depends on the model name suffix (pretraining, question answering, LM, token or
+    # sequence classification, multiple choice, next sentence, conditional generation, extra
+    # models). Raises NotImplementedError for an unsupported name when labels are requested.
+    # KNOWN ISSUE: for pretraining models other than Electra and Lxmert the labels entry is
+    # assigned a one-element tuple (trailing comma) instead of a tensor.
     # TODO - Check if following values are representative
     num_choices = 3
     num_visual_features = 42
@@ -293,6 +325,8 @@ def generate_inputs_for_model(
 
 
 def rand_int_tensor(device, low, high, shape):
+    # [FUNCTION DOC] Return a random int64 tensor of the given shape on the device with values
+    # in the range from low up to but excluding high, without gradient tracking.
     return torch.randint(
         low,
         high,
@@ -336,39 +370,52 @@ EXTRA_MODELS = {
 
 
 class HuggingfaceRunner(BenchmarkRunner):
+    # [CLASS DOC] BenchmarkRunner for the HuggingFace suite. Reads skip lists, tolerances,
+    # batch size divisors and precision restrictions from a yaml config file (re-read on each
+    # access). Sets an hf_llm flag when loading a model that uses generate-based speed tests.
     def __init__(self):
+        # [FUNCTION DOC] Initialize the base runner and set the suite name to huggingface.
         super().__init__()
         self.suite_name = "huggingface"
 
     @property
     def _config(self):
+        # [FUNCTION DOC] Property: load and return the parsed contents of the yaml config file.
         return load_yaml_file("huggingface.yaml")
 
     @property
     def _skip(self):
+        # [FUNCTION DOC] Property: the skip section of the config.
         return self._config["skip"]
 
     @property
     def _accuracy(self):
+        # [FUNCTION DOC] Property: the accuracy section of the config.
         return self._config["accuracy"]
 
     @property
     def skip_models(self):
+        # [FUNCTION DOC] Property: names of models skipped for all configurations.
         return self._skip["all"]
 
     @property
     def skip_models_for_cpu(self):
+        # [FUNCTION DOC] Property: names of models skipped when running on the CPU device.
         return self._skip["device"]["cpu"]
 
     @property
     def fp32_only_models(self):
+        # [FUNCTION DOC] Property: names of models restricted to float32 precision.
         return self._config["only_fp32"]
 
     @property
     def skip_models_due_to_control_flow(self):
+        # [FUNCTION DOC] Property: names of models skipped due to data-dependent control flow.
         return self._skip["control_flow"]
 
     def use_larger_multiplier_for_smaller_tensor(self, name):
+        # [FUNCTION DOC] Return true for the two named models (GPT2 sequence classification and
+        # Bert masked LM) whose numerics are noisy, so a larger accuracy multiplier is used.
         return name in [
             "GPT2ForSequenceClassification",
             # Scalar-loss training output; the fp64 RMSE ratio is noise-dominated
@@ -377,6 +424,10 @@ class HuggingfaceRunner(BenchmarkRunner):
         ]
 
     def _get_model_cls_and_config(self, model_name):
+        # [FUNCTION DOC] Return the (model class, config) pair for a name. Extra models come
+        # from the extra models table. Others are resolved by class name and given a default
+        # config instance; GPT2/GPT-Neo/GPT-J sequence classifiers and Roberta / Marian
+        # families get a pad token id of zero so batch sizes above one work.
         if model_name not in EXTRA_MODELS:
             model_cls = get_module_cls_by_model_name(model_name)
             config_cls = model_cls.config_class
@@ -402,6 +453,9 @@ class HuggingfaceRunner(BenchmarkRunner):
 
     @download_retry_decorator
     def _download_model(self, model_name):
+        # [FUNCTION DOC] Instantiate (randomly initialized, no weights downloaded) the model for
+        # a name, using the from-config constructor for auto classes and the plain constructor
+        # otherwise. The decorator retries on download failures.
         model_cls, config = self._get_model_cls_and_config(model_name)
         if "auto" in model_cls.__module__:
             # Handle auto classes
@@ -417,6 +471,14 @@ class HuggingfaceRunner(BenchmarkRunner):
         batch_size=None,
         extra_args=None,
     ):
+        # [FUNCTION DOC] Load a model and its example inputs. Resets the RNG state, picks the
+        # batch size (known-model table, default 16, optionally divided by a configured divisor
+        # when none is given), then builds either an LLM from the LLM registry (setting the
+        # hf_llm flag and installing a generate-based method on the runner) or a regular model
+        # moved to the device in float32 with generated inputs including labels. Dropout-like
+        # float config attributes are set to a tiny value after the model is built, and the KV
+        # cache is disabled. Optionally enables activation checkpointing, sets train or eval
+        # mode, validates the model and returns (device, name, model, inputs, batch size).
         is_training = self.args.training
         use_eval_mode = self.args.use_eval_mode
         dtype = torch.float32
@@ -452,6 +514,9 @@ class HuggingfaceRunner(BenchmarkRunner):
             self.hf_llm = True
 
             def generate(self, _, example_inputs, collect_outputs=True):
+                # [FUNCTION DOC] HELPER: Run model generate on the example inputs and return its
+                # result; bound to the runner as its generate method. The second and fourth
+                # arguments are ignored.
                 return model.generate(**example_inputs)
 
             self.generate = types.MethodType(generate, self)
@@ -496,6 +561,10 @@ class HuggingfaceRunner(BenchmarkRunner):
         return device, model_name, model, example_inputs, batch_size
 
     def iter_model_names(self, args):
+        # [FUNCTION DOC] Generator over benchmark model names: the sorted union of known and
+        # extra models, restricted to this run's shard of indices, kept when it matches the
+        # filter patterns (case-insensitive), does not match the exclude patterns, is not in
+        # the exact-exclude list and is not in the skip list.
         model_names = list(BATCH_SIZE_KNOWN_MODELS.keys()) + list(EXTRA_MODELS.keys())
         model_names = set(model_names)
         model_names = sorted(model_names)
@@ -515,21 +584,31 @@ class HuggingfaceRunner(BenchmarkRunner):
 
     @property
     def skip_accuracy_checks_large_models_dashboard(self):
+        # [FUNCTION DOC] Property: the set of large models whose accuracy check is skipped, taken
+        # from config when running in dashboard or accuracy mode, otherwise an empty set.
         if self.args.dashboard or self.args.accuracy:
             return self._accuracy["skip"]["large_models"]
         return set()
 
     @property
     def get_output_amp_train_process_func(self):
+        # [FUNCTION DOC] Property: mapping of per-name output processing functions for AMP
+        # training; always empty for this suite.
         return {}
 
     def pick_grad(self, name, is_training):
+        # [FUNCTION DOC] Return a gradient-enabling context when training, else a no-grad
+        # context. The name argument is unused.
         if is_training:
             return torch.enable_grad()
         else:
             return torch.no_grad()
 
     def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
+        # [FUNCTION DOC] Return (tolerance, cosine flag). Training uses 2e-2 for models in the
+        # higher training list (or the higher max-autotune list when max autotune is on), else
+        # 1e-2. Inference uses 5e-3 on CPU for the higher CPU list, 4e-3 for the higher
+        # inference list, else 1e-3. The cosine flag comes from the command line arguments.
         cosine = self.args.cosine
         if is_training:
             from torch._inductor import config as inductor_config
@@ -552,14 +631,21 @@ class HuggingfaceRunner(BenchmarkRunner):
         return 1e-3, cosine
 
     def compute_loss(self, pred):
+        # [FUNCTION DOC] Return the first element of the model output, used as the loss.
         return pred[0]
 
     def forward_pass(self, mod, inputs, collect_outputs=True):
+        # [FUNCTION DOC] Run the model on keyword inputs without gradients under autocast.
+        # Returns the logits for LLM models, otherwise the raw output. collect_outputs is unused.
         with torch.no_grad(), self.autocast(**self.autocast_arg):
             res = mod(**inputs)
         return res.logits if self.hf_llm else res
 
     def forward_and_backward_pass(self, mod, inputs, collect_outputs=True):
+        # [FUNCTION DOC] Training step: clone inputs, zero gradients, run the forward under
+        # autocast, take the loss, backward through the grad scaler and take an optimizer step.
+        # Returns collected results (outputs, loss and gradients) if collect_outputs is true,
+        # else None.
         cloned_inputs = clone_inputs(inputs)
         self.optimizer_zero_grad(mod)
         with self.autocast(**self.autocast_arg):
@@ -573,6 +659,11 @@ class HuggingfaceRunner(BenchmarkRunner):
 
 
 def refresh_model_names_and_batch_sizes():
+    # [FUNCTION DOC] Maintenance routine to regenerate the models list file: picks, per model
+    # family supported by the HF FX tracer, representative classes (skipping some known broken
+    # ones), adds the extra models, then for each runs this script in a subprocess to find the
+    # batch size, appending to the models list file. A failing subprocess only logs a warning.
+    # Not called by default (its call in the entry point is commented out).
     """
     This function reads the HF Fx tracer supported models and finds the largest
     batch size that could fit on the GPU with PyTorch eager.
@@ -657,6 +748,8 @@ def refresh_model_names_and_batch_sizes():
 
 
 def huggingface_main():
+    # [FUNCTION DOC] Entry point: set logging to warning level, silence Python warnings and run
+    # the common benchmark main with a HuggingFace runner.
     # Code to refresh model names and batch sizes
     # if "--find-batch-sizes" not in sys.argv:
     #     refresh_model_names_and_batch_sizes()

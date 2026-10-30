@@ -1,3 +1,8 @@
+# [MODULE DOC] Shared infrastructure for the genai layer kernel benchmarks: a GPU timing helper,
+# a Performance record, the BenchmarkKernel base class (backend dispatch, input cloning,
+# accuracy checking, per-shape benchmarking, geomean speedup report) and plotting helpers that
+# draw memory bandwidth per shape per backend. Imports matplotlib, scipy and the inductor
+# benchmarker at import time; plotting writes files into a pics directory.
 import os
 import sys
 from collections import defaultdict
@@ -13,6 +18,9 @@ from torch._inductor.runtime.benchmarking import benchmarker
 
 
 def benchmark_kernel_in_milliseconds(func: Callable, *args, **kwargs) -> float:
+    # [FUNCTION DOC] Time a callable on the GPU and return the latency in milliseconds. Calls
+    # it 5 times as warmup, then measures with the inductor GPU benchmarker while the compiler
+    # stance is set to fail on any recompile (so a recompile raises instead of being timed).
     # warmup
     for _ in range(5):
         func(*args, **kwargs)
@@ -22,6 +30,10 @@ def benchmark_kernel_in_milliseconds(func: Callable, *args, **kwargs) -> float:
 
 @dataclass
 class Performance:
+    # [CLASS DOC] Dataclass holding one benchmark measurement: setting label (usually the input
+    # shape), latency in milliseconds, memory traffic in bytes, memory bandwidth in GB/s
+    # (computed on construction, overriding any given value) and a compute intensity field
+    # that defaults to zero and is never computed here.
     # Benchmark setting usually the shape of the input tensor
     setting: str
 
@@ -38,14 +50,25 @@ class Performance:
     compute_intensity: float = 0.0
 
     def __post_init__(self):
+        # [FUNCTION DOC] Derive memory bandwidth in GB/s from memory bytes and latency in ms.
+        # Divides by the latency, so a zero latency raises ZeroDivisionError.
         self.memory_bandwidth = self.memory_bytes / (self.latency / 1000) / 1e9
 
     def __str__(self):
+        # [FUNCTION DOC] Return a one-line summary with the setting, latency and bandwidth.
         return f"setting: {self.setting}, latency: {self.latency} ms, memory bandwidth: {self.memory_bandwidth} GB/s"
 
 
 class BenchmarkKernel:
+    # [CLASS DOC] Base class for a kernel benchmark. Subclasses fill in the list of available
+    # backend names and provide shapes, a memory traffic model, one builder method per backend
+    # (each returns a zero-argument callable to time) and a benchmark loop over shapes.
+    # State: script_args (parsed command line), name (the class name), available_backends,
+    # compile_mode (taken from script_args) and profiling_results (mapping from backend name to
+    # a list of Performance records, created on demand).
     def __init__(self, script_args):
+        # [FUNCTION DOC] Store the script arguments, derive the kernel name from the class name,
+        # start with no available backends, and read the compile mode from the arguments.
         self.script_args = script_args
         self.name = self.__class__.__name__
         self.available_backends: list[str] = []
@@ -55,35 +78,58 @@ class BenchmarkKernel:
         self.profiling_results: defaultdict[str, list[Performance]] = defaultdict(list)
 
     def get_memory_bytes(self, args, kwargs) -> int:
+        # [FUNCTION DOC] Abstract: return the bytes of memory traffic for the given inputs.
+        # Subclasses must override; raises NotImplementedError here.
         # Get the necessary memory access in bytes for the kernelßß
         raise NotImplementedError
 
     def get_shapes(self) -> tuple[tuple[int, ...], ...]:
+        # [FUNCTION DOC] Abstract: return the input shapes to benchmark. Raises
+        # NotImplementedError here.
         # Get a list of input shapes to benchmark the kernel
         raise NotImplementedError
 
     def eager(self, args, kwargs) -> Any:
+        # [FUNCTION DOC] Abstract backend builder for the eager implementation. Raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def compiled(self, args, kwargs) -> Any:
+        # [FUNCTION DOC] Abstract backend builder for the compiled implementation. Raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def helion(self, args, kwargs) -> Any:
+        # [FUNCTION DOC] Abstract backend builder for the helion implementation. Raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def quack(self, args, kwargs) -> Any:
+        # [FUNCTION DOC] Abstract backend builder for the quack implementation. Raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def liger(self, args, kwargs) -> Any:
+        # [FUNCTION DOC] Abstract backend builder for the liger implementation. Raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def triton(self, args, kwargs) -> Any:
+        # [FUNCTION DOC] Abstract backend builder for the triton implementation. Raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def benchmark(self):
+        # [FUNCTION DOC] Abstract: run the whole benchmark over all shapes. Raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def clone_inputs(self, args, kwargs) -> Any:
+        # [FUNCTION DOC] Return a pair of cloned inputs: the positional arguments as a list of
+        # detached copies keeping each tensor's requires-grad flag, and the keyword arguments as
+        # a mapping with tensors copied the same way and other values passed through. If the
+        # keyword arguments are empty or None they are returned unchanged. Positional entries
+        # must all be tensors.
         args_ref = [
             arg.clone().detach().requires_grad_(arg.requires_grad) for arg in args
         ]
@@ -104,6 +150,13 @@ class BenchmarkKernel:
         return args_ref, kwargs_ref
 
     def check_accuracy(self, args, kwargs) -> None:
+        # [FUNCTION DOC] Run every available backend once on cloned inputs and compare to the
+        # eager result. If a compiled backend exists and custom compile options were given,
+        # also runs a recompiled version under patched inductor config, stored under the custom
+        # name. Compares with assert_close (optional tolerance used for both atol and rtol), and
+        # also compares gradients of result elements that require grad. Prints a success or
+        # failure line per backend; on failure exits the process with status 1 if the exit-on
+        # failure option is set.
         res = {}
         for backend in self.available_backends:
             args_ref, kwargs_ref = self.clone_inputs(args, kwargs)
@@ -150,6 +203,11 @@ class BenchmarkKernel:
     def benchmark_single_shape_for_backend(
         self, backend, args, kwargs, setting, fn=None
     ) -> bool:
+        # [FUNCTION DOC] Time one backend on the given inputs. Uses the given builder or else the
+        # method named by the backend, builds the callable on cloned inputs and times it. If
+        # that raises, prints the failure, removes the backend from the available list and
+        # returns False. Otherwise records a Performance (with the memory traffic model) under
+        # the backend name, prints it and returns True.
         if fn is None:
             fn = getattr(self, backend)
         args_ref, kwargs_ref = self.clone_inputs(args, kwargs)
@@ -170,6 +228,12 @@ class BenchmarkKernel:
     def benchmark_single_shape(
         self, args, kwargs=None, should_check_accuracy=True, setting: str = ""
     ):
+        # [FUNCTION DOC] Benchmark all available backends on one input, then optionally the
+        # compiled backend again with custom inductor options (after resetting dynamo); if that
+        # run fails the custom options are cleared so it is not retried. Then runs the accuracy
+        # check unless disabled. The setting string labels the results.
+        # KNOWN ISSUE: a failing backend is removed from the available list while it is being
+        # iterated, so the backend after it is skipped for that shape.
         for backend in self.available_backends:
             self.benchmark_single_shape_for_backend(backend, args, kwargs, setting)
         if (
@@ -194,6 +258,9 @@ class BenchmarkKernel:
             self.check_accuracy(args, kwargs)
 
     def visualize(self) -> None:
+        # [FUNCTION DOC] Plot memory bandwidth of all recorded backends, titled with the kernel
+        # name and the name of GPU 0, and save it as an image named after the kernel. Returns
+        # None.
         device_name = torch.cuda.get_device_name(0)
         visualize_comparison(
             self.profiling_results,
@@ -203,6 +270,10 @@ class BenchmarkKernel:
         return
 
     def report_geomean_speedup(self) -> None:
+        # [FUNCTION DOC] Print, for each non-eager backend, the geometric mean of the ratio of
+        # eager latency to backend latency across its recorded settings (zero for zero latency),
+        # plus the number of data points. Prints the eager data point count first.
+        # Raises KeyError if a backend has a setting that eager did not record.
         print(f"Geomean speedup for benchmark {self.name}")
         eager_result = {
             result.setting: result for result in self.profiling_results["eager"]
@@ -226,6 +297,8 @@ class BenchmarkKernel:
 
 
 def get_backend_colors() -> dict[str, str]:
+    # [FUNCTION DOC] Return a mapping from backend name to a hex color used in plots, with a
+    # default black entry for unknown backends.
     """Get consistent color scheme for different backends."""
     return {
         "eager": "#1f77b4",  # blue
@@ -245,6 +318,12 @@ def visualize_comparison(
     title: str | None = None,
     output_path: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Draw one line plot of memory bandwidth versus input setting for each
+    # backend in the results. The x axis ticks come from the settings recorded for eager;
+    # backends are plotted only at settings they share with eager, and skipped if none.
+    # If an output path is given, creates a pics directory if needed, saves a PNG there and
+    # prints the path. Always closes the figure. The optional title defaults to a generic one.
+    # Looks up the eager entry directly, so a plain mapping without it raises KeyError.
     """
     Create a single memory_bandwidth comparison plot from profiling results.
 
