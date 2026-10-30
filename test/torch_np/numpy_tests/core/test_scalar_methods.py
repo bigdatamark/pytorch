@@ -1,4 +1,7 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for scalar type methods (as_integer_ratio, is_integer, class subscripting,
+# bit_count) run against torch._numpy, or real numpy when running under dynamo. Every test class
+# is unconditionally skipped, so importing only defines the classes and a skip helper.
 
 """
 Test the scalar constructors, which also do type-coercion
@@ -36,6 +39,8 @@ skip = functools.partial(skipif, True)
 @skip(reason="XXX: scalar.as_integer_ratio not implemented")
 @instantiate_parametrized_tests
 class TestAsIntegerRatio(TestCase):
+    # [CLASS DOC] Skipped tests (scalar as_integer_ratio is not implemented) checking exact
+    # fraction results for half, single and double scalars, derived from a CPython float test.
     # derived in part from the cpython test "test_floatasratio"
 
     @parametrize("ftype", [np.half, np.single, np.double])
@@ -49,10 +54,15 @@ class TestAsIntegerRatio(TestCase):
         ],
     )
     def test_small(self, ftype, f, ratio):
+        # [FUNCTION DOC] Parametrized over float type and (value, expected ratio) pairs: checks
+        # that as_integer_ratio of a scalar of that type equals the expected
+        # numerator/denominator tuple.
         assert_equal(ftype(f).as_integer_ratio(), ratio)
 
     @parametrize("ftype", [np.half, np.single, np.double])
     def test_simple_fractions(self, ftype):
+        # [FUNCTION DOC] For each float type, converts several values through as_integer_ratio
+        # and compares the resulting Fraction with the exactly expected Fraction.
         R = fractions.Fraction
         assert_equal(R(0, 1), R(*ftype(0.0).as_integer_ratio()))
         assert_equal(R(5, 2), R(*ftype(2.5).as_integer_ratio()))
@@ -61,11 +71,16 @@ class TestAsIntegerRatio(TestCase):
 
     @parametrize("ftype", [np.half, np.single, np.double])
     def test_errors(self, ftype):
+        # [FUNCTION DOC] Checks that as_integer_ratio raises OverflowError for positive and
+        # negative infinity and ValueError for NaN, for each float type.
         assert_raises(OverflowError, ftype("inf").as_integer_ratio)
         assert_raises(OverflowError, ftype("-inf").as_integer_ratio)
         assert_raises(ValueError, ftype("nan").as_integer_ratio)
 
     def test_against_known_values(self):
+        # [FUNCTION DOC] Compares as_integer_ratio of 2.1 (and its negation) in half, single and
+        # double precision with hard-coded exact fractions; longdouble is skipped as platform
+        # dependent.
         R = fractions.Fraction
         assert_equal(R(1075, 512), R(*np.half(2.1).as_integer_ratio()))
         assert_equal(R(-1075, 512), R(*np.half(-2.1).as_integer_ratio()))
@@ -121,6 +136,10 @@ class TestAsIntegerRatio(TestCase):
         ],
     )
     def test_roundtrip(self, ftype, frac_vals, exp_vals):
+        # [FUNCTION DOC] Round trip check: builds scalars by scaling given fractions with ldexp
+        # and the given exponents, asserts the dtype is preserved, then divides numerator by
+        # denominator in longdouble and expects the original value. Raises SkipTest if
+        # longdouble cannot hold them.
         for frac, exp in zip(frac_vals, exp_vals):
             f = np.ldexp(ftype(frac), exp)
             if f.dtype != ftype:
@@ -140,9 +159,12 @@ class TestAsIntegerRatio(TestCase):
 @skip(reason="NP_VER: older numpies has problems with .is_integer")
 @instantiate_parametrized_tests
 class TestIsInteger(TestCase):
+    # [CLASS DOC] Skipped tests for the scalar is_integer method (old numpy versions are buggy).
     @parametrize("str_value", ["inf", "nan"])
     @parametrize("code", np.typecodes["Float"])
     def test_special(self, code, str_value):
+        # [FUNCTION DOC] For each float type code, infinity and NaN scalars must report
+        # is_integer as false; raises AssertionError otherwise.
         cls = np.dtype(code).type
         value = cls(str_value)
         if value.is_integer():
@@ -154,6 +176,8 @@ class TestIsInteger(TestCase):
         "code", "efd" + "Bbhil"
     )  # np.typecodes["Float"] + np.typecodes["AllInteger"])
     def test_true(self, code: str) -> None:
+        # [FUNCTION DOC] Builds an array of the integers from -5 to 4 cast to the given float or
+        # integer type code and asserts every element reports is_integer as true.
         float_array = np.arange(-5, 5).astype(code)
         for value in float_array:
             if not value.is_integer():
@@ -163,6 +187,11 @@ class TestIsInteger(TestCase):
 
     @parametrize("code", "bhil")  # np.typecodes["Float"])
     def test_false(self, code: str) -> None:
+        # [FUNCTION DOC] Takes the integers from -5 to 4 cast to an integer type code, scales
+        # the array in place by 1.1 and asserts each nonzero element is not an integer.
+        # KNOWN ISSUE: the type codes are all integer types, so in-place scaling by a float
+        # either # fails to cast or truncates, and the not-integer expectation looks
+        # unsatisfiable (skipped).
         float_array = np.arange(-5, 5).astype(code)
         float_array *= 1.1
         for value in float_array:
@@ -177,6 +206,9 @@ class TestIsInteger(TestCase):
 @skip(reason="XXX: implementation details of the type system differ")
 @instantiate_parametrized_tests
 class TestClassGetItem(TestCase):
+    # [CLASS DOC] Skipped tests (type system internals differ) for subscripting scalar classes,
+    # which should produce a generic alias for abstract numeric classes and raise TypeError
+    # otherwise.
     @parametrize(
         "cls",
         [
@@ -189,6 +221,8 @@ class TestClassGetItem(TestCase):
         ],
     )
     def test_abc(self, cls: type[np.number]) -> None:
+        # [FUNCTION DOC] Subscripting an abstract numeric class with a type must give a
+        # GenericAlias whose origin is that class; raises AssertionError otherwise.
         alias = cls[Any]
         if not isinstance(alias, types.GenericAlias):
             raise AssertionError(
@@ -200,6 +234,8 @@ class TestClassGetItem(TestCase):
             )
 
     def test_abc_complexfloating(self) -> None:
+        # [FUNCTION DOC] Same alias check for the complex floating class subscripted with two
+        # type arguments: result must be a GenericAlias with that class as origin.
         alias = np.complexfloating[Any, Any]
         if not isinstance(alias, types.GenericAlias):
             raise AssertionError(
@@ -212,6 +248,9 @@ class TestClassGetItem(TestCase):
 
     @parametrize("arg_len", range(4))
     def test_abc_complexfloating_subscript_tuple(self, arg_len: int) -> None:
+        # [FUNCTION DOC] Subscripts the complex floating class with a tuple of the given length:
+        # one or two entries must work, zero or more than two must raise TypeError with a too
+        # few or too many arguments message.
         arg_tup = (Any,) * arg_len
         if arg_len in (1, 2):
             if not np.complexfloating[arg_tup]:
@@ -225,17 +264,23 @@ class TestClassGetItem(TestCase):
 
     @parametrize("cls", [np.generic])
     def test_abc_non_numeric(self, cls: type[np.generic]) -> None:
+        # [FUNCTION DOC] Subscripting the non-numeric generic scalar base class must raise
+        # TypeError.
         with pytest.raises(TypeError):
             cls[Any]
 
     @parametrize("code", np.typecodes["All"])
     def test_concrete(self, code: str) -> None:
+        # [FUNCTION DOC] Subscripting the concrete scalar class of any type code must raise
+        # TypeError.
         cls = np.dtype(code).type
         with pytest.raises(TypeError):
             cls[Any]
 
     @parametrize("arg_len", range(4))
     def test_subscript_tuple(self, arg_len: int) -> None:
+        # [FUNCTION DOC] Subscripts the number class with a tuple of the given length: length
+        # one must yield a truthy result, any other length must raise TypeError.
         arg_tup = (Any,) * arg_len
         if arg_len == 1:
             if not np.number[arg_tup]:
@@ -245,6 +290,8 @@ class TestClassGetItem(TestCase):
                 np.number[arg_tup]
 
     def test_subscript_scalar(self) -> None:
+        # [FUNCTION DOC] Subscripting the number class with a single type must give a truthy
+        # result.
         if not np.number[Any]:
             raise AssertionError("Expected np.number[Any] to be truthy")
 
@@ -252,6 +299,7 @@ class TestClassGetItem(TestCase):
 @skip(reason="scalartype(...).bit_count() not implemented")
 @instantiate_parametrized_tests
 class TestBitCount(TestCase):
+    # [CLASS DOC] Skipped tests for the scalar bit_count method, derived from a CPython test.
     # derived in part from the cpython test "test_bit_count"
 
     @parametrize(
@@ -260,12 +308,17 @@ class TestBitCount(TestCase):
         + [np.uint8, np.uint16, np.uint32, np.uint64],
     )
     def test_small(self, itype):
+        # [FUNCTION DOC] For each integer type, loops over non-negative values below 128 and
+        # compares the scalar bit_count with the Python int bit_count; raises AssertionError on
+        # a mismatch.
         for a in range(max(np.iinfo(itype).min, 0), 128):
             msg = f"Smoke test for {itype}({a}).bit_count()"
             if itype(a).bit_count() != a.bit_count():
                 raise AssertionError(msg)
 
     def test_bit_count(self):
+        # [FUNCTION DOC] Checks bit_count of unsigned 64-bit scalars built from powers of two
+        # (exponents 10, 17, 63), one less, and two bit-flipped variants against known counts.
         for exp in [10, 17, 63]:
             a = 2**exp
             if np.uint64(a).bit_count() != 1:

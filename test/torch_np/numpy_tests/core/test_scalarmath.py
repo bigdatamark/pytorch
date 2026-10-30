@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Port of numpy scalar math tests to torch._numpy (or real numpy under dynamo):
+# type construction and promotion, power, modulus and divmod semantics, complex division,
+# conversions, comparison operators, repr, negation, abs, bit shifts, hashing, overflow warnings
+# and subclass deferral. Import time defines a skip helper, lists of scalar types, an operator
+# table and two small helper functions; several test classes are skipped or expected to fail
+# with torch.
 
 import contextlib
 import functools
@@ -87,12 +93,19 @@ reasonable_operators_for_scalars = [
 
 
 class TestTypes(TestCase):
+    # [CLASS DOC] Tests that scalar construction and scalar arithmetic agree with array
+    # behavior.
     def test_types(self):
+        # [FUNCTION DOC] For every scalar type, builds a scalar from one and asserts it equals
+        # one.
         for atype in types:
             a = atype(1)
             assert_(a == 1, f"error with {atype!r}: got {a!r}")
 
     def test_type_add(self):
+        # [FUNCTION DOC] For every pair of scalar types adds a scalar of each and adds one
+        # element arrays of each, then asserts the result dtypes agree (scalar promotion matches
+        # ufunc promotion).
         # list of types
         for k, atype in enumerate(types):
             a_scalar = atype(3)
@@ -116,6 +129,8 @@ class TestTypes(TestCase):
                 )
 
     def test_type_create(self):
+        # [FUNCTION DOC] For every scalar type, creates an array from a list with that dtype and
+        # calls the scalar type on the same list, then asserts the two results are equal.
         for atype in types:
             a = np.array([1, 2, 3], atype)
             b = atype([1, 2, 3])
@@ -123,6 +138,9 @@ class TestTypes(TestCase):
 
     @skipIfTorchDynamo()  # freezes under torch.Dynamo (loop unrolling, huh)
     def test_leak(self):
+        # [FUNCTION DOC] Leak smoke test: performs a scalar add two hundred thousand times; a
+        # leak would be seen externally (valgrind). Skipped under dynamo because it freezes
+        # there.
         # test leak of scalar objects
         # a leak would show up in valgrind as still-reachable of ~2.6MB
         for _ in range(200000):
@@ -130,7 +148,11 @@ class TestTypes(TestCase):
 
 
 class TestBaseMath(TestCase):
+    # [CLASS DOC] Basic elementwise add tests over generated memory alignments.
     def test_blocked(self):
+        # [FUNCTION DOC] For float32, float64 and int32, iterates over generated aligned and
+        # offset binary operand and output buffers and checks add, square, reciprocal (skipped
+        # for int32), scalar operands and the out argument against expected values.
         # test alignments offsets for simd instructions
         # alignments for vz + 2 * (vs - 1) + 1
         for dt, sz in [(np.float32, 11), (np.float64, 7), (np.int32, 11)]:
@@ -166,6 +188,10 @@ class TestBaseMath(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="pytorch does not have .view")
     def test_lower_align(self):
+        # [FUNCTION DOC] Builds float64 arrays from a byte buffer sliced at an offset of four
+        # bytes and viewed as double, then runs add variants including the out argument. Marked
+        # as expected to pass only under dynamo numpy because torch has no view with a dtype
+        # change.
         # check data that is not aligned to element size
         # i.e doubles are aligned to 4 bytes on i386
         d = np.zeros(23 * 8, dtype=np.int8)[4:-4].view(np.float64)
@@ -179,13 +205,18 @@ class TestBaseMath(TestCase):
 
 
 class TestPower(TestCase):
+    # [CLASS DOC] Tests for the power operator on scalars of several types.
     def test_small_types(self):
+        # [FUNCTION DOC] Raises small integer and float16 scalars of value three to the fourth
+        # power and asserts the result is 81.
         for t in [np.int8, np.int16, np.float16]:
             a = t(3)
             b = a**4
             assert_(b == 81, f"error with {t!r}: got {b!r}")
 
     def test_large_types(self):
+        # [FUNCTION DOC] Raises fifty-one to the fourth power in wider integer and float types;
+        # integers must match exactly 6765201 and floats must match approximately.
         for t in [np.int32, np.int64, np.float32, np.float64]:
             a = t(51)
             b = a**4
@@ -198,6 +229,11 @@ class TestPower(TestCase):
     @skip(reason="NP_VER: fails on CI on older NumPy")
     @xpassIfTorchDynamo_np  # (reason="Value-based casting: (2)**(-2) -> 0 in pytorch.")
     def test_integers_to_negative_integer_power(self):
+        # [FUNCTION DOC] Checks integer scalar power with a negative integer exponent:
+        # non-uint64 bases must raise ValueError, uint64 bases must give a float64 result.
+        # Skipped, and torch value based casting would give a different answer anyway.
+        # KNOWN ISSUE: the uint64 branch is dead for the negative one base list (no uint64
+        # member there).
         # Note that the combination of uint64 with a signed integer
         # has common type np.float64. The other combinations should all
         # raise a ValueError for integer ** negative integer.
@@ -234,6 +270,9 @@ class TestPower(TestCase):
                 assert_almost_equal(res, 0.5)
 
     def test_mixed_types(self):
+        # [FUNCTION DOC] Raises a scalar of value three to the power of a scalar of value two
+        # for all pairs of mixed integer and float types; integer results must equal nine,
+        # others approximately.
         typelist = [
             np.int8,
             np.int16,
@@ -257,6 +296,8 @@ class TestPower(TestCase):
                     assert_almost_equal(result, 9, err_msg=msg)
 
     def test_modular_power(self):
+        # [FUNCTION DOC] Three argument (modular) power is not implemented: asserts a TypeError
+        # for scalar and zero dimensional array inputs of int32, float32 and complex64.
         # modular power is not implemented, so ensure it errors
         a = 5
         b = 4
@@ -269,10 +310,14 @@ class TestPower(TestCase):
 
 
 def floordiv_and_mod(x, y):
+    # [FUNCTION DOC] HELPER: returns both the floor division and the remainder of two operands
+    # as a tuple, so it can be used interchangeably with the divmod builtin.
     return (x // y, x % y)
 
 
 def _signs(dt):
+    # [FUNCTION DOC] HELPER: returns the sign multipliers to test for a dtype code: only
+    # positive for unsigned integer codes, both positive and negative otherwise.
     if dt in np.typecodes["UnsignedInteger"]:
         return (+1,)
     else:
@@ -281,7 +326,13 @@ def _signs(dt):
 
 @instantiate_parametrized_tests
 class TestModulus(TestCase):
+    # [CLASS DOC] Tests for floor division and remainder (modulus) on scalars, checking sign
+    # rules.
     def test_modulus_basic(self):
+        # [FUNCTION DOC] For both division helpers and all pairs of integer and float codes with
+        # all sign combinations, divides seventy-one by nineteen scalars and checks div times b
+        # plus rem equals a and that the remainder has the sign of the divisor and magnitude
+        # below it.
         # dt = np.typecodes["AllInteger"] + np.typecodes["Float"]
         dt = "Bbhil" + "efd"
         for op in [floordiv_and_mod, divmod]:
@@ -300,6 +351,9 @@ class TestModulus(TestCase):
 
     @slow
     def test_float_modulus_exact(self):
+        # [FUNCTION DOC] Slow test: for all dividend and divisor pairs of small integers, checks
+        # float floor division and remainder results exactly match Python divmod, including
+        # signed zeros.
         # test that float results are exact for small integers. This also
         # holds for the same integers scaled by powers of two.
         nlst = list(range(-127, 0))
@@ -327,6 +381,9 @@ class TestModulus(TestCase):
                 assert_equal(rem, tgtrem, err_msg=msg)
 
     def test_float_modulus_roundoff(self):
+        # [FUNCTION DOC] Regression test for gh-6127: float scalars with tiny magnitudes in all
+        # sign combinations satisfy the division identity and the remainder sign and bound
+        # rules.
         # gh-6127
         # dt = np.typecodes["Float"]
         dt = "efd"
@@ -347,6 +404,10 @@ class TestModulus(TestCase):
 
     @parametrize("dt", "efd")
     def test_float_modulus_corner_cases(self, dt):
+        # [FUNCTION DOC] Parametrized over float codes; half precision is skipped by raising
+        # SkipTest since nextafter is missing. Checks the remainder of the value just below zero
+        # by one stays within bounds, then for each float code checks remainders with zero or
+        # NaN or infinity give NaN and that divmod by zero yields infinity and NaN.
         if dt == "e":
             # FIXME: make xfail
             raise SkipTest("RuntimeError: 'nextafter_cpu' not implemented for 'Half'")
@@ -385,8 +446,11 @@ class TestModulus(TestCase):
 
 
 class TestComplexDivision(TestCase):
+    # [CLASS DOC] Tests for complex scalar division.
     @skip(reason="With pytorch, 1/(0+0j) is nan + nan*j, not inf + nan*j")
     def test_zero_division(self):
+        # [FUNCTION DOC] Skipped: checks division by complex zero gives infinity or NaN for
+        # various infinite and NaN numerators; torch gives NaN where numpy gives infinity.
         for t in [np.complex64, np.complex128]:
             a = t(0.0)
             b = t(1.0)
@@ -403,6 +467,9 @@ class TestComplexDivision(TestCase):
             assert_(np.isnan(b / a))
 
     def test_signed_zeros(self):
+        # [FUNCTION DOC] Divides complex scalars in a table of numerator, denominator and
+        # expected tuples and compares real and imaginary parts separately so that signed zeros
+        # are checked.
         for t in [np.complex64, np.complex128]:
             # tupled (numerator, denominator, expected)
             # for testing as expected == numerator/denominator
@@ -427,6 +494,9 @@ class TestComplexDivision(TestCase):
                 assert_equal(result.imag, ex[1])
 
     def test_branches(self):
+        # [FUNCTION DOC] Exercises the two magnitude comparison branches of complex division
+        # with cases whose denominators have larger real or larger imaginary parts, expecting
+        # one.
         for t in [np.complex64, np.complex128]:
             # tupled (numerator, denominator, expected)
             # for testing as expected == numerator/denominator
@@ -455,7 +525,11 @@ class TestComplexDivision(TestCase):
 
 
 class TestConversion(TestCase):
+    # [CLASS DOC] Tests for conversions between scalars, arrays, Python numbers and integer
+    # limits.
     def test_int_from_long(self):
+        # [FUNCTION DOC] Converts large float and integer arrays elementwise to Python int and
+        # compares with the exact integers; assumes the default float type is float64.
         # NB: this test assumes that the default fp type is float64
         l = [1e6, 1e12, 1e18, -1e6, -1e12, -1e18]
         li = [10**6, 10**12, 10**18, -(10**6), -(10**12), -(10**18)]
@@ -466,6 +540,9 @@ class TestConversion(TestCase):
     @skipif(numpy.__version__ < "1.24", reason="NP_VER: fails on NumPy 1.23.x")
     @xpassIfTorchDynamo_np  # (reason="pytorch does not emit this warning.")
     def test_iinfo_long_values_1(self):
+        # [FUNCTION DOC] Expects a DeprecationWarning when creating a small integer array from a
+        # value one beyond the type maximum, and the result to wrap to the minimum. Skipped on
+        # old numpy and expected to fail with torch, which emits no warning.
         for code in "bBh":
             with pytest.warns(DeprecationWarning):
                 res = np.array(np.iinfo(code).max + 1, dtype=code)
@@ -473,6 +550,8 @@ class TestConversion(TestCase):
             assert_(res == tgt)
 
     def test_iinfo_long_values_2(self):
+        # [FUNCTION DOC] For each integer code, the maximum value round trips through array
+        # creation and through the scalar type unchanged.
         for code in np.typecodes["AllInteger"]:
             res = np.array(np.iinfo(code).max, dtype=code)
             tgt = np.iinfo(code).max
@@ -484,13 +563,20 @@ class TestConversion(TestCase):
             assert_(res == tgt)
 
     def test_int_raise_behaviour(self):
+        # [FUNCTION DOC] Checks that constructing 64-bit scalar types from a value above their
+        # maximum raises OverflowError or RuntimeError.
         def overflow_error_func(dtype):
+            # [FUNCTION DOC] HELPER: builds a scalar of the given dtype from its maximum plus
+            # one to trigger an overflow error; returns nothing.
             dtype(np.iinfo(dtype).max + 1)
 
         for code in [np.int_, np.longlong]:
             assert_raises((OverflowError, RuntimeError), overflow_error_func, code)
 
     def test_numpy_scalar_relational_operators(self):
+        # [FUNCTION DOC] Checks greater-than, less-than and equality between Python ints and
+        # scalars and between scalars of all integer pairs and all signed integer and float
+        # pairs.
         # All integer
         for dt1 in np.typecodes["AllInteger"]:
             assert_(1 > np.array(0, dtype=dt1)[()], f"type {dt1} failed")
@@ -527,6 +613,8 @@ class TestConversion(TestCase):
                 )
 
     def test_numpy_scalar_relational_operators_2(self):
+        # [FUNCTION DOC] Checks comparisons between unsigned byte scalars and Python ints or
+        # signed integer scalars with a negative value.
         # Unsigned integers
         for dt1 in "B":
             assert_(-1 < np.array(1, dtype=dt1)[()], f"type {dt1} failed")
@@ -549,6 +637,8 @@ class TestConversion(TestCase):
                 )
 
     def test_scalar_comparison_to_none(self):
+        # [FUNCTION DOC] Records warnings while checking a float scalar is not none and asserts
+        # none were emitted.
         # Scalars should just return False and not give a warnings.
         # The comparisons are flagged by pep8, ignore that.
         with warnings.catch_warnings(record=True) as w:
@@ -569,7 +659,12 @@ class TestConversion(TestCase):
 
 @xpassIfTorchDynamo_np  # (reason="can delegate repr to pytorch")
 class TestRepr(TestCase):
+    # [CLASS DOC] Round trip repr tests for float scalars; expected to pass only under dynamo
+    # numpy since torch could delegate repr.
     def _test_type_repr(self, t):
+        # [FUNCTION DOC] HELPER: for float type t, builds the smallest denormal and smallest
+        # normal bit patterns in a byte buffer, views them as t, evaluates the repr text back to
+        # a value and asserts equality unless the round trip underflowed to zero.
         finfo = np.finfo(t)
         last_fraction_bit_idx = finfo.nexp + finfo.nmant
         last_exponent_bit_idx = finfo.nexp
@@ -595,6 +690,8 @@ class TestRepr(TestCase):
                 assert_equal(val, val2)
 
     def test_float_repr(self):
+        # [FUNCTION DOC] Runs the repr round trip for float32 and float64 (long double excluded
+        # because the repr text is parsed through a Python float).
         # long double test cannot work, because eval goes through a python
         # float
         for t in [np.float32, np.float64]:
@@ -603,7 +700,13 @@ class TestRepr(TestCase):
 
 @skip(reason="Array scalars do not decay to python scalars.")
 class TestMultiply(TestCase):
+    # [CLASS DOC] Skipped tests (array scalars do not decay to Python scalars) for multiplying
+    # numpy scalars with sequences.
     def test_seq_repeat(self):
+        # [FUNCTION DOC] Checks list and tuple repeat via integer scalars, a deprecation warning
+        # for the bool code, and TypeError for all other scalar codes.
+        # KNOWN ISSUE: assert_warns is not imported in this module, so the deprecated branch
+        # would fail.
         # Test that basic sequences get repeated when multiplied with
         # numpy integers. And errors are raised when multiplied with others.
         # Some of this behaviour may be controversial and could be open for
@@ -635,14 +738,21 @@ class TestMultiply(TestCase):
                 assert_raises(TypeError, operator.mul, i, seq)
 
     def test_no_seq_repeat_basic_array_like(self):
+        # [FUNCTION DOC] Checks an array-like object and a memoryview multiplied by float32 or
+        # integer scalars multiply elementwise instead of repeating a sequence.
+        # KNOWN ISSUE: assert_array_equal is not imported in this module (test is skipped).
         # Test that an array-like which does not know how to be multiplied
         # does not attempt sequence repeat (raise TypeError).
         # See also gh-7428.
         class ArrayLike:
+            # [CLASS DOC] HELPER: minimal object wrapping an array and exposing it via the array
+            # protocol.
             def __init__(self, arr):
+                # [FUNCTION DOC] HELPER: stores the wrapped array in an attribute.
                 self.arr = arr
 
             def __array__(self):
+                # [FUNCTION DOC] HELPER: returns the wrapped array.
                 return self.arr
 
         # Test for simple ArrayLike above and memoryviews (original report)
@@ -654,12 +764,17 @@ class TestMultiply(TestCase):
 
 
 class TestNegative(TestCase):
+    # [CLASS DOC] Tests for unary negation of scalars.
     def test_exceptions(self):
+        # [FUNCTION DOC] Negating a boolean scalar must raise TypeError (numpy) or RuntimeError
+        # (torch).
         a = np.ones((), dtype=np.bool_)[()]
         # XXX: TypeError from numpy, RuntimeError from torch
         assert_raises((TypeError, RuntimeError), operator.neg, a)
 
     def test_result(self):
+        # [FUNCTION DOC] For integer and float codes, negating one gives the type maximum for
+        # unsigned codes (wraparound) and otherwise a value that sums with the original to zero.
         types = np.typecodes["AllInteger"] + np.typecodes["AllFloat"]
         # with suppress_warnings() as sup:
         #     sup.filter(RuntimeWarning)
@@ -674,12 +789,17 @@ class TestNegative(TestCase):
 
 
 class TestSubtract(TestCase):
+    # [CLASS DOC] Tests for scalar subtraction.
     def test_exceptions(self):
+        # [FUNCTION DOC] Subtracting boolean scalars must raise TypeError (numpy) or
+        # RuntimeError (torch).
         a = np.ones((), dtype=np.bool_)[()]
         with assert_raises((TypeError, RuntimeError)):  # XXX: TypeError from numpy
             operator.sub(a, a)  # RuntimeError from torch
 
     def test_result(self):
+        # [FUNCTION DOC] For integer and float codes, subtracting a scalar one from itself gives
+        # zero.
         types = np.typecodes["AllInteger"] + np.typecodes["AllFloat"]
         #        with suppress_warnings() as sup:
         #            sup.filter(RuntimeWarning)
@@ -690,7 +810,12 @@ class TestSubtract(TestCase):
 
 @instantiate_parametrized_tests
 class TestAbs(TestCase):
+    # [CLASS DOC] Tests for absolute value on float and complex scalars via two different
+    # functions.
     def _test_abs_func(self, absfunc, test_dtype):
+        # [FUNCTION DOC] HELPER: applies the given abs function to a scalar of the given type
+        # for negative, positive zero, negative zero, maximum, tiniest normal and minimum values
+        # and checks the expected magnitudes (zero must come back as positive zero).
         x = test_dtype(-1.5)
         assert_equal(absfunc(x), 1.5)
         x = test_dtype(0.0)
@@ -714,18 +839,28 @@ class TestAbs(TestCase):
 
     @parametrize("dtype", floating_types + complex_floating_types)
     def test_builtin_abs(self, dtype):
+        # [FUNCTION DOC] Runs the shared abs checks using the Python builtin abs for one float
+        # or complex type.
         self._test_abs_func(abs, dtype)
 
     @parametrize("dtype", floating_types + complex_floating_types)
     def test_numpy_abs(self, dtype):
+        # [FUNCTION DOC] Runs the shared abs checks using the library abs function for one float
+        # or complex type.
         self._test_abs_func(np.abs, dtype)
 
 
 @instantiate_parametrized_tests
 class TestBitShifts(TestCase):
+    # [CLASS DOC] Tests for bit shift operators on integer scalars.
     @parametrize("type_code", np.typecodes["AllInteger"])
     @parametrize("op", [operator.rshift, operator.lshift])
     def test_shift_all_bits(self, type_code, op):
+        # [FUNCTION DOC] Parametrized over integer code and shift operator. Shifts by the full
+        # bit width and by four more: negative values shifted right give minus one, everything
+        # else gives zero, and array results must match scalar results. Raises SkipTest for
+        # unsigned 16, 32 and 64 bit types and for a known torch issue with full-width shifts of
+        # int and long types.
         """Shifts where the shift amount is the width of the type or wider"""
         # gh-2449
         dt = np.dtype(type_code)
@@ -760,8 +895,11 @@ class TestBitShifts(TestCase):
 @skip(reason="Will rely on pytest for hashing")
 @instantiate_parametrized_tests
 class TestHash(TestCase):
+    # [CLASS DOC] Skipped tests that numpy scalar hashes match Python number hashes.
     @parametrize("type_code", np.typecodes["AllInteger"])
     def test_integer_hashes(self, type_code):
+        # [FUNCTION DOC] For each integer code, the hash of scalars built from 0 to 127 must
+        # equal the hash of the Python integer; raises AssertionError otherwise.
         scalar = np.dtype(type_code).type
         for i in range(128):
             if hash(i) != hash(scalar(i)):
@@ -769,6 +907,9 @@ class TestHash(TestCase):
 
     @parametrize("type_code", np.typecodes["AllFloat"])
     def test_float_and_complex_hashes(self, type_code):
+        # [FUNCTION DOC] For each float code, hashes of scalars built from several values
+        # (including pi and infinity) must equal the hash of the same Python value, and distinct
+        # NaN hashes are expected if Python distinguishes them.
         scalar = np.dtype(type_code).type
         for val in [np.pi, np.inf, 3, 6.0]:
             numpy_val = scalar(val)
@@ -795,6 +936,8 @@ class TestHash(TestCase):
 
     @parametrize("type_code", np.typecodes["Complex"])
     def test_complex_hashes(self, type_code):
+        # [FUNCTION DOC] For each complex code, hashes of scalars built from complex values must
+        # equal the hash of the corresponding Python complex.
         # Test some complex valued hashes specifically:
         scalar = np.dtype(type_code).type
         for val in [np.pi + 1j, np.inf - 3j, 3j, 6.0 + 1j]:
@@ -807,6 +950,9 @@ class TestHash(TestCase):
 
 @contextlib.contextmanager
 def recursionlimit(n):
+    # [FUNCTION DOC] HELPER: context manager that sets the interpreter recursion limit to the
+    # given value for the body and always restores the previous limit afterwards. Not used in
+    # this module.
     o = sys.getrecursionlimit()
     try:
         sys.setrecursionlimit(n)
@@ -817,6 +963,7 @@ def recursionlimit(n):
 
 @instantiate_parametrized_tests
 class TestScalarOpsMisc(TestCase):
+    # [CLASS DOC] Tests for warnings on scalar overflow and division by zero.
     @xfail  # (reason="pytorch does not warn on overflow")
     @parametrize("dtype", "Bbhil")
     @parametrize(
@@ -828,6 +975,9 @@ class TestScalarOpsMisc(TestCase):
         ],
     )
     def test_scalar_integer_operation_overflow(self, dtype, operation):
+        # [FUNCTION DOC] For each integer code and each of three operations (max plus max, min
+        # minus max, max times max), expects a RuntimeWarning about overflow. Expected to fail
+        # with torch, which does not warn.
         st = np.dtype(dtype).type
         min = st(np.iinfo(dtype).min)
         max = st(np.iinfo(dtype).max)
@@ -850,6 +1000,9 @@ class TestScalarOpsMisc(TestCase):
         ],
     )
     def test_scalar_signed_integer_overflow(self, dtype, operation):
+        # [FUNCTION DOC] Signed integer minimum cases (negate, abs, times minus one, floor
+        # divide by minus one) expect an overflow RuntimeWarning. Skipped because overflow
+        # crashes torch under sanitizers.
         # The minimum signed integer can "overflow" for some additional operations
         st = np.dtype(dtype).type
         min = st(np.iinfo(dtype).min)
@@ -862,6 +1015,8 @@ class TestScalarOpsMisc(TestCase):
     @xpassIfTorchDynamo_np  # (reason="pytorch does not warn on overflow")
     @parametrize("dtype", "B")
     def test_scalar_unsigned_integer_overflow(self, dtype):
+        # [FUNCTION DOC] Negating an unsigned byte scalar of value eight must warn about
+        # overflow, while negating zero must not. Skipped on old numpy; torch emits no warning.
         val = np.dtype(dtype).type(8)
         with pytest.warns(RuntimeWarning, match="overflow encountered"):
             -val
@@ -879,6 +1034,9 @@ class TestScalarOpsMisc(TestCase):
         ],
     )
     def test_scalar_integer_operation_divbyzero(self, dtype, operation):
+        # [FUNCTION DOC] Floor division and modulus of a hundred by zero for each integer code
+        # should warn about divide by zero. Expected to fail because torch raises RuntimeError
+        # instead.
         st = np.dtype(dtype).type
         val = st(100)
         zero = st(0)
@@ -907,10 +1065,14 @@ ops_with_names = [
 
 @instantiate_parametrized_tests
 class TestScalarSubclassingMisc(TestCase):
+    # [CLASS DOC] Skipped tests (scalar subclassing is unsupported) for operator deferral.
     @skip(reason="We do not support subclassing scalars.")
     @parametrize("__op__, __rop__, op, cmp", ops_with_names)
     @parametrize("sctype", [np.float32, np.float64])
     def test_subclass_deferral(self, sctype, __op__, __rop__, op, cmp):
+        # [FUNCTION DOC] Skipped. For each operator and float scalar type, checks that two
+        # unrelated subclasses fall back to the base operator while a subclass overriding the
+        # operator and its reflected form wins.
         """
         This test covers scalar subclass deferral.  Note that this is exceedingly
         complicated, especially since it tends to fall back to the array paths and
@@ -923,15 +1085,21 @@ class TestScalarSubclassingMisc(TestCase):
         """
 
         class myf_simple1(sctype):
+            # [FUNCTION DOC] HELPER: empty subclass of the scalar type under test.
             pass
 
         class myf_simple2(sctype):
+            # [FUNCTION DOC] HELPER: second empty subclass of the scalar type under test.
             pass
 
         def op_func(self, other):
+            # [FUNCTION DOC] HELPER: stand-in operator that ignores operands and returns the
+            # operator name.
             return __op__
 
         def rop_func(self, other):
+            # [FUNCTION DOC] HELPER: stand-in reflected operator that returns the reflected
+            # operator name.
             return __rop__
 
         myf_op = type("myf_op", (sctype,), {__op__: op_func, __rop__: rop_func})
@@ -957,10 +1125,17 @@ class TestScalarSubclassingMisc(TestCase):
     @parametrize("subtype", [float, int, complex, np.float16])
     # @np._no_nep50_warning()
     def test_pyscalar_subclasses(self, subtype, __op__, __rop__, op, cmp):
+        # [FUNCTION DOC] Skipped. Checks Python float, int, complex and float16 subclasses that
+        # define operators with array ufunc disabled defer correctly against numpy scalars, and
+        # without that marker are treated as ordinary subclasses with results of the base type.
         def op_func(self, other):
+            # [FUNCTION DOC] HELPER: stand-in operator that ignores operands and returns the
+            # operator name.
             return __op__
 
         def rop_func(self, other):
+            # [FUNCTION DOC] HELPER: stand-in reflected operator that returns the reflected
+            # operator name.
             return __rop__
 
         # Check that deferring is indicated using `__array_ufunc__`:

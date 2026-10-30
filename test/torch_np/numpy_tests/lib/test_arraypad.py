@@ -1,4 +1,7 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for constant mode array padding in torch._numpy (or real numpy under
+# dynamo), comparing against hard coded expected arrays. Import time only selects the numpy
+# implementation.
 
 from unittest import skipIf as skipif
 
@@ -21,8 +24,13 @@ else:
 
 
 class TestConstant(TestCase):
+    # [CLASS DOC] Tests of the pad function in constant mode with various constant value forms.
     @xpassIfTorchDynamo_np  # (reason="tuple values")
     def test_check_constant(self):
+        # [FUNCTION DOC] Pads a range of one hundred integers with 25 leading and 20 trailing
+        # elements using separate constants (10 before, 20 after) and compares to a long literal
+        # expected array. Expected to pass only under dynamo numpy because tuple constants are
+        # unsupported in torch.
         a = np.arange(100)
         a = np.pad(a, (25, 20), "constant", constant_values=(10, 20))
         b = np.array(
@@ -177,6 +185,8 @@ class TestConstant(TestCase):
         assert_array_equal(a, b)
 
     def test_check_constant_zeros(self):
+        # [FUNCTION DOC] Pads the same range with default constant mode (zeros) by 25 and 20
+        # elements and compares with the expected literal array.
         a = np.arange(100)
         a = np.pad(a, (25, 20), "constant")
         b = np.array(
@@ -331,6 +341,8 @@ class TestConstant(TestCase):
         assert_array_equal(a, b)
 
     def test_check_constant_float(self):
+        # [FUNCTION DOC] Pads an integer matrix with a float constant (1.1); the integer dtype
+        # is kept so the constant is truncated to one in the padded border.
         # If input array is int, but constant_values are float, the dtype of
         # the array to be padded is kept
         arr = np.arange(30).reshape(5, 6)
@@ -350,6 +362,8 @@ class TestConstant(TestCase):
         assert_allclose(test, expected)
 
     def test_check_constant_float2(self):
+        # [FUNCTION DOC] Pads a float64 matrix with the float constant 1.1 on a different width
+        # per side; the border keeps the float constant.
         # If input array is float, and constant_values are float, the dtype of
         # the array to be padded is kept - here retaining the float constants
         arr = np.arange(30).reshape(5, 6)
@@ -371,6 +385,9 @@ class TestConstant(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="tuple values")
     def test_check_constant_float3(self):
+        # [FUNCTION DOC] Pads a float range with separate float constants before and after and
+        # compares with a long literal. Expected to pass only under dynamo numpy (tuple
+        # constants).
         a = np.arange(100, dtype=float)
         a = np.pad(a, (25, 20), "constant", constant_values=(-1.1, -1.2))
         b = np.array(
@@ -525,6 +542,8 @@ class TestConstant(TestCase):
         assert_allclose(a, b)
 
     def test_check_constant_odd_pad_amount(self):
+        # [FUNCTION DOC] Pads rows by one on both sides and columns by two on both sides, given
+        # as single element tuples, with constant three, and checks the result.
         arr = np.arange(30).reshape(5, 6)
         test = np.pad(arr, ((1,), (2,)), mode="constant", constant_values=3)
         expected = np.array(
@@ -542,6 +561,9 @@ class TestConstant(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="tuple values")
     def test_check_constant_pad_2d(self):
+        # [FUNCTION DOC] Pads a two by two array with different widths and different per-axis,
+        # per-side constants and checks the five by six result. Expected to pass only under
+        # dynamo numpy.
         arr = np.arange(4).reshape(2, 2)
         test = np.pad(
             arr, ((1, 2), (1, 3)), mode="constant", constant_values=((1, 2), (3, 4))
@@ -561,6 +583,9 @@ class TestConstant(TestCase):
         True, reason="passes on MacOS, fails otherwise"
     )  # (reason="int64 overflow")
     def test_check_large_integers(self):
+        # [FUNCTION DOC] Pads an array of the maximum 64 bit integer value using its own minimum
+        # (which equals that value) as constant, expecting all elements to remain the maximum.
+        # Always skipped because behavior differs across platforms.
         int64_max = 2**63 - 1
         arr = np.full(5, int64_max, dtype=np.int64)
         test = np.pad(arr, 1, mode="constant", constant_values=arr.min())
@@ -568,6 +593,8 @@ class TestConstant(TestCase):
         assert_array_equal(test, expected)
 
     def test_pad_empty_dimension(self):
+        # [FUNCTION DOC] Padding a zero length axis with widths of zero, two and one must give a
+        # result of shape three by four by four.
         arr = np.zeros((3, 0, 2))
         result = np.pad(arr, [(0,), (2,), (1,)], mode="constant")
         if result.shape != (3, 4, 4):

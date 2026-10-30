@@ -1,4 +1,8 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the pocketfft style API (fft, ifft, rfft, irfft, hfft, ihfft and their
+# 2d and n-d variants) in torch._numpy, or real numpy under dynamo. Checks norm modes, axes,
+# dtypes, memory layout and thread safety against a naive transform. Import time selects the
+# numpy implementation and defines a skip helper, a wasm flag and a reference transform.
 
 import functools
 import queue
@@ -35,6 +39,9 @@ IS_WASM = False
 
 
 def fft1(x):
+    # [FUNCTION DOC] HELPER: naive discrete Fourier transform reference. Builds the matrix of
+    # complex phase factors from the signal length and returns the matrix applied to a one
+    # dimensional input, summed along the second axis.
     L = len(x)
     phase = -2j * np.pi * (np.arange(L) / L)
     phase = np.arange(L).reshape(-1, 1) * phase
@@ -42,17 +49,26 @@ def fft1(x):
 
 
 class TestFFTShift(TestCase):
+    # [CLASS DOC] Tests for argument validation (the class name is a leftover from another
+    # module).
     def test_fft_n(self):
+        # [FUNCTION DOC] A transform length of zero must raise ValueError or RuntimeError.
         assert_raises((ValueError, RuntimeError), np.fft.fft, [1, 2, 3], 0)
 
 
 @instantiate_parametrized_tests
 class TestFFT1D(TestCase):
+    # [CLASS DOC] Round trip, normalization and shape tests for the one and many dimensional
+    # FFTs.
     def setUp(self):
+        # [FUNCTION DOC] Seeds the random number generator with a fixed value before each test.
         super().setUp()
         np.random.seed(123456)
 
     def test_identity(self):
+        # [FUNCTION DOC] For prefixes of every length up to 511 of a random complex and a random
+        # real signal, checks inverse of forward transform recovers the input for complex and
+        # real transforms.
         maxlen = 512
         x = random(maxlen) + 1j * random(maxlen)
         xr = random(maxlen)
@@ -61,6 +77,8 @@ class TestFFT1D(TestCase):
             assert_allclose(np.fft.irfft(np.fft.rfft(xr[0:i]), i), xr[0:i], atol=1e-12)
 
     def test_fft(self):
+        # [FUNCTION DOC] Compares fft with the naive reference transform for default, backward,
+        # ortho and forward normalization, with matching scale factors.
         np.random.seed(1234)
         x = random(30) + 1j * random(30)
         assert_allclose(fft1(x), np.fft.fft(x), atol=3e-5)
@@ -73,6 +91,9 @@ class TestFFT1D(TestCase):
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/182098")
     @parametrize("norm", (None, "backward", "ortho", "forward"))
     def test_ifft(self, norm):
+        # [FUNCTION DOC] Parametrized over norm. Checks ifft of fft recovers the input and that
+        # ifft of an empty list raises ValueError or RuntimeError mentioning an invalid number.
+        # Skipped under dynamo because of linked torch issues.
         x = random(30) + 1j * random(30)
         assert_allclose(x, np.fft.ifft(np.fft.fft(x, norm=norm), norm=norm), atol=1e-6)
 
@@ -82,6 +103,9 @@ class TestFFT1D(TestCase):
             np.fft.ifft([], norm=norm)
 
     def test_fft2(self):
+        # [FUNCTION DOC] fft2 must equal two chained one dimensional fft calls and obey the norm
+        # scaling rules (backward unchanged, ortho divided by square root of size, forward
+        # divided by size).
         x = random((30, 20)) + 1j * random((30, 20))
         assert_allclose(
             np.fft.fft(np.fft.fft(x, axis=1), axis=0), np.fft.fft2(x), atol=1e-6
@@ -95,6 +119,8 @@ class TestFFT1D(TestCase):
         )
 
     def test_ifft2(self):
+        # [FUNCTION DOC] ifft2 must equal two chained ifft calls and obey the inverse norm
+        # scaling rules.
         x = random((30, 20)) + 1j * random((30, 20))
         assert_allclose(
             np.fft.ifft(np.fft.ifft(x, axis=1), axis=0), np.fft.ifft2(x), atol=1e-6
@@ -108,6 +134,8 @@ class TestFFT1D(TestCase):
         )
 
     def test_fftn(self):
+        # [FUNCTION DOC] fftn must equal three chained fft calls and obey norm scaling over all
+        # elements.
         x = random((30, 20, 10)) + 1j * random((30, 20, 10))
         assert_allclose(
             np.fft.fft(np.fft.fft(np.fft.fft(x, axis=2), axis=1), axis=0),
@@ -127,6 +155,8 @@ class TestFFT1D(TestCase):
         )
 
     def test_ifftn(self):
+        # [FUNCTION DOC] ifftn must equal three chained ifft calls and obey inverse norm
+        # scaling.
         x = random((30, 20, 10)) + 1j * random((30, 20, 10))
         assert_allclose(
             np.fft.ifft(np.fft.ifft(np.fft.ifft(x, axis=2), axis=1), axis=0),
@@ -146,6 +176,9 @@ class TestFFT1D(TestCase):
         )
 
     def test_rfft(self):
+        # [FUNCTION DOC] rfft must equal the leading half of the fft of a real signal, for the
+        # signal size and double that size and all norm modes, with consistent scaling of the
+        # norm options.
         x = random(30)
         for n in [x.size, 2 * x.size]:
             for norm in [None, "backward", "ortho", "forward"]:
@@ -167,6 +200,8 @@ class TestFFT1D(TestCase):
             )
 
     def test_irfft(self):
+        # [FUNCTION DOC] irfft of rfft must recover a real signal for default, backward, ortho
+        # and forward.
         x = random(30)
         assert_allclose(x, np.fft.irfft(np.fft.rfft(x)), atol=1e-6)
         assert_allclose(
@@ -180,6 +215,8 @@ class TestFFT1D(TestCase):
         )
 
     def test_rfft2(self):
+        # [FUNCTION DOC] rfft2 must equal the first eleven columns of fft2 of a real input and
+        # obey norm scaling.
         x = random((30, 20))
         assert_allclose(np.fft.fft2(x)[:, :11], np.fft.rfft2(x), atol=1e-6)
         assert_allclose(np.fft.rfft2(x), np.fft.rfft2(x, norm="backward"), atol=1e-6)
@@ -191,6 +228,7 @@ class TestFFT1D(TestCase):
         )
 
     def test_irfft2(self):
+        # [FUNCTION DOC] irfft2 of rfft2 must recover the input for every norm mode.
         x = random((30, 20))
         assert_allclose(x, np.fft.irfft2(np.fft.rfft2(x)), atol=1e-6)
         assert_allclose(
@@ -206,6 +244,8 @@ class TestFFT1D(TestCase):
         )
 
     def test_rfftn(self):
+        # [FUNCTION DOC] rfftn must equal the first six entries on the last axis of fftn and
+        # obey norm scaling.
         x = random((30, 20, 10))
         assert_allclose(np.fft.fftn(x)[:, :, :6], np.fft.rfftn(x), atol=1e-6)
         assert_allclose(np.fft.rfftn(x), np.fft.rfftn(x, norm="backward"), atol=1e-6)
@@ -221,6 +261,7 @@ class TestFFT1D(TestCase):
         )
 
     def test_irfftn(self):
+        # [FUNCTION DOC] irfftn of rfftn must recover the input for every norm mode.
         x = random((30, 20, 10))
         assert_allclose(x, np.fft.irfftn(np.fft.rfftn(x)), atol=1e-6)
         assert_allclose(
@@ -236,6 +277,8 @@ class TestFFT1D(TestCase):
         )
 
     def test_hfft(self):
+        # [FUNCTION DOC] Builds a Hermitian symmetric signal of length thirty and checks hfft of
+        # its half spectrum equals fft of the full signal and obeys norm scaling.
         x = random(14) + 1j * random(14)
         x_herm = np.concatenate((random(1), x, random(1)))
         x = np.concatenate((x_herm, np.flip(x).conj()))
@@ -253,6 +296,8 @@ class TestFFT1D(TestCase):
         )
 
     def test_ihfft(self):
+        # [FUNCTION DOC] ihfft of hfft of a Hermitian half signal must recover it for every norm
+        # mode.
         x = random(14) + 1j * random(14)
         x_herm = np.concatenate((random(1), x, random(1)))
         x = np.concatenate((x_herm, np.flip(x).conj()))
@@ -275,6 +320,9 @@ class TestFFT1D(TestCase):
 
     @parametrize("op", [np.fft.fftn, np.fft.ifftn, np.fft.rfftn, np.fft.irfftn])
     def test_axes(self, op):
+        # [FUNCTION DOC] Parametrized over the n-d transforms. For each permutation of three
+        # axes, transforming a transposed array must equal transposing the transform taken with
+        # those axes.
         x = random((30, 20, 10))
         axes = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
         for a in axes:
@@ -283,6 +331,8 @@ class TestFFT1D(TestCase):
             assert_allclose(op_tr, tr_op, atol=1e-6)
 
     def test_all_1d_norm_preserving(self):
+        # [FUNCTION DOC] For forward and backward transform pairs (fft, rfft, ihfft), norm modes
+        # and two lengths, the norm of the round trip result must equal the norm of the input.
         # verify that round-trip transforms are norm-preserving
         x = random(30)
         x_norm = np.linalg.norm(x)
@@ -303,6 +353,8 @@ class TestFFT1D(TestCase):
 
     @parametrize("dtype", [np.half, np.single, np.double])
     def test_dtypes(self, dtype):
+        # [FUNCTION DOC] Parametrized over half, single and double precision inputs: round trips
+        # through complex and real transforms must recover the input.
         # make sure that all input precisions are accepted and internally
         # converted to 64bit
         x = random(30).astype(dtype)
@@ -316,6 +368,10 @@ class TestFFT1D(TestCase):
         [np.fft.fft, np.fft.fft2, np.fft.fftn, np.fft.ifft, np.fft.ifft2, np.fft.ifftn],
     )
     def test_fft_with_order(self, dtype, order, fft):
+        # [FUNCTION DOC] Parametrized over dtype, layout and transform. Compares results of a
+        # transform on a contiguous array against a non contiguous strided view with the same
+        # values, over axes or axes tuples. The Fortran order case raises SkipTest.
+        # KNOWN ISSUE: code following the SkipTest raise in the Fortran branch is unreachable.
         # Check that FFT/IFFT produces identical results for C, Fortran and
         # non contiguous arrays
         #   rng = np.random.RandomState(42)
@@ -352,11 +408,20 @@ class TestFFT1D(TestCase):
 
 @skipif(IS_WASM, reason="Cannot start thread")
 class TestFFTThreadSafe(TestCase):
+    # [CLASS DOC] Thread safety tests: runs one transform concurrently from sixteen threads and
+    # checks every result matches a single threaded result. Class attributes hold the thread
+    # count and input shape. Skipped where threads cannot start.
     threads = 16
     input_shape = (800, 200)
 
     def _test_mtsame(self, func, *args):
+        # [FUNCTION DOC] HELPER: computes the function result once, starts the configured number
+        # of threads that each call it and put the result on a queue, joins them, then asserts
+        # every queued result is close to the expected one (queue reads time out after five
+        # seconds).
         def worker(args, q):
+            # [FUNCTION DOC] HELPER: thread body that calls the function with the given
+            # arguments and puts the result on the shared queue.
             q.put(func(*args))
 
         q = queue.Queue()
@@ -381,18 +446,22 @@ class TestFFTThreadSafe(TestCase):
             )
 
     def test_fft(self):
+        # [FUNCTION DOC] Runs the multithreaded check for fft on a complex array of ones.
         a = np.ones(self.input_shape) * 1 + 0j
         self._test_mtsame(np.fft.fft, a)
 
     def test_ifft(self):
+        # [FUNCTION DOC] Runs the multithreaded check for ifft on a complex array of ones.
         a = np.ones(self.input_shape) * 1 + 0j
         self._test_mtsame(np.fft.ifft, a)
 
     def test_rfft(self):
+        # [FUNCTION DOC] Runs the multithreaded check for rfft on a real array of ones.
         a = np.ones(self.input_shape)
         self._test_mtsame(np.fft.rfft, a)
 
     def test_irfft(self):
+        # [FUNCTION DOC] Runs the multithreaded check for irfft on a complex array of ones.
         a = np.ones(self.input_shape) * 1 + 0j
         self._test_mtsame(np.fft.irfft, a)
 
