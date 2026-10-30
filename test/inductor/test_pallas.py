@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Tests for the Inductor Pallas backend. Defines a mixin of
+# device-parameterized end-to-end tests (compile with the pallas backend
+# option, compare against eager, and in a few cases inspect generated
+# code), plus make_pallas which clones existing Inductor test classes with
+# the pallas backend patched in. At import time it reads the sentinel
+# directories pallas_expected_failures and pallas_skip_tests, exits or
+# skips on Windows CI, imports test_torchinductor, and registers CPU, CUDA
+# and TPU test classes only when the matching Pallas support is available.
 import functools
 import os
 import re
@@ -55,6 +63,17 @@ test_classes = {}
 
 
 def make_pallas(cls):
+    # [FUNCTION DOC] Build a Pallas variant of an existing Inductor test
+    # class. Patches the cpu and cuda backend config to pallas and disables
+    # the runtime triton dtype and shape asserts. Test methods named in the
+    # expected-failure sentinel set get an xfail marker attribute, and those
+    # in the skip set get a skip marker attribute, keyed by class name and
+    # method name. Creates the class with make_test_cls_with_patches (prefix
+    # Pallas, suffix _pallas), records double as an unsupported input
+    # generation type, registers it in test_classes and module globals (needed
+    # for test collection), sets its module name, and returns it.
+    # KNOWN ISSUE: the comment says float64 and int64 are unsupported but only
+    #   double is recorded.
     """Create a test class variant that uses Pallas backend.
 
     Args:
@@ -81,6 +100,9 @@ def make_pallas(cls):
                     fn._skip_pallas = True
 
     def skip_decorator(fn):
+        # [FUNCTION DOC] HELPER: Decorator passed to the class builder. Returns
+        # the test unchanged unless it carries the skip marker attribute, in which
+        # case it is wrapped in an unconditional unittest skip.
         if hasattr(fn, "_skip_pallas"):
             return unittest.skip("Skipped in Pallas backend")(fn)
         return fn
@@ -105,10 +127,22 @@ def make_pallas(cls):
 
 
 def _skip_if(condition_fn):
+    # [FUNCTION DOC] HELPER: Factory for skip decorators. Given a predicate
+    # taking the test instance, returns a decorator usable bare or with a
+    # reason keyword; the decorated test calls skipTest when the predicate is
+    # true.
     def skip(fn=None, *, reason=None):
+        # [FUNCTION DOC] HELPER: Decorator entry point. If a function is passed
+        # directly it is decorated at once; otherwise returns the decorator so the
+        # reason keyword form works.
         def decorator(fn):
+            # [FUNCTION DOC] HELPER: Wraps the test function, preserving its metadata.
             @functools.wraps(fn)
             def wrapper(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Runs the predicate on the test instance; if true
+                # skips with the given reason or a default message naming the device,
+                # otherwise calls the original test. The return value of the test is
+                # discarded.
                 if condition_fn(self):
                     self.skipTest(reason or f"Not yet working on {self.DEVICE}")
                 fn(self, *args, **kwargs)
@@ -128,6 +162,13 @@ skip_if_cuda = _skip_if(lambda self: self.DEVICE == "cuda")
 
 
 class PallasTestsMixin:
+    # [CLASS DOC] Mixin holding the Pallas backend tests, parameterized by the
+    # DEVICE class attribute (cpu, cuda or tpu); concrete subclasses are
+    # created below only when the device supports Pallas. On CUDA it disables
+    # the per-test fresh cache through an environment variable and clears
+    # dynamo and JAX caches before each test to avoid Mosaic GPU state
+    # problems. Tests compile small functions through _compile and compare
+    # with eager results.
     """Basic tests for Pallas backend functionality (parameterized by DEVICE). Mixin only, not collected.
 
     NOTE: CUDA tests disable per-test fresh_cache to avoid JAX Mosaic GPU backend state issues.
@@ -137,6 +178,9 @@ class PallasTestsMixin:
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: Class setup. For CUDA sets an environment
+        # variable that disables the per-test fresh cache; chains to the parent
+        # setup.
         super().setUpClass()
         # Disable per-test fresh_cache for CUDA to avoid JAX Mosaic state corruption
         if getattr(cls, "DEVICE", None) == "cuda":
@@ -144,11 +188,17 @@ class PallasTestsMixin:
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] HELPER: Class teardown. For CUDA removes the environment
+        # variable set at setup (no error if absent), then chains to the parent
+        # teardown.
         if getattr(cls, "DEVICE", None) == "cuda":
             os.environ.pop("INDUCTOR_TEST_DISABLE_FRESH_CACHE", None)
         super().tearDownClass()
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Per-test setup. For CUDA only: resets dynamo,
+        # runs garbage collection and clears JAX caches (ignored if JAX is not
+        # importable), to avoid Mosaic GPU backend state leakage.
         super().setUp()
         # Clear caches between tests to avoid Mosaic GPU backend state issues
         if self.DEVICE == "cuda":
@@ -164,6 +214,10 @@ class PallasTestsMixin:
                 pass
 
     def _compile(self, fn):
+        # [FUNCTION DOC] HELPER: Compile a function with inductor using the pallas
+        # backend for the current device. Maps the device name to the matching
+        # backend option key (cuda_backend, cpu_backend or tpu_backend) and
+        # compiles with static shapes. Raises a key error for an unknown device.
         device_to_backend_key = {
             "cuda": "cuda_backend",
             "cpu": "cpu_backend",
@@ -175,9 +229,13 @@ class PallasTestsMixin:
         )
 
     def test_simple_add(self):
+        # [FUNCTION DOC] Element-wise addition of two random tensors matches
+        # eager. Shapes: one 1D size, plus larger 1D and 2D shapes when not on
+        # CUDA.
         """Test basic element-wise addition."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return a + b
 
         shapes = [(1024,)]
@@ -193,9 +251,12 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_simple_mul(self):
+        # [FUNCTION DOC] Element-wise multiplication matches eager over the same
+        # shape set as the add test.
         """Test basic element-wise multiplication."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Multiplies the two inputs.
             return a * b
 
         shapes = [(1024,)]
@@ -211,9 +272,12 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_sin(self):
+        # [FUNCTION DOC] Sine of a random tensor matches eager; an extra larger
+        # shape is used off CUDA.
         """Test sin operation."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies sine.
             return torch.sin(x)
 
         shapes = [(1024,)]
@@ -228,9 +292,12 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_fused_ops(self):
+        # [FUNCTION DOC] A fused sin plus add of two 1024-element tensors matches
+        # eager.
         """Test fused operations (sin + add)."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine of the first input plus the second.
             return x.sin() + y
 
         compiled = self._compile(fn)
@@ -242,9 +309,11 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_exp_log(self):
+        # [FUNCTION DOC] Log of exp of a random tensor matches eager.
         """Test exp and log operations."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies exp then log.
             return torch.log(torch.exp(x))
 
         compiled = self._compile(fn)
@@ -256,9 +325,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="sqrt primitive not implemented in Pallas Mosaic GPU")
     def test_sqrt(self):
+        # [FUNCTION DOC] Square root of absolute values matches eager. Skipped on
+        # CUDA (sqrt primitive missing in Pallas Mosaic GPU).
         """Test sqrt operation."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies square root.
             return torch.sqrt(x)
 
         compiled = self._compile(fn)
@@ -269,9 +341,11 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_tanh(self):
+        # [FUNCTION DOC] Hyperbolic tangent of a random tensor matches eager.
         """Test tanh operation."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies tanh.
             return torch.tanh(x)
 
         compiled = self._compile(fn)
@@ -282,9 +356,11 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_abs_neg(self):
+        # [FUNCTION DOC] Absolute value of a negated tensor matches eager.
         """Test abs and neg operations."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Negates then takes the absolute value.
             return torch.abs(-x)
 
         compiled = self._compile(fn)
@@ -295,9 +371,12 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_maximum_minimum(self):
+        # [FUNCTION DOC] Sum of element-wise maximum and minimum of two tensors
+        # matches eager.
         """Test maximum and minimum operations."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Returns maximum plus minimum of the two inputs.
             return torch.maximum(a, b) + torch.minimum(a, b)
 
         compiled = self._compile(fn)
@@ -311,6 +390,11 @@ class PallasTestsMixin:
     @unittest.skipUnless(has_triton(), "requires triton")
     @unittest.skip("Random ops not yet implemented in Pallas backend")
     def test_random_consistency(self):
+        # [FUNCTION DOC] Intended to check that seeded random generation agrees
+        # between the pallas and triton backends on CUDA; currently
+        # unconditionally skipped because random ops are not implemented. Loops
+        # over rand and randn generators, compiling each with both backends,
+        # seeding before each call and comparing outputs.
         """Test that random number generation is consistent across backends."""
         seed = 1234
         shape = (3, 3)
@@ -323,10 +407,14 @@ class PallasTestsMixin:
 
             @torch.compile(backend="inductor", options={"cuda_backend": "pallas"})
             def get_rand_pallas():
+                # [FUNCTION DOC] HELPER: Compiled with the pallas CUDA backend; returns
+                # the generator output.
                 return rand_fn()
 
             @torch.compile(backend="inductor", options={"cuda_backend": "triton"})
             def get_rand_triton():
+                # [FUNCTION DOC] HELPER: Compiled with the triton CUDA backend; returns
+                # the generator output.
                 return rand_fn()
 
             torch.manual_seed(seed)
@@ -337,6 +425,9 @@ class PallasTestsMixin:
             self.assertEqual(pallas_output, triton_output)
 
     def test_compile_options(self):
+        # [FUNCTION DOC] Compiles a sin plus cos function with the pallas backend,
+        # fetches the generated source with run_and_get_code and asserts it
+        # contains the jax, jax.numpy and pallas imports.
         """Test that Pallas backend is properly configured."""
 
         pallas_fn = self._compile(lambda a, b: a.sin() + b.cos())
@@ -352,6 +443,13 @@ class PallasTestsMixin:
         self.assertIn("from jax.experimental import pallas as pl", code)
 
     def test_jax_jit_wrapper_is_emitted(self):
+        # [FUNCTION DOC] Checks the generated source for a jit wrapper. Finds the
+        # kernel name by regular expression, requires a wrapper function named
+        # after it and isolates the wrapper text up to the main function. Asserts
+        # the source uses jax.jit with donated arguments. On CUDA the wrapper must
+        # use plgpu.kernel and the source must have no copy_ call; elsewhere it
+        # must use input_output_aliases. In all cases the wrapper must not mention
+        # torch.
         """Ensure generated Pallas code wraps pl.pallas_call in jax.jit."""
 
         pallas_fn = self._compile(lambda a, b: a + b)
@@ -383,9 +481,12 @@ class PallasTestsMixin:
         self.assertNotIn("torch.", wrapper_block)
 
     def test_2d_tensor(self):
+        # [FUNCTION DOC] Addition of 2D tensors matches eager: a 32 by 32 shape,
+        # plus 16 by 2048 off CUDA.
         """Test with 2D tensors."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return x + y
 
         shapes = [(32, 32)]
@@ -404,9 +505,13 @@ class PallasTestsMixin:
         reason="iteration variables not supported in Pallas GPU (Mosaic) backend"
     )
     def test_different_shapes(self):
+        # [FUNCTION DOC] Multiplying by a constant for 1D inputs of sizes 64 to
+        # 1024 matches eager, reusing one compiled function. Skipped on CUDA
+        # (iteration variables unsupported).
         """Test with different tensor shapes."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by two.
             return x * 2.0
 
         compiled = self._compile(fn)
@@ -419,10 +524,16 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_contiguous_index_validation(self):
+        # [FUNCTION DOC] End-to-end check of contiguous and non-contiguous inputs.
+        # Runs an add and a scale on contiguous tensors, then for several shapes
+        # feeds a transposed (non-contiguous) view and its contiguous copy through
+        # a compiled sine, asserting the views are as expected and results match
+        # eager. Skipped on CUDA.
         """Test that contiguous index validation works correctly end-to-end."""
 
         # Test 1: Contiguous operations should work
         def contiguous_add(a, b):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return a + b
 
         compiled = self._compile(contiguous_add)
@@ -435,6 +546,7 @@ class PallasTestsMixin:
 
         # Test 2: Operations on contiguous tensors should work
         def contiguous_mul(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by two.
             return x * 2.0
 
         compiled = self._compile(contiguous_mul)
@@ -447,6 +559,7 @@ class PallasTestsMixin:
         # Test 3: Non-contiguous views should work with the simplified dlpack approach
         # The direct dlpack conversion handles non-contiguous tensors correctly
         def operate_on_tensor(x):
+            # [FUNCTION DOC] HELPER: Applies sine.
             return x.sin()
 
         compiled = self._compile(operate_on_tensor)
@@ -472,9 +585,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="strided access not supported in Pallas GPU (Mosaic) backend")
     def test_strided_int_pallas(self):
+        # [FUNCTION DOC] Strided slice with step two of a 1D range, scaled by two,
+        # matches eager. Skipped on CUDA.
         """Test strided access patterns with the Pallas backend."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Takes every second element and doubles it.
             return x[::2] * 2.0
 
         compiled = self._compile(fn)
@@ -486,9 +602,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="strided access not supported in Pallas GPU (Mosaic) backend")
     def test_strided_offset_pallas(self):
+        # [FUNCTION DOC] Strided slice starting at offset one with step two, plus
+        # one, matches eager. Skipped on CUDA.
         """Test strided access with offset."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Takes odd-index elements and adds one.
             return x[1::2] + 1.0
 
         compiled = self._compile(fn)
@@ -499,9 +618,11 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_strided_2d_pallas(self):
+        # [FUNCTION DOC] Scaling a 2D tensor by three matches eager.
         """Test strided access on 2D tensors."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by three.
             # Simple operation on 2D tensor
             return x * 3.0
 
@@ -513,6 +634,9 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_stride_non_contiguous_1d(self):
+        # [FUNCTION DOC] Compiled scale-and-shift on several 1D non-contiguous
+        # inputs (strides two, four and a double stride) matches eager; asserts
+        # each input is non-contiguous.
         """Test 1D non-contiguous input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -522,6 +646,8 @@ class PallasTestsMixin:
             self.assertEqual(compiled(x), x * 2.0 + 1.0)
 
     def test_stride_non_contiguous_2d_row_stride(self):
+        # [FUNCTION DOC] Scale-and-shift on a 2D view taking every second row
+        # matches eager.
         """Test 2D row-strided input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -531,6 +657,8 @@ class PallasTestsMixin:
         self.assertEqual(compiled(x), x * 2.0 + 1.0)
 
     def test_stride_non_contiguous_2d_col_stride(self):
+        # [FUNCTION DOC] Scale-and-shift on a 2D view taking every second column
+        # matches eager.
         """Test 2D col-strided input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -540,6 +668,8 @@ class PallasTestsMixin:
         self.assertEqual(compiled(x), x * 2.0 + 1.0)
 
     def test_stride_non_contiguous_2d_both_stride(self):
+        # [FUNCTION DOC] Scale-and-shift on a 2D view striding both dimensions
+        # matches eager.
         """Test 2D both-strided input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -550,6 +680,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_stride_non_contiguous_2d_transpose(self):
+        # [FUNCTION DOC] Scale-and-shift on transposed inputs of several shapes
+        # (including odd sizes) matches eager. Skipped on CUDA.
         """Test 2D transposed input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -569,6 +701,8 @@ class PallasTestsMixin:
                 self.assertEqual(compiled(x), x * 2.0 + 1.0)
 
     def test_stride_non_contiguous_3d(self):
+        # [FUNCTION DOC] Scale-and-shift on a 3D view striding every dimension by
+        # two matches eager.
         """Test 3D non-contiguous input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -579,6 +713,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_stride_non_contiguous_permuted(self):
+        # [FUNCTION DOC] Scale-and-shift on a permuted 3D tensor matches eager.
+        # Skipped on CUDA.
         """Test permuted non-contiguous input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -589,6 +725,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_stride_non_contiguous_channels_last(self):
+        # [FUNCTION DOC] Scale-and-shift on a channels-last 4D tensor, asserted
+        # non-contiguous, matches eager. Skipped on CUDA.
         """Test channels-last (NHWC) non-contiguous input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -599,6 +737,8 @@ class PallasTestsMixin:
         self.assertEqual(compiled(x), x * 2.0 + 1.0)
 
     def test_stride_non_contiguous_diagonal(self):
+        # [FUNCTION DOC] Scale-and-shift on the diagonal of a square matrix (a
+        # large-stride 1D view) matches eager.
         """Test diagonal (large stride) non-contiguous input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -608,6 +748,8 @@ class PallasTestsMixin:
         self.assertEqual(compiled(x), x * 2.0 + 1.0)
 
     def test_stride_non_contiguous_as_strided(self):
+        # [FUNCTION DOC] Scale-and-shift on a tensor built with an explicit size
+        # and stride layout matches eager.
         """Test as_strided (custom layout) non-contiguous input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -617,6 +759,8 @@ class PallasTestsMixin:
         self.assertEqual(compiled(x), x * 2.0 + 1.0)
 
     def test_stride_non_contiguous_select_stride(self):
+        # [FUNCTION DOC] Scale-and-shift on a strided row selected from a 2D
+        # tensor matches eager.
         """Test select then stride on non-contiguous input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -625,6 +769,8 @@ class PallasTestsMixin:
         self.assertEqual(compiled(x), x * 2.0 + 1.0)
 
     def test_stride_non_contiguous_unsqueeze(self):
+        # [FUNCTION DOC] Scale-and-shift on a strided 2D view with a leading
+        # dimension added matches eager.
         """Test unsqueeze on strided non-contiguous input patterns."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -634,6 +780,8 @@ class PallasTestsMixin:
 
     @skip_if_tpu(reason="TPU doesn't support float 64")
     def test_stride_non_contiguous_dtypes(self):
+        # [FUNCTION DOC] Scale-and-shift on strided views of float64, int32 and
+        # complex64 data matches eager. Skipped on TPU (no float64).
         """Test non-contiguous patterns with various dtypes."""
         compiled = self._compile(lambda x: x * 2.0 + 1.0)
 
@@ -651,6 +799,9 @@ class PallasTestsMixin:
         "gather ops on GPU which aren't supported by Pallas GPU lowering"
     )
     def test_stride_expanded_tensors(self):
+        # [FUNCTION DOC] Intended to cover expanded (zero-stride) inputs for
+        # single- and multi-dimension expansion; currently unconditionally skipped
+        # since gather ops are unsupported in Pallas GPU lowering.
         """Test expanded tensors with stride=0 (distinct code path)."""
         compiled = self._compile(lambda x, y: x + y)
 
@@ -665,6 +816,10 @@ class PallasTestsMixin:
         self.assertEqual(compiled(x, x), x + x)
 
     def test_stride_multiple_inputs(self):
+        # [FUNCTION DOC] Adds and multiplies several strided inputs with identical
+        # stride patterns, then separately checks a strided matrix combined with a
+        # broadcast vector and a 0-D scalar tensor, all against eager. Same-stride
+        # inputs avoid scatter operations.
         """Test multiple strided inputs and broadcasting."""
         compiled = self._compile(lambda a, b, c: a * b + c)
 
@@ -691,18 +846,25 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_scalar_scalar_ops(self):
+        # [FUNCTION DOC] Binary arithmetic (add, multiply, subtract, divide) on
+        # 0-D float32 tensors matches eager; also asserts the result is 0-D
+        # float32. Skipped on CUDA.
         """Test scalar-scalar operations."""
 
         def test_add(a, b):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return a + b
 
         def test_mul(a, b):
+            # [FUNCTION DOC] HELPER: Multiplies the two inputs.
             return a * b
 
         def test_sub(a, b):
+            # [FUNCTION DOC] HELPER: Subtracts the second input from the first.
             return a - b
 
         def test_div(a, b):
+            # [FUNCTION DOC] HELPER: Divides the first input by the second.
             return a / b
 
         for fn in [test_add, test_mul, test_sub, test_div]:
@@ -722,18 +884,26 @@ class PallasTestsMixin:
                 self.assertEqual(result.dtype, torch.float32)
 
     def test_scalar_tensor_ops(self):
+        # [FUNCTION DOC] Arithmetic between a 0-D tensor and tensors of rank one
+        # to three, with the scalar on either side, for add and multiply. Chooses
+        # the argument order from the helper name, and asserts value, shape and
+        # float32 dtype.
         """Test scalar-tensor operations."""
 
         def test_scalar_add_tensor(s, t):
+            # [FUNCTION DOC] HELPER: Scalar plus tensor.
             return s + t
 
         def test_tensor_add_scalar(t, s):
+            # [FUNCTION DOC] HELPER: Tensor plus scalar.
             return t + s
 
         def test_scalar_mul_tensor(s, t):
+            # [FUNCTION DOC] HELPER: Scalar times tensor.
             return s * t
 
         def test_tensor_mul_scalar(t, s):
+            # [FUNCTION DOC] HELPER: Tensor times scalar.
             return t * s
 
         shapes = [(16,), (8, 8), (4, 4, 4)]
@@ -764,6 +934,9 @@ class PallasTestsMixin:
                     self.assertEqual(result.dtype, torch.float32)
 
     def test_non_power_of_2_sizes(self):
+        # [FUNCTION DOC] Addition of two 10-element tensors (size not a power of
+        # two) matches eager. On GPU the backend relies on TMA out-of-bounds
+        # masking; on CPU and TPU on masked loads and stores.
         """Test that non-power-of-2 tensor sizes work correctly.
 
         On GPU (Mosaic backend), TMA automatically handles OOB masking for
@@ -771,6 +944,7 @@ class PallasTestsMixin:
         """
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return a + b
 
         compiled = self._compile(fn)
@@ -783,9 +957,12 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_non_power_of_2_multiple_ops(self):
+        # [FUNCTION DOC] A multi-op expression of sin, cos and product on
+        # 17-element tensors matches eager.
         """Test non-power-of-2 sizes with multiple operations."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sine of x plus cosine of y minus their product.
             return x.sin() + y.cos() - (x * y)
 
         compiled = self._compile(fn)
@@ -800,9 +977,14 @@ class PallasTestsMixin:
     @skip_if_tpu(reason="Cannot do int indexing on TPU")
     @skip_if_cuda(reason="gather not supported in Pallas GPU (Mosaic) backend")
     def test_complex_indexing_gather(self):
+        # [FUNCTION DOC] Index a 1D float tensor with an int64 index vector of
+        # eight entries; result matches eager. Skipped on TPU (integer indexing)
+        # and CUDA (gather).
         """Test complex indexing with gather-like operations."""
 
         def fn(x, indices):
+            # [FUNCTION DOC] HELPER: Gathers elements of the first input by the index
+            # tensor.
             # Use indices to gather elements from x
             return x[indices]
 
@@ -824,9 +1006,13 @@ class PallasTestsMixin:
         reason="Multi-dimensional gather not supported on Pallas Mosaic (CUDA) backend"
     )
     def test_complex_indexing_2d(self):
+        # [FUNCTION DOC] Selects rows of a 2D tensor using an int64 index vector
+        # of four entries; matches eager. Skipped on TPU and CUDA (multi-
+        # dimensional gather).
         """Test complex indexing on 2D tensors with integer array indexing."""
 
         def fn(x, row_indices):
+            # [FUNCTION DOC] HELPER: Selects the rows given by the index tensor.
             # Select specific rows using integer array indexing
             return x[row_indices, :]
 
@@ -841,9 +1027,12 @@ class PallasTestsMixin:
 
     @skip_if_tpu
     def test_complex64_mul(self):
+        # [FUNCTION DOC] Complex64 multiplication matches eager for a 128-element
+        # input, plus 2048 off CUDA. Skipped on TPU.
         """Test complex64 multiplication."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Multiplies the two inputs.
             return a * b
 
         sizes = [128]
@@ -860,9 +1049,12 @@ class PallasTestsMixin:
 
     @skip_if_tpu
     def test_complex_conj(self):
+        # [FUNCTION DOC] Complex conjugate of a complex64 tensor matches eager.
+        # Skipped on TPU.
         """Test complex conjugate."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Conjugates the input.
             return torch.conj(x)
 
         compiled = self._compile(fn)
@@ -874,9 +1066,12 @@ class PallasTestsMixin:
 
     @skip_if_tpu
     def test_complex_real(self):
+        # [FUNCTION DOC] Real part of a complex64 tensor matches eager. Skipped on
+        # TPU.
         """Test extracting real part of complex tensor."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Extracts the real part.
             return torch.real(x)
 
         compiled = self._compile(fn)
@@ -888,9 +1083,12 @@ class PallasTestsMixin:
 
     @skip_if_tpu
     def test_complex_imag(self):
+        # [FUNCTION DOC] Imaginary part of a complex64 tensor matches eager.
+        # Skipped on TPU.
         """Test extracting imaginary part of complex tensor."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Extracts the imaginary part.
             return torch.imag(x)
 
         compiled = self._compile(fn)
@@ -902,9 +1100,12 @@ class PallasTestsMixin:
 
     @skip_if_tpu
     def test_complex_abs(self):
+        # [FUNCTION DOC] Magnitude of a complex64 tensor matches eager. Skipped on
+        # TPU.
         """Test complex absolute value (magnitude)."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Takes the absolute value.
             return torch.abs(x)
 
         compiled = self._compile(fn)
@@ -916,9 +1117,12 @@ class PallasTestsMixin:
 
     @skip_if_tpu
     def test_complex128_conj(self):
+        # [FUNCTION DOC] Complex conjugate of a complex128 tensor matches eager.
+        # Skipped on TPU.
         """Test complex128 conjugate operation."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Conjugates the input.
             return torch.conj(x)
 
         compiled = self._compile(fn)
@@ -930,9 +1134,12 @@ class PallasTestsMixin:
 
     @skip_if_tpu
     def test_complex_mul_scalar(self):
+        # [FUNCTION DOC] Multiplying a complex64 tensor by a real constant matches
+        # eager. Skipped on TPU.
         """Test complex multiplication with scalar."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by 2.5.
             return x * 2.5
 
         compiled = self._compile(fn)
@@ -944,9 +1151,13 @@ class PallasTestsMixin:
 
     @skip_if_tpu
     def test_complex_conj_mul(self):
+        # [FUNCTION DOC] Conjugate of one complex64 tensor times another matches
+        # eager. Skipped on TPU.
         """Test conjugate followed by multiplication."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Conjugates the first input and multiplies by the
+            # second.
             return torch.conj(x) * y
 
         compiled = self._compile(fn)
@@ -958,9 +1169,14 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_where(self):
+        # [FUNCTION DOC] Conditional select between two tensors based on the sign
+        # of the first matches eager over 1D and (off CUDA) larger 1D and 2D
+        # shapes.
         """Test torch.where operation."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Chooses the first input where positive, else the
+            # second.
             return torch.where(x > 0, x, y)
 
         shapes = [(1024,)]
@@ -976,9 +1192,12 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_clamp(self):
+        # [FUNCTION DOC] Clamping values to the range minus one to one matches
+        # eager over several shapes.
         """Test torch.clamp operation."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Clamps the input to the range minus one to one.
             return torch.clamp(x, -1.0, 1.0)
 
         shapes = [(1024,)]
@@ -993,9 +1212,13 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_comparison_ops(self):
+        # [FUNCTION DOC] Sums of float conversions of greater-than, less-than and
+        # equal comparisons match eager.
         """Test comparison operations."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Adds the float results of three comparisons
+            # between the inputs.
             gt = a > b
             lt = a < b
             eq = a == b
@@ -1014,9 +1237,12 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_logical_ops(self):
+        # [FUNCTION DOC] Logical and of two positivity masks, converted to float,
+        # matches eager.
         """Test logical operations."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Logical and of the two positivity masks as float.
             return torch.logical_and(a > 0, b > 0).float()
 
         shapes = [(1024,)]
@@ -1032,9 +1258,11 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_sign(self):
+        # [FUNCTION DOC] Sign of a 16-element random tensor matches eager.
         """Test sign operation."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies sign.
             return torch.sign(x)
 
         compiled = self._compile(fn)
@@ -1046,9 +1274,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="integer_pow primitive not implemented in Pallas Mosaic GPU")
     def test_reciprocal(self):
+        # [FUNCTION DOC] Reciprocal of shifted random values matches eager.
+        # Skipped on CUDA (integer_pow primitive missing).
         """Test reciprocal operation."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies reciprocal.
             return torch.reciprocal(x)
 
         compiled = self._compile(fn)
@@ -1059,9 +1290,11 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_square(self):
+        # [FUNCTION DOC] Elementwise square matches eager.
         """Test square operation."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies square.
             return torch.square(x)
 
         compiled = self._compile(fn)
@@ -1075,9 +1308,12 @@ class PallasTestsMixin:
         reason="Pallas loweing crash: https://github.com/jax-ml/jax/issues/36149"
     )
     def test_erf(self):
+        # [FUNCTION DOC] Error function matches eager. Skipped on TPU because of a
+        # Pallas lowering crash.
         """Test erf operation."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies erf.
             return torch.erf(x)
 
         compiled = self._compile(fn)
@@ -1091,9 +1327,12 @@ class PallasTestsMixin:
         reason="Pallas loweing crash: https://github.com/jax-ml/jax/issues/36149"
     )
     def test_atan2(self):
+        # [FUNCTION DOC] Two-argument arctangent matches eager. Skipped on TPU
+        # because of a Pallas lowering crash.
         """Test atan2 operation."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Applies atan2 to the two inputs.
             return torch.atan2(a, b)
 
         compiled = self._compile(fn)
@@ -1105,9 +1344,12 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_sum_reduction(self):
+        # [FUNCTION DOC] Full sum reduction to a scalar matches eager over a 1D
+        # size, plus a larger size off CUDA.
         """Test sum reduction."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sums all elements.
             return x.sum()
 
         shapes = [(1024,)]
@@ -1122,9 +1364,12 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_max_reduction(self):
+        # [FUNCTION DOC] Full max reduction matches eager over a 1D size, plus a
+        # larger size off CUDA.
         """Test max reduction."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Takes the overall maximum.
             return x.max()
 
         shapes = [(1024,)]
@@ -1139,9 +1384,12 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_min_reduction(self):
+        # [FUNCTION DOC] Full min reduction matches eager over a 16-element input,
+        # plus a larger size off CUDA.
         """Test min reduction."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Takes the overall minimum.
             return x.min()
 
         shapes = [(16,)]
@@ -1158,9 +1406,13 @@ class PallasTestsMixin:
     @skip_if_tpu(reason="reduce_prod primitive not implemented in Pallas TPU lowering")
     @skip_if_cuda(reason="reduce_prod primitive not implemented in Pallas Mosaic GPU")
     def test_prod_reduction(self):
+        # [FUNCTION DOC] Full product reduction of inputs scaled down to avoid
+        # overflow matches eager. Skipped on TPU and CUDA (reduce_prod primitive
+        # missing).
         """Test prod reduction."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Product of all elements after scaling by 0.1.
             # Use smaller values to avoid overflow
             return (x * 0.1).prod()
 
@@ -1177,6 +1429,9 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_softmax_two_pass(self):
+        # [FUNCTION DOC] Softmax over the last dimension (max and sum reductions)
+        # for two 2D shapes; resets dynamo each iteration and compares with eager.
+        # Skipped on CUDA.
         """Test two-pass softmax (max reduction + sum reduction)."""
 
         for shape in [(32, 64), (2048, 64)]:
@@ -1184,6 +1439,7 @@ class PallasTestsMixin:
                 torch._dynamo.reset()
 
                 def fn(x):
+                    # [FUNCTION DOC] HELPER: Softmax along the last dimension.
                     return torch.softmax(x, dim=-1)
 
                 compiled = self._compile(fn)
@@ -1194,6 +1450,9 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_non_stride1_reduction(self):
+        # [FUNCTION DOC] Sum along dim 0 and dim 1 of a square 8 by 8 tensor, to
+        # check reduction axis detection uses strides not shapes. Resets dynamo
+        # per dim. Skipped on CUDA.
         """Test reductions along non-innermost axis on square tensors.
 
         On square tensors (e.g. 8x8), the reduction axis cannot be inferred
@@ -1206,6 +1465,7 @@ class PallasTestsMixin:
                 torch._dynamo.reset()
 
                 def fn(x, dim=dim):
+                    # [FUNCTION DOC] HELPER: Sums over the dimension bound at definition time.
                     return x.sum(dim)
 
                 compiled = self._compile(fn)
@@ -1215,6 +1475,9 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_rms_norm(self):
+        # [FUNCTION DOC] RMS normalization (mean of squares, reciprocal square
+        # root, weight scale) for two shapes matches eager; resets dynamo per
+        # shape. Skipped on CUDA.
         """Test RMS normalization (mean-of-squares reduction + rsqrt)."""
 
         for rows, cols in [(32, 64), (2048, 64)]:
@@ -1222,6 +1485,8 @@ class PallasTestsMixin:
                 torch._dynamo.reset()
 
                 def fn(x, weight):
+                    # [FUNCTION DOC] HELPER: Normalizes x by its root mean square over the
+                    # last dimension and scales by weight.
                     variance = x.pow(2).mean(-1, keepdim=True)
                     x = x * torch.rsqrt(variance + 1e-6)
                     return x * weight
@@ -1235,6 +1500,9 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_welford(self):
+        # [FUNCTION DOC] Variance and mean over the last dimension for two shapes.
+        # Compares against numpy (sample variance, ddof one) because eager
+        # torch_tpu cannot lower var_mean. Skipped on CUDA.
         """Test Welford variance/mean computation (two-pass fallback)."""
 
         for shape in [(32, 64), (2048, 64)]:
@@ -1242,6 +1510,8 @@ class PallasTestsMixin:
                 torch._dynamo.reset()
 
                 def fn(x):
+                    # [FUNCTION DOC] HELPER: Returns variance and mean along the last
+                    # dimension, kept as a dimension.
                     return torch.var_mean(x, dim=-1, keepdim=True)
 
                 compiled = self._compile(fn)
@@ -1255,6 +1525,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_layer_norm(self):
+        # [FUNCTION DOC] Layer normalization with weight and bias for two shapes
+        # matches eager; resets dynamo per shape. Skipped on CUDA.
         """Test layer normalization (mean + variance reduction, normalize, scale + shift)."""
 
         for rows, cols in [(32, 64), (2048, 64)]:
@@ -1262,6 +1534,8 @@ class PallasTestsMixin:
                 torch._dynamo.reset()
 
                 def fn(x, weight, bias):
+                    # [FUNCTION DOC] HELPER: Layer-norms x over the last dimension with
+                    # epsilon 1e-6, then applies weight and bias.
                     mean = x.mean(-1, keepdim=True)
                     variance = (x - mean).pow(2).mean(-1, keepdim=True)
                     x = (x - mean) * torch.rsqrt(variance + 1e-6)
@@ -1278,6 +1552,9 @@ class PallasTestsMixin:
     @skip_if_cuda
     @skip_if_tpu
     def test_rope(self):
+        # [FUNCTION DOC] Rotary position embedding using contiguous halves,
+        # rotated with cos and sin and concatenated; exercises non-contiguous
+        # output aliases. Skipped on CUDA and TPU.
         """Test Rotary Position Embedding with slice + cat.
 
         Splits input into halves, applies cos/sin rotation, and concatenates
@@ -1285,6 +1562,8 @@ class PallasTestsMixin:
         """
 
         def fn(x, cos, sin):
+            # [FUNCTION DOC] HELPER: Splits the last dimension in half, applies the
+            # rotation to both halves and concatenates.
             d = x.shape[-1]
             x1 = x[..., : d // 2]
             x2 = x[..., d // 2 :]
@@ -1302,6 +1581,9 @@ class PallasTestsMixin:
     @skip_if_cuda
     @skip_if_tpu  # stack+where fusion doesn't broadcast correctly on TPU yet
     def test_rope_interleaved(self):
+        # [FUNCTION DOC] Rotary embedding using even and odd strided slices,
+        # recombined by stacking and reshaping; exercises strided input. Skipped
+        # on CUDA and TPU (stack plus where fusion).
         """Test Rotary Position Embedding with interleaved halves.
 
         Uses even/odd stride-2 slicing instead of contiguous halves, then
@@ -1309,6 +1591,8 @@ class PallasTestsMixin:
         """
 
         def fn(x, cos, sin):
+            # [FUNCTION DOC] HELPER: Rotates the even and odd interleaved elements and
+            # reassembles to the input shape.
             x1 = x[..., 0::2]
             x2 = x[..., 1::2]
             o1 = x1 * cos - x2 * sin
@@ -1327,12 +1611,17 @@ class PallasTestsMixin:
     @skip_if_cuda
     @skip_if_tpu  # output last dim 10 not 128-aligned, Mosaic rejects it
     def test_chained_stride_slice(self):
+        # [FUNCTION DOC] Chained strided slices on the last dimension (which
+        # compose into a single strided access), plus one, match eager for a 4 by
+        # 480 input. Skipped on CUDA and TPU.
         """Test that chained stride slices compose into a single strided access.
 
         x[:, 1::2][:, 2::3][:, 3::4] should compose to x[:, 23::24].
         """
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies three chained strided slices and adds
+            # one.
             return x[:, 1::2][:, 2::3][:, 3::4] + 1
 
         compiled = self._compile(fn)
@@ -1346,9 +1635,14 @@ class PallasTestsMixin:
     @skip_if_cuda
     @skip_if_tpu  # store uses flatten+scatter, unsupported on Mosaic
     def test_strided_multi_dim(self):
+        # [FUNCTION DOC] Strided access on both dimensions of an 8 by 12 input,
+        # plus one, matches eager. Skipped on CUDA and TPU (flatten plus scatter
+        # store).
         """Test strided access on multiple dimensions simultaneously."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Strides rows by two and columns by three and adds
+            # one.
             return x[::2, ::3] + 1.0
 
         compiled = self._compile(fn)
@@ -1362,12 +1656,16 @@ class PallasTestsMixin:
     @skip_if_cuda
     @skip_if_tpu  # falls back to flatten+gather, unsupported on Mosaic
     def test_strided_non_divisible(self):
+        # [FUNCTION DOC] Stride three over a 16-element range (not divisible),
+        # doubled, matches eager; this takes the flatten plus gather fallback.
+        # Skipped on CUDA and TPU.
         """Test strided access where dim is not divisible by stride.
 
         Falls back to flatten+gather on CPU (blocks tiling).
         """
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Takes every third element and doubles it.
             return x[::3] * 2.0
 
         compiled = self._compile(fn)
@@ -1380,9 +1678,13 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_strided_large_offset(self):
+        # [FUNCTION DOC] Slice from offset five with step two over ten elements,
+        # plus one, matches eager. Skipped on CUDA.
         """Test strided access where offset >= stride (skip blocks)."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Takes elements from index five with step two and
+            # adds one.
             return x[5::2] + 1.0
 
         compiled = self._compile(fn)
@@ -1396,9 +1698,13 @@ class PallasTestsMixin:
     @skip_if_cuda
     @skip_if_tpu  # store uses scatter, unsupported on Mosaic
     def test_strided_large_offset_2d(self):
+        # [FUNCTION DOC] 2D slice on the last dimension from offset five with step
+        # two, doubled, matches eager. Skipped on CUDA and TPU (scatter store).
         """Test 2D strided access where offset >= stride on last dim."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Strides the last dimension from offset five and
+            # doubles.
             return x[:, 5::2] * 2.0
 
         compiled = self._compile(fn)
@@ -1411,9 +1717,14 @@ class PallasTestsMixin:
     @skip_if_tpu
     @skip_if_cuda(reason="arange not supported in Pallas GPU (Mosaic) backend")
     def test_arange_multi_output(self):
+        # [FUNCTION DOC] Two arange tensors (one viewed 8 by 8, one offset range)
+        # combined with an input, returning two outputs; checks tuple length and
+        # each element against eager. Skipped on TPU and CUDA.
         """Test arange with view and multiple outputs."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Builds the aranges on the input device and
+            # returns the product and the sum with the second range.
             rng1 = torch.arange(8 * 8, dtype=torch.float32, device=x.device).view(8, 8)
             rng2 = torch.arange(10, 18, device=x.device)
             tmp = x * rng1
@@ -1429,9 +1740,12 @@ class PallasTestsMixin:
             self.assertEqual(r, e)
 
     def test_dtype_bitcast(self):
+        # [FUNCTION DOC] Reinterpreting float32 data as int32 matches eager for a
+        # small size, plus a larger size off CUDA.
         """Test dtype bitcast (view tensor as different dtype)."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Bitcast view to int32.
             # View float32 tensor as int32 (same byte size)
             return x.view(torch.int32)
 
@@ -1447,9 +1761,11 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_dtype_bitcast_float16_to_int16(self):
+        # [FUNCTION DOC] Reinterpreting float16 data as int16 matches eager.
         """Test dtype bitcast from float16 to int16."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Bitcast view to int16.
             return x.view(torch.int16)
 
         compiled = self._compile(fn)
@@ -1460,9 +1776,12 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_exact_128(self):
+        # [FUNCTION DOC] Addition on exactly 128 elements (one warpgroup) matches
+        # eager.
         """Test with exactly 128 elements (1 warpgroup)."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return a + b
 
         compiled = self._compile(fn)
@@ -1475,9 +1794,11 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_multiple_256(self):
+        # [FUNCTION DOC] Multiply-add on 256 elements matches eager.
         """Test with 256 elements (multiple of 128)."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Product of the inputs plus the first input.
             return a * b + a
 
         compiled = self._compile(fn)
@@ -1490,9 +1811,11 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_multiple_512(self):
+        # [FUNCTION DOC] Add with doubling on 512 elements matches eager.
         """Test with 512 elements (multiple of 128)."""
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: First input plus twice the second.
             return a + b * 2
 
         compiled = self._compile(fn)
@@ -1505,6 +1828,8 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_below_128(self):
+        # [FUNCTION DOC] Addition on 100 elements (below the warpgroup size,
+        # padded for GPU) matches eager.
         """Test with fewer than 128 elements.
 
         Mosaic GPU requires tensor sizes to be multiples of 128 (WARPGROUP_SIZE).
@@ -1512,6 +1837,7 @@ class PallasTestsMixin:
         """
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return a + b
 
         compiled = self._compile(fn)
@@ -1524,6 +1850,8 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_non_aligned(self):
+        # [FUNCTION DOC] Multiplication on 200 elements (not a multiple of 128,
+        # padded for GPU) matches eager.
         """Test with non-aligned size (not a multiple of 128).
 
         Mosaic GPU requires tensor sizes to be multiples of 128 (WARPGROUP_SIZE).
@@ -1531,6 +1859,7 @@ class PallasTestsMixin:
         """
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Multiplies the two inputs.
             return a * b
 
         compiled = self._compile(fn)
@@ -1543,9 +1872,12 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_2d_128x128(self):
+        # [FUNCTION DOC] Addition of 2D tensors, 128 by 128 plus 2048 by 2048 off
+        # CUDA, matches eager.
         """Test 2D tensor with 128x128 and tiling-exercising sizes."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return x + y
 
         shapes = [(128, 128)]
@@ -1561,6 +1893,8 @@ class PallasTestsMixin:
                 self.assertEqual(result, expected)
 
     def test_warpgroup_size_small_tensor(self):
+        # [FUNCTION DOC] Addition on 64 elements (smaller than a warpgroup)
+        # matches eager.
         """Test with very small tensor (less than warpgroup size).
 
         Mosaic GPU requires tensor sizes to be multiples of 128 (WARPGROUP_SIZE).
@@ -1568,6 +1902,7 @@ class PallasTestsMixin:
         """
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return a + b
 
         compiled = self._compile(fn)
@@ -1580,6 +1915,8 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_2d_non_aligned_10x10(self):
+        # [FUNCTION DOC] Addition of 10 by 10 tensors (100 elements, unaligned)
+        # matches eager.
         """Test 2D tensor with 10x10 = 100 elements (not multiple of 128).
 
         Mosaic GPU requires total tensor size to be multiples of 128.
@@ -1587,6 +1924,7 @@ class PallasTestsMixin:
         """
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return x + y
 
         compiled = self._compile(fn)
@@ -1599,6 +1937,8 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_2d_non_aligned_15x15(self):
+        # [FUNCTION DOC] Multiply-add of 15 by 15 tensors (225 elements) matches
+        # eager.
         """Test 2D tensor with 15x15 = 225 elements (not multiple of 128).
 
         Mosaic GPU requires total tensor size to be multiples of 128.
@@ -1606,6 +1946,7 @@ class PallasTestsMixin:
         """
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Product of the inputs plus the first input.
             return x * y + x
 
         compiled = self._compile(fn)
@@ -1618,6 +1959,8 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_3d_non_aligned(self):
+        # [FUNCTION DOC] Addition of 5 by 5 by 5 tensors (125 elements) matches
+        # eager.
         """Test 3D tensor with non-aligned size (5x5x5 = 125 elements).
 
         Mosaic GPU requires total tensor size to be multiples of 128.
@@ -1625,6 +1968,7 @@ class PallasTestsMixin:
         """
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return x + y
 
         compiled = self._compile(fn)
@@ -1637,9 +1981,12 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_3d_aligned(self):
+        # [FUNCTION DOC] Addition of 4 by 4 by 8 tensors (exactly 128 elements)
+        # matches eager.
         """Test 3D tensor with aligned size (4x4x8 = 128 elements)."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return x + y
 
         compiled = self._compile(fn)
@@ -1652,6 +1999,8 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_2d_non_aligned_7x19(self):
+        # [FUNCTION DOC] Subtraction of 7 by 19 tensors (133 elements) matches
+        # eager.
         """Test 2D tensor with 7x19 = 133 elements (not multiple of 128).
 
         Mosaic GPU requires tensor sizes to be multiples of 128 (WARPGROUP_SIZE).
@@ -1659,6 +2008,7 @@ class PallasTestsMixin:
         """
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Subtracts the second input from the first.
             return x - y
 
         compiled = self._compile(fn)
@@ -1671,6 +2021,7 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_4d_non_aligned(self):
+        # [FUNCTION DOC] Addition of 4D tensors with 120 elements matches eager.
         """Test 4D tensor with non-aligned size (2x3x4x5 = 120 elements).
 
         Mosaic GPU requires tensor sizes to be multiples of 128 (WARPGROUP_SIZE).
@@ -1678,6 +2029,7 @@ class PallasTestsMixin:
         """
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return x + y
 
         compiled = self._compile(fn)
@@ -1690,9 +2042,12 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_4d_aligned(self):
+        # [FUNCTION DOC] Multiplication of 4D tensors with 256 elements matches
+        # eager.
         """Test 4D tensor with aligned size (2x2x4x16 = 256 elements)."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Multiplies the two inputs.
             return x * y
 
         compiled = self._compile(fn)
@@ -1705,9 +2060,12 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_2d_aligned_16x8(self):
+        # [FUNCTION DOC] First input plus twice the second on 16 by 8 tensors (128
+        # elements) matches eager.
         """Test 2D tensor with 16x8 = 128 elements (exactly 1 warpgroup)."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: First input plus twice the second.
             return x + y * 2
 
         compiled = self._compile(fn)
@@ -1720,7 +2078,11 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_simple_mlp(self):
+        # [FUNCTION DOC] Three chained matmul plus relu layers on 32 by 32 inputs
+        # match eager.
         def fn(w_0, w_1, w_2, x):
+            # [FUNCTION DOC] HELPER: Applies three matrix multiplies each followed by
+            # relu.
             x = (x @ w_0).relu()
             x = (x @ w_1).relu()
             x = (x @ w_2).relu()
@@ -1737,6 +2099,11 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_nanogpt(self):
+        # [FUNCTION DOC] A minimal GPT-style block: single-head causal self-
+        # attention with softmax, residual, GELU (tanh form) MLP and residual, on
+        # 2D tensors with small random weights and an upper triangular negative-
+        # infinity mask. Compares compiled and eager outputs. Skipped on CUDA
+        # (axis reductions unsupported).
         """Test a minimal NanoGPT-style transformer block.
 
         Tests the core transformer operations used in GPT-style models:
@@ -1755,6 +2122,9 @@ class PallasTestsMixin:
         n_embd = 64
 
         def transformer_block(x, w_q, w_k, w_v, w_proj, w_fc, w_out, mask):
+            # [FUNCTION DOC] HELPER: The block forward pass: q, k, v projections,
+            # scaled masked softmax attention, output projection with residual, then
+            # the MLP with residual; returns the new activations.
             T, C = x.shape
 
             # === Self-Attention ===
@@ -1812,6 +2182,12 @@ class PallasTestsMixin:
         atol=1e-5,
         rtol=1.3e-6,
     ):
+        # [FUNCTION DOC] HELPER: Shared driver for transformer layer tests. Resets
+        # dynamo, compiles a Llama-style layer (RMSNorm, multi-head attention with
+        # causal mask, residual, RMSNorm, SwiGLU FFN, residual), builds weights
+        # scaled by inverse square root of the hidden size plus unit norm weights
+        # and a causal mask, and compares with eager under the given absolute and
+        # relative tolerances.
         """Run a Llama-style transformer layer forward pass and verify correctness.
 
         Architecture: RMSNorm -> Multi-Head Attention -> Residual ->
@@ -1832,6 +2208,9 @@ class PallasTestsMixin:
             w_down,
             mask,
         ):
+            # [FUNCTION DOC] HELPER: The layer forward pass with per-head reshape and
+            # permute for attention, causal mask broadcast over heads, and a SwiGLU
+            # feed-forward; returns the updated activations.
             T, C = x.shape
 
             # Pre-attention RMSNorm
@@ -1915,6 +2294,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_transformer_layer_tiny(self):
+        # [FUNCTION DOC] Runs the single-layer driver with tiny sizes (sequence
+        # 32, hidden 64, 2 heads, FFN 256). Skipped on CUDA.
         """Test full Llama-style transformer layer at tiny dimensions."""
         self._run_transformer_layer(
             seq_len=32,
@@ -1926,6 +2307,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_transformer_layer_medium(self):
+        # [FUNCTION DOC] Runs the single-layer driver at Llama-7B sizes with
+        # loosened tolerances. Skipped on CUDA.
         """Test full Llama-style transformer layer at Llama-7B dimensions."""
         self._run_transformer_layer(
             seq_len=128,
@@ -1939,6 +2322,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_transformer_layer_large(self):
+        # [FUNCTION DOC] Runs the single-layer driver at Llama-405B sizes with
+        # loosened tolerances. Skipped on CUDA.
         """Test full Llama-style transformer layer at Llama-405B dimensions."""
         self._run_transformer_layer(
             seq_len=32,
@@ -1952,9 +2337,13 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_permute_contiguous_3d(self):
+        # [FUNCTION DOC] Permute of a 3D tensor followed by contiguous matches
+        # eager. Skipped on CUDA.
         """Test that permute + contiguous on a 3D tensor produces correct results."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Permutes dims one, zero, two and makes the result
+            # contiguous.
             return x.permute(1, 0, 2).contiguous()
 
         compiled = self._compile(fn)
@@ -1965,9 +2354,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_transpose_contiguous_2d(self):
+        # [FUNCTION DOC] Transpose plus contiguous on a 2 by 32 tensor matches
+        # eager. Skipped on CUDA.
         """Test that transpose + contiguous on a 2D tensor compiles and runs."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Transposes and makes contiguous.
             return x.transpose(0, 1).contiguous()
 
         compiled = self._compile(fn)
@@ -1978,9 +2370,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_permute_contiguous_2d_asymmetric(self):
+        # [FUNCTION DOC] Transpose plus contiguous over several asymmetric 2D
+        # shapes matches eager. Skipped on CUDA.
         """Test transpose+contiguous on asymmetric 2D shapes."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Transposes and makes contiguous.
             return x.transpose(0, 1).contiguous()
 
         compiled = self._compile(fn)
@@ -1993,6 +2388,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_permute_contiguous_3d_all_perms(self):
+        # [FUNCTION DOC] Three 3D permutations on a 2 by 1152 by 2048 tensor, each
+        # compiled and compared with eager. Skipped on CUDA.
         """Test non-identity 3D permutations with distinct dim sizes."""
         all_perms = [
             (1, 0, 2),
@@ -2005,6 +2402,8 @@ class PallasTestsMixin:
             with self.subTest(perm=perm):
 
                 def fn(x, p=perm):
+                    # [FUNCTION DOC] HELPER: Applies the permutation bound at definition time
+                    # and makes contiguous.
                     return x.permute(*p).contiguous()
 
                 compiled = self._compile(fn)
@@ -2015,6 +2414,9 @@ class PallasTestsMixin:
     @skip_if_cuda
     @skip_if_tpu
     def test_permute_contiguous_3d_collapsed(self):
+        # [FUNCTION DOC] Two 3D permutations needing collapsed-dimension
+        # detection, on a 2 by 1152 by 2048 tensor, compared with eager. Skipped
+        # on CUDA and TPU.
         """Test 3D permutations that require collapsed-dim detection."""
         all_perms = [
             (2, 0, 1),
@@ -2026,6 +2428,8 @@ class PallasTestsMixin:
             with self.subTest(perm=perm):
 
                 def fn(x, p=perm):
+                    # [FUNCTION DOC] HELPER: Applies the permutation bound at definition time
+                    # and makes contiguous.
                     return x.permute(*p).contiguous()
 
                 compiled = self._compile(fn)
@@ -2035,6 +2439,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_permute_contiguous_3d_large_notile(self):
+        # [FUNCTION DOC] Three 3D permutations on a 2 by 1152 by 1024 tensor
+        # (large, no tiling), compared with eager. Skipped on CUDA.
         """Test 3D perms with large shape but no tiling (dim=1024 exact fit)."""
         perms = [(1, 0, 2), (0, 2, 1), (2, 1, 0)]
 
@@ -2044,6 +2450,8 @@ class PallasTestsMixin:
             with self.subTest(perm=perm):
 
                 def fn(x, p=perm):
+                    # [FUNCTION DOC] HELPER: Applies the permutation bound at definition time
+                    # and makes contiguous.
                     return x.permute(*p).contiguous()
 
                 compiled = self._compile(fn)
@@ -2053,6 +2461,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_permute_contiguous_3d_medium(self):
+        # [FUNCTION DOC] Three 3D permutations on a 2 by 8 by 2048 tensor (tiling
+        # on the last dimension), compared with eager. Skipped on CUDA.
         """Test 3D perms with medium shape that triggers tiling on last dim."""
         perms = [(1, 0, 2), (0, 2, 1), (2, 1, 0)]
 
@@ -2062,6 +2472,8 @@ class PallasTestsMixin:
             with self.subTest(perm=perm):
 
                 def fn(x, p=perm):
+                    # [FUNCTION DOC] HELPER: Applies the permutation bound at definition time
+                    # and makes contiguous.
                     return x.permute(*p).contiguous()
 
                 compiled = self._compile(fn)
@@ -2071,6 +2483,9 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_permute_contiguous_3d_small(self):
+        # [FUNCTION DOC] Five 3D permutations on a small 2 by 8 by 16 tensor,
+        # compared with eager; on TPU one permutation is skipped because of a
+        # Mosaic shape cast bug. Skipped on CUDA.
         """Test 3D perms with small shapes that produce grid=(1,)."""
         all_perms = [
             (1, 0, 2),
@@ -2090,6 +2505,8 @@ class PallasTestsMixin:
             with self.subTest(perm=perm):
 
                 def fn(x, p=perm):
+                    # [FUNCTION DOC] HELPER: Applies the permutation bound at definition time
+                    # and makes contiguous.
                     return x.permute(*p).contiguous()
 
                 compiled = self._compile(fn)
@@ -2100,6 +2517,9 @@ class PallasTestsMixin:
     @skip_if_cuda
     @skip_if_tpu
     def test_permute_contiguous_4d(self):
+        # [FUNCTION DOC] All 23 non-identity 4D permutations, each on a shape
+        # chosen to be large in the last or first dimension, compared with eager.
+        # Skipped on CUDA and TPU.
         """Test all 23 non-identity 4D permutations with multi-tile grids."""
         all_perms = [
             (0, 1, 3, 2),
@@ -2149,6 +2569,8 @@ class PallasTestsMixin:
                 x = torch.randn(*shape, device=self.DEVICE)
 
                 def fn(x, p=perm):
+                    # [FUNCTION DOC] HELPER: Applies the permutation bound at definition time
+                    # and makes contiguous.
                     return x.permute(*p).contiguous()
 
                 compiled = self._compile(fn)
@@ -2167,10 +2589,17 @@ class PallasTestsMixin:
         atol=1e-5,
         rtol=1.3e-6,
     ):
+        # [FUNCTION DOC] HELPER: Driver for multi-layer transformer tests. Resets
+        # dynamo, compiles a function looping over layers with nine parameters
+        # each, builds unit norm weights and scaled random matrices plus a causal
+        # mask, and compares with eager under the given tolerances.
         """Run a multi-layer Llama-style transformer and verify correctness."""
         torch._dynamo.reset()
 
         def transformer(x, mask, *layer_params):
+            # [FUNCTION DOC] HELPER: Applies each layer in turn, pulling its nine
+            # parameters from the flat argument list by offset, and returns the final
+            # activations.
             T, C = x.shape
             params_per_layer = (
                 9  # rms_w1, rms_w2, w_q, w_k, w_v, w_o, w_gate, w_up, w_down
@@ -2247,6 +2676,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_transformer_tiny(self):
+        # [FUNCTION DOC] Four-layer transformer at tiny sizes with loose
+        # tolerances. Skipped on CUDA.
         """Test a 4-layer Llama-style transformer at tiny dimensions."""
         self._run_transformer(
             num_layers=4,
@@ -2261,6 +2692,8 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_transformer_medium(self):
+        # [FUNCTION DOC] Four-layer transformer at Llama-7B-like sizes with loose
+        # tolerances. Skipped on CUDA.
         """Test a 4-layer transformer at Llama-7B-like dimensions."""
         self._run_transformer(
             num_layers=4,
@@ -2285,12 +2718,19 @@ class PallasTestsMixin:
         atol=1e-5,
         rtol=1.3e-6,
     ):
+        # [FUNCTION DOC] HELPER: Driver for a full language model test. Resets
+        # dynamo, compiles an embedding lookup, the layer stack, a final RMSNorm
+        # and a vocabulary projection, builds random parameters and a causal mask,
+        # and compares logits with eager.
         """Run a full Llama-style LM (embedding + layers + norm + lm_head)."""
         torch._dynamo.reset()
 
         def transformer_lm(
             token_ids, embed_table, final_rms_w, lm_head_w, mask, *layer_params
         ):
+            # [FUNCTION DOC] HELPER: Embeds the token ids by table lookup, applies
+            # each layer using parameters taken by offset, then the final norm and the
+            # projection; returns logits.
             # Token embedding via gather
             x = embed_table[token_ids]  # (T, C)
             T, C = x.shape
@@ -2381,6 +2821,9 @@ class PallasTestsMixin:
 
     @unittest.skip("numerical mismatch in embedding + RMSNorm fusion")
     def test_transformer_lm_tiny(self):
+        # [FUNCTION DOC] Full language model at tiny sizes; currently
+        # unconditionally skipped due to a numerical mismatch in embedding plus
+        # RMSNorm fusion.
         """Test a full LM (embed + 4 layers + norm + lm_head) at tiny dims."""
         self._run_transformer_lm(
             num_layers=4,
@@ -2394,9 +2837,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_embedding_lookup(self):
+        # [FUNCTION DOC] Embedding table lookup by integer token ids matches
+        # eager. Skipped on CUDA (scalar prefetch unsupported).
         """Test simple embedding table lookup (integer indexing)."""
 
         def fn(token_ids, embed_table):
+            # [FUNCTION DOC] HELPER: Indexes the table with the token ids.
             return embed_table[token_ids]
 
         compiled = self._compile(fn)
@@ -2408,9 +2854,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_indirect_access_basic(self):
+        # [FUNCTION DOC] Plain table row lookup through indirect access matches
+        # eager. Skipped on CUDA.
         """Test bare embedding lookup via indirect access detection."""
 
         def fn(indices, table):
+            # [FUNCTION DOC] HELPER: Indexes the table with the indices.
             return table[indices]
 
         compiled = self._compile(fn)
@@ -2422,9 +2871,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_indirect_access_non_128_dim(self):
+        # [FUNCTION DOC] Row lookup from a table whose width is 100, not a
+        # multiple of 128. Skipped on CUDA.
         """Test indirect access with D not divisible by 128."""
 
         def fn(indices, table):
+            # [FUNCTION DOC] HELPER: Indexes the table with the indices.
             return table[indices]
 
         compiled = self._compile(fn)
@@ -2436,9 +2888,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_indirect_access_large_vocab(self):
+        # [FUNCTION DOC] Row lookup from a 2048 by 128 table with 64 indices.
+        # Skipped on CUDA.
         """Test indirect access with larger vocabulary."""
 
         def fn(indices, table):
+            # [FUNCTION DOC] HELPER: Indexes the table with the indices.
             return table[indices]
 
         compiled = self._compile(fn)
@@ -2450,9 +2905,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_indirect_access_fused_add(self):
+        # [FUNCTION DOC] Row lookup fused with adding a per-row bias matrix.
+        # Skipped on CUDA.
         """Test embedding + pointwise add fused."""
 
         def fn(indices, table, bias):
+            # [FUNCTION DOC] HELPER: Looks up rows and adds the bias.
             return table[indices] + bias
 
         compiled = self._compile(fn)
@@ -2465,9 +2923,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_indirect_access_fused_mul(self):
+        # [FUNCTION DOC] Row lookup fused with multiplication by a broadcast
+        # vector. Skipped on CUDA.
         """Test embedding + pointwise multiply with broadcast."""
 
         def fn(indices, table, scale):
+            # [FUNCTION DOC] HELPER: Looks up rows and multiplies by the scale.
             return table[indices] * scale
 
         compiled = self._compile(fn)
@@ -2480,9 +2941,13 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_indirect_access_fused_chain(self):
+        # [FUNCTION DOC] Row lookup followed by an add and a multiply. Skipped on
+        # CUDA.
         """Test embedding + chained add and multiply."""
 
         def fn(indices, table, bias, scale):
+            # [FUNCTION DOC] HELPER: Looks up rows, adds bias, then multiplies by the
+            # scale.
             x = table[indices] + bias
             return x * scale
 
@@ -2497,9 +2962,13 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_nn_embedding(self):
+        # [FUNCTION DOC] The functional embedding op through the indirect access
+        # path matches eager. Skipped on CUDA.
         """Test nn.functional.embedding path through indirect access."""
 
         def fn(indices, weight):
+            # [FUNCTION DOC] HELPER: Calls the functional embedding with the indices
+            # and weight.
             return torch.nn.functional.embedding(indices, weight)
 
         compiled = self._compile(fn)
@@ -2511,9 +2980,11 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_indirect_access_single_token(self):
+        # [FUNCTION DOC] Row lookup with a single index. Skipped on CUDA.
         """Test indirect access with seq=1."""
 
         def fn(indices, table):
+            # [FUNCTION DOC] HELPER: Indexes the table with the indices.
             return table[indices]
 
         compiled = self._compile(fn)
@@ -2525,9 +2996,12 @@ class PallasTestsMixin:
 
     @skip_if_cuda(reason="scalar prefetch not supported in Pallas GPU (Mosaic) backend")
     def test_indirect_access_duplicate_indices(self):
+        # [FUNCTION DOC] Row lookup with repeated indices in an eight-entry index
+        # tensor. Skipped on CUDA.
         """Test indirect access with repeated indices."""
 
         def fn(indices, table):
+            # [FUNCTION DOC] HELPER: Indexes the table with the indices.
             return table[indices]
 
         compiled = self._compile(fn)
@@ -2539,6 +3013,10 @@ class PallasTestsMixin:
 
     @skip_if_cuda
     def test_transformer_with_final_norm_and_lm_head(self):
+        # [FUNCTION DOC] Four-layer transformer on given activations (no
+        # embedding) followed by a final RMSNorm and vocabulary projection, built
+        # inline with fixed small sizes and compared with eager. Resets dynamo
+        # first. Skipped on CUDA.
         """Test multi-layer transformer + final RMSNorm + LM head (no embedding)."""
         torch._dynamo.reset()
         num_layers = 4
@@ -2550,6 +3028,8 @@ class PallasTestsMixin:
         vocab_size = 256
 
         def transformer_with_head(x, final_rms_w, lm_head_w, mask, *layer_params):
+            # [FUNCTION DOC] HELPER: Runs the layer loop with parameters taken by
+            # offset, then the final norm and projection; returns logits.
             T, C = x.shape
             params_per_layer = 9
             for i in range(num_layers):
@@ -2612,9 +3092,11 @@ class PallasTestsMixin:
         self.assertEqual(result, expected)
 
     def test_warpgroup_size_2d_aligned_32x8(self):
+        # [FUNCTION DOC] Addition of 32 by 8 tensors (256 elements) matches eager.
         """Test 2D tensor with 32x8 = 256 elements (2 warpgroups)."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Adds the two inputs.
             return x + y
 
         compiled = self._compile(fn)
@@ -2630,6 +3112,9 @@ class PallasTestsMixin:
 if test_torchinductor.RUN_CPU and has_cpu_pallas():
 
     class PallasTestsCPU(PallasTestsMixin, TestCase):
+        # [CLASS DOC] Concrete CPU test class: the mixin with the device set to
+        # cpu. Defined only when CPU tests are enabled and CPU Pallas support
+        # exists.
         DEVICE = "cpu"
 
     make_pallas(test_torchinductor.SweepInputsCpuTest)
@@ -2639,6 +3124,9 @@ if test_torchinductor.RUN_CPU and has_cpu_pallas():
 if test_torchinductor.RUN_GPU and has_cuda_pallas():
 
     class PallasTestsCUDA(PallasTestsMixin, TestCase):
+        # [CLASS DOC] Concrete CUDA test class: the mixin with the device set to
+        # cuda. Defined only when GPU tests are enabled and CUDA Pallas support
+        # exists.
         DEVICE = "cuda"
 
     make_pallas(test_torchinductor.SweepInputsGPUTest)
@@ -2647,6 +3135,9 @@ if test_torchinductor.RUN_GPU and has_cuda_pallas():
 if test_torchinductor.RUN_TPU and has_tpu_pallas():
 
     class PallasTestsTPU(PallasTestsMixin, TestCase):
+        # [CLASS DOC] Concrete TPU test class: the mixin with the device set to
+        # tpu. Defined only when TPU tests are enabled and TPU Pallas support
+        # exists.
         DEVICE = "tpu"
 
     make_pallas(test_torchinductor.SweepInputsTpuTest)
