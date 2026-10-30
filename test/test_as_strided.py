@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Tests for view-state reachability of a 1D contiguous tensor. A BFS helper
+# enumerates all (sizes, strides) states reachable via unflatten, slice and flatten, and the tests
+# check the exact state set for size 10 and that sets grow strictly with size. No import-time side
+# effects besides imports.
 
 from collections import deque
 
@@ -11,6 +15,8 @@ from torch.testing._internal.common_utils import (
 
 
 def get_state(t: torch.Tensor) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    # [FUNCTION DOC] HELPER: Returns the pair of the tensor's sizes and strides, each as a tuple
+    # of ints.
     """Extract (sizes, strides) tuple from a tensor."""
     return (tuple(t.size()), tuple(t.stride()))
 
@@ -18,6 +24,12 @@ def get_state(t: torch.Tensor) -> tuple[tuple[int, ...], tuple[int, ...]]:
 def enumerate_reachable_states(
     initial_size: int,
 ) -> set[tuple[tuple[int, ...], tuple[int, ...]]]:
+    # [FUNCTION DOC] HELPER: Breadth-first search over view states starting from a 1D arange
+    # tensor of initial_size elements. From each state it tries every unflatten into two factors
+    # (both at least 2), every slice (start, stop, step) on every dim, and every adjacent-dim
+    # flatten. New states with a size of 0 or 1 or non-descending strides are discarded. Returns
+    # the set of visited (sizes, strides) states including the initial one. Raises an
+    # AssertionError if a queued state has a dim of size 1 or less (cannot happen for sizes >= 2).
     """
     Use BFS with DP to enumerate all reachable (size, stride) states from
     a 1D contiguous tensor via valid view operations.
@@ -44,6 +56,9 @@ def enumerate_reachable_states(
         ndim = len(sizes)
 
         def add_state(new_t: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: Closure over visited, queue and state_to_tensor. Records the
+            # state of new_t and enqueues it with its tensor unless it has a size-0/1 dim, has
+            # non-descending strides, or was already visited. Returns None.
             new_state = get_state(new_t)
             sizes, strides = new_state
             # Skip if has size-0 or size-1 dimensions
@@ -88,9 +103,14 @@ def enumerate_reachable_states(
 
 
 class TestAsStrided(TestCase):
+    # [CLASS DOC] Test case holding exhaustive checks on the view-state enumeration helper.
+    # Classified as generic hardware (CPU-only tensors).
     hw_classification = HardwareClassification.GENERIC
 
     def test_size_10_exhaustive(self) -> None:
+        # [FUNCTION DOC] Checks the enumeration for a 10-element tensor yields exactly the
+        # expected hard-coded set of 54 (sizes, strides) states, comparing both count and set
+        # equality.
         """Test that size 10 produces exactly the expected 54 states."""
         expected_states = {
             ((2,), (1,)),
@@ -155,6 +175,9 @@ class TestAsStrided(TestCase):
         self.assertEqual(actual_states, expected_states)
 
     def test_subset_property(self) -> None:
+        # [FUNCTION DOC] For sizes 2 through 10, enumerates states and asserts the previous size's
+        # states are a subset of the current ones and strictly fewer in number. The assertion
+        # message arguments are callables that extend the default failure message.
         """
         Test that for sizes 2..10, each smaller tensor results in a strict
         subset of possible states compared to the next one.
