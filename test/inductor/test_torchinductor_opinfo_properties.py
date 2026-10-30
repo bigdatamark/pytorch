@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Property tests (batch invariance, determinism, eager equivalence, exhaustive unary
+# and sampled binary numerics) for a curated set of LLM-relevant ops, run on GPU across three
+# compile backends and three dtypes. Defines the op lists filtered from the shared databases,
+# sample generators, inductor strict-numerics options, tables of expected failures per test type
+# and backend (with ROCm and fbcode variants), and helper functions. Import-time side effects:
+# builds the op lists; device-type tests are instantiated for all devices except cpu.
 """
 OpInfo-based property tests for inductor numerical correctness.
 
@@ -153,6 +159,9 @@ NUM_SAMPLES = 65536
 
 
 def generate_exhaustive_16bit(dtype, device):
+    # [FUNCTION DOC] Returns a tensor of all 65536 values of a 16-bit float dtype on the given
+    # device, made by viewing every 16-bit pattern as the target type (half or bfloat16). Raises a
+    # value error for other dtypes.
     """Generate all 65536 possible values for a 16-bit float dtype.
 
     For fp16 and bf16, there are exactly 2^16 = 65536 possible bit patterns.
@@ -170,6 +179,10 @@ def generate_exhaustive_16bit(dtype, device):
 
 
 def generate_sampled_fp32(num_samples, device, seed=42):
+    # [FUNCTION DOC] Returns a one-dimensional float32 tensor of the requested number of random
+    # bit patterns (31 random low bits plus a random sign bit) on the device, produced with a
+    # generator seeded by the given seed so output is reproducible; includes denormals, infinities
+    # and NaNs.
     """Generate uniformly sampled fp32 bit patterns.
 
     Samples random 32-bit patterns and interprets them as fp32.
@@ -191,6 +204,9 @@ def generate_sampled_fp32(num_samples, device, seed=42):
 
 
 def generate_sampled_pairs(num_samples, dtype, device, seed=42):
+    # [FUNCTION DOC] Returns two equally sized tensors of random operand values for binary ops,
+    # generated with a seeded generator. For float32 uses random bit patterns including sign; for
+    # half and bfloat16 uses random 16-bit patterns. Raises a value error for other dtypes.
     """Generate pairs of sampled values for binary function testing.
 
     For fp32: uses random bit patterns
@@ -251,6 +267,11 @@ INDUCTOR_NUMERICS_OPTIONS = {
 
 
 def _slice_tensor_or_collection(value, batch_size, original_batch_size, input_ndim):
+    # [FUNCTION DOC] HELPER: Recursively cuts the leading dimension down to the batch size. A
+    # tensor is sliced only if its rank equals the input rank, it is not scalar and its first
+    # dimension equals the original batch size and exceeds one; other tensors are returned as is.
+    # Lists and tuples are processed element by element and rebuilt with the same type; other
+    # values pass through.
     """Recursively slice tensors in a value (tensor, list, tuple, or other).
 
     Only slices tensors that have the same number of dimensions as the input
@@ -276,6 +297,10 @@ def _slice_tensor_or_collection(value, batch_size, original_batch_size, input_nd
 
 
 def slice_tensors_to_batch_size(sample_input, batch_size):
+    # [FUNCTION DOC] Slices a sample input to a smaller batch size. Returns None when the main
+    # input is not a tensor, is zero-dimensional, or the batch size exceeds its first dimension.
+    # Otherwise returns a tuple of the sliced input, a tuple of sliced positional arguments and a
+    # mapping of sliced keyword arguments, using the helper that slices matching tensors only.
     """Slice all tensors in a SampleInput to the given batch size.
 
     For batch invariance testing, we need to slice all tensor inputs that have
@@ -320,6 +345,11 @@ def slice_tensors_to_batch_size(sample_input, batch_size):
 
 
 def sample_operates_on_batch_dim(op_name, sample_input):
+    # [FUNCTION DOC] Returns true when the sample normalizes over the batch dimension, which makes
+    # batch invariance meaningless. Only softmax and log softmax variants are considered: the dim
+    # is taken from the first positional argument and overridden by the keyword argument if
+    # present; negative values are shifted by the input rank. Returns false for other ops, missing
+    # dim or a non-tensor input.
     """Check if a sample input operates on the batch dimension (dim 0).
 
     For ops that normalize/reduce over a dimension, if that dimension is 0,
@@ -574,6 +604,10 @@ ROCM_RELAXED_PROPERTY_CASES = {
 
 
 def is_expected_failure(device_type, op_name, backend, test_type, dtype=None):
+    # [FUNCTION DOC] Decides whether a case is a known failure. Picks the ROCm table on HIP
+    # builds, else the default one, and looks up the set of dtypes for the test type, backend and
+    # op. On non-HIP fbcode builds also merges the fbcode table. Returns true if the dtype is in
+    # the set or the set contains the match-all marker. The device type argument is unused.
     """Check if a test is expected to fail."""
     xfail_dicts = ROCM_XFAIL_DICTS if torch.version.hip is not None else XFAIL_DICTS
     xfails = set(xfail_dicts.get(test_type, {}).get(backend, {}).get(op_name, set()))
@@ -589,6 +623,9 @@ def is_expected_failure(device_type, op_name, backend, test_type, dtype=None):
 
 
 def is_relaxed_property_case(device_type, op_name, backend, test_type, dtype=None):
+    # [FUNCTION DOC] Returns true only on ROCm CUDA-device runs when the op/dtype for the test
+    # type and backend appears in the relaxed-cases table (or is marked match-all), meaning
+    # numeric tolerance rather than bitwise equality is used.
     """Return True for the narrow ROCm op/dtype cases that use numeric tolerance."""
     if device_type != "cuda" or torch.version.hip is None:
         return False
@@ -602,6 +639,9 @@ def is_relaxed_property_case(device_type, op_name, backend, test_type, dtype=Non
 
 
 def compile_fn(fn, backend):
+    # [FUNCTION DOC] Returns the function compiled for one of the three backends: the AOT eager
+    # decomposition partition backend, the default inductor, or inductor with the strict-numerics
+    # option set. Raises a value error for an unknown backend name.
     """Compile a function with the given backend."""
     if backend == "aot_eager_decomp_partition":
         return torch.compile(fn, backend="aot_eager_decomp_partition")
@@ -617,9 +657,15 @@ def compile_fn(fn, backend):
 @unittest.skipIf(TEST_WITH_ASAN, "Skipped under ASAN")
 @unittest.skipIf(not HAS_GPU, "Requires GPU")
 class TestOpInfoProperties(TestCase):
+    # [CLASS DOC] Test case that checks numerical properties of LLM ops on GPU with OpInfo inputs.
+    # Skipped on Windows, under ASAN, and without a GPU. Holds no own state; setup lifts the
+    # dynamo recompile limits and tests are generated per device, op, dtype and backend.
     """Test op properties under various inductor modes using OpInfo on CUDA."""
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setup, resets dynamo, and enters a dynamo config patch
+        # that sets the recompile limits to the maximum integer; the patch exit is registered as a
+        # cleanup so it is undone after the test.
         super().setUp()
         torch._dynamo.reset()
         patch = torch._dynamo.config.patch(
@@ -629,10 +675,14 @@ class TestOpInfoProperties(TestCase):
         self.addCleanup(patch.__exit__, None, None, None)
 
     def tearDown(self):
+        # [FUNCTION DOC] Calls the parent teardown, then resets dynamo.
         super().tearDown()
         torch._dynamo.reset()
 
     def _get_sample_inputs(self, op, device, dtype):
+        # [FUNCTION DOC] HELPER: Returns a list of sample inputs for the op, device and dtype
+        # without gradients. Prefers the reference inputs; if generating them raises any
+        # exception, falls back to the ordinary sample inputs.
         """Get sample inputs from OpInfo using reference_inputs for comprehensive coverage."""
         # Use reference_inputs for more comprehensive test coverage
         # Falls back to sample_inputs if reference_inputs_func is not defined
@@ -644,6 +694,10 @@ class TestOpInfoProperties(TestCase):
 
     def _run_with_expected_failure(
         self, device_type, op_name, backend, test_type, dtype, test_fn
+    # [FUNCTION DOC] HELPER: Runs a test callable honoring the expected-failure tables. If the
+    # case is expected to fail: an assertion or runtime error is treated as the known failure (an
+    # xfail under pytest, otherwise a skip); passing without error fails the test as an unexpected
+    # pass telling which entry to remove. If not expected, just runs the callable.
     ):
         """Run a test with expected failure handling.
 
@@ -682,6 +736,13 @@ class TestOpInfoProperties(TestCase):
     @ops(llm_ops, allowed_dtypes=DTYPES)
     @parametrize("backend", BACKENDS)
     def test_batch_invariance(self, device, dtype, op, backend):
+        # [FUNCTION DOC] Batch invariance test. For each sample whose input is at least size four
+        # on dim 0, not broadcast, and not normalized over dim 0, compiles the op, runs the full
+        # batch, then reruns with batch sizes halved down to one and asserts bitwise equality with
+        # the matching slice of the full output. Skips samples with non-tensor, scalar or non-
+        # batch-shaped outputs; skips the test if no sample was usable. Temporarily switches the
+        # BLAS library to cublaslt and disables reduced precision reduction and split-k, restoring
+        # all settings afterwards even on failure.
         """Test batch invariance with exponentially decreasing batch sizes.
 
         For each sample input, this test:
@@ -730,6 +791,9 @@ class TestOpInfoProperties(TestCase):
         )
 
         def run_test():
+            # [FUNCTION DOC] HELPER: Body executed under the expected-failure wrapper; loops over
+            # the samples as described for the enclosing test and skips the test if none was
+            # tested.
             tested_any = False
 
             for sample in samples:
@@ -818,6 +882,10 @@ class TestOpInfoProperties(TestCase):
     @ops(llm_ops, allowed_dtypes=DTYPES)
     @parametrize("backend", BACKENDS)
     def test_determinism(self, device, dtype, op, backend):
+        # [FUNCTION DOC] Determinism test. Turns on deterministic algorithms (restored afterwards)
+        # and for each sample compiles the op three times with fresh dynamo and inductor cache:
+        # plain, with benchmark results distorted to inverse, and with them distorted to random.
+        # Asserts bitwise equal outputs among all three. Skips if there are no samples.
         """Test run-to-run determinism with fresh cache and benchmark perturbation.
 
         For enhanced determinism testing, this test:
@@ -840,6 +908,8 @@ class TestOpInfoProperties(TestCase):
         torch.use_deterministic_algorithms(True)
 
         def run_test():
+            # [FUNCTION DOC] HELPER: Body executed under the expected-failure wrapper; performs
+            # the three compilations and comparisons for every sample.
             import torch._inductor.config as inductor_config
 
             for sample in samples:
@@ -890,6 +960,10 @@ class TestOpInfoProperties(TestCase):
     @ops(llm_ops, allowed_dtypes=DTYPES)
     @parametrize("backend", BACKENDS)
     def test_eager_equivalence(self, device, dtype, op, backend):
+        # [FUNCTION DOC] Eager equivalence test. Skips float32 gelu on the default inductor
+        # backend (disabled for CI failures). Otherwise compiles the op and compares against eager
+        # output for each sample, bitwise unless the case is in the relaxed ROCm table, where
+        # default tolerance is used. Skips if there are no samples.
         """Test bitwise equivalence with eager execution."""
         if (
             op.name == "nn.functional.gelu"
@@ -909,6 +983,8 @@ class TestOpInfoProperties(TestCase):
         fn = op.get_op()
 
         def run_test():
+            # [FUNCTION DOC] HELPER: Body executed under the expected-failure wrapper; compares
+            # eager and compiled outputs for each sample.
             for sample in samples:
                 args = (sample.input,) + tuple(sample.args)
                 kwargs = sample.kwargs
@@ -941,6 +1017,11 @@ class TestOpInfoProperties(TestCase):
     @ops(llm_unary_ops, allowed_dtypes=DTYPES)
     @parametrize("backend", BACKENDS)
     def test_unary_ufunc_numerical(self, device, dtype, op, backend):
+        # [FUNCTION DOC] Unary numerical test. Skips log10 on ROCm 7.14 or newer for half and
+        # float32 with inductor backends. Builds all 16-bit values for half and bfloat16, or
+        # sampled random float32 values; on ROCm CUDA devices filters inputs to the op domain.
+        # Computes eager and compiled outputs, then asserts bitwise equality (default tolerance
+        # for relaxed ROCm cases) under the expected-failure wrapper.
         """Test unary ufuncs with exhaustive (16-bit) or sampled (fp32) inputs.
 
         For fp16 and bf16: exhaustively tests all 65536 possible bit patterns.
@@ -982,6 +1063,8 @@ class TestOpInfoProperties(TestCase):
         compiled_out = compiled_fn(test_values)
 
         def run_test():
+            # [FUNCTION DOC] HELPER: Compares the precomputed eager and compiled outputs, with
+            # default tolerance for relaxed cases and zero tolerance otherwise.
             # Zero-tolerance equality unless this ROCm case needs numeric tolerance.
             if is_relaxed_property_case(
                 device_type, op.name, backend, "unary_numerical", dtype
@@ -1003,6 +1086,9 @@ class TestOpInfoProperties(TestCase):
     @ops(llm_binary_ops, allowed_dtypes=DTYPES)
     @parametrize("backend", BACKENDS)
     def test_binary_ufunc_numerical(self, device, dtype, op, backend):
+        # [FUNCTION DOC] Binary numerical test. Generates sampled operand pairs for the dtype,
+        # computes eager and compiled outputs and asserts bitwise equality under the expected-
+        # failure wrapper.
         """Test binary ufuncs on 64k sampled value pairs.
 
         For fp32: samples random 32-bit patterns.
@@ -1026,6 +1112,8 @@ class TestOpInfoProperties(TestCase):
         compiled_out = compiled_fn(x, y)
 
         def run_test():
+            # [FUNCTION DOC] HELPER: Asserts that eager and compiled outputs are equal with zero
+            # tolerance.
             # Zero-tolerance equality.
             self.assertEqual(eager_out, compiled_out, rtol=0, atol=0)
 

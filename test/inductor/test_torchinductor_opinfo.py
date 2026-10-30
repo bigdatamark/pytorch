@@ -1,4 +1,12 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Parametrized OpInfo sweep that compiles every op in the shared op database with
+# inductor and compares against eager (and, on GPU, gradients). Per-device tables of skips,
+# expected failures, tolerance/kwarg overrides, one-sample ops and exact-stride exemptions drive
+# the single test method. Import-time side effects: reads env vars for expect collection, all-
+# samples mode and an op index range (validating that both range ends are given and ordered), may
+# exit or raise a skip if the sibling test module cannot be imported or on slow Windows CI, and
+# registers an atexit printer when expectation collection is on. Device-specific tests are
+# instantiated at the bottom for native devices including XPU.
 import atexit
 import contextlib
 import functools
@@ -131,13 +139,23 @@ failed_reasons = defaultdict(set)
 
 
 def print_seen():
+    # [FUNCTION DOC] HELPER: Exit hook used when expectation collection is enabled. Prints, for
+    # the cpu and the GPU device type, a ready-to-paste dictionary literal of failed op names with
+    # their failing dtype sets (sorted by op name and variant) and, when recorded, a trailing
+    # comment of truncated failure reasons. Reads the module-level failure records; prints only.
     expected_failures = defaultdict(list)
 
     def fmt_dtypes(dtypes):
+        # [FUNCTION DOC] HELPER: Formats a collection of dtypes as a brace-wrapped, comma
+        # separated string of their short abbreviations, sorted alphabetically.
         r = ", ".join(sorted(dtype_abbrs[d] for d in dtypes))
         return "{" + r + "}"
 
     def sort_key(kv):
+        # [FUNCTION DOC] HELPER: Sort key for failure records. Takes a key/value pair whose key is
+        # a device type plus an op identifier; returns the op identifier itself when it is a
+        # name/variant pair, otherwise a pair of the name and an empty string, so both sort
+        # together.
         k, _ = kv
         _, op = k
         if isinstance(op, tuple):
@@ -151,6 +169,10 @@ def print_seen():
         if failed_reasons[key]:
 
             def maybe_truncate(x, length=80):
+                # [FUNCTION DOC] HELPER: Makes a failure reason printable on one line. Converts to
+                # text, replaces newlines with spaces, cuts at the first literal backslash-n
+                # sequence and appends an ellipsis, then clips to the given maximum length
+                # (default 80) with an ellipsis. Returns text.
                 x = str(x).replace("\n", " ")
 
                 idx = x.find("\\n")
@@ -166,6 +188,8 @@ def print_seen():
         if failed_dtypes:
 
             def format_op(op):
+                # [FUNCTION DOC] HELPER: Renders an op key as source text: a quoted name/variant
+                # pair in parentheses when the key is a pair, otherwise the quoted name.
                 if isinstance(op, tuple):
                     return f'("{op[0]}", "{op[1]}")'
                 else:
@@ -371,6 +395,10 @@ if IS_LINUX and IS_ARM64:
 
 
 def get_skips_and_xfails(from_dict, xfails=True):
+    # [FUNCTION DOC] HELPER: Flattens a nested mapping of device to op to dtypes into a set of
+    # tuples holding op name, variant name (empty when the key is a plain string), device, a tuple
+    # of dtypes and the given xfails flag. Used to build the argument for the skipOps decorator.
+    # Does not modify its input.
     retval = set()
     for device, d in from_dict.items():
         for op, dtypes in d.items():
@@ -395,6 +423,9 @@ test_skips_or_fails = (
 
 
 def wrapper_noop_set_seed(op, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Replacement for the seed-setting wrapper of the shared method
+    # invocations module; simply calls the op with the given arguments so no seed is set.
+    # Installed by patching in the decorator defined right after it.
     return op(*args, **kwargs)
 
 
@@ -1096,6 +1127,12 @@ inductor_skip_exact_stride_xpu = {
 
 
 def get_sort_argsort_assert_equal_fn(is_argsort, args, kwargs):
+    # [FUNCTION DOC] HELPER: Builds a custom equality checker for sort or argsort results. Args: a
+    # flag saying whether the op is argsort (otherwise sort, returning values and indices), the
+    # call positional arguments and keyword arguments. Returns the boolean True when a stable
+    # keyword is present (meaning the default comparison is used); otherwise returns a checker
+    # function that accepts ties in any order, using the sort dimension from the keyword arguments
+    # or else the last dimension of the first argument.
     # Use the normal assert_equal_fn suffices for a stable sort
     if "stable" in kwargs:
         return True
@@ -1121,6 +1158,14 @@ def get_sort_argsort_assert_equal_fn(is_argsort, args, kwargs):
         exact_dtype=True,
         exact_stride=False,
     ):
+        # [FUNCTION DOC] HELPER: Checker returned by the factory above, called with the test case,
+        # the eager and compiled results and the usual comparison options. For sort, first
+        # compares the sorted values with the normal tensor comparison. Then raises an error on
+        # dtype mismatch (if exact dtype is requested), shape mismatch or stride mismatch (if
+        # exact stride is requested). Walks every index element; where the index tensors differ it
+        # looks up the original input values the indices point to and accepts them if equal (or
+        # both NaN when NaN equality is on), otherwise raises an error naming the position. Raises
+        # on wrong result types.
         if is_argsort:
             if not isinstance(x, torch.Tensor):
                 raise AssertionError(f"Expected torch.Tensor, got {type(x)}")
@@ -1161,6 +1206,9 @@ def get_sort_argsort_assert_equal_fn(is_argsort, args, kwargs):
             )
 
         def el_to_indices(el):
+            # [FUNCTION DOC] HELPER: Converts a flat element number into a list of per-dimension
+            # indices for the shape of the index tensor, last dimension varying fastest. Raises an
+            # error if any index stays unset.
             """Turn an element number into a list of indices"""
             indices = [None] * x.dim()
             for cur_dim in reversed(range(x.dim())):
@@ -1171,6 +1219,8 @@ def get_sort_argsort_assert_equal_fn(is_argsort, args, kwargs):
             return indices
 
         def get_val_by_ids(t, ids):
+            # [FUNCTION DOC] HELPER: Walks a tensor by successively indexing with each entry of
+            # the index list and returns the final element as a Python number.
             """Return a value from a tensor at a given list of indices"""
             for idx in ids:
                 t = t[idx]
@@ -1209,10 +1259,14 @@ def get_sort_argsort_assert_equal_fn(is_argsort, args, kwargs):
 
 
 def get_argsort_assert_equal_fn(args, kwargs):
+    # [FUNCTION DOC] HELPER: Factory for the argsort entry of the custom equality table; delegates
+    # to the shared sort/argsort factory with the argsort flag set.
     return get_sort_argsort_assert_equal_fn(True, args, kwargs)
 
 
 def get_sort_assert_equal_fn(args, kwargs):
+    # [FUNCTION DOC] HELPER: Factory for the sort entry of the custom equality table; delegates to
+    # the shared sort/argsort factory with the argsort flag cleared.
     return get_sort_argsort_assert_equal_fn(False, args, kwargs)
 
 
@@ -1223,8 +1277,14 @@ CUSTOM_ASSERT_EQUALS_FNS = {
 
 
 def collection_decorator(fn):
+    # [FUNCTION DOC] HELPER: Decorator for the device-generic test. The wrapped test runs
+    # normally; if it raises and expectation collection is on, the device type and op key (name,
+    # or name plus variant) are recorded with the failing dtype in the module-level failure
+    # records. The original exception is always re-raised.
     @functools.wraps(fn)
     def inner(self, device, dtype, op):
+        # [FUNCTION DOC] HELPER: Wrapper with the test signature that forwards to the decorated
+        # test, records failures when collecting expectations, and re-raises.
         try:
             fn(self, device, dtype, op)
         except Exception as e:
@@ -1240,6 +1300,11 @@ def collection_decorator(fn):
 
 
 def _inductor_extra_samples(op_name, device, dtype, requires_grad):
+    # [FUNCTION DOC] HELPER: Returns extra sample inputs on top of the shared OpInfo samples.
+    # Args: op name, device, dtype and requires-grad flag. For addcmul and addcdiv with floating
+    # or complex dtypes returns one sample whose scale value is a zero-dim tensor; for add with
+    # floating or complex dtypes returns one sample whose alpha is a zero-dim tensor; otherwise an
+    # empty list. Creates tensors on the given device.
     """Extra sample inputs for inductor-specific coverage.
 
     These exercise dynamo decomposition paths (e.g. tensor value/alpha triggering
@@ -1277,8 +1342,16 @@ def _inductor_extra_samples(op_name, device, dtype, requires_grad):
 
 @wrapper_noop_set_seed_decorator
 class TestInductorOpInfo(TestCase):
+    # [CLASS DOC] Device-generic test case holding the single comprehensive OpInfo test; it is
+    # decorated with a seed-wrapper patch so ops run without seed setting. Exposes the CPU and GPU
+    # model-check helpers imported from the main inductor test module as class attributes. The
+    # class setup patches inductor test configs to turn on runtime dtype and shape asserts for all
+    # tests, and teardown resets dynamo.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class-level setup. Calls the parent setup, then enters an inductor config
+        # patch (kept on an exit stack stored on the class) enabling the runtime Triton dtype and
+        # shape assertion test configs.
         super().setUpClass()
         cls._test_config_stack = contextlib.ExitStack()
         cls._test_config_stack.enter_context(
@@ -1292,10 +1365,14 @@ class TestInductorOpInfo(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class-level teardown. Closes the exit stack, undoing the config patch
+        # from setup, then calls the parent teardown.
         cls._test_config_stack.close()
         super().tearDownClass()
 
     def tearDown(self):
+        # [FUNCTION DOC] Per-test teardown: resets dynamo state. Does not call the parent
+        # teardown.
         torch._dynamo.reset()
 
     check_model = check_model
@@ -1324,6 +1401,19 @@ class TestInductorOpInfo(TestCase):
     @torch._inductor.config.patch("shape_padding", False)
     @collection_decorator
     def test_comprehensive(self, device, dtype, op):
+        # [FUNCTION DOC] Core test, instantiated for each op, device and dtype. Skips dtypes
+        # outside the supported list (except a few interpolate/upsample/fill ops). Empties the
+        # device cache, looks up the skip, expected-failure and override tables for the op, builds
+        # sample inputs (plus extra ones, truncated to one sample for ops in the one-sample table
+        # unless all-samples mode is set), and for each sample determines via fake tensors whether
+        # the op can be traced without graph breaks and whether it uses seeded random ops. It then
+        # runs the model check helper for the device (gradients checked only on GPU and only with
+        # grad-requiring inputs), with merged tolerances, overrides and a stride-exactness setting
+        # that depends on the exemption tables. Exceptions are swallowed only when the op/dtype
+        # has a registered should-fail message contained in the error text; otherwise re-raised.
+        # KNOWN ISSUE: the computed expected-result value is never used afterwards (lint is
+        # silenced); skipping and failure expectations are enforced by the skipOps decorator
+        # instead.
         device_type = torch.device(device).type
 
         if device_type not in (GPU_TYPE, "cpu"):
@@ -1404,6 +1494,8 @@ class TestInductorOpInfo(TestCase):
         func = op.get_op()
 
         def fn(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Thin wrapper that calls the OpInfo operator with the given
+            # arguments and returns its result; this is the function handed to the model checker.
             return func(*args, **kwargs)
 
         requires_grad = (
@@ -1429,11 +1521,19 @@ class TestInductorOpInfo(TestCase):
                 samples = [next(samples)]
 
         class HasRngOp(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Dispatch mode that runs every intercepted op normally while
+            # recording, in a boolean attribute, whether any op carries the seeded-
+            # nondeterministic tag.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initializes the base mode and sets the random-op flag to
+                # false.
                 super().__init__()
                 self.has_rng_op = False
 
             def __torch_dispatch__(self, func, types, args, kwargs=None):
+                # [FUNCTION DOC] HELPER: Dispatch hook. Sets the random-op flag when the
+                # intercepted op has the seeded-nondeterministic tag, then executes the op with
+                # the given arguments (empty keyword arguments if none) and returns its result.
                 kwargs = kwargs if kwargs else {}
                 if torch.Tag.nondeterministic_seeded in func.tags:
                     self.has_rng_op = True
@@ -1441,10 +1541,16 @@ class TestInductorOpInfo(TestCase):
                 return func(*args, **kwargs)
 
         def do_nopython_and_has_rng(fn, args, kwargs):
+            # [FUNCTION DOC] HELPER: Runs the function once on fake tensor copies of the arguments
+            # with the Python dispatcher enabled, inside the random-op detecting mode. Returns a
+            # pair: whether tracing succeeded and whether a random op was seen. Returns false for
+            # the first element if a data-dependent or dynamic output shape exception is raised.
             try:
                 mode = FakeTensorMode()
 
                 def map_to_fake(e):
+                    # [FUNCTION DOC] HELPER: Converts a tensor to a fake tensor using the
+                    # enclosing fake mode; returns any other value unchanged.
                     if isinstance(e, torch.Tensor):
                         return mode.from_tensor(e)
                     else:
@@ -1461,6 +1567,11 @@ class TestInductorOpInfo(TestCase):
             return True, rng_mode.has_rng_op
 
         def get_contexts(has_rng_op, args, kwargs):
+            # [FUNCTION DOC] HELPER: Chooses how each sample is checked. Returns a tuple of pairs
+            # of a context-manager factory and keyword overrides. With random ops: a null context
+            # and equality checking disabled. Otherwise a context from the size-assert helper for
+            # the op, with a custom equality function added for sort and argsort; else no
+            # overrides.
             if has_rng_op:
                 # TODO - enable this, running into errors
                 return (
@@ -1491,6 +1602,9 @@ class TestInductorOpInfo(TestCase):
         try:
 
             def _get_tolerances(dtype):
+                # [FUNCTION DOC] HELPER: Returns a pair of relative and absolute tolerance for the
+                # dtype: fixed values for float32, and a pair of unset values (use defaults) for
+                # others.
                 _custom_tolerances = {
                     torch.float32: (1.3e-5, 1.5e-5),
                 }
