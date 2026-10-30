@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Tests for on-device dynamic post-training quantization of TorchScript modules.
+# Defines two small test models, a utility class wrapping the prepare and quantize helpers plus
+# graph inspection routines, and three test cases covering observer insertion, quant/dequant
+# node insertion and finalization (packed params, quantized forward, comparison with off-device
+# dynamic PTQ, serialization and lite interpreter use). Per the trailing guard, running the file
+# directly raises a RuntimeError saying it is not currently used.
 
 import io
 
@@ -22,18 +28,28 @@ from torch.utils import bundled_inputs
 
 
 class myMod(torch.nn.Module):
+    # [CLASS DOC] HELPER: Two-layer linear model whose first layer weight is supplied by the
+    # caller.
     def __init__(self, weight):
+        # [FUNCTION DOC] HELPER: Creates two 5 by 5 float linear layers and replaces the first
+        # layer weight with the given weight parameter.
         super().__init__()
         self.fc1 = torch.nn.Linear(5, 5).float()
         self.fc1.weight = weight
         self.fc2 = torch.nn.Linear(5, 5).float()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the first then the second linear layer to x.
         return self.fc2(self.fc1(x))
 
 
 class MyConvLinearModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Test model chaining a convolution, a nested two-linear module and a
+    # functional linear op using a free weight parameter; supplies example inputs.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates a 3-to-5 channel 3 by 3 convolution, a ones 5 by 5
+        # weight handed to the nested model, a second ones weight parameter, and the nested
+        # model.
         super().__init__()
         self.conv = torch.nn.Conv2d(3, 5, 3)
         weight = torch.nn.Parameter(torch.ones(5, 5))
@@ -41,20 +57,29 @@ class MyConvLinearModule(torch.nn.Module):
         self.mymod = myMod(weight)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Convolves x, passes the result through the nested module, then
+        # applies the functional linear op with the free weight; returns the result.
         conv_output = self.conv(x)
         y = self.mymod(conv_output)
         z = torch.nn.functional.linear(y, self.weight1)
         return z
 
     def get_example_inputs(self):
+        # [FUNCTION DOC] HELPER: Returns a one-element tuple holding a random 1x3x12x7 tensor.
         return (torch.rand(1, 3, 12, 7),)
 
 
 class OnDevicePTQUtils:
+    # [CLASS DOC] HELPER: Static utility namespace for the on-device PTQ tests. The class
+    # attribute lists the observer class names recognized (min-max and per-channel min-max); no
+    # instance state.
     observer_module_name = ["MinMaxObserver", "PerChannelMinMaxObserver"]
 
     @staticmethod
     def insert_observers(model, qconfig_dict):
+        # [FUNCTION DOC] HELPER: Scripts the model (via get_script_module with the example
+        # inputs) and runs the on-device dynamic prepare pass with the given qconfig mapping;
+        # returns the prepared scripted module.
         inputs = model.get_example_inputs()
         scripted_model = get_script_module(model, False, inputs)
         scripted_model = _prepare_ondevice_dynamic_jit(scripted_model, qconfig_dict)
@@ -62,6 +87,9 @@ class OnDevicePTQUtils:
 
     @staticmethod
     def ptq_dynamic_quantize(model, qconfig_dict):
+        # [FUNCTION DOC] HELPER: Scripts the model and runs the full on-device dynamic
+        # quantization for the forward method with the flag enabled; returns the resulting
+        # scripted module.
         inputs = model.get_example_inputs()
         m = get_script_module(model, False, inputs)
         m = _quantize_ondevice_dynamic_jit(m, qconfig_dict, "forward", True)
@@ -69,6 +97,8 @@ class OnDevicePTQUtils:
 
     @staticmethod
     def find_observer_modules(m):
+        # [FUNCTION DOC] HELPER: Returns the list of direct child modules whose original name is
+        # one of the known observer class names.
         observer_modules = []
         for child_module in m.children():
             if child_module.original_name in OnDevicePTQUtils.observer_module_name:
@@ -77,6 +107,8 @@ class OnDevicePTQUtils:
 
     @staticmethod
     def is_value_type_observer(value):
+        # [FUNCTION DOC] HELPER: Returns True if the string form of the graph value's type
+        # contains a known observer class name, else False.
         type_name = value.type()
         for observer_type in OnDevicePTQUtils.observer_module_name:
             if observer_type in type_name.str():
@@ -85,6 +117,8 @@ class OnDevicePTQUtils:
 
     @staticmethod
     def is_calculate_qparam(node):
+        # [FUNCTION DOC] HELPER: Returns True if the node is a method call whose name is
+        # calculate_qparams, else False.
         if node.kind() == "prim::CallMethod":
             if node.s("name") == "calculate_qparams":
                 return True
@@ -92,6 +126,10 @@ class OnDevicePTQUtils:
 
     @staticmethod
     def get_linear_packed_param_fp_weight(node):
+        # [FUNCTION DOC] HELPER: For a prepack node, finds the producer of its weight input,
+        # requires it to be a per-tensor or per-channel quantize op (raises ValueError
+        # otherwise), requires that op's input to come from an attribute read (raises
+        # AssertionError otherwise) and returns that attribute name.
         weight = node.inputsAt(0).node()
         if (
             weight.kind() != "aten::quantize_per_tensor"
@@ -106,6 +144,12 @@ class OnDevicePTQUtils:
 
     @staticmethod
     def is_per_channel_quantized_packed_param(node):
+        # [FUNCTION DOC] HELPER: Returns True when the weight producer of a linear prepack node
+        # is not the per-tensor quantize op. Raises AssertionError if the node is not a linear
+        # prepack.
+        # KNOWN ISSUE: The check on the weight kind negates a condition that is always true (a
+        # kind cannot equal both quantize ops), so the AssertionError for an unexpected weight
+        # kind can never fire.
         if node.kind() != "quantized::linear_prepack":
             raise AssertionError("Node must corresponds to linear_prepack.")
         weight = node.inputsAt(0).node()
@@ -118,7 +162,12 @@ class OnDevicePTQUtils:
 
 
 class TestOnDeviceDynamicPTQInsertObservers(TestCase):
+    # [CLASS DOC] Tests that observer modules are inserted by the on-device dynamic prepare
+    # pass. Stateless; uses the utilities class and example models.
     def _check_num_and_type_of_observers(self, model, num_observers):
+        # [FUNCTION DOC] HELPER: For default dynamic qconfig, asserts the prepared module has
+        # the expected number of min-max observer children; repeats with per-channel dynamic
+        # qconfig expecting per-channel observers of that count.
         qconfig_dict = {"": default_dynamic_qconfig}
         scripted_model = OnDevicePTQUtils.insert_observers(model, qconfig_dict)
         observer_modules = OnDevicePTQUtils.find_observer_modules(scripted_model)
@@ -134,6 +183,10 @@ class TestOnDeviceDynamicPTQInsertObservers(TestCase):
             self.assertTrue(observer.original_name == "PerChannelMinMaxObserver")
 
     def _check_observer_method(self, model, num_observers):
+        # [FUNCTION DOC] HELPER: Compares the line count of the inlined original graph with the
+        # prepared forward graph, then uses FileCheck to require the expected count of observer
+        # forward calls in the observe method graph and observer reset calls in the reset
+        # observers method graph.
         qconfig_dict = {"": default_dynamic_qconfig}
         inputs = model.get_example_inputs()
         orig_scripted_model = get_script_module(model, False, inputs)
@@ -158,22 +211,31 @@ class TestOnDeviceDynamicPTQInsertObservers(TestCase):
         ).run(reset_observers_method)
 
     def _observer_is_weight_only(self, node):
+        # [FUNCTION DOC] HELPER: Returns True if the node is a forward method call on an
+        # observer whose observed input is produced by an attribute read (i.e. a weight), else
+        # False.
         if (node.kind() == "prim::CallMethod") and node.s("name") == "forward":
             if OnDevicePTQUtils.is_value_type_observer(node.inputsAt(0)):
                 return node.inputsAt(1).node().kind() == "prim::GetAttr"
         return False
 
     def test_num_observers(self):
+        # [FUNCTION DOC] Asserts 2 observers for the linear add model and 3 for the conv-linear
+        # model, for both qconfig kinds.
         model = LinearAddModel()
         self._check_num_and_type_of_observers(model, 2)
         model = MyConvLinearModule()
         self._check_num_and_type_of_observers(model, 3)
 
     def test_observe_method(self):
+        # [FUNCTION DOC] Checks the observe and reset method graphs of the conv-linear model
+        # contain 3 observer calls.
         model = MyConvLinearModule()
         self._check_observer_method(model, 3)
 
     def test_weight_only_observers(self):
+        # [FUNCTION DOC] Counts forward calls on observers fed by attributes in the observe
+        # graph of the conv-linear model and asserts there are 3.
         model = MyConvLinearModule()
         qconfig_dict = {"": default_dynamic_qconfig}
         scripted_model = OnDevicePTQUtils.insert_observers(model, qconfig_dict)
@@ -186,7 +248,12 @@ class TestOnDeviceDynamicPTQInsertObservers(TestCase):
 
 
 class TestOnDeviceDynamicPTQInsertQuantDequant(TestCase):
+    # [CLASS DOC] Tests the quantize_forward graph produced by the on-device dynamic
+    # quantization pass. Stateless.
     def _validate_quant_dequant_nodes(self, model, num_nodes, per_channel=0):
+        # [FUNCTION DOC] HELPER: Counts per-tensor and per-channel quantize nodes in the
+        # quantize forward graph and asserts the total equals num_nodes. The per_channel
+        # argument is unused.
         quantize_forward_graph = model.quantize_forward.graph
         quantize_per_tensor = quantize_per_channel = 0
         for n in quantize_forward_graph.nodes():
@@ -197,6 +264,8 @@ class TestOnDeviceDynamicPTQInsertQuantDequant(TestCase):
         self.assertEqual(quantize_per_tensor + quantize_per_channel, num_nodes)
 
     def _validate_calculate_qparams(self, model, num_nodes):
+        # [FUNCTION DOC] HELPER: Counts calculate-qparams method calls in the quantize forward
+        # graph and asserts the count equals num_nodes.
         quantize_forward_graph = model.quantize_forward.graph
         num_calculate_qparams = 0
         for n in quantize_forward_graph.nodes():
@@ -205,6 +274,10 @@ class TestOnDeviceDynamicPTQInsertQuantDequant(TestCase):
         self.assertEqual(num_calculate_qparams, num_nodes)
 
     def _validate_no_observer_forward(self, model):
+        # [FUNCTION DOC] HELPER: Returns False if the quantize forward graph still has a forward
+        # call on an observer, else True.
+        # KNOWN ISSUE: Callers ignore the returned boolean, so no test fails if observer forward
+        # calls remain.
         quantize_forward_graph = model.quantize_forward.graph
         for n in quantize_forward_graph.nodes():
             if (n.kind() == "prim::CallMethod") and n.s("name") == "forward":
@@ -213,6 +286,9 @@ class TestOnDeviceDynamicPTQInsertQuantDequant(TestCase):
         return True
 
     def _check_quant_dequant_and_calc_qparams(self, model, num_nodes):
+        # [FUNCTION DOC] HELPER: For default and per-channel dynamic qconfigs, quantizes the
+        # model on device and validates the quantize node count, calculate-qparams count and
+        # absence of observer forward calls.
         qconfig_dict = {"": default_dynamic_qconfig}
         m = OnDevicePTQUtils.ptq_dynamic_quantize(model, qconfig_dict)
         self._validate_quant_dequant_nodes(m, num_nodes)
@@ -226,6 +302,8 @@ class TestOnDeviceDynamicPTQInsertQuantDequant(TestCase):
         self._validate_no_observer_forward(m)
 
     def _check_quantize_forward_runs(self, model):
+        # [FUNCTION DOC] HELPER: Quantizes the model on device for both qconfig kinds, runs
+        # observe_forward then quantize_forward on the example inputs; passes if nothing raises.
         inputs = model.get_example_inputs()
         qconfig_dict = {"": default_dynamic_qconfig}
         m = OnDevicePTQUtils.ptq_dynamic_quantize(model, qconfig_dict)
@@ -240,12 +318,16 @@ class TestOnDeviceDynamicPTQInsertQuantDequant(TestCase):
         m.quantize_forward(*inputs)
 
     def test_num_quant_dequant_nodes(self):
+        # [FUNCTION DOC] Runs the quant/dequant checks expecting 2 nodes for the linear add
+        # model and 3 for the conv-linear model.
         model = LinearAddModel()
         self._check_quant_dequant_and_calc_qparams(model, 2)
         model = MyConvLinearModule()
         self._check_quant_dequant_and_calc_qparams(model, 3)
 
     def test_quantize_forward_runs(self):
+        # [FUNCTION DOC] Runs quantize_forward execution checks for the linear add model and the
+        # conv-linear model.
         model = LinearAddModel()
         self._check_quantize_forward_runs(model)
         model = MyConvLinearModule()
@@ -253,7 +335,14 @@ class TestOnDeviceDynamicPTQInsertQuantDequant(TestCase):
 
 
 class TestOnDeviceDynamicPTQFinalize(TestCase):
+    # [CLASS DOC] Tests the finalization step of on-device dynamic quantization: packed
+    # parameters, original weight reset, quantized forward graph, accuracy versus off-device
+    # quantization, and serialization. Stateless.
     def _validate_packed_params(self, model, num_nodes, per_channel=0):
+        # [FUNCTION DOC] HELPER: In the quantize forward graph, inspects state-setting nodes
+        # whose value comes from a linear prepack, counting prepacks, uses and per-channel ones;
+        # asserts total and per-channel counts equal the expected values, and that prepacks and
+        # their uses equal num_nodes.
         quantize_forward_graph = model.quantize_forward.graph
         quantize_per_tensor = quantize_per_channel = 0
         linear_prepack = 0
@@ -277,6 +366,9 @@ class TestOnDeviceDynamicPTQFinalize(TestCase):
         self.assertEqual(linear_prepack_uses, num_nodes)
 
     def _validate_no_linear_unpack(self, model):
+        # [FUNCTION DOC] HELPER: Returns False if the quantize forward graph contains a linear
+        # unpack node, else True.
+        # KNOWN ISSUE: Callers ignore the returned boolean, so the check does not fail any test.
         quantize_forward_graph = model.quantize_forward.graph
         for n in quantize_forward_graph.nodes():
             if n.kind() == "quantized::linear_unpack":
@@ -284,6 +376,9 @@ class TestOnDeviceDynamicPTQFinalize(TestCase):
         return True
 
     def _validate_setattr_fp_weights(self, model, num_nodes):
+        # [FUNCTION DOC] HELPER: Collects names of float weights feeding linear prepacks, then
+        # counts attribute-setting nodes for those names whose value is a constant (weight
+        # reset); asserts the count equals num_nodes.
         quantize_forward_graph = model.quantize_forward.graph
         fp_weights_setattr = 0
         fp_weight_names = []
@@ -311,6 +406,9 @@ class TestOnDeviceDynamicPTQFinalize(TestCase):
         self.assertEqual(fp_weights_setattr, num_nodes)
 
     def _validate_quantized_forward(self, model, num_nodes):
+        # [FUNCTION DOC] HELPER: Scans the quantized forward graph: asserts no quantize ops
+        # remain, that dynamic linear ops and linear packed parameter attribute reads each equal
+        # num_nodes. Set-attribute count is gathered but its assertion is commented out.
         quantized_forward_graph = model.quantized_forward.graph
         quantize_per_tensor = quantize_per_channel = 0
         quantized_linear_dynamic = 0
@@ -337,6 +435,9 @@ class TestOnDeviceDynamicPTQFinalize(TestCase):
         # self.assertEqual(num_setattr, 0)
 
     def _check_quantize_forward(self, model, num_nodes):
+        # [FUNCTION DOC] HELPER: Quantizes on device for both qconfig kinds and validates packed
+        # params (per-channel count when per-channel), absence of linear unpack and the reset of
+        # float weights.
         qconfig_dict = {"": default_dynamic_qconfig}
         m = OnDevicePTQUtils.ptq_dynamic_quantize(model, qconfig_dict)
         self._validate_packed_params(m, num_nodes)
@@ -350,6 +451,8 @@ class TestOnDeviceDynamicPTQFinalize(TestCase):
         self._validate_setattr_fp_weights(m, num_nodes)
 
     def _check_quantized_forward(self, model, num_nodes):
+        # [FUNCTION DOC] HELPER: Quantizes on device for both qconfig kinds and validates the
+        # quantized forward graph.
         qconfig_dict = {"": default_dynamic_qconfig}
         m = OnDevicePTQUtils.ptq_dynamic_quantize(model, qconfig_dict)
         self._validate_quantized_forward(m, num_nodes)
@@ -359,6 +462,10 @@ class TestOnDeviceDynamicPTQFinalize(TestCase):
         self._validate_quantized_forward(m, num_nodes)
 
     def _check_against_ref_dynamic_ptq(self, model):
+        # [FUNCTION DOC] HELPER: Puts the model in eval mode, builds an off-device dynamic
+        # quantized reference, then runs on-device observe, quantize and quantized forward
+        # methods and asserts the outputs are close. Also asserts calling the module directly
+        # raises. Repeats with per-channel qconfig.
         model.eval()
         inputs = model.get_example_inputs()
         ref_m = torch.jit.script(model)
@@ -403,6 +510,13 @@ class TestOnDeviceDynamicPTQFinalize(TestCase):
     def _check_serdes_and_device_side_api_helper(
         self, model, check_device_side_api=False
     ):
+        # [FUNCTION DOC] HELPER: In eval mode, builds a reference by off-device dynamic
+        # quantization, saved and reloaded through a bytes buffer. For each qconfig kind: if not
+        # testing device-side API, saves and loads the on-device quantized module, runs reset,
+        # observe, quantize and quantized forward, and asserts closeness to the reference.
+        # Otherwise bundles a random input, loads in the lite interpreter, runs the on-device
+        # PTQ conversion, asserts the helper methods are removed, compares outputs, and for the
+        # first qconfig also round-trips through a flatbuffer mobile module.
         model.eval()
         inputs = model.get_example_inputs()
         ref_m = torch.jit.script(model)
@@ -497,34 +611,48 @@ class TestOnDeviceDynamicPTQFinalize(TestCase):
             self.assertTrue(torch.allclose(ref_output, output))
 
     def _check_serialization_deserialization(self, model):
+        # [FUNCTION DOC] HELPER: Runs the serialization helper with the device-side API check
+        # off.
         self._check_serdes_and_device_side_api_helper(model, False)
 
     def _check_device_side_api(self, model):
+        # [FUNCTION DOC] HELPER: Runs the serialization helper with the device-side API check
+        # on.
         self._check_serdes_and_device_side_api_helper(model, True)
 
     def test_quantize_forward(self):
+        # [FUNCTION DOC] Checks packed parameter structure for the linear add model (2) and
+        # conv-linear model (3).
         model = LinearAddModel()
         self._check_quantize_forward(model, 2)
         model = MyConvLinearModule()
         self._check_quantize_forward(model, 3)
 
     def test_quantized_forward(self):
+        # [FUNCTION DOC] Checks quantized forward graph structure for the linear add model (2)
+        # and conv-linear model (3).
         model = LinearAddModel()
         self._check_quantized_forward(model, 2)
         model = MyConvLinearModule()
         self._check_quantized_forward(model, 3)
 
     def test_against_offdevice_dynamic_ptq(self):
+        # [FUNCTION DOC] Compares on-device quantized outputs with off-device dynamic
+        # quantization for both models.
         model = LinearAddModel()
         self._check_against_ref_dynamic_ptq(model)
         model = MyConvLinearModule()
         self._check_against_ref_dynamic_ptq(model)
 
     def test_serialization_deserialization(self):
+        # [FUNCTION DOC] Round-trips the conv-linear model through save and load and compares
+        # outputs.
         model = MyConvLinearModule()
         self._check_serialization_deserialization(model)
 
     def test_device_side_api(self):
+        # [FUNCTION DOC] Exercises the lite interpreter and flatbuffer path for the conv-linear
+        # model.
         model = MyConvLinearModule()
         self._check_device_side_api(model)
 

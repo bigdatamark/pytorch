@@ -1,5 +1,10 @@
 # Owner(s): ["oncall: quantization"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests that the deprecated TorchScript quantized RNN and linear conversion helpers
+# now fail. Each test builds float recurrent or linear modules, assigns fixed weights, and
+# asserts that the torch.jit.quantized conversion function raises a RuntimeError saying it is no
+# longer supported. Also checks erasing tensor shape information on a scripted class. Running
+# the file directly raises a RuntimeError pointing to the quantization test entry.
 
 import torch
 from torch.testing._internal.common_quantization import skipIfNoFBGEMM
@@ -7,8 +12,15 @@ from torch.testing._internal.jit_utils import JitTestCase
 
 
 class TestDeprecatedJitQuantized(JitTestCase):
+    # [CLASS DOC] Test case (JitTestCase) for deprecated JIT quantization APIs. Holds no state;
+    # its tests expect errors from removed conversion functions and exercise one shape-erasure
+    # pass.
     @skipIfNoFBGEMM
     def test_rnn_cell_quantized(self):
+        # [FUNCTION DOC] For each of LSTM cell, GRU cell and RNN cell (input and hidden size 2),
+        # replaces the input and hidden weights with fixed non-trainable values (truncated to
+        # hidden size times the gate count) and asserts that quantize_rnn_cell_modules raises
+        # RuntimeError with a no longer supported message. Skipped without FBGEMM.
         d_in, d_hid = 2, 2
 
         for cell in [
@@ -60,6 +72,9 @@ class TestDeprecatedJitQuantized(JitTestCase):
 
     @skipIfNoFBGEMM
     def test_rnn_quantized(self):
+        # [FUNCTION DOC] For LSTM and GRU modules (sizes 2), overwrites layer-0 weights with
+        # fixed values and asserts that quantize_rnn_modules raises RuntimeError saying it is no
+        # longer supported, both for int8 and float16 dtype. Skipped without FBGEMM.
         d_in, d_hid = 2, 2
 
         for cell in [
@@ -116,14 +131,23 @@ class TestDeprecatedJitQuantized(JitTestCase):
     if "fbgemm" in torch.backends.quantized.supported_engines:
 
         def test_quantization_modules(self):
+            # [FUNCTION DOC] Defined only when fbgemm is a supported quantized engine. Builds a
+            # one-linear model with fixed weights and zero bias, computes a float reference,
+            # then asserts that quantize_linear_modules raises RuntimeError (no longer
+            # supported) with default and float16 arguments.
             K1, N1 = 2, 2
 
             class FooBar(torch.nn.Module):
+                # [CLASS DOC] HELPER: Single-layer model holding one float linear layer of sizes
+                # K1 by N1.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the linear layer attribute.
                     super().__init__()
                     self.linear1 = torch.nn.Linear(K1, N1).float()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the linear layer to x and returns the
+                    # result.
                     x = self.linear1(x)
                     return x
 
@@ -153,8 +177,16 @@ class TestDeprecatedJitQuantized(JitTestCase):
 
     @skipIfNoFBGEMM
     def test_erase_class_tensor_shapes(self):
+        # [FUNCTION DOC] Scripts a module that stores a packed quantized linear weight, with get
+        # and set state and a weight property, with emit hooks disabled, then runs the erase-
+        # shape-information pass on its graph. Passes if nothing raises. Skipped without FBGEMM.
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a prepacked quantized int8 linear weight, with
+            # state saving, forward returning the packed parameter, and a weight property.
             def __init__(self, in_features, out_features):
+                # [FUNCTION DOC] HELPER: Creates an empty int8 affine-quantized weight of the
+                # given shape (scale 1, zero point 0), prepacks it with the quantized linear
+                # prepack op and stores it.
                 super().__init__()
                 qweight = torch._empty_affine_quantized(
                     [out_features, in_features],
@@ -166,25 +198,35 @@ class TestDeprecatedJitQuantized(JitTestCase):
 
             @torch.jit.export
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: Exported method used when scripting: returns a tuple of
+                # the unpacked weight tensor and the training flag.
                 return (
                     torch.ops.quantized.linear_unpack(self._packed_weight)[0],
                     self.training,
                 )
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the packed weight parameter.
                 return self._packed_weight
 
             @torch.jit.export
             def __setstate__(self, state):
+                # [FUNCTION DOC] HELPER: Exported method: restores the packed weight by
+                # prepacking the first state entry and sets the training flag from the second
+                # entry.
                 self._packed_weight = torch.ops.quantized.linear_prepack(state[0])
                 self.training = state[1]
 
             @property
             def weight(self):
+                # [FUNCTION DOC] HELPER: Property getter: returns the unpacked weight tensor of
+                # the packed parameter.
                 return torch.ops.quantized.linear_unpack(self._packed_weight)[0]
 
             @weight.setter
             def weight(self, w):
+                # [FUNCTION DOC] HELPER: Property setter: prepacks the given tensor w and stores
+                # it as the packed weight.
                 self._packed_weight = torch.ops.quantized.linear_prepack(w)
 
         with torch._jit_internal._disable_emit_hooks():
