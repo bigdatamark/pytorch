@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: profiler"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests that profiler record-function events appear (with the right input shapes and
+# names) in profiler results: user record_function scopes, the low-level enter/exit with
+# arguments, datapipe iteration, python dispatch modes and tensor subclasses, and the dynamo
+# ChromiumEventLogger integration. Import-time side effect: if tqdm is installed its monitor
+# thread interval is set to zero to avoid lingering threads with invalid thread ids. Defines the
+# Json alias for a string-keyed dict.
 
 from typing import Any
 
@@ -35,7 +41,14 @@ Json = dict[str, Any]
 
 
 class TestRecordFunction(TestCase):
+    # [CLASS DOC] Test case for RecordFunction integration with the autograd profiler. Stateless;
+    # each test opens its own profile session and inspects its function_events.
     def _record_function_with_param(self):
+        # [FUNCTION DOC] HELPER: Profiles (stack, kineto if available, shapes recorded) a block
+        # that opens two nested scopes. The first record_function scope TEST 1 carries a string
+        # argument and contains a low-level enter/exit pair TEST 2 given an int, bool, float,
+        # list of two tensors, string and a 3x4x5 tensor. A second scope TEST 3 contains a
+        # no-argument pair TEST 4. Returns the finished profile object.
         u = torch.randn(3, 4, 5, requires_grad=True)
         with _profile(
             with_stack=True, use_kineto=kineto_available(), record_shapes=True
@@ -51,6 +64,10 @@ class TestRecordFunction(TestCase):
         return prof
 
     def test_record_function(self):
+        # [FUNCTION DOC] Runs the helper and scans function events by name, asserting each of the
+        # four scopes was found. Expected recorded input shapes: TEST 1 a single empty shape (one
+        # string arg), TEST 2 five empty shapes for scalars/list/string followed by the shape
+        # 3,4,5 for the tensor, TEST 3 and TEST 4 no shapes.
         prof_result = self._record_function_with_param()
         found_test_1 = False
         found_test_2 = False
@@ -75,6 +92,9 @@ class TestRecordFunction(TestCase):
         self.assertTrue(found_test_4)
 
     def test_datapipe_with_record_function(self):
+        # [FUNCTION DOC] Profiles building three iterable-wrapper datapipes and muxing them, then
+        # consuming the output into a list. Asserts profiler events exist whose names contain
+        # IterableWrapper and Multiplexer, showing datapipe iteration is recorded.
         with _profile(
             with_stack=True, use_kineto=kineto_available(), record_shapes=True
         ) as prof:
@@ -98,15 +118,28 @@ class TestRecordFunction(TestCase):
         self.assertTrue(has_mux)
 
     def test_datapipe_delegation_with_profiler(self):
+        # [FUNCTION DOC] Not profiler related: verifies datapipe attribute delegation. An
+        # iterator datapipe is checked for direct method access, for access through the iterator
+        # obtained from it, and for being fully consumable; then a delegating datapipe wrapping
+        # it is checked to expose the wrapped datapipe's get_value method through its iterator
+        # and to yield the same ten items.
         class IDPIterator(torch.utils.data.IterDataPipe):
+            # [CLASS DOC] HELPER: Iterator datapipe that is its own iterator over the integers 0
+            # to 9. Holds the data list and a position index; raises StopIteration at the end and
+            # resets the index so it can be iterated again.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initializes the data list with 0..9 and the position
+                # index to zero.
                 self.data = list(range(10))
                 self._idx = 0
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns self as the iterator.
                 return self
 
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Returns the next item and advances the index. After ten
+                # items it resets the index to zero and raises StopIteration.
                 if self._idx >= 10:
                     self._idx = 0
                     raise StopIteration
@@ -114,6 +147,7 @@ class TestRecordFunction(TestCase):
                 return self.data[self._idx - 1]
 
             def get_value(self, idx):
+                # [FUNCTION DOC] HELPER: Returns the stored item at the given index.
                 return self.data[idx]
 
         dp1 = IDPIterator()  # The object itself is an iterator
@@ -123,10 +157,14 @@ class TestRecordFunction(TestCase):
         self.assertEqual(list(range(10)), list(it_dp1))
 
         class IDPDelegator(torch.utils.data.IterDataPipe):
+            # [CLASS DOC] HELPER: Iterator datapipe that wraps another datapipe in an attribute
+            # and iterates by returning an iterator over the wrapped one.
             def __init__(self, datapipe):
+                # [FUNCTION DOC] HELPER: Stores the wrapped datapipe.
                 self.datapipe = datapipe
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns a fresh iterator over the wrapped datapipe.
                 return iter(self.datapipe)
 
         dp2 = IDPDelegator(dp1)
@@ -135,6 +173,9 @@ class TestRecordFunction(TestCase):
         self.assertEqual(list(range(10)), list(it_dp2))
 
     def test_datapipe_with_record_function_fork(self):
+        # [FUNCTION DOC] Profiles forking an iterable-wrapper datapipe into three children and
+        # consuming only the first child. Asserts events exist whose names contain
+        # IterableWrapper and _ChildDataPipe.
         with _profile(
             with_stack=True, use_kineto=kineto_available(), record_shapes=True
         ) as prof:
@@ -155,10 +196,17 @@ class TestRecordFunction(TestCase):
         self.assertTrue(has_child)
 
     def test_python_dispatch_mode_record_function(self):
+        # [FUNCTION DOC] Profiles a sine op on a random tensor under the python dispatcher and a
+        # pass-through TorchDispatchMode, and asserts a function event named PythonDispatchMode
+        # was recorded.
         from torch.utils._python_dispatch import TorchDispatchMode
 
         class TestDispatchMode(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Dispatch mode that does nothing but forward each
+            # intercepted op.
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Calls the intercepted function with its args and kwargs
+                # (an absent kwargs is treated as empty) and returns the result unchanged.
                 if kwargs is None:
                     kwargs = {}
                 return func(*args, **kwargs)
@@ -180,9 +228,17 @@ class TestRecordFunction(TestCase):
         )
 
     def test_python_subclass_record_function(self):
+        # [FUNCTION DOC] Profiles a sine op on a wrapper-subclass tensor under the python
+        # dispatcher and asserts a function event named PythonSubclass was recorded.
         class TestTensorSubclass(torch.Tensor):
+            # [CLASS DOC] HELPER: Wrapper tensor subclass holding the real tensor in an elem
+            # attribute; created with the same size, dtype, device and requires_grad as the
+            # wrapped tensor. Its dispatch hook unwraps subclass arguments, runs the op, and
+            # wraps tensor results.
             @staticmethod
             def __new__(cls, elem):
+                # [FUNCTION DOC] HELPER: Builds a wrapper subclass instance matching the metadata
+                # of the given tensor, stores that tensor as elem, and returns the instance.
                 r = torch.Tensor._make_wrapper_subclass(
                     cls,
                     elem.size(),
@@ -195,13 +251,20 @@ class TestRecordFunction(TestCase):
 
             @classmethod
             def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Unwraps subclass args and kwargs values to their elem
+                # tensors, calls the op, and returns the result wrapped in the subclass if it is
+                # a tensor, else unchanged.
                 if kwargs is None:
                     kwargs = {}
 
                 def unwrap(x):
+                    # [FUNCTION DOC] HELPER: Returns the elem tensor for subclass instances,
+                    # other values as is.
                     return x.elem if isinstance(x, TestTensorSubclass) else x
 
                 def wrap(x):
+                    # [FUNCTION DOC] HELPER: Wraps a tensor into the subclass; other values are
+                    # returned as is.
                     return TestTensorSubclass(x) if isinstance(x, torch.Tensor) else x
 
                 unwrapped_args = tuple(unwrap(arg) for arg in args)
@@ -228,6 +291,9 @@ class TestRecordFunction(TestCase):
         )
 
     def test_chromium_event_logger_profiler_integration(self):
+        # [FUNCTION DOC] Within a profile session, a ChromiumEventLogger logs the start and end
+        # of an event named test_compile_event (no pt2 compile event logging). Asserts the
+        # profiler captured a function event with that name.
         """Verify ChromiumEventLogger emits RecordFunction events to profiler"""
 
         with _profile(use_kineto=kineto_available()) as prof:
@@ -248,6 +314,10 @@ class TestRecordFunction(TestCase):
         )
 
     def test_chromium_logger_reset_cleans_open_events(self):
+        # [FUNCTION DOC] Within a profile session, starts an event on a ChromiumEventLogger
+        # without ending it, asserts it appears in the logger's record function mapping, then
+        # resets the logger and asserts the mapping is empty (open record functions were
+        # cleaned up).
         """Verify reset() cleans up lingering record functions on exception"""
         from torch._dynamo.utils import ChromiumEventLogger
 
@@ -265,6 +335,9 @@ class TestRecordFunction(TestCase):
             self.assertEqual(len(rf_dict), 0, "reset() failed to clean up open events")
 
     def test_chromium_logger_no_overhead_when_profiler_disabled(self):
+        # [FUNCTION DOC] With no profiler enabled (asserted via the autograd profiler flag), logs
+        # a start and end event on a ChromiumEventLogger and asserts the logger's record function
+        # mapping stays empty, i.e. no RecordFunction objects were created.
         """Verify zero overhead when profiler is not enabled"""
         from torch._dynamo.utils import ChromiumEventLogger
 

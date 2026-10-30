@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Tests of the structured data the profiler's experimental event tree exposes for
+# tensors, modules, optimizers and allocations: storage pointers and tensor ids, allocation ids
+# across set and resize, tensor metadata (sizes, strides, layout, device, dtype), scalar and list
+# arguments, nn.Module and optimizer parameter capture, allocation events and closure reference
+# counts. Import-time side effect: if tqdm is installed its monitor thread interval is set to
+# zero to avoid lingering threads. Defines the Json alias and a small two-layer network.
 
 import gc
 import re
@@ -40,29 +46,44 @@ Json = dict[str, Any]
 
 
 def find_node_with_name(nodes, name):
+    # [FUNCTION DOC] HELPER: Depth-first search of the given event tree roots; returns the first
+    # node whose name equals the given string, or None implicitly if there is none.
     for node in _utils.traverse_dfs(nodes):
         if node.name == name:
             return node
 
 
 def find_node_with_regex(nodes, pattern):
+    # [FUNCTION DOC] HELPER: Depth-first search of the event tree roots; returns the first node
+    # whose name matches the given regular expression anywhere, or None implicitly.
     for node in _utils.traverse_dfs(nodes):
         if re.search(pattern, node.name):
             return node
 
 
 class SimpleNet(nn.Module):
+    # [CLASS DOC] HELPER: Two-layer linear network (10 to 5, then 5 to 2) used as a profiling
+    # target; the forward pass applies the first layer then the second.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the two linear layers fc1 and fc2.
         super().__init__()
         self.fc1 = nn.Linear(10, 5)
         self.fc2 = nn.Linear(5, 2)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the second layer applied to the first layer's output.
         return self.fc2(self.fc1(x))
 
 
 class TestTorchTidyProfiler(TestCase):
+    # [CLASS DOC] Test case for tensor, module, optimizer and allocation metadata captured by the
+    # profiler's event tree. Stateless; each test profiles its own code and inspects the tree.
+    # Helpers: field extraction for tensor inputs, allocation table formatting, and optimizer
+    # result checking.
     def _get_tensor_fields(self, node, index):
+        # [FUNCTION DOC] HELPER: Asserts the node is a torch op node and that its input at the
+        # given index is tensor metadata with implementation pointer, storage data pointer and id
+        # all set. Returns those three values as a tuple.
         self.assertIsNotNone(node)
         self.assertIsInstance(
             node.extra_fields, torch._C._profiler._ExtraFields_TorchOp
@@ -75,6 +96,11 @@ class TestTorchTidyProfiler(TestCase):
         return tensor_info.impl_ptr, tensor_info.storage_data_ptr, tensor_info.id
 
     def test_pointers_and_ids(self):
+        # [FUNCTION DOC] Profiles adds, muls, a resize, a relu, and a set_ on tensors, then
+        # checks: storage pointers match the Python API; views share storage but have distinct
+        # impl pointers; a tensor reused across ops has identical impl, storage and id; resize
+        # keeps impl and id but changes the storage pointer; and set_ to another tensor's storage
+        # gives the two tensors the same id while impls differ.
         a = torch.randn(4, 3)
         a_initial_storage_data = a.storage().data_ptr()
 
@@ -100,6 +126,8 @@ class TestTorchTidyProfiler(TestCase):
         nodes = p.profiler.kineto_results.experimental_event_tree()
 
         def get_fields(op_name, index):
+        # [FUNCTION DOC] HELPER: Finds the first node with the given op name in the profiled tree
+        # and returns the impl pointer, storage pointer and id of its input at the given index.
             return self._get_tensor_fields(find_node_with_name(nodes, op_name), index)
 
         a_impl, a_storage_data, a_id = get_fields("aten::add", 0)
@@ -133,6 +161,11 @@ class TestTorchTidyProfiler(TestCase):
 
     @staticmethod
     def _format_allocations(profiled_code):
+        # [FUNCTION DOC] HELPER: Static. Runs a garbage collection, profiles the callable with
+        # memory and shape recording followed by another collection, and takes all allocation
+        # events from the event tree sorted by start time. Returns a string with one line per
+        # event holding the tensor id, allocation id and the word Allocation or Free (by sign of
+        # size), indented by twelve spaces.
         gc.collect()
         with profile(profile_memory=True, record_shapes=True) as prof:
             profiled_code()
@@ -159,7 +192,14 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def test_tensorimpl_invalidation_set(self) -> None:
+        # [FUNCTION DOC] Checks allocation and free ordering and ids when a tensor is pointed
+        # at a new storage via set_, with and without a preceding empty set_ that frees the
+        # old storage first. Compares formatted allocation tables against expected strings
+        # for both variants.
         def profiled_code(add_empty_set: bool):
+            # [FUNCTION DOC] HELPER: Creates a one-element tensor, optionally calls an
+            # argumentless set_ (controlling whether the old storage is released before the new
+            # one is created), then sets it to a new storage and calls view_as.
             x = torch.ones((1,))
 
             # Determines if new storage is created before or after the old one
@@ -189,7 +229,15 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def test_tensorimpl_invalidation_keep_alive(self) -> None:
+        # [FUNCTION DOC] Checks allocation ids when old storages are kept alive in a list across
+        # repeated set_ calls and then released deterministically with garbage collection;
+        # compares the formatted allocation table to expected text, with and without an extra
+        # empty set_.
         def profiled_code(add_empty_set: bool):
+            # [FUNCTION DOC] HELPER: Repeatedly re-sets a tensor to new storages while
+            # keeping the old storages in a list, frees them one at a time with collections,
+            # optionally does an empty set_, sets storage three more times, then deletes the
+            # tensor and collects.
             x = torch.ones((1,))
             x_storages = [x.storage()]
             for _ in range(3):
@@ -257,7 +305,12 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def test_tensorimpl_invalidation_full(self) -> None:
+        # [FUNCTION DOC] Combined scenario of kept-alive storages, repeated set_ (with and
+        # without empty set_ calls) and resize_ steps; compares the formatted allocation table
+        # against the expected text.
         def profiled_code():
+            # [FUNCTION DOC] HELPER: Runs the combined set_ / resize_ workload on a one-element
+            # tensor, releasing kept storages in a deterministic order.
             x = torch.ones((1,))
             x_storages = [x.storage()]
             for _ in range(3):
@@ -314,7 +367,12 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def test_tensorimpl_invalidation_scalar_args(self) -> None:
+        # [FUNCTION DOC] Checks allocation tables for repeated in-place adds with a scalar
+        # argument under no-grad: each add yields allocation events for the scalar wrapper tensor
+        # with increasing ids, compared to expected text.
         def profiled_code():
+            # [FUNCTION DOC] HELPER: Under no-grad, creates a one-element tensor and adds the
+            # number two to it in place ten times.
             with torch.no_grad():
                 x = torch.ones((1,))
                 for _ in range(10):
@@ -372,10 +430,20 @@ class TestTorchTidyProfiler(TestCase):
         "https://github.com/pytorch/pytorch/issues/87581",
     )
     def test_module_and_optimizer_ids(self) -> None:
+        # [FUNCTION DOC] Profiles a linear model forward, backward and an SGD step and, for a
+        # cold start (first step, weight grad not yet present) and warm run, verifies tensor ids
+        # captured for module parameters and optimizer parameters and state match ground truth
+        # tensors marked by unary ops. Skipped on every supported OS and under dynamo (tracking
+        # issue 87581), so it effectively never runs.
         model = torch.nn.Linear(2, 1, bias=True)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
 
         def check(cold_start: bool) -> None:
+            # [FUNCTION DOC] HELPER: Runs one profiled iteration and asserts: ids of marked
+            # tensors are distinct; the module event for the linear layer exposes weight with the
+            # matching id and a grad id only when not a cold start; the optimizer step event
+            # exposes two parameters (weight and bias) with their grad ids and a single momentum
+            # buffer state with the marked id.
             with profile(with_stack=True, profile_memory=True, record_shapes=True) as p:
                 x = torch.ones((1, 2))
                 _ = x.sin()  # Mark `x`
@@ -389,6 +457,8 @@ class TestTorchTidyProfiler(TestCase):
             nodes = p.profiler.kineto_results.experimental_event_tree()
 
             def get_fields(op_name, index):
+                # [FUNCTION DOC] HELPER: Returns impl pointer, storage pointer and id of the
+                # input at the given index of the first node with the given op name.
                 return self._get_tensor_fields(
                     find_node_with_name(nodes, op_name), index
                 )
@@ -441,6 +511,12 @@ class TestTorchTidyProfiler(TestCase):
         check(cold_start=False)
 
     def _test_allocation_ids(self, before_fn, after_fn) -> None:
+        # [FUNCTION DOC] HELPER: Profiles a random tensor created, resized, used and deleted,
+        # with the two given callables run before and after to add unrelated work. Checks the
+        # allocation event under rand and empty matches the uniform fill input pointer and id;
+        # the resize has two children (new allocation, free of the old) keeping the id with a new
+        # pointer; and the final top-level allocation event is the free of the new storage with
+        # the same id and pointer.
         with profile(profile_memory=True, record_shapes=True) as p:
             # Introduce other operations and allocations to check robustness
             _ = before_fn()
@@ -463,6 +539,9 @@ class TestTorchTidyProfiler(TestCase):
         nodes = p.profiler.kineto_results.experimental_event_tree()
 
         def find_chain(names: list[str]):
+            # [FUNCTION DOC] HELPER: Given a list of op names, finds each successive node
+            # starting from the roots and then in the previous found node's subtree, asserting
+            # each is found. Returns the list of nodes.
             out = []
             for name in names:
                 root = [out[-1]] if out else nodes
@@ -503,15 +582,21 @@ class TestTorchTidyProfiler(TestCase):
         self.assertEqual(free_new.ptr, allocate_new.ptr)
 
     def test_allocation_ids(self) -> None:
+        # [FUNCTION DOC] Runs the allocation id check with no extra work before or after.
         self._test_allocation_ids(lambda: None, lambda: None)
 
     def test_allocation_ids_with_other_ops(self) -> None:
+        # [FUNCTION DOC] Runs the allocation id check with extra ops (add then in-place relu, and
+        # zeros then cos) before and after.
         x = torch.ones((1,))
         self._test_allocation_ids(
             lambda: (x + 1).relu_(), lambda: torch.zeros((1,)).cos()
         )
 
     def test_impl_reuse(self) -> None:
+        # [FUNCTION DOC] Profiles a thousand short-lived ones tensors and asserts the thousand
+        # fill ops have a thousand distinct impl pointers, i.e. tensor impl addresses are not
+        # reported as reused.
         repeats = 1_000
         with profile(profile_memory=True, record_shapes=True) as p:
             for _ in range(repeats):
@@ -529,6 +614,9 @@ class TestTorchTidyProfiler(TestCase):
         self.assertEqual(len(set(tensor_impls)), repeats)
 
     def test_allocation_id_uniqueness(self) -> None:
+        # [FUNCTION DOC] Profiles a thousand short-lived ones tensors and gathers allocation ids
+        # from tensor inputs of ops and from allocation events, ignoring None. Asserts the set
+        # has exactly a thousand entries, i.e. ids are unique per allocation.
         repeats = 1_000
         with profile(profile_memory=True, record_shapes=True) as p:
             for _ in range(repeats):
@@ -553,6 +641,9 @@ class TestTorchTidyProfiler(TestCase):
         self.assertEqual(repeats, len(id_set))
 
     def test_extra_fields(self):
+        # [FUNCTION DOC] Profiles creation of a ones tensor with stack and memory profiling and
+        # checks the node for the op has torch-op fields, its parent has Python C-call fields,
+        # its first child is the empty op, and that has a memory child with allocation fields.
         with profile(with_stack=True, profile_memory=True) as p:
             _ = torch.ones((1,))
 
@@ -576,6 +667,10 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def test_tensor_properties(self):
+        # [FUNCTION DOC] Profiles an add and a mul of a strided view and a grad-requiring tensor.
+        # Asserts the add node's input sizes, strides, layouts, devices and dtypes (the trailing
+        # non-tensor argument gives defaults), its record scope is function, and the mul's
+        # sequence number is one more than the add's.
         x = torch.ones(10, 10).as_strided([4, 4], [12, 3])
         y = torch.ones(4, 1, requires_grad=True)
 
@@ -592,6 +687,8 @@ class TestTorchTidyProfiler(TestCase):
         )
 
         def getattr_inputs(name, default):
+        # [FUNCTION DOC] HELPER: Returns, for each input of the add node, the named attribute or
+        # the given default if the input lacks it.
             return [getattr(i, name, default) for i in node.extra_fields.inputs]
 
         self.assertEqual(getattr_inputs("sizes", []), [[4, 4], [4, 1], []])
@@ -615,6 +712,9 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def test_sparse_tensors(self):
+        # [FUNCTION DOC] Profiles adding a sparse COO tensor to itself and asserts the inputs
+        # report full sizes, empty strides, sparse COO layout and cpu device (trailing argument
+        # gives defaults).
         i = [[0, 1, 1], [2, 0, 2]]
         v = [3, 4, 5]
         s = torch.sparse_coo_tensor(i, v, (2, 3))
@@ -631,6 +731,8 @@ class TestTorchTidyProfiler(TestCase):
         )
 
         def getattr_inputs(name, default):
+        # [FUNCTION DOC] HELPER: Returns, for each input of the add node, the named attribute or
+        # the given default if the input lacks it.
             return [getattr(i, name, default) for i in node.extra_fields.inputs]
 
         self.assertEqual(getattr_inputs("sizes", []), [[2, 3], [2, 3], []])
@@ -647,6 +749,9 @@ class TestTorchTidyProfiler(TestCase):
         not torch.backends.mkldnn.is_available(), "MKL-DNN build is disabled"
     )
     def test_mkldnn_tensors(self):
+        # [FUNCTION DOC] Profiles adding an MKL-DNN tensor to itself and asserts sizes,
+        # empty strides, the mkldnn layout and cpu device for the inputs. Skipped when
+        # MKL-DNN is unavailable.
         x = torch.ones(4, 3).to_mkldnn()
 
         with profile(with_stack=True, profile_memory=True, record_shapes=True) as p:
@@ -661,6 +766,8 @@ class TestTorchTidyProfiler(TestCase):
         )
 
         def getattr_inputs(name, default):
+        # [FUNCTION DOC] HELPER: Returns, for each input of the add node, the named attribute or
+        # the given default if the input lacks it.
             return [getattr(i, name, default) for i in node.extra_fields.inputs]
 
         self.assertEqual(getattr_inputs("sizes", []), [[4, 3], [4, 3], []])
@@ -674,6 +781,9 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def test_scalar_ins(self):
+        # [FUNCTION DOC] Profiles adding a Python float to a float tensor with an alpha keyword.
+        # Asserts the float is promoted to a zero-dimensional double tensor input (dtype and
+        # sizes), and that the third input is the alpha value itself.
         x = torch.ones(5, 5)
         alpha = 0.9
 
@@ -685,6 +795,8 @@ class TestTorchTidyProfiler(TestCase):
         self.assertIsNotNone(node)
 
         def getattr_inputs(name, default):
+        # [FUNCTION DOC] HELPER: Returns, for each input of the add node, the named attribute or
+        # the given default if the input lacks it.
             return [getattr(i, name, default) for i in node.extra_fields.inputs]
 
         # The second argument to the add gets promotoed to a zerodim Tensor
@@ -695,6 +807,9 @@ class TestTorchTidyProfiler(TestCase):
         self.assertEqual(node.extra_fields.inputs[2], alpha)
 
     def test_tensor_lists(self):
+        # [FUNCTION DOC] Profiles stacking two tensors and asserts the stack op has two
+        # inputs, the first a list of two tensor metadata entries whose storage pointers
+        # match the tensors.
         x = torch.ones((1,))
         y = torch.ones((1,))
         with profile(with_stack=True, profile_memory=True, record_shapes=True) as p:
@@ -710,7 +825,14 @@ class TestTorchTidyProfiler(TestCase):
         self.assertEqual(y.storage().data_ptr(), inputs[0][1].storage_data_ptr)
 
     def test_nnmodule_params(self):
+        # [FUNCTION DOC] Profiles a forward pass of the two-layer net after a backward (so grads
+        # exist) and checks that exactly two module records with parameters are captured and that
+        # their (name, storage pointer, grad storage pointer) triples equal those of the first
+        # then second layer parameters.
         def flat_out_extrafields(nodes, out=None):
+            # [FUNCTION DOC] HELPER: Recursively collects module info objects, from Python call
+            # nodes that have a module with a non-empty parameter list, across the tree into an
+            # output list (created if absent) and returns it.
             if out is None:
                 out = []
             for node in nodes:
@@ -757,6 +879,9 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def _flat_out_extrafields(self, nodes, out=None):
+        # [FUNCTION DOC] HELPER: Recursively collects optimizer info objects from Python call
+        # nodes with an optimizer having parameters, skipping any whose first parameter storage
+        # pointer duplicates one already collected (repeated iterations). Returns the list.
         if out is None:
             out = []
         for node in nodes:
@@ -773,6 +898,11 @@ class TestTorchTidyProfiler(TestCase):
         return out
 
     def _check_results(self, opt, opts, check_items=False):
+        # [FUNCTION DOC] HELPER: Asserts exactly one profiled optimizer was found and that its
+        # recorded self pointer equals the identity of the real optimizer. If the flag is true,
+        # also checks the parameter group count equals the optimizer count, each group's
+        # parameter storage pointers match the recorded ones, and recorded state storage pointers
+        # match the real state for every parameter.
         self.assertEqual(
             len(opts),
             1,
@@ -808,6 +938,8 @@ class TestTorchTidyProfiler(TestCase):
                     )
 
     def test_optimizer(self):
+        # [FUNCTION DOC] Profiles building a net and SGD optimizer and one training step, then
+        # checks the captured optimizer record (identity only, without items).
         inputs = torch.rand(10)
         with torch.profiler.profile(with_stack=True, profile_memory=True) as p:
             net = SimpleNet()
@@ -827,6 +959,8 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def _test_optimizer_parameters(self, optimizer_factory):
+        # [FUNCTION DOC] HELPER: Profiles building a net and an optimizer from the given factory
+        # and two training steps, then runs the full check of identity, parameters and state.
         inputs = torch.rand(10)
         with torch.profiler.profile(with_stack=True, profile_memory=True) as p:
             net = SimpleNet()
@@ -846,16 +980,22 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def test_optimizer_parameters_sgd(self):
+        # [FUNCTION DOC] Runs the optimizer parameter check with SGD with momentum.
         self._test_optimizer_parameters(
             lambda params: torch.optim.SGD(params, lr=0.01, momentum=0.9)
         )
 
     def test_optimizer_parameters_adam(self):
+        # [FUNCTION DOC] Runs the optimizer parameter check with Adam using foreach.
         self._test_optimizer_parameters(
             lambda params: torch.optim.Adam(params, foreach=True)
         )
 
     def test_allocations(self):
+        # [FUNCTION DOC] Profiles allocating then freeing a 3x4 float tensor. Asserts the memory
+        # event has a positive pointer, size twelve floats in bytes (48), cpu device, and zero
+        # total reserved; then in a second profile the free event has the same pointer, the
+        # negative size and total allocated reduced by that size.
         gc.collect()
         with profile(profile_memory=True) as p:
             x = torch.empty((3, 4))
@@ -890,18 +1030,30 @@ class TestTorchTidyProfiler(TestCase):
         )
 
     def test_refcounts(self):
+        # [FUNCTION DOC] Checks that profiling with stack does not leak references through
+        # closures: after calling the outer function, the inner sentinel is gone, while the outer
+        # sentinel stays alive until the outer function is deleted.
         class Sentinel:
+            # [CLASS DOC] HELPER: Empty marker class whose instances are tracked with
+            # weak references.
             pass
 
         def make():
+            # [FUNCTION DOC] HELPER: Creates an outer sentinel and a nested function; returns
+            # that function and a weak reference to the sentinel.
             outer_sentinel = Sentinel()
 
             def outer():
+                # [FUNCTION DOC] HELPER: Touches the outer sentinel to capture it, creates an
+                # inner sentinel, runs a nested function using it under a stack-recording
+                # profiler, and returns a weak reference to the inner sentinel.
                 # Python will only close over variables used in the function.
                 _ = outer_sentinel
                 inner_sentinel = Sentinel()
 
                 def inner():
+                    # [FUNCTION DOC] HELPER: Reads the inner sentinel so the closure captures it;
+                    # no result.
                     _ = inner_sentinel
 
                 with profile(with_stack=True):

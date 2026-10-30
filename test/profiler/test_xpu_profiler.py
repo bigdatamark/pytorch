@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Intel XPU profiler tests. Defines a module-level verbosity flag (off by default)
+# that makes the tests print collected counts, and one test class whose tests need an XPU device
+# and are skipped otherwise. Checks device event collection, the overhead category in exported
+# chrome traces, and the structure of an exported trace. Runs through the standard test runner.
 
 
 import json
@@ -16,8 +20,13 @@ Verbose = False
 
 
 class XpuProfilerTest(TestCase):
+    # [CLASS DOC] XPU profiler test case. Stateless apart from the module verbosity flag; all
+    # tests except the JSON helper are skipped when no XPU is present.
     @unittest.skipIf(not TEST_XPU, "test requires XPU")
     def test_profiler(self):
+        # [FUNCTION DOC] Zeroes an integer tensor on the XPU ten times under a profiler enabled
+        # for XPU activity only, counts profiler events per device type, and asserts exactly two
+        # device types were seen: CPU and XPU.
         t = torch.empty(1000, dtype=torch.int, device="xpu")
         with torch.profiler.profile(
             activities=[
@@ -39,6 +48,11 @@ class XpuProfilerTest(TestCase):
         self.assertTrue(DeviceType.XPU in events)
 
     def gen_and_check_json(self, p, json_file):
+        # [FUNCTION DOC] HELPER: Exports the profile as a chrome trace to the given path, reloads
+        # it, and asserts: a trace events list exists and is non-empty; every event has a phase
+        # and name; complete events (phase X) have a category. Counts names and categories of
+        # complete events and asserts the categories include xpu_runtime, xpu_driver and kernel.
+        # Prints counts if verbose.
         p.export_chrome_trace(json_file)
 
         with open(json_file) as f:
@@ -70,6 +84,10 @@ class XpuProfilerTest(TestCase):
 
     @unittest.skipIf(not TEST_XPU, "test requires XPU")
     def test_profiler_overhead(self):
+        # [FUNCTION DOC] Profiles ten matrix multiplications on the XPU with CPU and XPU
+        # activities, exports a chrome trace to a temporary file and loads it. Asserts at least
+        # one complete event in the overhead category exists and that each carries overhead cost
+        # and overhead count arguments.
         # The OVERHEAD activity type surfaces the profiler's own collection cost
         # on a dedicated track, matching CUDA behaviour. It is enabled together
         # with ProfilerActivity.XPU via kXpuTypes. PTI instruments the device
@@ -110,6 +128,10 @@ class XpuProfilerTest(TestCase):
 
     @unittest.skipIf(not TEST_XPU, "test requires XPU")
     def test_profiler_xpu_driver(self):
+        # [FUNCTION DOC] Profiles a matmul, add and abs chain on the XPU with CPU and XPU
+        # activities. Validates the exported trace through the JSON helper, writing to the path
+        # in the JSON_FILE environment variable if set, otherwise to a temporary file. Prints the
+        # key averages table when verbose.
         a = torch.rand([100, 200]).to("xpu")
         b = torch.rand([200, 300]).to("xpu")
         with torch.profiler.profile(

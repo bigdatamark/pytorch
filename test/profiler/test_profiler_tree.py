@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Tests that the profiler's experimental event tree has the expected structure.
+# Defines pruning constants and a table of function names whose subtrees are pruned or collapsed
+# for platform independence, a flag allowing CUDA result mismatches on ROCm and Windows, two
+# tensor subclasses, a ProfilerTree helper that renders the tree as indented text, and a test
+# case comparing rendered trees with expected inline strings (set the expecttest accept
+# environment variable to regenerate). Line numbers in file names are always masked, so adding
+# lines to this file does not affect the expected output.
 
 import functools
 import os
@@ -55,24 +62,38 @@ ALLOW_CUDA_FAILURE = (torch.version.hip is not None) or IS_WINDOWS
 
 
 class TorchFunctionTensor(torch.Tensor):
+    # [CLASS DOC] HELPER: Tensor subclass that overrides torch function dispatch only to defer to
+    # the parent implementation, so the Python hook appears in the profiler tree.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] HELPER: Forwards the intercepted call to the parent class torch function
+        # handler with the same arguments and returns its result.
         return super().__torch_function__(func, types, args, kwargs)
 
 
 class TorchDispatchTensor(torch.Tensor):
+    # [CLASS DOC] HELPER: Wrapper tensor subclass holding the real tensor in an elem attribute.
+    # Its torch dispatch hook unwraps subclass arguments, runs the op, and wraps tensor results.
     @staticmethod
     def __new__(cls, elem):
+        # [FUNCTION DOC] HELPER: Creates a subclass instance sharing the data of the given tensor
+        # with its requires_grad flag, stores the tensor as elem, and returns the instance.
         t = torch.Tensor._make_subclass(cls, elem, elem.requires_grad)
         t.elem = elem
         return t
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] HELPER: Maps unwrap over the positional args and keyword args (empty if
+        # none), calls the op, maps wrap over the result and returns it.
         def unwrap(x):
+            # [FUNCTION DOC] HELPER: Returns the elem tensor of a subclass instance, else the
+            # value as is.
             return x.elem if isinstance(x, TorchDispatchTensor) else x
 
         def wrap(x):
+            # [FUNCTION DOC] HELPER: Wraps a plain tensor in the subclass; other values are
+            # returned as is.
             return TorchDispatchTensor(x) if isinstance(x, torch.Tensor) else x
 
         args = tree_map(unwrap, args)
@@ -82,8 +103,15 @@ class TorchDispatchTensor(torch.Tensor):
 
 
 class ProfilerTree:
+    # [CLASS DOC] Namespace of static and class helpers (no instances) used to render a profiler
+    # event tree as text and to decorate tests so they run several replicates.
     @staticmethod
     def test(f):
+        # [FUNCTION DOC] Decorator for tests that use tree rendering. Returns a wrapper that runs
+        # the test up to a given number of replicates (default three), setting the replicate
+        # index on the test case before each run; stops early if the index is cleared to None by
+        # a tolerated mismatch; always removes the attribute afterward. The wrapper name marks
+        # where the test body starts in rendered stacks.
         """Mark unit test that will be using ProfilerTree to test traces.
 
         This decorator serves two purposes. First, it provides a method name
@@ -95,6 +123,9 @@ class ProfilerTree:
 
         @functools.wraps(f)
         def begin_unit_test_marker(self, replicates=3):
+            # [FUNCTION DOC] HELPER: The wrapper described above. Runs the wrapped test in a loop
+            # of replicates, recording the replicate number on the test instance, and returns the
+            # last result; the attribute is deleted in a finally block.
             try:
                 for i in range(replicates):
                     self.tree_replicate = i
@@ -109,7 +140,16 @@ class ProfilerTree:
 
     @classmethod
     def format(cls, profiler, indent: int = 0):
+        # [FUNCTION DOC] Renders the profiler's event tree as an indented multi-line string.
+        # Flattens the tree with depth, validating each node, normalizing names, and applying the
+        # pruning table (drop a subtree, keep only its name plus an ellipsis child, keep only an
+        # ellipsis, or skip the node but keep children). Removes trailing device or context
+        # synchronization events, trims everything above and including the test marker frame, and
+        # indents by two spaces per depth plus the given extra indent.
         def flatten(nodes, depth=0, out=None):
+            # [FUNCTION DOC] HELPER: Recursive depth-first walk building a list of pairs of depth
+            # and name. Validates and renames each node, then applies the prune level for the
+            # name; raises an assertion error for an unknown prune level. Returns the list.
             if out is None:
                 out = []
 
@@ -164,6 +204,11 @@ class ProfilerTree:
 
     @staticmethod
     def fmt_name(name: str) -> str:
+        # [FUNCTION DOC] Normalizes an event name for stable comparison. For Python function
+        # names of the file.py(line): function form, strips directories for this test file,
+        # converts path separators to forward slashes and masks the line number. For other names,
+        # collapses template arguments of known kernel names, rewrites a pybind11 detail function
+        # record prefix to PyCapsule, and masks object addresses. Returns the new string.
         match = re.match(r"^(.*)\.py\(([0-9]+)\): (.*)$", name)
         if match:
             filename, _, fn = match.groups()
@@ -211,6 +256,10 @@ class ProfilerTree:
 
     @classmethod
     def validate_node(cls, node):
+        # [FUNCTION DOC] Checks consistency of Python call nodes: finds the nearest ancestor
+        # Python call and compares its callsite file and function with the caller recorded on the
+        # node's own fields. Raises an assertion error describing both names if they differ.
+        # Other node kinds are ignored.
         extra_fields = node.extra_fields
         if isinstance(extra_fields, (_ExtraFields_PyCall, _ExtraFields_PyCCall)):
             # Check that the lineage established by the profiler matches the
@@ -222,6 +271,8 @@ class ProfilerTree:
                 parent = parent.parent
 
             def to_string(frame_state):
+                # [FUNCTION DOC] HELPER: Formats a frame state as its file name with a masked
+                # line number, a colon, and its function name.
                 return f"{frame_state.file_name}(...): {frame_state.function_name}"
 
             if parent:
@@ -233,7 +284,18 @@ class ProfilerTree:
 
 @unittest.skipIf(IS_ARM64, "Not working on ARM")
 class TestProfilerTree(TestCase):
+    # [CLASS DOC] Test case holding profiler tree tests, skipped on ARM64. Each test is
+    # decorated to run replicates, profiles a small workload and compares the rendered tree
+    # with an inline expected string. Several CUDA and memory-with-stack tests are currently
+    # unconditionally skipped.
     def assertTreesMatch(self, actual: str, expected: str, allow_failure: bool = False):
+        # [FUNCTION DOC] Compares the rendered actual tree with the expected string. Requires the
+        # test to be decorated (the replicate index must exist) else the assertion fails. In
+        # accept mode the actual text is not padded; otherwise it is padded to the expected
+        # length so diffs show. On the first replicate it uses the inline expect assertion; on
+        # later replicates it requires equality. If allowed to fail and the first replicate
+        # mismatches, it clears the replicate index so the remaining runs stop, and prints the
+        # error message instead of raising.
         # Warning: Here be dragons
         #   Different platforms will have subtly different behavior for Python
         #   tracing. Observed differences include:
@@ -282,6 +344,9 @@ class TestProfilerTree(TestCase):
         "Test not working for CUDA and XPU",
     )
     def test_profiler_experimental_tree(self):
+        # [FUNCTION DOC] Profiles an add, a ones creation, a subtraction, a power and a backward
+        # of the loss, and compares the op tree (including autograd engine nodes) to the expected
+        # text. Skipped when CUDA or XPU is available.
         t1, t2 = torch.ones(1, requires_grad=True), torch.ones(1, requires_grad=True)
         with torch.profiler.profile() as p:
             z = torch.add(t1, t2)
@@ -340,6 +405,9 @@ class TestProfilerTree(TestCase):
         "Test not working for CUDA and XPU",
     )
     def test_profiler_experimental_tree_with_record_function(self):
+        # [FUNCTION DOC] Profiles nested user annotations, including one entered without ever
+        # being exited, around an op and a backward, and compares the tree to the expected text.
+        # Skipped when CUDA or XPU is available.
         with torch.profiler.profile() as p:
             with torch.autograd.profiler.record_function("Top level Annotation"):
                 with torch.autograd.profiler.record_function("First Annotation"):
@@ -393,6 +461,9 @@ class TestProfilerTree(TestCase):
         "Test not working for CUDA and XPU",
     )
     def test_profiler_experimental_tree_with_memory(self):
+        # [FUNCTION DOC] Same workload as the basic tree test with memory profiling on,
+        # comparing the tree including memory events to the expected text. Skipped when CUDA
+        # or XPU is available.
         t1, t2 = torch.ones(1, requires_grad=True), torch.ones(1, requires_grad=True)
         with torch.profiler.profile(profile_memory=True) as p:
             z = torch.add(t1, t2)
@@ -469,6 +540,9 @@ class TestProfilerTree(TestCase):
     )
     @ProfilerTree.test
     def test_profiler_experimental_tree_with_memory_and_stack(self):
+        # [FUNCTION DOC] Profiles the same workload with stack and memory recording and compares
+        # the full tree including Python frames to the expected text. Currently skipped
+        # unconditionally (issue 83606) and when crossref mode is on.
         t1, t2 = torch.ones(1, requires_grad=True), torch.ones(1, requires_grad=True)
         with torch.profiler.profile(with_stack=True, profile_memory=True) as p:
             z = torch.add(t1, t2)
@@ -581,8 +655,15 @@ class TestProfilerTree(TestCase):
     )
     @ProfilerTree.test
     def test_profiler_experimental_tree_with_stack_and_modules(self):
+        # [FUNCTION DOC] Profiles two calls to a module whose forward applies a stored list of
+        # activation and linear layers, with stack recording, and compares the tree including
+        # module call frames to the expected text. Skipped under dynamo and crossref.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a plain list of a ReLU, a one-to-one Linear and
+            # another ReLU; the layers are not registered as submodules because they are in a
+            # plain list.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initializes the base module and creates the layer list.
                 super().__init__()
                 self.layers = [
                     torch.nn.ReLU(),
@@ -591,6 +672,8 @@ class TestProfilerTree(TestCase):
                 ]
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies each layer in order to the input and returns
+                # the result.
                 for l in self.layers:
                     x = l(x)
                 return x
@@ -708,6 +791,9 @@ class TestProfilerTree(TestCase):
     )
     @ProfilerTree.test
     def test_profiler_experimental_tree_with_stack_and_torch_function(self):
+        # [FUNCTION DOC] Warms up lazy initialization with an add on a torch-function subclass
+        # tensor, then profiles an add with stack recording and compares the tree, including the
+        # Python torch function hook frames, to the expected text. Skipped under crossref.
         x = TorchFunctionTensor(torch.ones((1,)))
         y = torch.ones((1,))
 
@@ -749,6 +835,9 @@ class TestProfilerTree(TestCase):
     )
     @ProfilerTree.test
     def test_profiler_experimental_tree_with_stack_and_torch_dispatch(self):
+        # [FUNCTION DOC] Warms up with a profiled add of a dispatch-subclass tensor, then
+        # profiles it again with stack recording and compares the tree, including the Python
+        # dispatch hook frames, to the expected text. Skipped under dynamo and crossref.
         x = TorchDispatchTensor(torch.ones((1,)))
         y = torch.ones((1,))
 
@@ -791,6 +880,10 @@ class TestProfilerTree(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
     @ProfilerTree.test
     def test_profiler_experimental_tree_cuda(self):
+        # [FUNCTION DOC] CUDA workload with memory profiling: ones on device, add, power,
+        # backward and an SGD step with momentum; compares the tree with kernel launches to the
+        # expected text, tolerating mismatch on ROCm or Windows. Currently skipped
+        # unconditionally and without CUDA.
         with torch.profiler.profile(profile_memory=True) as p:
             weight = torch.ones(1, device="cuda", requires_grad=True)
             x = torch.ones(1, device="cuda")
@@ -889,6 +982,10 @@ class TestProfilerTree(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
     @ProfilerTree.test
     def test_profiler_experimental_tree_cuda_with_stream(self):
+        # [FUNCTION DOC] CUDA workload that runs a tanh and subtraction on three separate
+        # streams with memory profiling, then waits on them, and compares the tree to the
+        # expected text, tolerating mismatch on ROCm or Windows. Currently skipped
+        # unconditionally and without CUDA.
         streams = [torch.cuda.Stream() for _ in range(3)]
         results = []
         with torch.profiler.profile(profile_memory=True) as p:
@@ -949,6 +1046,11 @@ class TestProfilerTree(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
     @ProfilerTree.test
     def test_profiler_experimental_tree_cuda_detailed(self):
+        # [FUNCTION DOC] CUDA training step (linear model, backward, SGD with momentum) warmed up
+        # three times then profiled once with stack and memory recording; compares the full tree
+        # with Python frames and kernels to the expected text, tolerating mismatch on ROCm or
+        # Windows. Preloads a lazily imported nested tensor module so it does not appear.
+        # Currently skipped unconditionally, without CUDA, and under crossref.
         # Do lazy imports ahead of time to avoid it showing up in the tree
         import torch.nested._internal.nested_tensor
 
@@ -957,6 +1059,8 @@ class TestProfilerTree(TestCase):
         opt = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
 
         def step():
+            # [FUNCTION DOC] HELPER: One training step on the CUDA model: forward on a ones
+            # input, backward on the output, and an optimizer step.
             x = torch.ones((1, 1), device="cuda")
             loss = model(x)
             loss.backward()

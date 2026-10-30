@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Tests for the profiler chrome-trace validator rules. Provides device-type to
+# profiler-activity mapping, a small ResNet50 model builder, and payload functions that profile a
+# workload and return the exported trace events. Contains synthetic unit tests that feed
+# hand-built event mappings to each rule, plus end-to-end test classes (agnostic and CUDA) that
+# profile real workloads; both end-to-end classes are currently skipped at class level pending a
+# kineto clock-skew fix. Import-time side effect: registers device-type instantiations of the
+# agnostic class for all device types except cpu.
 
 import json
 import os
@@ -43,6 +50,9 @@ _DEVICE_TYPE_TO_ACTIVITY = {
 
 
 def _activity_for_device_type(device_type):
+    # [FUNCTION DOC] HELPER: Looks up the profiler activity for a device type string in the
+    # module mapping. Raises ValueError telling the caller to extend the mapping if the type
+    # is unknown.
     """Map a device type string to its ProfilerActivity enum."""
     if device_type not in _DEVICE_TYPE_TO_ACTIVITY:
         raise ValueError(
@@ -53,6 +63,8 @@ def _activity_for_device_type(device_type):
 
 
 def _sync_device(device):
+    # [FUNCTION DOC] HELPER: Synchronizes the device's backend module in the torch namespace if
+    # it has a synchronize function. Does nothing for no device, cpu, or a backend without one.
     """Synchronize the given device's backend."""
     if device is None or device.type == "cpu":
         return
@@ -67,7 +79,14 @@ def _sync_device(device):
 
 
 class _Bottleneck(nn.Module):
+    # [CLASS DOC] HELPER: ResNet bottleneck block module with three convolution and batch norm
+    # stages (1x1, 3x3 with the given stride, 1x1) and an in-place ReLU. A projection shortcut of
+    # convolution plus batch norm is created only when channel counts differ or stride is not
+    # one; otherwise the shortcut is the identity.
     def __init__(self, in_ch, mid_ch, out_ch, stride=1):
+        # [FUNCTION DOC] HELPER: Builds the three conv and batch norm layers, the ReLU, and
+        # the optional downsample projection from the input, middle and output channel counts
+        # and stride.
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, mid_ch, 1, bias=False)
         self.bn1 = nn.BatchNorm2d(mid_ch)
@@ -86,6 +105,9 @@ class _Bottleneck(nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs the three conv/batch-norm stages with ReLU after the first
+        # two, computes the shortcut (projected input if a downsample exists, else the input),
+        # and returns the ReLU of the sum.
         identity = x
         out = self.relu(self.bn1(self.conv1(x)))
         out = self.relu(self.bn2(self.conv2(out)))
@@ -96,6 +118,9 @@ class _Bottleneck(nn.Module):
 
 
 def _make_layer(in_ch, mid_ch, out_ch, n, stride=1):
+    # [FUNCTION DOC] HELPER: Builds a sequential stage of the given number of bottleneck blocks.
+    # The first block changes channels from the input to the output count with the given stride;
+    # the rest map output channels to output channels with stride one.
     layers = [_Bottleneck(in_ch, mid_ch, out_ch, stride=stride)]
     for _ in range(n - 1):
         layers.append(_Bottleneck(out_ch, mid_ch, out_ch))
@@ -103,6 +128,9 @@ def _make_layer(in_ch, mid_ch, out_ch, n, stride=1):
 
 
 def _resnet50():
+    # [FUNCTION DOC] HELPER: Builds an untrained ResNet50-style sequential network: strided 7x7
+    # conv, batch norm, ReLU, max pool, four stages of 3, 4, 6 and 3 blocks, adaptive average
+    # pool, flatten, and a linear layer to 1000 outputs.
     return nn.Sequential(
         nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=False),
         nn.BatchNorm2d(64),
@@ -124,6 +152,10 @@ def _resnet50():
 
 
 def _profile_resnet_payload(trace_path):
+    # [FUNCTION DOC] HELPER: CUDA-only payload. Builds a ResNet50 and random input on the first
+    # CUDA device, then profiles three iterations of forward, backward and optimizer step (each
+    # in a named record_function scope) with CPU and CUDA activities and CUDA sync events
+    # enabled. Exports a chrome trace to the given path and returns the loaded events.
     """Profile a ResNet50 training loop and return events (CUDA-specific)."""
     device = torch.device("cuda:0")
     model = _resnet50().to(device)
@@ -152,6 +184,10 @@ def _profile_resnet_payload(trace_path):
 
 
 def _profile_complex_payload(trace_path):
+    # [FUNCTION DOC] HELPER: CUDA-only payload. Under a profiler with CUDA sync events, runs a
+    # matrix multiply with backward, then multiplies on one stream, records a CUDA event, makes a
+    # second stream wait on it and multiplies there, and synchronizes the second stream. Exports
+    # the trace to the given path and returns the loaded events.
     """Profile multi-stream + CUDA events + forward/backward (CUDA-specific)."""
     device = torch.device("cuda:0")
 
@@ -182,6 +218,10 @@ def _profile_complex_payload(trace_path):
 
 
 def _profile_training_payload(trace_path, device, activity):
+    # [FUNCTION DOC] HELPER: Accelerator-agnostic variant of the resnet payload: same training
+    # loop of three iterations on the given device, profiled with CPU and the given activity but
+    # without CUDA-specific configuration. Syncs the device before and after, exports the trace
+    # to the given path and returns the loaded events.
     """Profile a ResNet50 training loop on any accelerator and return events.
 
     Unlike _profile_resnet_payload, this avoids CUDA-specific APIs
@@ -210,6 +250,8 @@ def _profile_training_payload(trace_path, device, activity):
 
 
 def _load_events(trace_path):
+    # [FUNCTION DOC] HELPER: Reads a trace JSON file and returns its trace events list if the top
+    # level is an object with that key; if the key is missing, returns the whole loaded data.
     with open(trace_path) as f:
         data = json.load(f)
     return data.get("traceEvents", data)
@@ -221,13 +263,21 @@ def _load_events(trace_path):
 
 
 class _TraceValidatorE2EMixin:
+    # [CLASS DOC] HELPER: Mixin for the end-to-end test classes. Expects the host class to
+    # define a payloads mapping from payload name to event list. Provides event lookup and
+    # violation formatting.
     """Shared helpers for E2E trace validator test classes."""
 
     def _events(self, payload):
+        # [FUNCTION DOC] HELPER: Returns the stored event list for the named payload; raises
+        # KeyError if missing.
         return self._payloads[payload]
 
     @staticmethod
     def _fmt(violations, limit=5):
+        # [FUNCTION DOC] HELPER: Formats up to limit violations (default five) as indented
+        # lines joined by newlines, adding a final line with the count of omitted ones if
+        # there are more.
         lines = [f"  {v}" for v in violations[:limit]]
         if len(violations) > limit:
             lines.append(f"  ... and {len(violations) - limit} more")
@@ -240,6 +290,9 @@ class _TraceValidatorE2EMixin:
 
 
 class TestTraceValidatorRules(TestCase):
+    # [CLASS DOC] Synthetic unit tests of each validation rule using hand-built event mappings;
+    # no profiling or devices involved. For every rule there is a passing case returning an empty
+    # list and a failing case checking the violation count, rule name and message text.
     """Synthetic unit tests for validation rules.
 
     Category: Accelerator-UNRELATED
@@ -252,6 +305,8 @@ class TestTraceValidatorRules(TestCase):
     # --- _check_nccl_metadata ---
 
     def test_nccl_metadata_pass(self):
+        # [FUNCTION DOC] A communication event carrying all five required metadata arguments
+        # yields no NCCL metadata violations.
         events = [
             {
                 "ph": "X",
@@ -270,6 +325,8 @@ class TestTraceValidatorRules(TestCase):
         self.assertEqual(_check_nccl_metadata(events), [])
 
     def test_nccl_metadata_fail(self):
+        # [FUNCTION DOC] A communication event with only the collective name argument yields
+        # exactly one violation attributed to the NCCL metadata rule.
         events = [
             {
                 "ph": "X",
@@ -284,6 +341,8 @@ class TestTraceValidatorRules(TestCase):
         self.assertEqual(v[0].rule_name, "_check_nccl_metadata")
 
     def test_nccl_metadata_partial_fields(self):
+        # [FUNCTION DOC] A communication event lacking the in and out message element counts
+        # yields one violation whose message mentions both missing field names.
         events = [
             {
                 "ph": "X",
@@ -306,6 +365,8 @@ class TestTraceValidatorRules(TestCase):
     # --- _check_gpu_kernel_causality ---
 
     def test_gpu_kernel_causality_pass(self):
+        # [FUNCTION DOC] A launch at time 100 and a kernel at time 110 sharing an External id
+        # gives no causality violations.
         events = [
             {
                 "ph": "X",
@@ -327,6 +388,9 @@ class TestTraceValidatorRules(TestCase):
         self.assertEqual(_check_gpu_kernel_causality(events), [])
 
     def test_gpu_kernel_causality_fail(self):
+        # [FUNCTION DOC] A kernel starting at time 100, before its launch at time 200 (same
+        # External id), gives one violation from the causality rule whose message says the kernel
+        # starts before its launch.
         events = [
             {
                 "ph": "X",
@@ -353,6 +417,8 @@ class TestTraceValidatorRules(TestCase):
     # --- _check_stream_wait_corr_id_populated ---
 
     def test_stream_wait_corr_id_populated_pass(self):
+        # [FUNCTION DOC] A stream wait event with a correlation id of 42 gives no
+        # populated-id violations.
         events = [
             {
                 "ph": "X",
@@ -370,6 +436,8 @@ class TestTraceValidatorRules(TestCase):
         self.assertEqual(_check_stream_wait_corr_id_populated(events), [])
 
     def test_stream_wait_corr_id_populated_fail(self):
+        # [FUNCTION DOC] A stream wait event whose correlation id is negative one gives exactly
+        # one violation from the populated-id rule.
         events = [
             {
                 "ph": "X",
@@ -391,6 +459,8 @@ class TestTraceValidatorRules(TestCase):
     # --- _check_stream_sync_overlap ---
 
     def test_stream_sync_overlap_pass(self):
+        # [FUNCTION DOC] A kernel running 100 to 150 and a stream sync starting at 200 on the
+        # same device and stream gives no overlap violations.
         events = [
             {
                 "ph": "X",
@@ -412,6 +482,9 @@ class TestTraceValidatorRules(TestCase):
         self.assertEqual(_check_stream_sync_overlap(events), [])
 
     def test_stream_sync_overlap_fail(self):
+        # [FUNCTION DOC] A kernel running 100 to 300 with a stream sync starting at 150 on the
+        # same device and stream gives one overlap violation whose message says the kernel is
+        # still running.
         events = [
             {
                 "ph": "X",
@@ -438,6 +511,8 @@ class TestTraceValidatorRules(TestCase):
     # --- _check_stream_wait_corr_id_in_past ---
 
     def test_stream_wait_corr_id_in_past_pass(self):
+        # [FUNCTION DOC] An event record at time 100 referenced by a stream wait at time 200
+        # gives no in-the-past violations.
         events = [
             {
                 "ph": "X",
@@ -461,6 +536,8 @@ class TestTraceValidatorRules(TestCase):
         self.assertEqual(_check_stream_wait_corr_id_in_past(events), [])
 
     def test_stream_wait_corr_id_in_past_fail(self):
+        # [FUNCTION DOC] An event record at time 300 referenced by a stream wait at time 200
+        # gives one violation whose message says the record is in the future.
         events = [
             {
                 "ph": "X",
@@ -487,6 +564,8 @@ class TestTraceValidatorRules(TestCase):
         self.assertIn("in the future", v[0].message)
 
     def test_stream_wait_corr_id_in_past_missing_record(self):
+        # [FUNCTION DOC] A stream wait referencing correlation id 999 with no event record in the
+        # list gives one violation whose message says there is no matching event record.
         events = [
             {
                 "ph": "X",
@@ -507,6 +586,8 @@ class TestTraceValidatorRules(TestCase):
     # --- _check_backward_seq_id_uniqueness ---
 
     def test_backward_seq_id_uniqueness_pass(self):
+        # [FUNCTION DOC] Two backward evaluate-function events of the same op sharing sequence
+        # number one give no uniqueness violations.
         events = [
             {
                 "ph": "X",
@@ -526,6 +607,8 @@ class TestTraceValidatorRules(TestCase):
         self.assertEqual(_check_backward_seq_id_uniqueness(events), [])
 
     def test_backward_seq_id_uniqueness_fail(self):
+        # [FUNCTION DOC] Two backward evaluate-function events of different ops sharing sequence
+        # number one give one violation whose message says the number is shared by several ops.
         events = [
             {
                 "ph": "X",
@@ -559,6 +642,11 @@ class TestTraceValidatorRules(TestCase):
 @unittest.skip("E2E tests disabled pending kineto clock-skew fix; see per-test skips")
 @skipIfTorchDynamo("profiler tests do not work with dynamo")
 class TestTraceValidatorE2EAgnostic(_TraceValidatorE2EMixin, TestCase):
+    # [CLASS DOC] End-to-end test class for hardware-independent rules (backward sequence id
+    # uniqueness). Class-level state: a temporary trace directory path and a payload mapping,
+    # both filled in setUpClass by profiling a training loop on the class's device type. Skipped
+    # at class level pending a kineto clock-skew fix and also skipped under dynamo; instantiated
+    # per device type except cpu.
     """E2E tests for validation rules that are not tied to any specific accelerator.
 
     Category: Accelerator-AGNOSTIC
@@ -576,6 +664,9 @@ class TestTraceValidatorE2EAgnostic(_TraceValidatorE2EMixin, TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Creates a temporary directory, profiles the generic training payload on
+        # the first device of the class's device type with the matching activity, and stores the
+        # events under the training key. Not run while the class is skipped.
         super().setUpClass()
         device = torch.device(cls.device_type, 0)
         activity = _activity_for_device_type(cls.device_type)
@@ -590,6 +681,8 @@ class TestTraceValidatorE2EAgnostic(_TraceValidatorE2EMixin, TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Removes the temporary trace directory, ignoring errors if it exists,
+        # then calls the base class teardown.
         if cls._trace_dir and os.path.isdir(cls._trace_dir):
             shutil.rmtree(cls._trace_dir, ignore_errors=True)
         super().tearDownClass()
@@ -598,6 +691,9 @@ class TestTraceValidatorE2EAgnostic(_TraceValidatorE2EMixin, TestCase):
         "kineto backward sequence ID uniqueness not yet verified in kineto integration testing"
     )
     def test_backward_seq_id_uniqueness(self, device):
+        # [FUNCTION DOC] Would assert the backward sequence id rule finds no violations in the
+        # training payload, showing formatted violations on failure. Currently skipped because
+        # the kineto behaviour is not yet verified. The device argument is unused.
         v = _check_backward_seq_id_uniqueness(self._events("training"))
         self.assertEqual(len(v), 0, self._fmt(v))
 
@@ -620,6 +716,11 @@ instantiate_device_type_tests(
 @skipIfTorchDynamo("profiler tests do not work with dynamo")
 @instantiate_parametrized_tests
 class TestTraceValidatorE2ECUDA(_TraceValidatorE2EMixin, TestCase):
+    # [CLASS DOC] End-to-end test class for CUDA-specific rules. Only runs when CUDA is
+    # available and is currently skipped at class level pending a kineto clock-skew fix; also
+    # skipped under dynamo. Class-level state: a temporary trace directory and a mapping of
+    # payload names (resnet and complex) to events, filled in setUpClass. Each test is
+    # parametrized over both payloads.
     """E2E tests for CUDA-specific profiler trace validation.
 
     Category: Accelerator-SPECIFIC (CUDA only)
@@ -635,6 +736,9 @@ class TestTraceValidatorE2ECUDA(_TraceValidatorE2EMixin, TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Creates a temporary directory and profiles the CUDA ResNet and the
+        # complex multi-stream payloads, storing events under the resnet and complex keys. Not
+        # run while the class is skipped.
         super().setUpClass()
         cls._trace_dir = tempfile.mkdtemp(prefix="profiler_e2e_trace_cuda_")
         cls._payloads = {
@@ -648,6 +752,8 @@ class TestTraceValidatorE2ECUDA(_TraceValidatorE2EMixin, TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Removes the temporary trace directory, ignoring errors if it exists,
+        # then calls the base class teardown.
         if cls._trace_dir and os.path.isdir(cls._trace_dir):
             shutil.rmtree(cls._trace_dir, ignore_errors=True)
         super().tearDownClass()
@@ -657,6 +763,9 @@ class TestTraceValidatorE2ECUDA(_TraceValidatorE2EMixin, TestCase):
     )
     @parametrize("payload", ["resnet", "complex"])
     def test_gpu_kernel_causality(self, payload):
+        # [FUNCTION DOC] Asserts the kernel causality rule finds no violations in the given
+        # payload. Currently skipped because kineto reports GPU timestamps before launches
+        # (clock skew).
         v = _check_gpu_kernel_causality(self._events(payload))
         self.assertEqual(len(v), 0, self._fmt(v))
 
@@ -665,6 +774,9 @@ class TestTraceValidatorE2ECUDA(_TraceValidatorE2EMixin, TestCase):
     )
     @parametrize("payload", ["resnet", "complex"])
     def test_stream_wait_corr_id_populated(self, payload):
+        # [FUNCTION DOC] Asserts the populated-id rule finds no violations in the given
+        # payload. Currently skipped because kineto leaves the correlation id at negative one
+        # for stream waits.
         v = _check_stream_wait_corr_id_populated(self._events(payload))
         self.assertEqual(len(v), 0, self._fmt(v))
 
@@ -673,6 +785,8 @@ class TestTraceValidatorE2ECUDA(_TraceValidatorE2EMixin, TestCase):
     )
     @parametrize("payload", ["resnet", "complex"])
     def test_stream_sync_overlap(self, payload):
+        # [FUNCTION DOC] Asserts the stream sync overlap rule finds no violations in the given
+        # payload. Currently skipped because kineto behaviour is not yet verified.
         v = _check_stream_sync_overlap(self._events(payload))
         self.assertEqual(len(v), 0, self._fmt(v))
 
@@ -681,6 +795,8 @@ class TestTraceValidatorE2ECUDA(_TraceValidatorE2EMixin, TestCase):
     )
     @parametrize("payload", ["resnet", "complex"])
     def test_stream_wait_corr_id_in_past(self, payload):
+        # [FUNCTION DOC] Asserts the in-the-past rule finds no violations in the given payload.
+        # Currently skipped because temporal ordering is not yet verified in kineto.
         v = _check_stream_wait_corr_id_in_past(self._events(payload))
         self.assertEqual(len(v), 0, self._fmt(v))
 
@@ -689,6 +805,8 @@ class TestTraceValidatorE2ECUDA(_TraceValidatorE2EMixin, TestCase):
     )
     @parametrize("payload", ["resnet", "complex"])
     def test_nccl_metadata(self, payload):
+        # [FUNCTION DOC] Asserts the NCCL metadata rule finds no violations in the given payload.
+        # Currently skipped because NCCL metadata is not yet verified in kineto.
         v = _check_nccl_metadata(self._events(payload))
         self.assertEqual(len(v), 0, self._fmt(v))
 
