@@ -1,6 +1,13 @@
 # mypy: ignore-errors
 
 # Owner(s): ["module: dataloader"]
+# [MODULE DOC] Unit tests for the torch.utils.data datapipes (IterDataPipe and MapDataPipe).
+# Covers DataChunk, StreamWrapper, file listing/opening/decoding pipes, the DataFrame pipes,
+# every functional iter and map datapipe (batch, collate, concat, demux, fork, filter, group,
+# map, mux, shuffle, zip, ...), pickling and dill serialization, graph traversal, sharding,
+# snapshot restoration, runtime type validation and DataLoader integration. Module level code
+# imports dill if present, computes HAS_PANDAS and the skip decorators, and defines picklable
+# helper callables, lambdas and small datasets used by the test classes.
 
 import copy
 import itertools
@@ -73,6 +80,11 @@ T_co = TypeVar("T_co", covariant=True)
 
 
 def create_temp_dir_and_files():
+    # [FUNCTION DOC] HELPER: Builds a temp directory holding three files (.txt, .byte, .empty;
+    # only the first two are written with the 16 characters 0123456789abcdef) and a nested temp
+    # sub directory holding a .txt and a .byte file with the same content. Returns a list of two
+    # tuples: the directory object plus its file paths, and the sub directory object plus its
+    # file paths. The caller must clean up the directory objects, normally in tearDown.
     # The temp dir and files within it will be released and deleted in tearDown().
     # Adding `noqa: P201` to avoid mypy's warning on not releasing the dir handle within this function.
     temp_dir = tempfile.TemporaryDirectory()  # noqa: P201
@@ -120,6 +132,10 @@ def create_temp_dir_and_files():
 def reset_after_n_next_calls(
     datapipe: IterDataPipe[T_co] | MapDataPipe[T_co], n: int
 ) -> tuple[list[T_co], list[T_co]]:
+    # [FUNCTION DOC] HELPER: Creates an iterator over the given datapipe, reads n elements from
+    # it into a list, then builds a fresh full list from the datapipe (which resets it). Returns
+    # a tuple of the elements read before the reset and all elements after the reset. Raises
+    # StopIteration if the datapipe has fewer than n elements.
     """
     Given a DataPipe and integer n, iterate the DataPipe for n elements and store the elements into a list
     Then, reset the DataPipe and return a tuple of two lists
@@ -134,28 +150,42 @@ def reset_after_n_next_calls(
 
 
 def odd_or_even(x: int) -> int:
+    # [FUNCTION DOC] HELPER: Module level picklable classifier returning the parity of the
+    # integer (0 for even, 1 for odd); used as a demux classifier in pickling tests.
     return x % 2
 
 
 class TestDataChunk(TestCase):
+    # [CLASS DOC] Tests for DataChunk, the list subclass returned by batching datapipes. setUp
+    # stores ten shuffled integers and a DataChunk wrapping them; tests check indexing,
+    # iteration, length, string form, and that sort and reverse keep the DataChunk type.
     def setUp(self):
+        # [FUNCTION DOC] Creates the shuffled list of integers zero to nine in self.elements and
+        # the DataChunk wrapping it in self.chunk.
         super().setUp()
         self.elements = list(range(10))
         random.shuffle(self.elements)
         self.chunk: DataChunk[int] = DataChunk(self.elements)
 
     def test_getitem(self):
+        # [FUNCTION DOC] Checks that indexing the chunk returns the same item as the
+        # source list.
         for i in range(10):
             self.assertEqual(self.elements[i], self.chunk[i])
 
     def test_iter(self):
+        # [FUNCTION DOC] Checks that iterating the chunk yields the source elements in order.
         for ele, dc in zip(self.elements, iter(self.chunk)):
             self.assertEqual(ele, dc)
 
     def test_len(self):
+        # [FUNCTION DOC] Checks that the chunk length equals the source list length.
         self.assertEqual(len(self.elements), len(self.chunk))
 
     def test_as_string(self):
+        # [FUNCTION DOC] Checks the string form of a chunk equals that of the plain list,
+        # including when chunks are nested inside a list that is compared with a list of
+        # plain lists.
         self.assertEqual(str(self.chunk), str(self.elements))
 
         batch = [self.elements] * 3
@@ -163,6 +193,8 @@ class TestDataChunk(TestCase):
         self.assertEqual(str(batch), str(chunks))
 
     def test_sort(self):
+        # [FUNCTION DOC] Sorts a fresh chunk in place, checks it is still a DataChunk and that
+        # its elements are now 0..9 in order.
         chunk: DataChunk[int] = DataChunk(self.elements)
         chunk.sort()
         self.assertTrue(isinstance(chunk, DataChunk))
@@ -170,6 +202,8 @@ class TestDataChunk(TestCase):
             self.assertEqual(i, d)
 
     def test_reverse(self):
+        # [FUNCTION DOC] Reverses a fresh chunk in place, checks it is still a DataChunk and
+        # that each position holds the mirrored source element.
         chunk: DataChunk[int] = DataChunk(self.elements)
         chunk.reverse()
         self.assertTrue(isinstance(chunk, DataChunk))
@@ -177,6 +211,9 @@ class TestDataChunk(TestCase):
             self.assertEqual(chunk[i], self.elements[9 - i])
 
     def test_random_shuffle(self):
+        # [FUNCTION DOC] Shuffles a chunk and a plain list with identically seeded random
+        # generators and checks the results are equal, showing that DataChunk supports
+        # in-place shuffling.
         elements = list(range(10))
         chunk: DataChunk[int] = DataChunk(elements)
 
@@ -190,34 +227,51 @@ class TestDataChunk(TestCase):
 
 
 class TestStreamWrapper(TestCase):
+    # [CLASS DOC] Tests for StreamWrapper, which proxies a file-like object. Uses the nested
+    # _FakeFD class as a stand-in descriptor; covers dir listing, open/read/close forwarding,
+    # automatic close on deletion, pickling behavior and repr.
     class _FakeFD:
+        # [CLASS DOC] HELPER: Fake file descriptor with opened and closed flags. Reading is only
+        # allowed after open; iteration yields the strings "0" to "4"; close only takes effect
+        # when the descriptor was opened; repr is the fixed text FakeFD.
         def __init__(self, filepath):
+            # [FUNCTION DOC] HELPER: Stores the path and initializes the opened and closed flags
+            # to False.
             self.filepath = filepath
             self.opened = False
             self.closed = False
 
         def open(self):
+            # [FUNCTION DOC] HELPER: Marks the descriptor as opened.
             self.opened = True
 
         def read(self):
+            # [FUNCTION DOC] HELPER: Returns the concatenation of the iterated strings when
+            # opened; raises OSError if the descriptor has not been opened.
             if self.opened:
                 return "".join(self)
             else:
                 raise OSError("Cannot read from un-opened file descriptor")
 
         def __iter__(self):
+            # [FUNCTION DOC] HELPER: Generator yielding the strings for the numbers 0 through 4.
             for i in range(5):
                 yield str(i)
 
         def close(self):
+            # [FUNCTION DOC] HELPER: If opened, clears opened and sets closed; otherwise
+            # does nothing.
             if self.opened:
                 self.opened = False
                 self.closed = True
 
         def __repr__(self):
+            # [FUNCTION DOC] HELPER: Returns the fixed text FakeFD.
             return "FakeFD"
 
     def test_dir(self):
+        # [FUNCTION DOC] Wraps a fake descriptor and checks that open, read and close appear in
+        # the attribute listing of the wrapper.
         fd = TestStreamWrapper._FakeFD("")
         wrap_fd = StreamWrapper(fd)
 
@@ -227,6 +281,9 @@ class TestStreamWrapper(TestCase):
 
     @skipIfTorchDynamo()
     def test_api(self):
+        # [FUNCTION DOC] Checks the wrapper forwards open and read to the descriptor (read
+        # before open raises an IOError), and that deleting the wrapper closes the
+        # underlying descriptor.
         fd = TestStreamWrapper._FakeFD("")
         wrap_fd = StreamWrapper(fd)
 
@@ -244,6 +301,9 @@ class TestStreamWrapper(TestCase):
         self.assertTrue(fd.closed)
 
     def test_pickle(self):
+        # [FUNCTION DOC] Checks that pickling a real temp file and a wrapper around it both
+        # raise TypeError with the same message, and that a wrapper around the fake descriptor
+        # can be pickled and unpickled.
         with tempfile.TemporaryFile() as f:
             with self.assertRaises(TypeError) as ctx1:
                 pickle.dumps(f)
@@ -260,6 +320,8 @@ class TestStreamWrapper(TestCase):
         _ = pickle.loads(pickle.dumps(wrap_fd))
 
     def test_repr(self):
+        # [FUNCTION DOC] Checks the wrapper string form is the wrapper name followed by the repr
+        # of the wrapped object in angle brackets, for the fake descriptor and for a temp file.
         fd = TestStreamWrapper._FakeFD("")
         wrap_fd = StreamWrapper(fd)
         self.assertEqual(str(wrap_fd), "StreamWrapper<FakeFD>")
@@ -270,7 +332,12 @@ class TestStreamWrapper(TestCase):
 
 
 class TestIterableDataPipeBasic(TestCase):
+    # [CLASS DOC] Basic tests for file based iterable datapipes (FileLister, FileOpener,
+    # RoutedDecoder, Grouper, demux/mux). setUp creates temp files and sub files; tearDown
+    # removes them and only warns if cleanup fails.
     def setUp(self):
+        # [FUNCTION DOC] Creates the temp directory tree and stores the directory objects and
+        # file path tuples as attributes for later tests.
         super().setUp()
         ret = create_temp_dir_and_files()
         self.temp_dir = ret[0][0]
@@ -279,6 +346,8 @@ class TestIterableDataPipeBasic(TestCase):
         self.temp_sub_files = ret[1][1:]
 
     def tearDown(self):
+        # [FUNCTION DOC] Cleans up the sub directory and the directory; on any exception only
+        # emits a warning describing the failure.
         try:
             self.temp_sub_dir.cleanup()
             self.temp_dir.cleanup()
@@ -288,6 +357,10 @@ class TestIterableDataPipeBasic(TestCase):
             )
 
     def test_listdirfiles_iterable_datapipe(self):
+        # [FUNCTION DOC] Checks FileLister over the temp directory yields exactly the top level
+        # files, that recursive mode also includes sub directory files, that a list of paths
+        # mixing a directory and files yields each file twice overall, and that the functional
+        # list_files form behaves the same.
         temp_dir = self.temp_dir.name
         datapipe: IterDataPipe = dp.iter.FileLister(temp_dir, "")
 
@@ -323,6 +396,8 @@ class TestIterableDataPipeBasic(TestCase):
         self.assertEqual(count, 2 * len(self.temp_files))
 
     def test_listdirfilesdeterministic_iterable_datapipe(self):
+        # [FUNCTION DOC] Checks FileLister output order is identical across two passes, both for
+        # non-recursive and recursive listing.
         temp_dir = self.temp_dir.name
 
         datapipe = dp.iter.FileLister(temp_dir, "")
@@ -334,6 +409,10 @@ class TestIterableDataPipeBasic(TestCase):
         self.assertEqual(list(datapipe), list(datapipe))
 
     def test_openfilesfromdisk_iterable_datapipe(self):
+        # [FUNCTION DOC] Pipes FileLister into FileOpener in binary mode (class form and
+        # functional open_files form), checks each yielded path is a known file and the stream
+        # content matches the file content, closing each stream; also checks that len on the
+        # opener raises TypeError.
         # test import datapipe class directly
         from torch.utils.data.datapipes.iter import FileLister, FileOpener
 
@@ -367,6 +446,10 @@ class TestIterableDataPipeBasic(TestCase):
             len(datapipe3)
 
     def test_routeddecoder_iterable_datapipe(self):
+        # [FUNCTION DOC] Saves a numpy array into the temp dir, lists and opens files,
+        # then decodes them with RoutedDecoder using a custom png handler plus the basic
+        # handlers (added in either order) and checks decoded content and that the source
+        # streams get closed.
         temp_dir = self.temp_dir.name
         temp_pngfile_pathname = os.path.join(temp_dir, "test_png.png")
         png_data = np.array(
@@ -378,11 +461,17 @@ class TestIterableDataPipeBasic(TestCase):
         datapipe2 = dp.iter.FileOpener(datapipe1, mode="b")
 
         def _png_decoder(extension, data):
+            # [FUNCTION DOC] HELPER: Decoder handler: returns None unless the extension is png,
+            # otherwise loads a numpy array from the data stream.
             if extension != "png":
                 return None
             return np.load(data)
 
         def _helper(prior_dp, dp, channel_first=False):
+            # [FUNCTION DOC] HELPER: Verifies a decoded datapipe against its cached source
+            # records: source streams are open before decoding, png records equal the expected
+            # array (transposed to channel first when requested), other records equal the
+            # decoded file text, and the source stream is closed after its record is decoded.
             # Byte stream is not closed
             for inp in prior_dp:
                 self.assertFalse(inp[1].closed)
@@ -418,6 +507,10 @@ class TestIterableDataPipeBasic(TestCase):
         _helper(cached, datapipe4, channel_first=True)
 
     def test_groupby_iterable_datapipe(self):
+        # [FUNCTION DOC] Groups a wrapped list of (filename, stream) records by the base name
+        # with group size two, orders each group by file name descending, and checks the grouped
+        # pairs and stream contents; repeats with keep_key enabled so each result carries the
+        # group key.
         file_list = [
             "a.png",
             "b.png",
@@ -444,12 +537,16 @@ class TestIterableDataPipeBasic(TestCase):
         )
 
         def group_fn(data):
+            # [FUNCTION DOC] HELPER: Group key function returning the file base name without
+            # its extension.
             filepath, _ = data
             return os.path.basename(filepath).split(".")[0]
 
         datapipe2 = dp.iter.Grouper(datapipe1, group_key_fn=group_fn, group_size=2)
 
         def order_fn(data):
+            # [FUNCTION DOC] HELPER: Sorts the group in place by file name descending and
+            # returns it.
             data.sort(key=lambda f: f[0], reverse=True)
             return data
 
@@ -482,6 +579,8 @@ class TestIterableDataPipeBasic(TestCase):
         )
 
         def order_fn(data):
+            # [FUNCTION DOC] HELPER: For keyed groups, sorts the group list (second item) in
+            # place by file name descending and returns the key and group pair.
             data[1].sort(key=lambda f: f[0], reverse=True)
             return data
 
@@ -510,6 +609,9 @@ class TestIterableDataPipeBasic(TestCase):
         self.assertEqual(count, 8)
 
     def test_demux_mux_datapipe(self):
+        # [FUNCTION DOC] Checks demux splitting a dataset into even and odd streams, that demux
+        # followed by mux restores the original order for three streams, and mux behavior with
+        # uneven children (mux stops at the shortest stream).
         numbers = NumbersDataset(10)
         n1, n2 = numbers.demux(2, lambda x: x % 2)
         self.assertEqual([0, 2, 4, 6, 8], list(n1))
@@ -532,11 +634,17 @@ class TestIterableDataPipeBasic(TestCase):
 
     @suppress_warnings  # Suppress warning for lambda fn
     def test_map_with_col_file_handle_datapipe(self):
+        # [FUNCTION DOC] Checks that mapping with an input column that reads the file handle
+        # gives the same result as an equivalent mapping on the whole record, for tuple and
+        # list records.
         temp_dir = self.temp_dir.name
         datapipe1 = dp.iter.FileLister(temp_dir, "")
         datapipe2 = dp.iter.FileOpener(datapipe1)
 
         def _helper(datapipe):
+            # [FUNCTION DOC] HELPER: Compares the results of mapping with an input column
+            # against mapping with a function that rebuilds the tuple with the content read from
+            # the handle.
             dp1 = datapipe.map(lambda x: x.read(), input_col=1)
             dp2 = datapipe.map(lambda x: (x[0], x[1].read()))
             self.assertEqual(list(dp1), list(dp2))
@@ -550,10 +658,17 @@ class TestIterableDataPipeBasic(TestCase):
 
 @skipIfNoDataFrames
 class TestCaptureDataFrame(TestCase):
+    # [CLASS DOC] Tests for CaptureDataFrame, which records operations applied to a dataframe
+    # and replays them on a real one. Skipped when pandas is unavailable.
     def get_new_df(self):
+        # [FUNCTION DOC] HELPER: Returns a fresh one-row dataframe with columns a and b via the
+        # dataframe wrapper.
         return df_wrapper.create_dataframe([[1, 2]], columns=["a", "b"])
 
     def compare_capture_and_eager(self, operations):
+        # [FUNCTION DOC] HELPER: Applies the given operations function to a capture object,
+        # replays it on a new dataframe, applies the same function eagerly on another new
+        # dataframe, and asserts the two results are equal.
         cdf = CaptureDataFrame()
         cdf = operations(cdf)
         df = self.get_new_df()
@@ -565,7 +680,11 @@ class TestCaptureDataFrame(TestCase):
         self.assertTrue(df.equals(cdf))
 
     def test_basic_capture(self):
+        # [FUNCTION DOC] Compares capture and eager execution for an operation assigning a new
+        # column computed from column b and column a times seven.
         def operations(df):
+            # [FUNCTION DOC] HELPER: Adds column c computed from column b plus column a times
+            # seven and returns the dataframe.
             df["c"] = df.b + df["a"] * 7
             # somehow swallows pandas UserWarning when `df.c = df.b + df['a'] * 7`
             return df
@@ -574,15 +693,22 @@ class TestCaptureDataFrame(TestCase):
 
 
 class TestDataFramesPipes(TestCase):
+    # [CLASS DOC] Tests for datapipes producing and transforming dataframes (capture,
+    # shuffle, batch, unbatch, filter, collate). Most tests need pandas and dill because they
+    # use lambdas.
     """
     Most of test will fail if pandas installed, but no dill available.
     Need to rework them to avoid multiple skips.
     """
 
     def _get_datapipe(self, range=10, dataframe_size=7):
+        # [FUNCTION DOC] HELPER: Returns a NumbersDataset of the given range mapped to pairs of
+        # the number and its remainder modulo three. The dataframe_size argument is unused.
         return NumbersDataset(range).map(lambda i: (i, i % 3))
 
     def _get_dataframes_pipe(self, range=10, dataframe_size=7):
+        # [FUNCTION DOC] HELPER: Like the plain pair datapipe but converted to a dataframes pipe
+        # with columns i and j, using the given dataframe_size.
         return (
             NumbersDataset(range)
             .map(lambda i: (i, i % 3))
@@ -592,6 +718,8 @@ class TestDataFramesPipes(TestCase):
     @skipIfNoDataFrames
     @skipIfNoDill  # TODO(VitalyFedyunin): Decouple tests from dill by avoiding lambdas in map
     def test_capture(self):
+        # [FUNCTION DOC] Adds a derived column k to the dataframe pipe by column arithmetic and
+        # checks the resulting rows equal those of an ordinary map producing the same triples.
         dp_numbers = self._get_datapipe().map(lambda x: (x[0], x[1], x[1] + 3 * x[0]))
         df_numbers = self._get_dataframes_pipe()
         df_numbers["k"] = df_numbers["j"] + df_numbers.i * 3
@@ -602,6 +730,8 @@ class TestDataFramesPipes(TestCase):
     @skipIfNoDataFrames
     @skipIfNoDill
     def test_shuffle(self):
+        # [FUNCTION DOC] Shuffles a 1000 row dataframe pipe and checks the order differs from
+        # the source while the sorted rows equal the source (can rarely fail by chance).
         #  With non-zero (but extremely low) probability (when shuffle do nothing),
         #  this test fails, so feel free to restart
         df_numbers = self._get_dataframes_pipe(range=1000).shuffle()
@@ -613,6 +743,8 @@ class TestDataFramesPipes(TestCase):
     @skipIfNoDataFrames
     @skipIfNoDill
     def test_batch(self):
+        # [FUNCTION DOC] Batches 100 rows by 8 and checks the final batch holds the last
+        # four rows.
         df_numbers = self._get_dataframes_pipe(range=100).batch(8)
         df_numbers_list = list(df_numbers)
         last_batch = df_numbers_list[-1]
@@ -623,6 +755,8 @@ class TestDataFramesPipes(TestCase):
     @skipIfNoDataFrames
     @skipIfNoDill
     def test_unbatch(self):
+        # [FUNCTION DOC] Batches twice (8, then 3) and checks that unbatch with level two
+        # restores the original rows.
         df_numbers = self._get_dataframes_pipe(range=100).batch(8).batch(3)
         dp_numbers = self._get_datapipe(range=100)
         self.assertEqual(list(dp_numbers), list(df_numbers.unbatch(2)))
@@ -630,6 +764,8 @@ class TestDataFramesPipes(TestCase):
     @skipIfNoDataFrames
     @skipIfNoDill
     def test_filter(self):
+        # [FUNCTION DOC] Filters the dataframe pipe on column i greater than five and checks the
+        # surviving rows.
         df_numbers = self._get_dataframes_pipe(range=10).filter(lambda x: x.i > 5)
         actual = list(df_numbers)
         self.assertEqual([(6, 0), (7, 1), (8, 2), (9, 0)], actual)
@@ -637,10 +773,15 @@ class TestDataFramesPipes(TestCase):
     @skipIfNoDataFrames
     @skipIfNoDill
     def test_collate(self):
+        # [FUNCTION DOC] Batches 30 rows by three and collates with per column functions (sum
+        # for i, product for j); checks the per batch i sums, via tuple unpacking and via
+        # attribute access.
         def collate_i(column):
+            # [FUNCTION DOC] HELPER: Returns the sum of a column.
             return column.sum()
 
         def collate_j(column):
+            # [FUNCTION DOC] HELPER: Returns the product of a column.
             return column.prod()
 
         df_numbers = self._get_dataframes_pipe(range=30).batch(3)
@@ -671,12 +812,18 @@ class TestDataFramesPipes(TestCase):
 
 
 class IDP_NoLen(IterDataPipe):
+    # [CLASS DOC] HELPER: Iterable datapipe wrapper without a length: iterates over the input
+    # datapipe, or over a deep copy when the input is not a datapipe, so repeated iteration does
+    # not mutate the source. Used to test length propagation errors.
     def __init__(self, input_dp):
+        # [FUNCTION DOC] HELPER: Stores the input datapipe or iterable.
         super().__init__()
         self.input_dp = input_dp
 
     # Prevent in-place modification
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Generator yielding every element of the input (or of its deep
+        # copy when the input is not an IterDataPipe).
         input_dp = (
             self.input_dp
             if isinstance(self.input_dp, IterDataPipe)
@@ -686,34 +833,43 @@ class IDP_NoLen(IterDataPipe):
 
 
 def _fake_fn(data):
+    # [FUNCTION DOC] HELPER: Module level identity function (picklable stand-in for a map fn).
     return data
 
 
 def _fake_add(constant, data):
+    # [FUNCTION DOC] HELPER: Returns the sum of the constant and the data; used with partial.
     return constant + data
 
 
 def _fake_filter_fn(data):
+    # [FUNCTION DOC] HELPER: Filter predicate that accepts every element.
     return True
 
 
 def _simple_filter_fn(data):
+    # [FUNCTION DOC] HELPER: Filter predicate that accepts values greater than or equal to five.
     return data >= 5
 
 
 def _fake_filter_fn_constant(constant, data):
+    # [FUNCTION DOC] HELPER: Predicate that accepts data greater than or equal to the constant;
+    # used with partial.
     return data >= constant
 
 
 def _mul_10(x):
+    # [FUNCTION DOC] HELPER: Returns the argument multiplied by ten.
     return x * 10
 
 
 def _mod_3_test(x):
+    # [FUNCTION DOC] HELPER: Returns True when the remainder modulo three equals one.
     return x % 3 == 1
 
 
 def _to_list(x):
+    # [FUNCTION DOC] HELPER: Wraps the argument in a one element list.
     return [x]
 
 
@@ -723,17 +879,28 @@ lambda_fn3 = lambda x: x >= 5  # noqa: E731
 
 
 class Add1Module(nn.Module):
+    # [CLASS DOC] HELPER: Module that adds one to its input; used to test map with modules.
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the input plus one.
         return x + 1
 
 
 class Add1Callable:
+    # [CLASS DOC] HELPER: Picklable callable object that adds one to its argument.
     def __call__(self, x):
+        # [FUNCTION DOC] HELPER: Returns the argument plus one.
         return x + 1
 
 
 class TestFunctionalIterDataPipe(TestCase):
+    # [CLASS DOC] Tests for the functional IterDataPipe classes (batch, collate, concat, demux,
+    # fork, mux, map, filter, group, shuffle, zip, ...). Includes serialization helpers that
+    # compare the output of a datapipe before and after pickle or dill round trips at several
+    # stages of iteration, and per-datapipe functional, reset and length tests.
     def _serialization_test_helper(self, datapipe, use_dill):
+        # [FUNCTION DOC] HELPER: Serializes the datapipe with dill or pickle, deserializes
+        # it, and asserts both produce equal lists. On mismatch prints the datapipe name
+        # and re-raises.
         if use_dill:
             serialized_dp = dill.dumps(datapipe)
             deserialized_dp = dill.loads(serialized_dp)
@@ -747,6 +914,8 @@ class TestFunctionalIterDataPipe(TestCase):
             raise e
 
     def _serialization_test_for_single_dp(self, dp, use_dill=False):
+        # [FUNCTION DOC] HELPER: Runs the round trip comparison on a single datapipe at three
+        # stages: before iteration, after reading one element, and after fully reading it.
         # 1. Testing for serialization before any iteration starts
         self._serialization_test_helper(dp, use_dill)
         # 2. Testing for serialization after DataPipe is partially read
@@ -759,6 +928,10 @@ class TestFunctionalIterDataPipe(TestCase):
         self._serialization_test_helper(dp, use_dill)
 
     def _serialization_test_for_dp_with_children(self, dp1, dp2, use_dill=False):
+        # [FUNCTION DOC] HELPER: Round trip comparison for two sibling child datapipes
+        # (fork/demux): before iteration, after one element from each, after fully reading the
+        # first child, and after fully reading the second. Warnings about unexhausted children
+        # are recorded and discarded where they are expected.
         # 1. Testing for serialization before any iteration starts
         self._serialization_test_helper(dp1, use_dill)
         self._serialization_test_helper(dp2, use_dill)
@@ -787,6 +960,11 @@ class TestFunctionalIterDataPipe(TestCase):
         self._serialization_test_helper(dp2, use_dill)
 
     def test_serializable(self):
+        # [FUNCTION DOC] Builds a table of picklable datapipe classes with constructor arguments
+        # and checks each survives pickling. FileOpener and StreamReader are only pickled and
+        # loaded; Demultiplexer and Forker (which return child pipes) use the children helper;
+        # all others are compared with the single datapipe helper. Default input is a wrapper
+        # over range ten.
         picklable_datapipes: list = [
             (
                 dp.iter.Batcher,
@@ -840,6 +1018,10 @@ class TestFunctionalIterDataPipe(TestCase):
 
     @skipIfTorchDynamo("Dict with function as keys")
     def test_serializable_with_dill(self):
+        # [FUNCTION DOC] Checks datapipes taking functions (collator, demux, filter, grouper,
+        # mapper) given lambdas and local functions. With dill available the pipes must round
+        # trip; without it, construction must warn that lambda or local functions are
+        # unsupported and pickling must raise PicklingError or AttributeError.
         """Only for DataPipes that take in a function as argument"""
         input_dp = dp.iter.IterableWrapper(range(10))
 
@@ -861,13 +1043,18 @@ class TestFunctionalIterDataPipe(TestCase):
         ]
 
         def _local_fns():
+            # [FUNCTION DOC] HELPER: Returns three locally defined functions: identity, parity,
+            # and greater-or-equal-five. They cannot be pickled by the standard pickle module.
             def _fn1(x):
+                # [FUNCTION DOC] HELPER: Identity function.
                 return x
 
             def _fn2(x):
+                # [FUNCTION DOC] HELPER: Returns the remainder of the input modulo two.
                 return x % 2
 
             def _fn3(x):
+                # [FUNCTION DOC] HELPER: Returns True when the input is at least five.
                 return x >= 5
 
             return _fn1, _fn2, _fn3
@@ -920,6 +1107,10 @@ class TestFunctionalIterDataPipe(TestCase):
                         pickle.dumps(datapipe)
 
     def test_docstring(self):
+        # [FUNCTION DOC] Regression test that the functional methods on an iterable wrapper
+        # render documentation (via the pydoc renderer) that contains the functional name
+        # marker, an Args section and an Example or Examples section, for each listed
+        # functional name.
         """
         Ensure functional form of IterDataPipe has the correct docstring from
         the class form.
@@ -955,6 +1146,10 @@ class TestFunctionalIterDataPipe(TestCase):
                 raise AssertionError(f"expected 'Example:' or 'Examples:' in docstring for {dp_funcname}")
 
     def test_iterable_wrapper_datapipe(self):
+        # [FUNCTION DOC] Tests IterableWrapper: output preserves values and order; deep copy
+        # happens when the first element is read (later source mutation is not seen), shallow
+        # mode sees later appends; reset after five reads restarts from the beginning; length
+        # equals the source length.
         input_ls = list(range(10))
         input_dp = dp.iter.IterableWrapper(input_ls)
 
@@ -989,6 +1184,9 @@ class TestFunctionalIterDataPipe(TestCase):
         self.assertEqual(len(input_ls), len(input_dp))
 
     def test_concat_iterdatapipe(self):
+        # [FUNCTION DOC] Tests Concater: ValueError with no inputs, TypeError for a
+        # non-IterDataPipe input, concatenated output and length of fifteen, reset behavior, and
+        # TypeError when an input lacks a valid length.
         input_dp1 = dp.iter.IterableWrapper(range(10))
         input_dp2 = dp.iter.IterableWrapper(range(5))
 
@@ -1024,6 +1222,12 @@ class TestFunctionalIterDataPipe(TestCase):
         self.assertEqual(list(concat_dp), list(range(10)) + list(range(5)))
 
     def test_fork_iterdatapipe(self):
+        # [FUNCTION DOC] Tests fork: ValueError for zero instances; a single instance returns
+        # the source itself; children share element references by default; sequential and
+        # lock-step reading; BufferError when the buffer is too small, with the boundary at
+        # sizes four and five; unlimited buffer warns; shallow and deep copy modes and
+        # ValueError for an unknown mode; slowest pointer handling; reset semantics and warnings
+        # about unexhausted children; length inheritance; traversal of the graph does not fail.
         input_dp = dp.iter.IterableWrapper(range(10))
 
         with self.assertRaises(ValueError):
@@ -1193,6 +1397,9 @@ class TestFunctionalIterDataPipe(TestCase):
         traverse_dps(dp2)  # This should not raise any error either
 
     def test_mux_iterdatapipe(self):
+        # [FUNCTION DOC] Tests mux: round robin output across three equal pipes, stopping at the
+        # shortest input for uneven pipes, an empty input giving empty output, and TypeError for
+        # len when an input has no length.
         # Functional Test: Elements are yielded one at a time from each DataPipe, until they are all exhausted
         input_dp1 = dp.iter.IterableWrapper(range(4))
         input_dp2 = dp.iter.IterableWrapper(range(4, 8))
@@ -1226,6 +1433,12 @@ class TestFunctionalIterDataPipe(TestCase):
             len(output_dp)
 
     def test_demux_iterdatapipe(self):
+        # [FUNCTION DOC] Tests demux: ValueError for zero instances; splitting by parity read
+        # sequentially and in lock step; BufferError with buffer size four and success with five
+        # for a lumped classifier; unlimited buffer warning; ValueError for an out-of-range
+        # class; reset semantics with warnings; drop_none true drops None classes and false
+        # raises ValueError; len raises TypeError on children; graph traversal works with a
+        # picklable classifier.
         input_dp = dp.iter.IterableWrapper(range(10))
 
         with self.assertRaises(ValueError):
@@ -1388,10 +1601,15 @@ class TestFunctionalIterDataPipe(TestCase):
         traverse_dps(dp2)  # This should not raise any error either
 
     def test_map_iterdatapipe(self):
+        # [FUNCTION DOC] Tests map: applies a function with keyword options to each element,
+        # works with a partial function, length is inherited (TypeError when the source has no
+        # length), and the pipe resets after partial reading.
         target_length = 10
         input_dp = dp.iter.IterableWrapper(range(target_length))
 
         def fn(item, dtype=torch.float, *, sum=False):
+            # [FUNCTION DOC] HELPER: Converts the item to a tensor of the given dtype and
+            # returns it, or its sum when the keyword-only sum flag is true.
             data = torch.tensor(item, dtype=dtype)
             return data if not sum else data.sum()
 
@@ -1428,31 +1646,50 @@ class TestFunctionalIterDataPipe(TestCase):
 
     @suppress_warnings  # Suppress warning for lambda fn
     def test_map_tuple_list_with_col_iterdatapipe(self):
+        # [FUNCTION DOC] Tests map over tuple and list records with input and output column
+        # choices and many function signatures (defaults, var positional, keyword-only,
+        # partials, a function with a very large argument). Valid cases are compared to a
+        # reference function and re-run after reset; invalid column or signature combinations
+        # must raise IndexError or ValueError.
         def fn_11(d):
+            # [FUNCTION DOC] HELPER: Returns the negation of the input.
             return -d
 
         def fn_1n(d):
+            # [FUNCTION DOC] HELPER: Returns a pair of the negated input and the input.
             return -d, d
 
         def fn_n1(d0, d1):
+            # [FUNCTION DOC] HELPER: Returns the sum of two arguments.
             return d0 + d1
 
         def fn_nn(d0, d1):
+            # [FUNCTION DOC] HELPER: Returns a triple: both negated and their sum.
             return -d0, -d1, d0 + d1
 
         def fn_n1_def(d0, d1=1):
+            # [FUNCTION DOC] HELPER: Returns the sum of two arguments, the second defaulting
+            # to one.
             return d0 + d1
 
         def fn_n1_kwargs(d0, d1, **kwargs):
+            # [FUNCTION DOC] HELPER: Returns the sum of two arguments; extra keyword
+            # arguments ignored.
             return d0 + d1
 
         def fn_n1_pos(d0, d1, *args):
+            # [FUNCTION DOC] HELPER: Returns the sum of the first two arguments; extra
+            # positional ones ignored.
             return d0 + d1
 
         def fn_n1_sep_pos(d0, *args, d1):
+            # [FUNCTION DOC] HELPER: Returns the sum of the first argument and a keyword-only
+            # second one.
             return d0 + d1
 
         def fn_cmplx(d0, d1=1, *args, d2, **kwargs):
+            # [FUNCTION DOC] HELPER: Complex signature (default, var positional, required
+            # keyword-only, var keyword); returns the sum of the first two arguments.
             return d0 + d1
 
         p_fn_n1 = partial(fn_n1, d1=1)
@@ -1462,6 +1699,10 @@ class TestFunctionalIterDataPipe(TestCase):
         )
 
         def _helper(ref_fn, fn, input_col=None, output_col=None, error=None):
+            # [FUNCTION DOC] HELPER: For both list and tuple records of three columns, maps with
+            # the given function and columns. If the reference function is None it expects the
+            # given error type while building and consuming the result; otherwise it compares
+            # the output with a map using the reference function, both before and after a reset.
             for constr in (list, tuple):
                 datapipe = dp.iter.IterableWrapper(
                     [constr((0, 1, 2)), constr((3, 4, 5)), constr((6, 7, 8))]
@@ -1559,36 +1800,57 @@ class TestFunctionalIterDataPipe(TestCase):
     @suppress_warnings  # Suppress warning for lambda fn
     @skipIfTorchDynamo()
     def test_map_dict_with_col_iterdatapipe(self):
+        # [FUNCTION DOC] Tests map over dict records with input and output keys and several
+        # function signatures. Valid cases are compared with a reference function (and after
+        # reset); unsuitable signatures, mismatched column counts, or output spec problems raise
+        # ValueError, and a missing input key raises KeyError. Output keys may overwrite, drop
+        # merged inputs, or add new keys.
         def fn_11(d):
+            # [FUNCTION DOC] HELPER: Returns the negation of the input.
             return -d
 
         def fn_1n(d):
+            # [FUNCTION DOC] HELPER: Returns a pair of the negated input and the input.
             return -d, d
 
         def fn_n1(d0, d1):
+            # [FUNCTION DOC] HELPER: Returns the sum of two arguments.
             return d0 + d1
 
         def fn_nn(d0, d1):
+            # [FUNCTION DOC] HELPER: Returns a triple: both negated and their sum.
             return -d0, -d1, d0 + d1
 
         def fn_n1_def(d0, d1=1):
+            # [FUNCTION DOC] HELPER: Returns the sum of two arguments, the second defaulting
+            # to one.
             return d0 + d1
 
         p_fn_n1 = partial(fn_n1, d1=1)
 
         def fn_n1_pos(d0, d1, *args):
+            # [FUNCTION DOC] HELPER: Returns the sum of the first two arguments; extra
+            # positional ones ignored.
             return d0 + d1
 
         def fn_n1_kwargs(d0, d1, **kwargs):
+            # [FUNCTION DOC] HELPER: Returns the sum of two arguments; extra keyword
+            # arguments ignored.
             return d0 + d1
 
         def fn_kwonly(*, d0, d1):
+            # [FUNCTION DOC] HELPER: Function with only keyword-only parameters; returns
+            # their sum.
             return d0 + d1
 
         def fn_has_nondefault_kwonly(d0, *, d1):
+            # [FUNCTION DOC] HELPER: One positional plus one required keyword-only parameter;
+            # returns sum.
             return d0 + d1
 
         def fn_cmplx(d0, d1=1, *args, d2, **kwargs):
+            # [FUNCTION DOC] HELPER: Complex signature (default, var positional, required
+            # keyword-only, var keyword); returns the sum of the first two arguments.
             return d0 + d1
 
         p_fn_cmplx = partial(fn_cmplx, d2=2)
@@ -1598,6 +1860,9 @@ class TestFunctionalIterDataPipe(TestCase):
 
         # Prevent modification in-place to support resetting
         def _dict_update(data, newdata, remove_idx=None):
+            # [FUNCTION DOC] HELPER: Returns a new dict copied from data, updated with newdata,
+            # and with any keys listed in remove_idx deleted. Never mutates its input so
+            # datapipes can be reset.
             _data = dict(data)
             _data.update(newdata)
             if remove_idx:
@@ -1606,6 +1871,10 @@ class TestFunctionalIterDataPipe(TestCase):
             return _data
 
         def _helper(ref_fn, fn, input_col=None, output_col=None, error=None):
+            # [FUNCTION DOC] HELPER: Maps a datapipe of three dict records with the function and
+            # columns. When the reference function is None expects the given error type while
+            # building and consuming; otherwise compares with a map using the reference, before
+            # and after a reset.
             datapipe = dp.iter.IterableWrapper(
                 [
                     {"x": 0, "y": 1, "z": 2},
@@ -1729,10 +1998,15 @@ class TestFunctionalIterDataPipe(TestCase):
         )
 
     def test_collate_iterdatapipe(self):
+        # [FUNCTION DOC] Tests collate: the default collate gives tensors, a custom function and
+        # a partial one are used when given, reset behavior, length inheritance, and TypeError
+        # for len when the source has no length.
         arrs = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
         input_dp = dp.iter.IterableWrapper(arrs)
 
         def _collate_fn(batch, default_type=torch.float):
+            # [FUNCTION DOC] HELPER: Returns a tensor holding the sum of the batch with the
+            # given dtype.
             return torch.tensor(sum(batch), dtype=default_type)
 
         # Functional Test: defaults to the default collate function when a custom one is not specified
@@ -1771,6 +2045,10 @@ class TestFunctionalIterDataPipe(TestCase):
             self.assertEqual(torch.tensor(x), y)
 
     def test_batch_iterdatapipe(self):
+        # [FUNCTION DOC] Tests batch: AssertionError for batch size zero; the last short
+        # batch is kept by default (length four for ten items by three) and dropped with
+        # drop_last; batch contents and sizes; len raises TypeError when the source has no
+        # length; reset behavior.
         arrs = list(range(10))
         input_dp = dp.iter.IterableWrapper(arrs)
 
@@ -1812,6 +2090,9 @@ class TestFunctionalIterDataPipe(TestCase):
         self.assertEqual([[0, 1, 2, 3], [4, 5, 6, 7]], res_after_reset)
 
     def test_unbatch_iterdatapipe(self):
+        # [FUNCTION DOC] Tests unbatch: flattening one level, nested input one level at a time,
+        # two levels, and all levels with negative one; ValueError for a level below negative
+        # one and IndexError for a level that is too deep; reset behavior.
         target_length = 6
         prebatch_dp = dp.iter.IterableWrapper(range(target_length))
 
@@ -1875,9 +2156,13 @@ class TestFunctionalIterDataPipe(TestCase):
         self.assertEqual([0, 1, 2, 3, 4, 5], res_after_reset)
 
     def test_filter_datapipe(self):
+        # [FUNCTION DOC] Tests filter: partial predicate, ValueError when the predicate returns
+        # a non-bool, single and multiple input columns, ValueError for unsuitable signatures,
+        # partial and default argument predicates, TypeError for len, and reset behavior.
         input_ds = dp.iter.IterableWrapper(range(10))
 
         def _filter_fn(data, val):
+            # [FUNCTION DOC] HELPER: Returns True when data is at least val.
             return data >= val
 
         # Functional Test: filter works with partial function
@@ -1885,6 +2170,7 @@ class TestFunctionalIterDataPipe(TestCase):
         self.assertEqual(list(filter_dp), list(range(5, 10)))
 
         def _non_bool_fn(data):
+            # [FUNCTION DOC] HELPER: Predicate returning the integer one instead of a bool.
             return 1
 
         # Functional Test: filter function must return bool
@@ -1903,6 +2189,8 @@ class TestFunctionalIterDataPipe(TestCase):
 
         # Multiple input_col
         def _mul_filter_fn(a, b):
+            # [FUNCTION DOC] HELPER: Returns True when the sum of the two arguments is
+            # below ten.
             return a + b < 10
 
         input_col_2_dp = tuple_input_ds.filter(_mul_filter_fn, input_col=[0, 2])
@@ -1917,18 +2205,24 @@ class TestFunctionalIterDataPipe(TestCase):
         self.assertEqual(list(out), [(d - 1, d, d + 1) for d in range(10)])
 
         def _mul_filter_fn_with_defaults(a, b=1):
+            # [FUNCTION DOC] HELPER: Like the two argument predicate but the second argument
+            # defaults to one.
             return a + b < 10
 
         out = tuple_input_ds.filter(_mul_filter_fn_with_defaults, input_col=0)
         self.assertEqual(list(out), [(d - 1, d, d + 1) for d in range(10)])
 
         def _mul_filter_fn_with_kw_only(*, a, b):
+            # [FUNCTION DOC] HELPER: Keyword-only two argument version of the
+            # sum-below-ten predicate.
             return a + b < 10
 
         with self.assertRaises(ValueError):
             tuple_input_ds.filter(_mul_filter_fn_with_kw_only, input_col=0)
 
         def _mul_filter_fn_with_kw_only_1_default(*, a, b=1):
+            # [FUNCTION DOC] HELPER: Keyword-only predicate where the second argument defaults
+            # to one.
             return a + b < 10
 
         with self.assertRaises(ValueError):
@@ -1948,6 +2242,9 @@ class TestFunctionalIterDataPipe(TestCase):
         self.assertEqual(list(range(5, 10)), res_after_reset)
 
     def test_sampler_iterdatapipe(self):
+        # [FUNCTION DOC] Tests Sampler: the default sampler yields indices with length ten, it
+        # can be built with a RandomSampler and keyword arguments, and an input without length
+        # makes construction raise AssertionError.
         input_dp = dp.iter.IterableWrapper(range(10))
         # Default SequentialSampler
         sampled_dp = dp.iter.Sampler(input_dp)  # type: ignore[var-annotated]
@@ -1966,6 +2263,9 @@ class TestFunctionalIterDataPipe(TestCase):
             sampled_dp = dp.iter.Sampler(input_dp_nolen)
 
     def test_stream_reader_iterdatapipe(self):
+        # [FUNCTION DOC] Tests read_from_stream on pairs of name and string stream: full
+        # read gives the whole strings, chunk size one gives single characters, and len
+        # raises TypeError.
         from io import StringIO
 
         input_dp = dp.iter.IterableWrapper(
@@ -1986,6 +2286,10 @@ class TestFunctionalIterDataPipe(TestCase):
             len(dp1)
 
     def test_shuffler_iterdatapipe(self):
+        # [FUNCTION DOC] Tests shuffle: AssertionError for buffer size zero; shuffled output has
+        # the same members; global seed and set_seed give repeatable output; set_shuffle false
+        # keeps order; reset behavior; length equals source; and pickled shuffler snapshot
+        # restoration for buffer sizes two, five and fifteen.
         input_dp = dp.iter.IterableWrapper(list(range(10)))
 
         with self.assertRaises(AssertionError):
@@ -2031,6 +2335,10 @@ class TestFunctionalIterDataPipe(TestCase):
         from torch.utils.data.datapipes._hook_iterator import _SnapshotState
 
         def _serialization_helper(bs):
+            # [FUNCTION DOC] HELPER: For a buffer size, reads two items, pickles a copy,
+            # restores the copy graph snapshot from the number of samples yielded, marks
+            # it restored, and asserts the copy's output equals the remaining output of
+            # the original.
             shuffler_dp = input_dp.shuffle(buffer_size=bs)
             it = iter(shuffler_dp)
             for _ in range(2):
@@ -2050,6 +2358,9 @@ class TestFunctionalIterDataPipe(TestCase):
             _serialization_helper(bs)
 
     def test_zip_iterdatapipe(self):
+        # [FUNCTION DOC] Tests Zipper: TypeError for a non-datapipe input, len raising TypeError
+        # when an input has no length, zipping to the shortest input, length equal to the
+        # shortest, and reset behavior.
         # Functional Test: raises TypeError when an input is not of type `IterDataPipe`
         with self.assertRaises(TypeError):
             dp.iter.Zipper(dp.iter.IterableWrapper(range(10)), list(range(10)))  # type: ignore[arg-type]
@@ -2084,7 +2395,11 @@ class TestFunctionalIterDataPipe(TestCase):
 
 
 class TestFunctionalMapDataPipe(TestCase):
+    # [CLASS DOC] Tests for the functional MapDataPipe classes (batch, concat, map, shuffle,
+    # zip, sequence wrapper), including pickle and dill round trips and per-datapipe behavior.
     def _serialization_test_helper(self, datapipe, use_dill):
+        # [FUNCTION DOC] HELPER: Serializes with dill or pickle, deserializes, and asserts both
+        # produce equal lists; prints the datapipe name and re-raises on mismatch.
         if use_dill:
             serialized_dp = dill.dumps(datapipe)
             deserialized_dp = dill.loads(serialized_dp)
@@ -2098,6 +2413,8 @@ class TestFunctionalMapDataPipe(TestCase):
             raise e
 
     def _serialization_test_for_single_dp(self, dp, use_dill=False):
+        # [FUNCTION DOC] HELPER: Round trip comparison for a datapipe before iteration, after
+        # reading one element, and after fully reading it.
         # 1. Testing for serialization before any iteration starts
         self._serialization_test_helper(dp, use_dill)
         # 2. Testing for serialization after DataPipe is partially read
@@ -2109,6 +2426,9 @@ class TestFunctionalMapDataPipe(TestCase):
         self._serialization_test_helper(dp, use_dill)
 
     def test_serializable(self):
+        # [FUNCTION DOC] Checks that the listed map datapipes (batcher, concater, mapper
+        # variants, sequence wrapper, shuffler, zipper) round trip through pickle with
+        # equal output.
         picklable_datapipes: list = [
             (dp.map.Batcher, None, (2,), {}),
             (dp.map.Concater, None, (dp.map.SequenceWrapper(range(10)),), {}),
@@ -2126,6 +2446,9 @@ class TestFunctionalMapDataPipe(TestCase):
             self._serialization_test_for_single_dp(datapipe)
 
     def test_serializable_with_dill(self):
+        # [FUNCTION DOC] Checks a map datapipe given a lambda or a local function: with dill the
+        # pipe can be dumped; without dill construction warns about lambda or local functions
+        # and pickling raises PicklingError or AttributeError.
         """Only for DataPipes that take in a function as argument"""
         input_dp = dp.map.SequenceWrapper(range(10))
 
@@ -2136,7 +2459,10 @@ class TestFunctionalMapDataPipe(TestCase):
         ]
 
         def _local_fns():
+            # [FUNCTION DOC] HELPER: Returns a locally defined identity function
+            # (not picklable).
             def _fn1(x):
+                # [FUNCTION DOC] HELPER: Identity function.
                 return x
 
             return _fn1
@@ -2169,6 +2495,9 @@ class TestFunctionalMapDataPipe(TestCase):
                         pickle.dumps(datapipe)
 
     def test_docstring(self):
+        # [FUNCTION DOC] Regression test that the functional methods on a sequence wrapper
+        # render documentation containing the functional name marker, an Args section and an
+        # Example section.
         """
         Ensure functional form of MapDataPipe has the correct docstring from
         the class form.
@@ -2195,6 +2524,9 @@ class TestFunctionalMapDataPipe(TestCase):
                 raise AssertionError(f"expected 'Example:' or 'Examples:' in docstring for {dp_funcname}")
 
     def test_sequence_wrapper_datapipe(self):
+        # [FUNCTION DOC] Tests SequenceWrapper: values and order preserved, deep copy by
+        # default (later appends not visible), shallow copy mode sees appends, reset
+        # behavior, length inheritance.
         seq = list(range(10))
         input_dp = dp.map.SequenceWrapper(seq)
 
@@ -2224,6 +2556,9 @@ class TestFunctionalMapDataPipe(TestCase):
         self.assertEqual(len(seq), len(input_dp))
 
     def test_concat_mapdatapipe(self):
+        # [FUNCTION DOC] Tests the map Concater: ValueError with no input, TypeError for
+        # non-MapDataPipe input, length of fifteen, indexed access across both sources, and
+        # full iteration.
         input_dp1 = dp.map.SequenceWrapper(range(10))
         input_dp2 = dp.map.SequenceWrapper(range(5))
 
@@ -2244,6 +2579,9 @@ class TestFunctionalMapDataPipe(TestCase):
         self.assertEqual(list(concat_dp), list(range(10)) + list(range(5)))
 
     def test_zip_mapdatapipe(self):
+        # [FUNCTION DOC] Tests the map Zipper: ValueError with no input, TypeError for
+        # non-MapDataPipe input, tuple elements, IndexError past the shortest length, zipping
+        # with batchers, and length equal to the shortest input.
         input_dp1 = dp.map.SequenceWrapper(range(10))
         input_dp2 = dp.map.SequenceWrapper(range(5))
         input_dp3 = dp.map.SequenceWrapper(range(15))
@@ -2281,6 +2619,9 @@ class TestFunctionalMapDataPipe(TestCase):
         self.assertEqual(5, len(zip_dp))
 
     def test_shuffler_mapdatapipe(self):
+        # [FUNCTION DOC] Tests the map Shuffler: default indices, custom indices over a dict
+        # source, global seed and set_seed repeatability, set_shuffle false, reset behavior,
+        # length, and snapshot restoration after pickling a partially read shuffler.
         input_dp1 = dp.map.SequenceWrapper(range(10))
         input_dp2 = dp.map.SequenceWrapper({"a": 1, "b": 2, "c": 3, "d": 4, "e": 5})
 
@@ -2338,10 +2679,14 @@ class TestFunctionalMapDataPipe(TestCase):
         self.assertEqual(exp, list(shuffler_dp_copy))
 
     def test_map_mapdatapipe(self):
+        # [FUNCTION DOC] Tests map for map datapipes: indexed access applies the function, with
+        # and without a partial, and length equals the source length.
         arr = range(10)
         input_dp = dp.map.SequenceWrapper(arr)
 
         def fn(item, dtype=torch.float, *, sum=False):
+            # [FUNCTION DOC] HELPER: Converts the item to a tensor of the given dtype and
+            # returns it, or its sum when the keyword-only sum flag is true.
             data = torch.tensor(item, dtype=dtype)
             return data if not sum else data.sum()
 
@@ -2360,6 +2705,8 @@ class TestFunctionalMapDataPipe(TestCase):
             )
 
     def test_batch_mapdatapipe(self):
+        # [FUNCTION DOC] Tests the map Batcher: batches with and without drop_last, nested
+        # batching, reset behavior, and batch counts.
         arr = list(range(13))
         input_dp = dp.map.SequenceWrapper(arr)
 
@@ -2397,11 +2744,17 @@ class TestFunctionalMapDataPipe(TestCase):
 
 
 class TestTyping(TestCase):
+    # [CLASS DOC] Tests for the datapipe typing machinery (isinstance behavior, protocols and
+    # subtype checks); the subtype test is skipped because of a known typing bug.
     def test_isinstance(self):
+        # [FUNCTION DOC] Defines two empty IterDataPipe subclasses and checks isinstance is true
+        # only for the matching class.
         class A(IterDataPipe):
+            # [CLASS DOC] HELPER: Empty IterDataPipe subclass used for isinstance checks.
             pass
 
         class B(IterDataPipe):
+            # [CLASS DOC] HELPER: Second empty IterDataPipe subclass used for isinstance checks.
             pass
 
         a = A()
@@ -2409,6 +2762,9 @@ class TestTyping(TestCase):
         self.assertFalse(isinstance(a, B))
 
     def test_protocol(self):
+        # [FUNCTION DOC] Resolves a Protocol class (falling back to the private one on
+        # ImportError), then defines a protocol subclass and an IterDataPipe subclass
+        # parameterized by it; passes if class creation does not raise.
         try:
             from typing import Protocol  # type: ignore[attr-defined]
         except ImportError:
@@ -2417,13 +2773,21 @@ class TestTyping(TestCase):
             Protocol = _Protocol
 
         class P(Protocol):
+            # [CLASS DOC] HELPER: Empty protocol class.
             pass
 
         class A(IterDataPipe[P]):
+            # [CLASS DOC] HELPER: Empty IterDataPipe subclass parameterized by the protocol.
             pass
 
     @skipTyping
     def test_subtype(self):
+        # [FUNCTION DOC] Skipped test (known typing bug) of the issubtype helper: every basic
+        # type is a subtype of itself and of Any, only the covariant type variable accepts Any
+        # as a subtype, and distinct basic types are unrelated. Constrained type variables,
+        # unions and optional types are subtypes of their parents but not the reverse, and
+        # subscripted list, tuple, set and dict types follow the same relation, with a
+        # non-recursive mode ignoring parameters.
         from torch.utils.data.datapipes._typing import issubtype
 
         basic_type = (int, str, bool, float, complex, list, tuple, dict, set, T_co)
@@ -2473,6 +2837,10 @@ class TestTyping(TestCase):
 
     @skipTyping
     def test_issubinstance(self):
+        # [FUNCTION DOC] Skipped test (known typing bug) of the issubinstance helper: basic
+        # values are instances of Any and the covariant variable, constrained variable
+        # membership, exact type matches, list and set instances checked against element types,
+        # and dict and tuple instances checked against parameterized types.
         from torch.utils.data.datapipes._typing import issubinstance
 
         basic_data = (1, "1", True, 1.0, complex(1.0, 0.0))
@@ -2513,29 +2881,49 @@ class TestTyping(TestCase):
     # Static checking annotation
     @skipTyping
     def test_compile_time(self):
+        # [FUNCTION DOC] Skipped test (known typing bug) of class-definition-time checking of
+        # IterDataPipe subclasses: an iterator method annotated with the wrong return type
+        # raises TypeError at class creation, subclassing a non-generic class raises TypeError,
+        # and classes with matching, generic, missing, plain or abstract-base annotations get
+        # the expected type attribute and subtype relations.
         with self.assertRaisesRegex(TypeError, r"Expected 'Iterator' as the return"):
 
             class InvalidDP1(IterDataPipe[int]):
+                # [CLASS DOC] HELPER: Datapipe declared as producing int whose iterator method
+                # is annotated to return a string; class creation is expected to fail.
                 def __iter__(self) -> str:  # type: ignore[misc, override]
+                    # [FUNCTION DOC] HELPER: Generator yielding zero; its wrong return
+                    # annotation triggers the error.
                     yield 0
 
         with self.assertRaisesRegex(TypeError, r"Expected return type of '__iter__'"):
 
             class InvalidDP2(IterDataPipe[tuple]):
+                # [CLASS DOC] HELPER: Datapipe of tuples whose iterator method is annotated to
+                # return an iterator of int; class creation is expected to fail.
                 def __iter__(self) -> Iterator[int]:  # type: ignore[override]
+                    # [FUNCTION DOC] HELPER: Generator yielding zero; return annotation
+                    # mismatches the class type.
                     yield 0
 
         with self.assertRaisesRegex(TypeError, r"Expected return type of '__iter__'"):
 
             class InvalidDP3(IterDataPipe[tuple[int, str]]):
+                # [CLASS DOC] HELPER: Datapipe of int-string tuples whose iterator method is
+                # annotated as an iterator of bare tuple; class creation is expected to fail.
                 def __iter__(self) -> Iterator[tuple]:  # type: ignore[override]
+                    # [FUNCTION DOC] HELPER: Generator yielding a one element tuple.
                     yield (0,)
 
         class DP1(IterDataPipe[tuple[int, str]]):
+            # [CLASS DOC] HELPER: Valid datapipe of int-string tuples built from a given length.
             def __init__(self, length):
+                # [FUNCTION DOC] HELPER: Stores the length.
                 self.length = length
 
             def __iter__(self) -> Iterator[tuple[int, str]]:
+                # [FUNCTION DOC] HELPER: Generator yielding pairs of each number below the
+                # length and its text.
                 for d in range(self.length):
                     yield d, str(d)
 
@@ -2548,11 +2936,17 @@ class TestTyping(TestCase):
         with self.assertRaisesRegex(TypeError, r"is not a generic class"):
 
             class InvalidDP5(DP1[tuple]):  # type: ignore[type-arg]
+                # [CLASS DOC] HELPER: Subclass that subscripts a non-generic datapipe class;
+                # creation is expected to raise TypeError.
                 def __iter__(self) -> Iterator[tuple]:  # type: ignore[override]
+                    # [FUNCTION DOC] HELPER: Generator yielding a one element tuple.
                     yield (0,)
 
         class DP2(IterDataPipe[T_co]):
+            # [CLASS DOC] HELPER: Datapipe with a free type variable element type yielding
+            # range ten.
             def __iter__(self) -> Iterator[T_co]:
+                # [FUNCTION DOC] HELPER: Generator yielding the numbers zero to nine.
                 yield from range(10)  # type: ignore[misc]
 
         self.assertTrue(issubclass(DP2, IterDataPipe))
@@ -2562,12 +2956,16 @@ class TestTyping(TestCase):
         self.assertEqual(dp2.type, dp2_.type)
 
         class DP3(IterDataPipe[tuple[T_co, str]]):
+            # [CLASS DOC] HELPER: Datapipe of tuples with a free type variable and a string,
+            # built from a data source.
             r"""DataPipe without fixed type with __init__ function"""
 
             def __init__(self, datasource):
+                # [FUNCTION DOC] HELPER: Stores the data source.
                 self.datasource = datasource
 
             def __iter__(self) -> Iterator[tuple[T_co, str]]:
+                # [FUNCTION DOC] HELPER: Generator yielding each source item with its text form.
                 for d in self.datasource:
                     yield d, str(d)
 
@@ -2578,9 +2976,12 @@ class TestTyping(TestCase):
         self.assertEqual(dp3.type, dp3_.type)
 
         class DP4(IterDataPipe[tuple]):
+            # [CLASS DOC] HELPER: Datapipe of tuples whose iterator method has no
+            # return annotation.
             r"""DataPipe without __iter__ annotation"""
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Raises NotImplementedError.
                 raise NotImplementedError
 
         self.assertTrue(issubclass(DP4, IterDataPipe))
@@ -2588,9 +2989,12 @@ class TestTyping(TestCase):
         self.assertTrue(dp4.type.param is tuple)
 
         class DP5(IterDataPipe):
+            # [CLASS DOC] HELPER: Datapipe with no type parameter whose iterator is annotated
+            # as strings.
             r"""DataPipe without type annotation"""
 
             def __iter__(self) -> Iterator[str]:
+                # [FUNCTION DOC] HELPER: Raises NotImplementedError.
                 raise NotImplementedError
 
         self.assertTrue(issubclass(DP5, IterDataPipe))
@@ -2602,9 +3006,12 @@ class TestTyping(TestCase):
         )
 
         class DP6(IterDataPipe[int]):
+            # [CLASS DOC] HELPER: Datapipe of int whose iterator is annotated with a plain
+            # iterator type.
             r"""DataPipe with plain Iterator"""
 
             def __iter__(self) -> Iterator:
+                # [FUNCTION DOC] HELPER: Raises NotImplementedError.
                 raise NotImplementedError
 
         self.assertTrue(issubclass(DP6, IterDataPipe))
@@ -2612,12 +3019,16 @@ class TestTyping(TestCase):
         self.assertTrue(dp6.type.param is int)
 
         class DP7(IterDataPipe[Awaitable[T_co]]):
+            # [CLASS DOC] HELPER: Datapipe whose element type is an abstract base class of the
+            # type variable.
             r"""DataPipe with abstract base class"""
 
         self.assertTrue(issubclass(DP7, IterDataPipe))
         self.assertTrue(DP7.type.param == Awaitable[T_co])  # type: ignore[attr-defined]
 
         class DP8(DP7[str]):
+            # [CLASS DOC] HELPER: Subclass of the abstract-typed datapipe fixing its parameter
+            # to str.
             r"""DataPipe subclass from a DataPipe with abc type"""
 
         self.assertTrue(issubclass(DP8, IterDataPipe))
@@ -2625,21 +3036,34 @@ class TestTyping(TestCase):
 
     @skipTyping
     def test_construct_time(self):
+        # [FUNCTION DOC] Skipped test (known typing bug) of construction-time argument
+        # validation: passing a plain list where a datapipe is declared raises TypeError,
+        # and passing a datapipe whose element type is not a subtype of the declared one
+        # raises TypeError.
         class DP0(IterDataPipe[tuple]):
+            # [CLASS DOC] HELPER: Datapipe of tuples validating that its input is
+            # an IterDataPipe.
             @argument_validation
             def __init__(self, dp: IterDataPipe):
+                # [FUNCTION DOC] HELPER: Validated constructor; stores the input datapipe.
                 self.dp = dp
 
             def __iter__(self) -> Iterator[tuple]:
+                # [FUNCTION DOC] HELPER: Generator yielding each input item with its text form.
                 for d in self.dp:
                     yield d, str(d)
 
         class DP1(IterDataPipe[int]):
+            # [CLASS DOC] HELPER: Datapipe of int validating its input is a datapipe of
+            # int-string tuples.
             @argument_validation
             def __init__(self, dp: IterDataPipe[tuple[int, str]]):
+                # [FUNCTION DOC] HELPER: Validated constructor; stores the input datapipe.
                 self.dp = dp
 
             def __iter__(self) -> Iterator[int]:
+                # [FUNCTION DOC] HELPER: Generator yielding the first element of each
+                # input pair.
                 for a, _ in self.dp:
                     yield a
 
@@ -2658,12 +3082,20 @@ class TestTyping(TestCase):
 
     @skipTyping
     def test_runtime(self):
+        # [FUNCTION DOC] Skipped test (known typing bug) of runtime validation: valid data
+        # iterates correctly twice; data whose elements violate the declared tuple type raises
+        # RuntimeError; validation can be turned off with the disabling context manager (also
+        # nested), after which it is active again.
         class DP(IterDataPipe[tuple[int, T_co]]):
+            # [CLASS DOC] HELPER: Datapipe of int-and-any tuples over a data source with
+            # runtime validation.
             def __init__(self, datasource):
+                # [FUNCTION DOC] HELPER: Stores the data source.
                 self.ds = datasource
 
             @runtime_validation
             def __iter__(self) -> Iterator[tuple[int, T_co]]:
+                # [FUNCTION DOC] HELPER: Validated generator yielding the source items.
                 yield from self.ds
 
         dss = ([(1, "1"), (2, "2")], [(1, 1), (2, "2")])
@@ -2697,14 +3129,22 @@ class TestTyping(TestCase):
 
     @skipTyping
     def test_reinforce(self):
+        # [FUNCTION DOC] Skipped test (known typing bug) of reinforce_type: narrowing the
+        # type to int works and iterates, a non-type argument or a non-subtype raises
+        # TypeError, narrowing to str raises RuntimeError on iteration of int data unless
+        # validation is disabled.
         T = TypeVar("T", int, str)
 
         class DP(IterDataPipe[T]):
+            # [CLASS DOC] HELPER: Datapipe over a constrained type variable with
+            # runtime validation.
             def __init__(self, ds):
+                # [FUNCTION DOC] HELPER: Stores the data source.
                 self.ds = ds
 
             @runtime_validation
             def __iter__(self) -> Iterator[T]:
+                # [FUNCTION DOC] HELPER: Validated generator yielding the source items.
                 yield from self.ds
 
         ds = list(range(10))
@@ -2734,32 +3174,52 @@ class TestTyping(TestCase):
 
 
 class NumbersDataset(IterDataPipe):
+    # [CLASS DOC] Simple iterable datapipe over the integers from zero to size minus one.
+    # Holds the size; it supports iteration and a length equal to the size. Used throughout
+    # these tests.
     def __init__(self, size=10):
+        # [FUNCTION DOC] Stores the size (default ten); does not call the base constructor.
         self.size = size
 
     def __iter__(self):
+        # [FUNCTION DOC] Generator yielding the integers from zero to size minus one.
         yield from range(self.size)
 
     def __len__(self):
+        # [FUNCTION DOC] Returns the size.
         return self.size
 
 
 class TestGraph(TestCase):
+    # [CLASS DOC] Tests for traverse_dps, which builds a nested mapping of datapipe identity to
+    # the datapipe and its source graph, and for helpers over that graph. Covers a linear chain,
+    # forked pipes, map datapipes, mixed iter/map graphs, and circular or unhashable datapipes.
     class CustomIterDataPipe(IterDataPipe):
+        # [CLASS DOC] HELPER: Datapipe that maps its source with a bound method that
+        # reads an attribute, creating a reference cycle; its hash function always
+        # raises NotImplementedError.
         def add_v(self, x):
+            # [FUNCTION DOC] HELPER: Returns x plus the instance attribute v.
             return x + self.v
 
         def __init__(self, source_dp, v=1):
+            # [FUNCTION DOC] HELPER: Builds the mapped pipe from the source using a bound method
+            # and sets v to one (the v argument is ignored).
             self._dp = source_dp.map(self.add_v)
             self.v = 1
 
         def __iter__(self):
+            # [FUNCTION DOC] HELPER: Generator yielding from the mapped pipe.
             yield from self._dp
 
         def __hash__(self):
+            # [FUNCTION DOC] HELPER: Raises NotImplementedError so the datapipe is unhashable.
             raise NotImplementedError
 
     def test_simple_traverse(self):
+        # [FUNCTION DOC] Builds numbers, shuffle, sharding filter and map; checks the traversed
+        # graph equals the expected nested mapping and that the collection of graph pipes holds
+        # exactly the four datapipes.
         numbers_dp = NumbersDataset(size=50)
         shuffled_dp = numbers_dp.shuffle()
         sharded_dp = shuffled_dp.sharding_filter()
@@ -2789,6 +3249,9 @@ class TestGraph(TestCase):
             self.assertTrue(datapipe in dps)
 
     def test_traverse_forked(self):
+        # [FUNCTION DOC] Forks a numbers datapipe three ways, maps and filters two children and
+        # muxes all three; checks the traversed graph (including the fork container internals)
+        # and that eight datapipes are found in the graph.
         numbers_dp = NumbersDataset(size=50)
         dp0, dp1, dp2 = numbers_dp.fork(num_instances=3)
         dp0_upd = dp0.map(lambda x: x * 10)
@@ -2871,6 +3334,8 @@ class TestGraph(TestCase):
             self.assertTrue(_dp in dps)
 
     def test_traverse_mapdatapipe(self):
+        # [FUNCTION DOC] Checks the traversed graph of a map datapipe built on a
+        # sequence wrapper.
         source_dp = dp.map.SequenceWrapper(range(10))
         map_dp = source_dp.map(partial(_fake_add, 1))
         graph = traverse_dps(map_dp)
@@ -2880,6 +3345,8 @@ class TestGraph(TestCase):
         self.assertEqual(expected, graph)
 
     def test_traverse_mixdatapipe(self):
+        # [FUNCTION DOC] Checks the traversed graph of an iterable wrapper over a map datapipe,
+        # which contains the map datapipe as its source.
         source_map_dp = dp.map.SequenceWrapper(range(10))
         iter_dp = dp.iter.IterableWrapper(source_map_dp)
         graph = traverse_dps(iter_dp)
@@ -2889,6 +3356,8 @@ class TestGraph(TestCase):
         self.assertEqual(expected, graph)
 
     def test_traverse_circular_datapipe(self):
+        # [FUNCTION DOC] Checks that traversing a datapipe with a self-referencing bound method
+        # terminates and gives the expected graph of three datapipes.
         source_iter_dp = dp.iter.IterableWrapper(list(range(10)))
         circular_dp = TestGraph.CustomIterDataPipe(source_iter_dp)
         graph = traverse_dps(circular_dp)
@@ -2912,6 +3381,8 @@ class TestGraph(TestCase):
             self.assertTrue(_dp in dps)
 
     def test_traverse_unhashable_datapipe(self):
+        # [FUNCTION DOC] Checks that an unhashable datapipe can still be traversed (hashing
+        # raises NotImplementedError) and that the expected graph is produced.
         source_iter_dp = dp.iter.IterableWrapper(list(range(10)))
         unhashable_dp = TestGraph.CustomIterDataPipe(source_iter_dp)
         graph = traverse_dps(unhashable_dp)
@@ -2932,12 +3403,18 @@ class TestGraph(TestCase):
 
 
 def unbatch(x):
+    # [FUNCTION DOC] HELPER: Collate function returning the first item of a batch of size one.
     return x[0]
 
 
 class TestSerialization(TestCase):
+    # [CLASS DOC] Tests that datapipes containing lambdas can be sent to spawn-mode DataLoader
+    # workers (needs dill).
     @skipIfNoDill
     def test_spawn_lambdas_iter(self):
+        # [FUNCTION DOC] Loads a shuffled, lambda-mapped iterable pipe with two spawn workers
+        # and batch size one; checks the sorted results contain each of 1, 2 and 3 twice (one
+        # copy per worker).
         idp = dp.iter.IterableWrapper(range(3)).map(lambda x: x + 1).shuffle()
         dl = DataLoader(
             idp,
@@ -2952,6 +3429,8 @@ class TestSerialization(TestCase):
 
     @skipIfNoDill
     def test_spawn_lambdas_map(self):
+        # [FUNCTION DOC] Same as the iterable version but for a lambda-mapped, shuffled
+        # map datapipe.
         mdp = dp.map.SequenceWrapper(range(3)).map(lambda x: x + 1).shuffle()
         dl = DataLoader(
             mdp,
@@ -2966,19 +3445,30 @@ class TestSerialization(TestCase):
 
 
 class TestCircularSerialization(TestCase):
+    # [CLASS DOC] Tests pickling and dill serialization of datapipes with circular references (a
+    # datapipe holding a bound method of itself), and the resulting traversed graphs.
     class CustomIterDataPipe(IterDataPipe):
+        # [CLASS DOC] HELPER: Datapipe that stores a function, a source (default a wrapper over
+        # a small list), and a child built by mapping with static and bound methods then
+        # demuxing; sets v after building the child, creating a cycle.
         @staticmethod
         def add_one(x):
+            # [FUNCTION DOC] HELPER: Static method returning x plus one.
             return x + 1
 
         @classmethod
         def classify(cls, x):
+            # [FUNCTION DOC] HELPER: Class method classifier that always returns class zero.
             return 0
 
         def add_v(self, x):
+            # [FUNCTION DOC] HELPER: Returns x plus the instance attribute v.
             return x + self.v
 
         def __init__(self, fn, source_dp=None):
+            # [FUNCTION DOC] HELPER: Stores the function and the source (default a wrapper
+            # over the list 1, 2, 4), then builds the first demux child from two chained
+            # maps. Sets v last.
             self.fn = fn
             self.source_dp = (
                 source_dp if source_dp else dp.iter.IterableWrapper([1, 2, 4])
@@ -2991,9 +3481,13 @@ class TestCircularSerialization(TestCase):
             self.v = 1
 
         def __iter__(self):
+            # [FUNCTION DOC] HELPER: Generator yielding from the child pipe.
             yield from self._dp
 
     def test_circular_serialization_with_pickle(self):
+        # [FUNCTION DOC] Checks a custom datapipe, alone and nested as the source of a second
+        # one, produces the same output after a pickle round trip, and that the traversed graphs
+        # match the expected nested mappings of the map, demux and source datapipes.
         # Test for circular reference issue with pickle
         dp1 = TestCircularSerialization.CustomIterDataPipe(fn=_fake_fn)
         self.assertTrue(list(dp1) == list(pickle.loads(pickle.dumps(dp1))))
@@ -3126,7 +3620,12 @@ class TestCircularSerialization(TestCase):
         self.assertEqual(res2, exp_res_2)
 
     class LambdaIterDataPipe(CustomIterDataPipe):
+        # [CLASS DOC] HELPER: Custom datapipe that additionally stores a lambda container and
+        # lambda function and rebuilds its child with an extra lambda map; only serializable
+        # with dill.
         def __init__(self, fn, source_dp=None):
+            # [FUNCTION DOC] HELPER: Calls the parent constructor, stores lambdas, and rebuilds
+            # the child pipe with the lambda inserted in the map chain.
             super().__init__(fn, source_dp)
             self.container = [
                 lambda x: x + 1,
@@ -3142,6 +3641,8 @@ class TestCircularSerialization(TestCase):
     @skipIfNoDill
     @skipIf(True, "Dill Tests")
     def test_circular_serialization_with_dill(self):
+        # [FUNCTION DOC] Same checks as the pickle variant but using dill round trips on the
+        # lambda datapipe; unconditionally skipped.
         # Test for circular reference issue with dill
         dp1 = TestCircularSerialization.LambdaIterDataPipe(lambda x: x + 1)
         self.assertTrue(list(dp1) == list(dill.loads(dill.dumps(dp1))))
@@ -3278,23 +3779,36 @@ class TestCircularSerialization(TestCase):
 
 
 class CustomShardingIterDataPipe(IterDataPipe):
+    # [CLASS DOC] HELPER: Iterable datapipe with the legacy custom sharding protocol. Wraps a
+    # source datapipe and keeps the instance count (default one) and instance id (default zero);
+    # iteration yields only the items whose position modulo the instance count equals the id.
     def __init__(self, dp):
+        # [FUNCTION DOC] HELPER: Stores the source datapipe and sets one instance with id zero.
         self.dp = dp
         self.num_of_instances = 1
         self.instance_id = 0
 
     def apply_sharding(self, num_of_instances, instance_id):
+        # [FUNCTION DOC] HELPER: Records the instance count and instance id; the legacy sharding
+        # hook called by the graph settings helper.
         self.num_of_instances = num_of_instances
         self.instance_id = instance_id
 
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Generator yielding the source items that belong to this shard.
         for i, d in enumerate(self.dp):
             if i % self.num_of_instances == self.instance_id:
                 yield d
 
 
 class TestSharding(TestCase):
+    # [CLASS DOC] Tests for sharding_filter and the graph settings sharding helpers: simple
+    # sharding, sharding groups with priorities, legacy custom sharding, sharded lengths, use
+    # with DataLoader workers, and errors for sharding the same pipeline twice.
     def _get_pipeline(self):
+        # [FUNCTION DOC] HELPER: Builds a numbers datapipe of size ten forked in two; one branch
+        # is multiplied by ten and the other filtered to values with remainder one modulo three
+        # (using module level picklable functions); returns the two branches muxed together.
         numbers_dp = NumbersDataset(size=10)
         dp0, dp1 = numbers_dp.fork(num_instances=2)
         dp0_upd = dp0.map(_mul_10)
@@ -3303,6 +3817,7 @@ class TestSharding(TestCase):
         return combined_dp
 
     def _get_dill_pipeline(self):
+        # [FUNCTION DOC] HELPER: Same pipeline as the picklable version but built with lambdas.
         numbers_dp = NumbersDataset(size=10)
         dp0, dp1 = numbers_dp.fork(num_instances=2)
         dp0_upd = dp0.map(lambda x: x * 10)
@@ -3311,6 +3826,9 @@ class TestSharding(TestCase):
         return combined_dp
 
     def test_simple_sharding(self):
+        # [FUNCTION DOC] Applies sharding with three instances and id one to the pipeline and
+        # checks the items; then runs all three ids on fresh pipelines and checks the union
+        # equals all items.
         sharded_dp = self._get_pipeline().sharding_filter()
         torch.utils.data.graph_settings.apply_sharding(sharded_dp, 3, 1)
         items = list(sharded_dp)
@@ -3325,7 +3843,15 @@ class TestSharding(TestCase):
         self.assertEqual(sorted(all_items), sorted(items))
 
     def test_sharding_groups(self):
+        # [FUNCTION DOC] Builds a chain of three sharding filters in different groups
+        # (distributed, multiprocessing, and a custom priority) and applies sharding to every
+        # filter; checks the resulting items and length. Also checks that applying the
+        # default group sharding and then the multiprocessing group (or the reverse order)
+        # raises an exception.
         def construct_sharded_pipe():
+            # [FUNCTION DOC] HELPER: Builds a numbers datapipe of size 90 with three chained
+            # sharding filters for the distributed group, multiprocessing group and group 300.
+            # Returns the final datapipe and the list of the three filter datapipes.
             sharding_pipes = []
             dp = NumbersDataset(size=90)
             dp = dp.sharding_filter(
@@ -3365,6 +3891,9 @@ class TestSharding(TestCase):
             dp.apply_sharding(2, 1, sharding_group=SHARDING_PRIORITIES.DEFAULT)
 
     def test_legacy_custom_sharding(self):
+        # [FUNCTION DOC] Checks the graph settings sharding helper also works with a datapipe
+        # using the legacy apply_sharding hook, producing the same items as the standard
+        # sharding filter.
         dp = self._get_pipeline()
         sharded_dp = CustomShardingIterDataPipe(dp)
         torch.utils.data.graph_settings.apply_sharding(sharded_dp, 3, 1)
@@ -3372,6 +3901,8 @@ class TestSharding(TestCase):
         self.assertEqual([1, 20], items)
 
     def test_sharding_length(self):
+        # [FUNCTION DOC] Checks the lengths of three shards of thirteen items are 5, 4 and 4,
+        # and of two shards of a single item are one and zero.
         numbers_dp = dp.iter.IterableWrapper(range(13))
         sharded_dp0 = numbers_dp.sharding_filter()
         torch.utils.data.graph_settings.apply_sharding(sharded_dp0, 3, 0)
@@ -3393,6 +3924,8 @@ class TestSharding(TestCase):
         self.assertEqual(0, len(sharded_dp1))
 
     def test_old_dataloader(self):
+        # [FUNCTION DOC] Compares the sorted output of a sharded pipeline loaded by a DataLoader
+        # with two workers against the output without sharding.
         dp0 = self._get_pipeline()
         expected = list(dp0)
 
@@ -3403,6 +3936,8 @@ class TestSharding(TestCase):
         self.assertEqual(sorted(expected), sorted(items))
 
     def test_legacy_custom_sharding_with_old_dataloader(self):
+        # [FUNCTION DOC] Same as the previous DataLoader test but using the legacy custom
+        # sharding datapipe at the end of the pipeline.
         dp0 = self._get_pipeline()
         expected = list(dp0)
 
@@ -3414,6 +3949,10 @@ class TestSharding(TestCase):
         self.assertEqual(sorted(expected), sorted(items))
 
     def test_multi_sharding(self):
+        # [FUNCTION DOC] Checks that applying sharding raises RuntimeError mentioning sharding
+        # twice when two filters are chained, when one is on the source and another on a branch,
+        # or when one is on a branch and another at the end. Single filters (on the source or on
+        # each branch) work and produce every third element.
         # Raises Error when multiple sharding on the single branch
         numbers_dp = dp.iter.IterableWrapper(range(13))
         sharded_dp = numbers_dp.sharding_filter()
@@ -3461,12 +4000,19 @@ class TestSharding(TestCase):
 
 
 class TestIterDataPipeSingletonConstraint(TestCase):
+    # [CLASS DOC] Tests that each IterDataPipe has only one active iterator: creating a new
+    # iterator invalidates older ones, covering generator, self-returning, new-object and buggy
+    # datapipes, and forked child datapipes.
     r"""
     Each `IterDataPipe` can only have one active iterator. Whenever a new iterator is created, older
     iterators are invalidated. These tests aim to ensure `IterDataPipe` follows this behavior.
     """
 
     def _check_single_iterator_invalidation_logic(self, source_dp: IterDataPipe):
+        # [FUNCTION DOC] HELPER: Verifies the datapipe (which yields the numbers zero to
+        # nine) can be read fully twice using fresh iterators, and that creating a second
+        # iterator makes the first raise RuntimeError about invalidation while the second
+        # reads from the start.
         r"""
         Given a IterDataPipe, verifies that the iterator can be read, reset, and the creation of
         a second iterator invalidates the first one.
@@ -3485,6 +4031,9 @@ class TestIterDataPipeSingletonConstraint(TestCase):
             next(it1)
 
     def test_iterdatapipe_singleton_generator(self):
+        # [FUNCTION DOC] Checks invalidation for a generator-based datapipe, for a map and
+        # filter pipeline, that zipping a datapipe with itself raises RuntimeError, and that
+        # sequential reads of lists work.
         r"""
         Testing for the case where IterDataPipe's `__iter__` is a generator function.
         """
@@ -3507,24 +4056,34 @@ class TestIterDataPipeSingletonConstraint(TestCase):
             pass
 
     def test_iterdatapipe_singleton_self_next(self):
+        # [FUNCTION DOC] Checks invalidation for datapipes whose iterator method returns the
+        # object itself and which define a next method; same object is returned each time, the
+        # datapipe stays readable afterwards, and zipping it with itself raises RuntimeError.
         r"""
         Testing for the case where IterDataPipe's `__iter__` returns `self` and there is a `__next__` method
         Note that the following DataPipe by is singleton by default (because `__iter__` returns `self`).
         """
 
         class _CustomIterDP_Self(IterDataPipe):
+            # [CLASS DOC] HELPER: Datapipe whose iterator resets and returns itself; next reads
+            # from an internal iterator over the source.
             def __init__(self, iterable):
+                # [FUNCTION DOC] HELPER: Stores the source and an iterator over it.
                 self.source = iterable
                 self.iterable = iter(iterable)
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Resets the internal iterator and returns self.
                 self.reset()
                 return self
 
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Returns the next item of the internal iterator.
                 return next(self.iterable)
 
             def reset(self):
+                # [FUNCTION DOC] HELPER: Replaces the internal iterator with a fresh one over
+                # the source.
                 self.iterable = iter(self.source)
 
         # Functional Test: Check that every `__iter__` call returns the same object
@@ -3555,16 +4114,24 @@ class TestIterDataPipeSingletonConstraint(TestCase):
                 pass
 
     def test_iterdatapipe_singleton_new_object(self):
+        # [FUNCTION DOC] Checks invalidation for a datapipe whose iterator method returns a
+        # separate shared iterator object (not a generator, no next method): a second iterator
+        # invalidates the first, for plain and pipeline sources, and zipping it with itself
+        # raises RuntimeError.
         r"""
         Testing for the case where IterDataPipe's `__iter__` isn't a generator nor returns `self`,
         and there isn't a `__next__` method.
         """
 
         class _CustomIterDP(IterDataPipe):
+            # [CLASS DOC] HELPER: Datapipe that stores one iterator over its input and returns
+            # it from the iterator method, without resetting.
             def __init__(self, iterable):
+                # [FUNCTION DOC] HELPER: Stores an iterator over the input.
                 self.iterable = iter(iterable)
 
             def __iter__(self):  # Note that this doesn't reset
+                # [FUNCTION DOC] HELPER: Returns the stored iterator (not self and no reset).
                 return self.iterable  # Intentionally not returning `self`
 
         # Functional Test: Check if invalidation logic is correct
@@ -3593,20 +4160,28 @@ class TestIterDataPipeSingletonConstraint(TestCase):
                 pass
 
     def test_iterdatapipe_singleton_buggy(self):
+        # [FUNCTION DOC] Checks a deliberately buggy datapipe whose iterator method returns a
+        # new iterator but which also defines a next method. Shows that next is independent of
+        # iteration and that creating a second iterator invalidates the first one only.
         r"""
         Buggy test case case where IterDataPipe's `__iter__` returns a new object, but also has
         a `__next__` method.
         """
 
         class _CustomIterDP(IterDataPipe):
+            # [CLASS DOC] HELPER: Datapipe whose iterator method returns a fresh iterator over
+            # the source while next reads from a separate stored iterator.
             def __init__(self, iterable):
+                # [FUNCTION DOC] HELPER: Stores the source and an iterator over it.
                 self.source = iterable
                 self.iterable = iter(iterable)
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns a new iterator over the source (not self).
                 return iter(self.source)  # Intentionally not returning `self`
 
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Returns the next item of the stored iterator.
                 return next(self.iterable)
 
         # Functional Test: Check if invalidation logic is correct
@@ -3629,6 +4204,10 @@ class TestIterDataPipeSingletonConstraint(TestCase):
         )  # `it2` still works because it is a new object
 
     def test_iterdatapipe_singleton_constraint_multiple_outputs(self):
+        # [FUNCTION DOC] Checks invalidation with forked children: creating a new iterator on
+        # one child invalidates iterators of its siblings (with a warning about unexhausted
+        # children), creating an iterator on the source invalidates the children, and the same
+        # holds for a map and filter pipeline.
         r"""
         Testing for the case where IterDataPipe has multiple child DataPipes as outputs.
         """
@@ -3705,7 +4284,14 @@ class TestIterDataPipeSingletonConstraint(TestCase):
 
 
 class TestIterDataPipeCountSampleYielded(TestCase):
+    # [CLASS DOC] Tests the private count of samples yielded by a datapipe iterator, which
+    # must be correct for full reads, partial reads, resets, and when an exception
+    # interrupts iteration.
     def _yield_count_test_helper(self, datapipe, n_expected_samples):
+        # [FUNCTION DOC] HELPER: Verifies that after a full read the count equals the number
+        # of items, after reading the expected number and stopping the count equals that
+        # number, and after creating a new iterator and reading fully the count equals the
+        # item count again.
         # Functional Test: Check if number of samples yielded is as expected
         res = list(datapipe)
         self.assertEqual(len(res), datapipe._number_of_samples_yielded)
@@ -3725,15 +4311,23 @@ class TestIterDataPipeCountSampleYielded(TestCase):
         self.assertEqual(len(res), datapipe._number_of_samples_yielded)
 
     def test_iterdatapipe_sample_yielded_generator_function(self):
+        # [FUNCTION DOC] Checks the sample count for a generator-based datapipe (five samples
+        # expected after a partial read).
         # Functional Test: `__iter__` is a generator function
         datapipe: IterDataPipe = dp.iter.IterableWrapper(range(10))
         self._yield_count_test_helper(datapipe, n_expected_samples=5)
 
     def test_iterdatapipe_sample_yielded_generator_function_exception(self):
+        # [FUNCTION DOC] Checks the count is three when a generator datapipe raises RuntimeError
+        # after yielding three items, both on the first read and after a reset.
         # Functional Test: `__iter__` is a custom generator function with exception
         class _CustomGeneratorFnDataPipe(IterDataPipe):
+            # [CLASS DOC] HELPER: Generator datapipe yielding 0, 1, 2 then raising RuntimeError;
+            # the final yield is unreachable.
             # This class's `__iter__` has a Runtime Error
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Yields three values, then raises RuntimeError with a
+                # custom message.
                 yield 0
                 yield 1
                 yield 2
@@ -3757,55 +4351,79 @@ class TestIterDataPipeCountSampleYielded(TestCase):
         self.assertEqual(3, datapipe._number_of_samples_yielded)
 
     def test_iterdatapipe_sample_yielded_return_self(self):
+        # [FUNCTION DOC] Checks the sample count for a datapipe whose iterator method returns a
+        # stored iterator and which provides a reset method.
         class _CustomGeneratorDataPipe(IterDataPipe):
+            # [CLASS DOC] HELPER: Datapipe returning a stored iterator over ten numbers; reset
+            # replaces it.
             # This class's `__iter__` is not a generator function
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores an iterator over range ten.
                 self.source = iter(range(10))
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns the stored iterator.
                 return self.source
 
             def reset(self):
+                # [FUNCTION DOC] HELPER: Replaces the stored iterator with a fresh one.
                 self.source = iter(range(10))
 
         datapipe: IterDataPipe = _CustomGeneratorDataPipe()
         self._yield_count_test_helper(datapipe, n_expected_samples=5)
 
     def test_iterdatapipe_sample_yielded_next(self):
+        # [FUNCTION DOC] Checks the sample count for a datapipe that returns itself from the
+        # iterator method and defines next and reset.
         class _CustomNextDataPipe(IterDataPipe):
+            # [CLASS DOC] HELPER: Datapipe that is its own iterator over ten numbers; reset
+            # replaces it.
             # This class's `__iter__` returns `self` and has a `__next__`
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores an iterator over range ten.
                 self.source = iter(range(10))
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns self.
                 return self
 
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Returns the next item of the stored iterator.
                 return next(self.source)
 
             def reset(self):
+                # [FUNCTION DOC] HELPER: Replaces the stored iterator with a fresh one.
                 self.source = iter(range(10))
 
         datapipe: IterDataPipe = _CustomNextDataPipe()
         self._yield_count_test_helper(datapipe, n_expected_samples=5)
 
     def test_iterdatapipe_sample_yielded_next_exception(self):
+        # [FUNCTION DOC] Checks the count is three when a self-iterating datapipe raises
+        # RuntimeError from next after three items, on the first read and after a reset.
         class _CustomNextDataPipe(IterDataPipe):
+            # [CLASS DOC] HELPER: Self-iterating datapipe whose next raises RuntimeError once
+            # three items have been returned; reset clears the counter and the iterator.
             # This class's `__iter__` returns `self` and has a `__next__`
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores an iterator over range ten and a zero counter.
                 self.source = iter(range(10))
                 self.count = 0
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns self.
                 return self
 
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Raises RuntimeError when three items were already
+                # returned; otherwise increments the counter and returns the next item.
                 if self.count == 3:
                     raise RuntimeError("Custom test error after yielding 3 elements")
                 self.count += 1
                 return next(self.source)
 
             def reset(self):
+                # [FUNCTION DOC] HELPER: Resets the counter to zero and replaces the iterator.
                 self.count = 0
                 self.source = iter(range(10))
 
@@ -3827,40 +4445,59 @@ class TestIterDataPipeCountSampleYielded(TestCase):
 
 
 class _CustomNonGeneratorTestDataPipe(IterDataPipe):
+    # [CLASS DOC] HELPER: Non-generator datapipe over a list of ten numbers; the iterator method
+    # returns a new list iterator and the length is ten.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the size to ten and creates the source list.
         self.n = 10
         self.source = list(range(self.n))
 
     # This class's `__iter__` is not a generator function
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Returns a new iterator over the source list.
         return iter(self.source)
 
     def __len__(self):
+        # [FUNCTION DOC] HELPER: Returns the size.
         return self.n
 
 
 class _CustomSelfNextTestDataPipe(IterDataPipe):
+    # [CLASS DOC] HELPER: Self-iterating datapipe over ten numbers with next, reset and a length
+    # equal to ten.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the size to ten and stores an iterator over that range.
         self.n = 10
         self.iter = iter(range(self.n))
 
     def __iter__(self):
+        # [FUNCTION DOC] HELPER: Returns self.
         return self
 
     def __next__(self):
+        # [FUNCTION DOC] HELPER: Returns the next item of the stored iterator.
         return next(self.iter)
 
     def reset(self):
+        # [FUNCTION DOC] HELPER: Replaces the stored iterator with a fresh one.
         self.iter = iter(range(self.n))
 
     def __len__(self):
+        # [FUNCTION DOC] HELPER: Returns the size.
         return self.n
 
 
 class TestIterDataPipeGraphFastForward(TestCase):
+    # [CLASS DOC] Tests for fast-forwarding a datapipe graph to a snapshot position, using the
+    # simple snapshot restoration helper, including combination with pickling.
     def _fast_forward_graph_test_helper(
         self, datapipe, fast_forward_fn, expected_res, n_iterations=3, rng=None
     ):
+    # [FUNCTION DOC] HELPER: Seeds a generator (a new one if none is given) with zero and
+    # applies it to the graph. Then twice (once reading the result as a list, once through an
+    # iterator) reseeds, fast-forwards the datapipe by n_iterations steps with the given
+    # function, and asserts the remaining output equals the expected output after that many
+    # items; the iterator must also be exhausted afterwards.
         if rng is None:
             rng = torch.Generator()
         rng = rng.manual_seed(0)
@@ -3884,6 +4521,10 @@ class TestIterDataPipeGraphFastForward(TestCase):
             next(it)
 
     def test_simple_snapshot_graph(self):
+        # [FUNCTION DOC] Fast-forwards progressively larger graphs (wrapper, map, shuffle,
+        # batch, fork with zip, fork with concat) and checks remaining output; also checks that
+        # restoring the same graph twice raises RuntimeError saying snapshot restoration cannot
+        # be applied.
         graph1 = dp.iter.IterableWrapper(range(10))
         res1 = list(range(10))
         self._fast_forward_graph_test_helper(
@@ -3945,18 +4586,24 @@ class TestIterDataPipeGraphFastForward(TestCase):
             _simple_graph_snapshot_restoration(graph7, 1)
 
     def test_simple_snapshot_custom_non_generator(self):
+        # [FUNCTION DOC] Checks fast-forward on a non-generator custom datapipe.
         graph = _CustomNonGeneratorTestDataPipe()
         self._fast_forward_graph_test_helper(
             graph, _simple_graph_snapshot_restoration, expected_res=range(10)
         )
 
     def test_simple_snapshot_custom_self_next(self):
+        # [FUNCTION DOC] Checks fast-forward on a custom self-iterating datapipe.
         graph = _CustomSelfNextTestDataPipe()
         self._fast_forward_graph_test_helper(
             graph, _simple_graph_snapshot_restoration, expected_res=range(10)
         )
 
     def _snapshot_test_helper(self, datapipe, expected_res, n_iter=3, rng=None):
+        # [FUNCTION DOC] HELPER: Reads some items from a seeded datapipe, pickles and unpickles
+        # it, checks both report the same yielded count, restores the copy to that position with
+        # a seeded generator, and checks both the original iterator and the copy produce the
+        # remaining items.
         """
         Extend the previous test with serialization and deserialization test.
         """
@@ -3981,6 +4628,8 @@ class TestIterDataPipeGraphFastForward(TestCase):
         self.assertEqual(expected_res[n_iter:], list(deserialized_graph))
 
     def test_simple_snapshot_graph_with_serialization(self):
+        # [FUNCTION DOC] Runs the serialize and restore helper over the same progressively
+        # larger graphs as the fast-forward test (wrapper through fork with concat).
         graph1 = dp.iter.IterableWrapper(range(10))
         res1 = list(range(10))
         self._snapshot_test_helper(graph1, expected_res=res1)
@@ -4019,6 +4668,9 @@ class TestIterDataPipeGraphFastForward(TestCase):
         self._snapshot_test_helper(graph7, expected_res=res7)
 
     def test_simple_snapshot_graph_repeated(self):
+        # [FUNCTION DOC] Takes a graph of maps, shuffle and a forked zip, reads a few items,
+        # pickles it, restores a copy and checks the next item; then pickles the restored copy
+        # again, restores that and checks it yields the remaining expected items.
         cdp1, cdp2 = (
             dp.iter.IterableWrapper(range(10))
             .map(_mul_10)
