@@ -1,3 +1,7 @@
+# [MODULE DOC] Operator microbenchmarks for batched matrix multiply via einsum, and elementwise
+# multiply via einsum or torch.mul, on random 3-D float tensors on CPU and CUDA. Two benchmark
+# classes with their own op lists and short and long config sets are registered at import time
+# through the op list helper. Running as a script starts the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -42,7 +46,10 @@ batch_mm_op_list = op_bench.op_list(
 
 
 class BatchMatrixMultBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for batched matrix multiply of a BxMxN and a BxNxK random tensor.
     def init(self, B, M, N, K, device, op_func):
+        # [FUNCTION DOC] Create random tensors BxMxN and BxNxK on the device, store them in the
+        # inputs mapping and keep the op callable in op_func. Returns nothing.
         self.inputs = {
             "input_one": torch.rand(B, M, N, device=device),
             "input_two": torch.rand(B, N, K, device=device),
@@ -50,6 +57,8 @@ class BatchMatrixMultBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, input_one, input_two):
+        # [FUNCTION DOC] If the op callable is einsum, contract the two inputs with a batched
+        # matrix multiply subscript spec; otherwise call bmm. Returns the BxMxK result.
         if self.op_func.__name__ == "einsum":
             return torch.einsum("bij,bjk->bik", input_one, input_two)
         else:
@@ -92,7 +101,11 @@ batch_elementwise_op_list = op_bench.op_list(
 
 
 class BatchElementWiseBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for elementwise multiply of two BxMxN random tensors, using either
+    # einsum or torch.mul.
     def init(self, B, M, N, device, op_func):
+        # [FUNCTION DOC] Create two random BxMxN tensors on the device, store them in the inputs
+        # mapping and keep the op callable in op_func. Returns nothing.
         self.inputs = {
             "input_one": torch.rand(B, M, N, device=device),
             "input_two": torch.rand(B, M, N, device=device),
@@ -100,6 +113,8 @@ class BatchElementWiseBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, input_one, input_two):
+        # [FUNCTION DOC] If the op callable is einsum, compute the elementwise product via an
+        # einsum subscript spec; otherwise call torch.mul. Returns the BxMxN result.
         if self.op_func.__name__ == "einsum":
             return torch.einsum("bij,bij->bij", input_one, input_two)
         else:

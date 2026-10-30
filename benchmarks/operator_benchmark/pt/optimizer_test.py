@@ -1,3 +1,7 @@
+# [MODULE DOC] Operator microbenchmark for single optimizer steps (AdamW, Adam, SGD, RMSprop,
+# Adagrad) on one large CUDA float32 parameter with a random gradient, for three sizes. Tests are
+# registered from the op list at import time. Includes a memory traffic estimate. Running as a
+# script starts the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -26,7 +30,13 @@ optimizer_configs_long = op_bench.cross_product_configs(
 
 
 class OptimizerBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for one optimizer step on a single parameter tensor. State: the
+    # optimizer class in op_func, the parameter with a preset gradient, and the optimizer instance.
     def init(self, op_func, device, shape):
+        # [FUNCTION DOC] Create a random float32 parameter requiring grad of the given shape on the
+        # device and assign it a random gradient. Builds the optimizer with learning rate 0.001
+        # over that parameter, adding momentum 0.9 for SGD only. Stores the parameter as a
+        # dummy input.
         self.op_func = op_func
         self.param = torch.randn(
             shape, device=device, requires_grad=True, dtype=torch.float32
@@ -39,10 +49,15 @@ class OptimizerBenchmark(op_bench.TorchBenchmarkBase):
         self.inputs = {"dummy": self.param}
 
     def forward(self, dummy):
+        # [FUNCTION DOC] Run one optimizer step, which updates the parameter in place, and return
+        # the parameter. The dummy argument is unused.
         self.optimizer.step()
         return self.param
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate bytes moved by one step as parameter element count times element
+        # size times a fixed multiplier: seven for Adam and AdamW (parameter, gradient and two
+        # moment buffers read; parameter and moments written), five for every other optimizer.
         # Memory traffic calculation for bandwidth
         total_elements = self.param.numel()
         bytes_per_element = self.param.element_size()

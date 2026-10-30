@@ -1,3 +1,8 @@
+# [MODULE DOC] Operator microbenchmarks for torch.cat with an explicit out tensor. Defines config
+# sets (short, static runtime, long, multidim for the more-than-4-dimension CUDA path, and
+# many-inputs), run on CPU and CUDA. Size entries may be callables that draw random sizes, resolved
+# when a benchmark is initialized. Tests are registered at import time. Running as a script starts
+# the op_bench runner.
 import random
 
 import operator_benchmark as op_bench
@@ -121,7 +126,15 @@ cat_configs_manyinputs = op_bench.config_list(
 
 
 class CatBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark that concatenates a list of random tensors along a dimension into a
+    # preallocated empty out tensor. State in the inputs mapping: result, inputs list and dim.
     def init(self, sizes, N, dim, device):
+        # [FUNCTION DOC] Seed the random module with 42, then build the list of input shapes. If
+        # sizes is a list and N is -1, sizes is used directly as the list of shapes. Otherwise N
+        # shapes are generated, each by resolving every entry of sizes (calling it when callable).
+        # Creates a random tensor per shape on the device plus an empty result tensor, stores
+        # result, inputs and dim in the inputs mapping and sets the module name to cat.
+        # Returns nothing.
         random.seed(42)
         inputs = []
         gen_sizes = []
@@ -143,6 +156,7 @@ class CatBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("cat")
 
     def forward(self, result: torch.Tensor, inputs: list[torch.Tensor], dim: int):
+        # [FUNCTION DOC] Concatenate the input tensors along dim into result and return it.
         return torch.cat(inputs, dim=dim, out=result)
 
 

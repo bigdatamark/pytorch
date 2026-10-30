@@ -1,3 +1,6 @@
+# [MODULE DOC] Operator microbenchmarks for the boolean reductions all and any on random bool
+# tensors, on CPU and CUDA. Registers tests at import time with long and short configs for all, and
+# a separate config set for any. Running as a script starts the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -26,13 +29,17 @@ all_short_configs = op_bench.config_list(
 
 
 class AllBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for the all reduction over a random boolean MxNxK tensor.
     def init(self, M, N, K, device):
+        # [FUNCTION DOC] Create a random boolean tensor of shape MxNxK on the device, store it in
+        # the inputs mapping and set the reported module name to all. Returns nothing.
         self.inputs = {
             "input_one": torch.randint(0, 2, (M, N, K), device=device, dtype=torch.bool)
         }
         self.set_module_name("all")
 
     def forward(self, input_one):
+        # [FUNCTION DOC] Return the all reduction of input_one, a single boolean scalar tensor.
         return torch.all(input_one)
 
 
@@ -50,13 +57,17 @@ op_bench.generate_pt_test(all_long_configs + all_short_configs, AllBenchmark)
 
 
 class AnyBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for the any reduction over a random boolean MxN tensor.
     def init(self, M, N, device):
+        # [FUNCTION DOC] Create a random boolean tensor of shape MxN on the device, store it in the
+        # inputs mapping and set the reported module name to any. Returns nothing.
         self.inputs = {
             "input_one": torch.randint(0, 2, (M, N), device=device, dtype=torch.bool)
         }
         self.set_module_name("any")
 
     def forward(self, input_one):
+        # [FUNCTION DOC] Return the any reduction of input_one, a single boolean scalar tensor.
         return torch.any(input_one)
 
 

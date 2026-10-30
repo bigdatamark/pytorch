@@ -1,3 +1,6 @@
+# [MODULE DOC] Operator microbenchmark for torch.gather on a random MxN matrix along dimension 0 or
+# 1, on CPU and CUDA, with short and long configs. Registers tests at import time. Running as a
+# script starts the op_bench runner.
 import numpy
 
 import operator_benchmark as op_bench
@@ -27,7 +30,12 @@ gather_configs_long = op_bench.cross_product_configs(
 
 
 class GatherBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for gather with a random integer index tensor of the same shape as the
+    # input. State in the inputs mapping: input_one, dim and index.
     def init(self, M, N, dim, device):
+        # [FUNCTION DOC] Seed numpy with a fixed value, create a random MxN input on the device and
+        # an MxN integer index tensor with values below the input size along dim (M for dim 0, else
+        # N). Stores input, dim and index in the inputs mapping and sets the module name to gather.
         min_val = M if dim == 0 else N
         numpy.random.seed((1 << 32) - 1)
         self.inputs = {
@@ -40,6 +48,8 @@ class GatherBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("gather")
 
     def forward(self, input_one, dim: int, index):
+        # [FUNCTION DOC] Gather values of input_one along dim at the positions given by index and
+        # return the result, which has the shape of index.
         return torch.gather(input_one, dim, index)
 
 

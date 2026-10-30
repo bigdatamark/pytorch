@@ -1,3 +1,7 @@
+# [MODULE DOC] Operator microbenchmark for torch.nn.functional.interpolate. Defines config sets for
+# 4-D images (short and long, including a uint8 nearest-mode set), 3-D signals, 5-D volumes and
+# CUDA bicubic cases with high channel counts, then registers a test for each set in a loop at
+# import time. Running as a script starts the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -7,6 +11,8 @@ import torch
 
 
 class InterpolateBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for interpolate with selectable mode, memory format, dtype and device.
+    # State in the inputs mapping: input_image, output_size, mode and align_corners.
     def init(
         self,
         input_size,
@@ -16,6 +22,13 @@ class InterpolateBenchmark(op_bench.TorchBenchmarkBase):
         dtype=torch.float,
         device="cpu",
     ):
+        # [FUNCTION DOC] Build a random integer-valued image tensor (values 0 to 255) of input_size
+        # with the dtype and device; requires_grad comes from auto_set. If channels_last is true it
+        # is converted to channels_last for 4-D or channels_last_3d for 5-D, and any other rank
+        # raises ValueError. align_corners is unset for nearest mode and false otherwise. A generic
+        # linear mode is mapped by rank to linear, bilinear or trilinear (3-D, 4-D, 5-D). Stores
+        # image, size, mode and align_corners in the inputs mapping and sets the module name
+        # to interpolate.
         input_image = torch.randint(
             0,
             256,
@@ -55,6 +68,8 @@ class InterpolateBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("interpolate")
 
     def forward(self, input_image, output_size, mode, align_corners):
+        # [FUNCTION DOC] Resize input_image to output_size with the given mode and align_corners
+        # and return the result.
         return torch.nn.functional.interpolate(
             input_image, size=output_size, mode=mode, align_corners=align_corners
         )

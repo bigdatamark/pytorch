@@ -1,3 +1,7 @@
+# [MODULE DOC] Operator microbenchmark for nan_to_num and its in-place variant nan_to_num_ on
+# random CPU matrices with one NaN planted, over float and double and with or without keeping
+# infinities. Tests are registered from the op list at import time. Running as a script starts the
+# op_bench runner.
 import math
 
 import operator_benchmark as op_bench
@@ -36,7 +40,12 @@ nan_to_num_short_configs = op_bench.cross_product_configs(
 
 
 class ReplaceNaNBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for replacing NaN (and optionally infinities) in a random matrix. State
+    # in the inputs mapping: input and the replace_inf flag; op_func holds the chosen variant.
     def init(self, M, N, dtype, replace_inf, op_func):
+        # [FUNCTION DOC] Create a random MxN tensor of the given dtype and set its first element to
+        # NaN. Stores it with replace_inf in the inputs mapping, keeps op_func, and sets the module
+        # name to nan_to_num, or to nan_to_num_ for the in-place variant so test names stay unique.
         input = torch.randn(M, N, dtype=dtype)
         input[0][0] = float("nan")
         self.inputs = {"input": input, "replace_inf": replace_inf}
@@ -48,6 +57,9 @@ class ReplaceNaNBenchmark(op_bench.TorchBenchmarkBase):
             self.set_module_name("nan_to_num_")
 
     def forward(self, input, replace_inf: bool):
+        # [FUNCTION DOC] Run the op with NaN replaced by 1.0. If replace_inf is true, infinities
+        # take the default replacements; otherwise posinf and neginf are passed as the infinities
+        # themselves, so they are kept. The in-place variant mutates input. Returns the result.
         # compare inplace
         if replace_inf:
             return self.op_func(input, nan=1.0)

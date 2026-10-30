@@ -1,3 +1,6 @@
+# [MODULE DOC] Operator microbenchmark for the quantized linear_unpack_fp16 op, which recovers a
+# weight from its fp16 packed form. CPU only, with long and short configs. Registers tests at
+# import time. Running as a script starts the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -25,7 +28,12 @@ linear_unpack_fp16_short_configs = op_bench.config_list(
 
 
 class LinearUnpackFP16Benchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for unpacking an fp16 prepacked weight. The input is created by running
+    # the prepack op on a random tensor.
     def init(self, M, N, K, device):
+        # [FUNCTION DOC] Create a random float32 tensor of shape MxNxK on the device, run the
+        # quantized prepack op on it (the unpack op needs the prepack output as input), store the
+        # packed object in the inputs mapping and set the module name to linear_unpack_fp16.
         # input to unpack operator must be what the output is for prepack operator
         self.inputs = {
             "input_one": torch.ops.quantized.linear_prepack_fp16(
@@ -37,6 +45,7 @@ class LinearUnpackFP16Benchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("linear_unpack_fp16")
 
     def forward(self, input_one):
+        # [FUNCTION DOC] Run the quantized unpack op on the packed input_one and return the result.
         return torch.ops.quantized.linear_unpack_fp16(input_one)
 
 

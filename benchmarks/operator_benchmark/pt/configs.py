@@ -1,3 +1,8 @@
+# [MODULE DOC] Config lists shared by several operator benchmarks (conv, linear, embedding) plus
+# helpers that filter config lists by device or platform. All configs are built with op_bench
+# config helpers at import time. Each config is a list of single-entry mappings, one per attribute.
+# Covers conv1d, convtranspose1d, conv2d, pointwise conv2d, conv3d, linear, embedding bag and
+# embedding configs, with short and long variants and cpu/cuda/xpu devices.
 import operator_benchmark as op_bench
 
 import torch
@@ -9,16 +14,23 @@ Configs shared by multiple benchmarks
 
 
 def remove_cuda(config_list):
+    # [FUNCTION DOC] Return the configs of config_list that do not contain a device entry for cuda.
+    # Pure function; the input list is not modified.
     cuda_config = {"device": "cuda"}
     return [config for config in config_list if cuda_config not in config]
 
 
 def remove_cpu(config_list):
+    # [FUNCTION DOC] Return the configs of config_list that do not contain a device entry for cpu.
+    # Pure function; the input list is not modified.
     cpu_config = {"device": "cpu"}
     return [config for config in config_list if cpu_config not in config]
 
 
 def remove_rocm_slow_3d_transpose(config_list):
+    # [FUNCTION DOC] On ROCm (HIP) builds, drop configs that have both kernel size 5 and stride 2,
+    # because ConvTranspose3d runs for hours on them. On other builds return the list unchanged.
+    # The check uses the runtime HIP version since ROCm devices report cuda.
     # ConvTranspose3d gradient/compile on ROCm (e.g. gfx950) spends ~1-2h per
     # kernel=5, stride=2 config going through MIOpen generic-solver fallbacks,
     # pushing the operator_microbenchmark job past its timeout (see

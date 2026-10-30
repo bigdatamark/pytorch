@@ -1,3 +1,6 @@
+# [MODULE DOC] Operator microbenchmark for the in-place index_add_ method on a random MxNxK tensor
+# along dimension 0, 1 or 2 (float dtype). Short configs run on CPU, long configs on CPU and CUDA.
+# Registers tests at import time. Running as a script starts the op_bench runner.
 import numpy
 
 import operator_benchmark as op_bench
@@ -28,7 +31,14 @@ configs_long = op_bench.cross_product_configs(
 
 
 class IndexAddBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for index_add_ with a random subset of indices along the chosen
+    # dimension. State in the inputs mapping: tensor, dim, index and source.
     def init(self, M, N, K, dim, dtype, device):
+        # [FUNCTION DOC] Create a random MxNxK tensor, choose a random count (at least one) of
+        # distinct indices along dim using the unseeded numpy generator, and build a source tensor
+        # whose size along dim equals that count. Stores tensor, dim, index and source in the
+        # inputs mapping and sets the module name to index_add_. The index count is therefore not
+        # reproducible between runs.
         # creating the original tensor
         tensor = torch.rand(M, N, K, dtype=dtype, device=device)
 
@@ -52,6 +62,8 @@ class IndexAddBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("index_add_")
 
     def forward(self, tensor, dim, index, source):
+        # [FUNCTION DOC] Add source into tensor in place along dim at the given indices and return
+        # tensor. The tensor is mutated by every call.
         return tensor.index_add_(dim, index, source)
 
 

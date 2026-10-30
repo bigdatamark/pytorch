@@ -1,3 +1,9 @@
+# [MODULE DOC] Operator microbenchmarks for convolution modules: Conv1d, ConvTranspose1d, Conv2d,
+# ConvTranspose2d, pointwise Conv2d, Conv3d and ConvTranspose3d. Config lists come from the shared
+# pt configs module. Each benchmark builds a module and an input, and reports a memory traffic
+# estimate (input, weight and output elements times element size; bias is not counted). Forward
+# tests are registered for all, gradient tests for non-CPU configs, all at import time. Running as
+# a script starts the op_bench runner.
 from pt import configs
 
 import operator_benchmark as op_bench
@@ -12,7 +18,12 @@ Microbenchmarks for Conv1d and ConvTranspose1d operators.
 
 
 class Conv1dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a Conv1d module. State: the input tensor in the inputs mapping and
+    # the conv1d module.
     def init(self, IC, OC, kernel, stride, N, L, device):
+        # [FUNCTION DOC] Create a random input of shape N x IC x L (requires_grad from auto_set)
+        # and a Conv1d module with the given channels, kernel and stride on the device. Sets the
+        # module name.
         self.inputs = {
             "input": torch.rand(N, IC, L, device=device, requires_grad=self.auto_set())
         }
@@ -20,9 +31,13 @@ class Conv1dBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("Conv1d")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the convolution module to input and return the output.
         return self.conv1d(input)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate memory traffic in bytes as input plus weight plus output element
+        # counts times the element size. The output size is found by running the module once
+        # without gradients.
         """Calculate memory traffic for Conv1d: read(input + weight) + write(output)"""
         input_tensor = self.inputs["input"]
         # Run forward to get output shape
@@ -42,7 +57,11 @@ class Conv1dBenchmark(op_bench.TorchBenchmarkBase):
 
 
 class ConvTranspose1dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a ConvTranspose1d module. State: the input tensor in the inputs
+    # mapping and the convtranspose1d module.
     def init(self, IC, OC, kernel, stride, N, L, device):
+        # [FUNCTION DOC] Create a random input of shape N x IC x L and a ConvTranspose1d module
+        # with the given channels, kernel and stride on the device. Sets the module name.
         self.inputs = {"input": torch.rand(N, IC, L, device=device)}
         self.convtranspose1d = nn.ConvTranspose1d(IC, OC, kernel, stride=stride).to(
             device=device
@@ -50,9 +69,13 @@ class ConvTranspose1dBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("ConvTranspose1d")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the transposed convolution module to input and return the output.
         return self.convtranspose1d(input)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate memory traffic in bytes as input plus weight plus output element
+        # counts times the element size. The output size is found by running the module once
+        # without gradients.
         """Calculate memory traffic for ConvTranspose1d: read(input + weight) + write(output)"""
         input_tensor = self.inputs["input"]
         # Run forward to get output shape
@@ -93,7 +116,11 @@ Microbenchmarks for Conv2d, ConvTranspose2d, and Conv2dPointwise operators.
 
 
 class Conv2dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a Conv2d module with groups and padding. State: input tensor in the
+    # inputs mapping and the conv2d module.
     def init(self, IC, OC, kernel, stride, N, H, W, G, pad, device):
+        # [FUNCTION DOC] Create a random input of shape N x IC x H x W and a Conv2d module with the
+        # given channels, kernel, stride, groups G and padding on the device. Sets the module name.
         self.inputs = {"input": torch.rand(N, IC, H, W, device=device)}
         self.conv2d = nn.Conv2d(
             IC, OC, kernel, stride=stride, groups=G, padding=pad
@@ -101,9 +128,13 @@ class Conv2dBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("Conv2d")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the convolution module to input and return the output.
         return self.conv2d(input)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate memory traffic in bytes as input plus weight plus output element
+        # counts times the element size. The output size is found by running the module once
+        # without gradients.
         """Calculate memory traffic for Conv2d: read(input + weight) + write(output)"""
         input_tensor = self.inputs["input"]
         # Run forward to get output shape
@@ -123,7 +154,12 @@ class Conv2dBenchmark(op_bench.TorchBenchmarkBase):
 
 
 class ConvTranspose2dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a ConvTranspose2d module with groups and padding. State: input
+    # tensor in the inputs mapping and the convtranspose2d module.
     def init(self, IC, OC, kernel, stride, N, H, W, G, pad, device):
+        # [FUNCTION DOC] Create a random input of shape N x IC x H x W and a ConvTranspose2d module
+        # with the given channels, kernel, stride, groups G and padding on the device. Sets the
+        # module name.
         self.inputs = {"input": torch.rand(N, IC, H, W, device=device)}
         self.convtranspose2d = nn.ConvTranspose2d(
             IC, OC, kernel, stride=stride, groups=G, padding=pad
@@ -131,9 +167,13 @@ class ConvTranspose2dBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("ConvTranspose2d")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the transposed convolution module to input and return the output.
         return self.convtranspose2d(input)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate memory traffic in bytes as input plus weight plus output element
+        # counts times the element size. The output size is found by running the module once
+        # without gradients.
         """Calculate memory traffic for ConvTranspose2d: read(input + weight) + write(output)"""
         input_tensor = self.inputs["input"]
         # Run forward to get output shape
@@ -153,7 +193,13 @@ class ConvTranspose2dBenchmark(op_bench.TorchBenchmarkBase):
 
 
 class Conv2dPointwiseBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for pointwise convolution: a Conv2d module whose kernel size is fixed
+    # to one, with groups and padding. State: input tensor in the inputs mapping and the
+    # conv2d module.
     def init(self, IC, OC, stride, N, H, W, G, pad, device):
+        # [FUNCTION DOC] Create a random input of shape N x IC x H x W and a Conv2d module with
+        # kernel size one, the given stride, groups G and padding on the device. Sets the
+        # module name.
         self.inputs = {"input": torch.rand(N, IC, H, W, device=device)}
         # Use 1 as kernel for pointwise convolution
         self.conv2d = nn.Conv2d(IC, OC, 1, stride=stride, groups=G, padding=pad).to(
@@ -162,9 +208,13 @@ class Conv2dPointwiseBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("Conv2dPointwise")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the pointwise convolution module to input and return the output.
         return self.conv2d(input)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate memory traffic in bytes as input plus weight plus output element
+        # counts times the element size. The output size is found by running the module once
+        # without gradients.
         """Calculate memory traffic for Conv2dPointwise: read(input + weight) + write(output)"""
         input_tensor = self.inputs["input"]
         # Run forward to get output shape
@@ -216,7 +266,12 @@ Microbenchmarks for Conv3d and ConvTranspose3d operators.
 
 
 class Conv3dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a Conv3d module with a configurable dtype (float32 by default).
+    # State: input tensor in the inputs mapping and the conv3d module.
     def init(self, IC, OC, kernel, stride, N, D, H, W, device, dtype=torch.float32):
+        # [FUNCTION DOC] Create a random input of shape N x IC x D x H x W with the dtype and a
+        # Conv3d module with the given channels, kernel and stride, moved to the device and dtype.
+        # Sets the module name.
         self.inputs = {"input": torch.rand(N, IC, D, H, W, device=device, dtype=dtype)}
         self.conv3d = nn.Conv3d(IC, OC, kernel, stride=stride).to(
             device=device, dtype=dtype
@@ -224,9 +279,13 @@ class Conv3dBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("Conv3d")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the convolution module to input and return the output.
         return self.conv3d(input)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate memory traffic in bytes as input plus weight plus output element
+        # counts times the element size. The output size is found by running the module once
+        # without gradients.
         """Calculate memory traffic for Conv3d: read(input + weight) + write(output)"""
         input_tensor = self.inputs["input"]
         # Run forward to get output shape
@@ -246,7 +305,12 @@ class Conv3dBenchmark(op_bench.TorchBenchmarkBase):
 
 
 class ConvTranspose3dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a ConvTranspose3d module with a configurable dtype (float32 by
+    # default). State: input tensor in the inputs mapping and the convtranspose3d module.
     def init(self, IC, OC, kernel, stride, N, D, H, W, device, dtype=torch.float32):
+        # [FUNCTION DOC] Create a random input of shape N x IC x D x H x W with the dtype and a
+        # ConvTranspose3d module with the given channels, kernel and stride, moved to the device
+        # and dtype. Sets the module name.
         self.inputs = {"input": torch.rand(N, IC, D, H, W, device=device, dtype=dtype)}
         self.convtranspose3d = nn.ConvTranspose3d(IC, OC, kernel, stride=stride).to(
             device=device, dtype=dtype
@@ -254,9 +318,13 @@ class ConvTranspose3dBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("ConvTranspose3d")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the transposed convolution module to input and return the output.
         return self.convtranspose3d(input)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate memory traffic in bytes as input plus weight plus output element
+        # counts times the element size. The output size is found by running the module once
+        # without gradients.
         """Calculate memory traffic for ConvTranspose3d: read(input + weight) + write(output)"""
         input_tensor = self.inputs["input"]
         # Run forward to get output shape

@@ -1,3 +1,7 @@
+# [MODULE DOC] Operator microbenchmark for concatenation of two quantized tensors through a
+# QFunctional module. Varies the dtype and whether none, one or both operands are non-contiguous.
+# Short and long config sets; tests are registered at import time. Running as a script starts the
+# op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -33,7 +37,17 @@ qcat_configs_long = op_bench.cross_product_configs(
 
 
 class QCatBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for QFunctional cat on a pair of quantized MxNxK tensors. State: the
+    # QFunctional module with scale and zero point set, and the tensor pair plus dim in the
+    # inputs mapping.
     def init(self, M, N, K, L, dim, contig, dtype):
+        # [FUNCTION DOC] Create a random MxNxK float tensor, quantize it per tensor with scale 1.0
+        # and zero point 0 in the dtype, and configure a QFunctional with the same scale and zero
+        # point. Builds a non-contiguous copy of the same shape by reversing dimensions, making
+        # contiguous and reversing back. The pair is both contiguous for contig all, one of each
+        # for one, and both non-contiguous for none. Stores the pair and dim in the inputs mapping
+        # and sets the module name to qcat. Raises AssertionError for any other contig value.
+        # KNOWN ISSUE: the config attribute L is accepted but never used.
         f_input = (torch.rand(M, N, K) - 0.5) * 256
         self.qf = nnq.QFunctional()
         scale = 1.0
@@ -60,6 +74,8 @@ class QCatBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("qcat")
 
     def forward(self, input: list[torch.Tensor], dim: int):
+        # [FUNCTION DOC] Concatenate the pair of quantized tensors along dim with the QFunctional
+        # module and return the quantized result.
         return self.qf.cat(input, dim=dim)
 
 

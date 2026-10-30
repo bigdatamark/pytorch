@@ -1,3 +1,6 @@
+# [MODULE DOC] Operator microbenchmark for the Hardswish module on random NCHW CPU tensors. The op
+# list holds the module class, which is instantiated per benchmark. Registers tests from the op
+# list with short and long configs at import time. Running as a script starts the runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -37,11 +40,16 @@ hardswish_ops_list = op_bench.op_list(
 
 
 class HardswishBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for an activation module class applied to a random NxCxHxW tensor.
     def init(self, N, C, H, W, device, op_func):
+        # [FUNCTION DOC] Create a random NxCxHxW tensor on the device, store it in the inputs
+        # mapping and instantiate op_func (a module class) with no arguments, keeping the instance.
+        # Returns nothing.
         self.inputs = {"input_one": torch.rand(N, C, H, W, device=device)}
         self.op_func = op_func()
 
     def forward(self, input_one):
+        # [FUNCTION DOC] Apply the activation module instance to input_one and return the result.
         return self.op_func(input_one)
 
 

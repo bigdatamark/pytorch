@@ -1,3 +1,9 @@
+# [MODULE DOC] Operator microbenchmarks for quantized activations. Long configs use VGG-16 ReLU
+# shapes (with and without a batch of 16) in quint8; short configs use small shapes in quint8,
+# qint8 and qint32. One benchmark class calls activations taking only the tensor (relu, relu6,
+# hardtanh, hardsigmoid, leaky_relu, sigmoid, tanh); another calls ones needing scale and zero
+# point (hardswish, elu, celu). Tests are registered at import time. Running as a script starts the
+# op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -56,9 +62,15 @@ qactivation_ops = op_bench.op_list(
 
 
 class QActivationBenchmarkBase(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Base class for the quantized activation benchmarks. It builds a per-tensor
+    # quantized input and stores the activation callable in qop; subclasses define forward.
     r"""Base class for all the activations."""
 
     def _setup(self, dims, contig, dtype):
+        # [FUNCTION DOC] HELPER: Create a random float tensor of the given dims scaled to roughly
+        # minus 128 to 128, quantize it per tensor with scale 1.0 and zero point 0 in the given
+        # dtype (both kept as attributes), and if contig is false reverse the dimension order with
+        # a permute so the tensor is non-contiguous. Stores it as q_input in the inputs mapping.
         # Input
         f_input = (torch.rand(*dims) - 0.5) * 256
         self.scale = 1.0
@@ -76,12 +88,18 @@ class QActivationBenchmarkBase(op_bench.TorchBenchmarkBase):
         self.inputs = {"q_input": q_input}
 
     def init(self, dims, contig, inplace, dtype, op_func):
+        # [FUNCTION DOC] Build the quantized input through the setup helper and keep op_func as the
+        # activation callable.
+        # KNOWN ISSUE: the inplace config value is accepted but never used, so inplace true and
+        # false configs produce identical benchmarks.
         self._setup(dims, contig, dtype)
         self.qop = op_func
 
 
 class QActivationBenchmark(QActivationBenchmarkBase):
+    # [CLASS DOC] Benchmark for activations that take only the quantized tensor.
     def forward(self, q_input):
+        # [FUNCTION DOC] Apply the activation to q_input and return the quantized result.
         return self.qop(q_input)
 
 
@@ -103,7 +121,11 @@ qactivation_scale_zero_point_ops = op_bench.op_list(
 
 
 class QActivationScaleZeroPointBenchmark(QActivationBenchmarkBase):
+    # [CLASS DOC] Benchmark for activations that also take explicit output scale and zero point,
+    # reusing the values chosen when the input was quantized.
     def forward(self, q_input):
+        # [FUNCTION DOC] Apply the activation to q_input with the stored scale and zero point and
+        # return the quantized result.
         return self.qop(q_input, scale=self.scale, zero_point=self.zero_point)
 
 

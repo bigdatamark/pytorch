@@ -1,3 +1,8 @@
+# [MODULE DOC] Operator microbenchmark for torch.matmul of an MxN by an NxK matrix, with optional
+# transposed (non-contiguous) operand layouts. Short configs run on cpu, cuda and xpu; long configs
+# on cuda and xpu with half, bfloat16 and float32. Forward tests for all configs and gradient tests
+# for long configs are registered at import time. Includes a memory traffic estimate. Running as a
+# script starts the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -31,7 +36,14 @@ mm_long_configs = op_bench.cross_product_configs(
 
 
 class MatMulBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for matmul with controllable operand layout. State in the inputs
+    # mapping: input_one (MxN) and input_two (NxK).
     def init(self, M, N, K, trans_a, trans_b, device, dtype=torch.float):
+        # [FUNCTION DOC] Create random operands. If trans_a is true, input_one is created directly
+        # as MxN, otherwise as NxM and transposed. If trans_b is true, input_two is created
+        # directly as NxK, otherwise as KxN and transposed. Each tensor gets requires_grad set
+        # afterwards if the harness auto_set flag says so, avoiding non-leaf copies. Stores both in
+        # the inputs mapping and sets the module name to matmul.
         # Create tensors without requires_grad first, then set it separately
         # This avoids creating graph leaves that cannot be deep copied
         if trans_a:
@@ -57,9 +69,13 @@ class MatMulBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("matmul")
 
     def forward(self, input_one, input_two):
+        # [FUNCTION DOC] Return the matrix product of input_one and input_two.
         return torch.matmul(input_one, input_two)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate bytes moved by one call as elements read from both inputs plus
+        # elements written to the MxK output, times the element size of input_one. Raises
+        # AssertionError if the inner dimensions of the two inputs differ.
         """Override for matmul: (M, N) @ (N, K) -> (M, K)
         Memory traffic: read(M*N + N*K) + write(M*K)
         """

@@ -1,3 +1,6 @@
+# [MODULE DOC] Operator microbenchmark for the quantized linear_prepack_fp16 op, which packs a
+# float32 weight into half-precision form. CPU only, with long and short configs. Registers tests
+# at import time. Running as a script starts the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -25,7 +28,10 @@ linear_prepack_fp16_short_configs = op_bench.config_list(
 
 
 class LinearPrepackFP16Benchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for prepacking a random float32 tensor of shape MxNxK to fp16.
     def init(self, M, N, K, device):
+        # [FUNCTION DOC] Create a random float32 tensor of shape MxNxK on the device without
+        # gradients, store it in the inputs mapping and set the module name to linear_prepack_fp16.
         self.inputs = {
             "input_one": torch.rand(
                 M, N, K, device=device, requires_grad=False, dtype=torch.float32
@@ -34,6 +40,7 @@ class LinearPrepackFP16Benchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("linear_prepack_fp16")
 
     def forward(self, input_one):
+        # [FUNCTION DOC] Run the quantized prepack op on input_one and return the packed result.
         return torch.ops.quantized.linear_prepack_fp16(input_one)
 
 

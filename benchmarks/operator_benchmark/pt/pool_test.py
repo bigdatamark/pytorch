@@ -1,3 +1,7 @@
+# [MODULE DOC] Operator microbenchmarks for pooling modules in 1-D, 2-D and 3-D: max and average
+# pooling, plus adaptive and fractional max pooling in 2-D and 3-D (wrapped in small adapters so
+# every op takes kernel and stride). Short and long configs on CPU and CUDA; tests are registered
+# from op lists at import time. Running as a script starts the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -40,11 +44,15 @@ pool_1d_ops_list = op_bench.op_list(
 
 
 class Pool1dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a 1-D pooling module applied to a random NxCxL tensor.
     def init(self, kernel, stride, N, C, L, device, op_func):
+        # [FUNCTION DOC] Create a random NxCxL input on the device, store it in the inputs mapping
+        # and build the pooling module from op_func with the kernel and stride. Returns nothing.
         self.inputs = {"input": torch.rand(N, C, L, device=device)}
         self.op_func = op_func(kernel, stride=stride)
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the pooling module to input and return the output.
         return self.op_func(input)
 
 
@@ -96,11 +104,17 @@ pool_2d_ops_list = op_bench.op_list(
 
 
 class Pool2dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a 2-D pooling module applied to a random NxCxHxW tensor.
     def init(self, kernel, stride, N, C, H, W, device, op_func):
+        # [FUNCTION DOC] Create a random NxCxHxW input on the device, store it in the inputs
+        # mapping and build the pooling module from op_func with the kernel and stride. For the
+        # adaptive variant the kernel is used as the output size and stride is ignored; the
+        # fractional variant uses an output size of two.
         self.inputs = {"input": torch.rand(N, C, H, W, device=device)}
         self.op_func = op_func(kernel, stride=stride)
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the pooling module to input and return the output.
         return self.op_func(input)
 
 
@@ -154,11 +168,17 @@ pool_3d_ops_list = op_bench.op_list(
 
 
 class Pool3dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a 3-D pooling module applied to a random NxCxDxHxW tensor.
     def init(self, kernel, stride, N, C, D, H, W, device, op_func):
+        # [FUNCTION DOC] Create a random NxCxDxHxW input on the device, store it in the inputs
+        # mapping and build the pooling module from op_func with the kernel and stride. For the
+        # adaptive variant the kernel is used as the output size and stride is ignored; the
+        # fractional variant uses an output size of two.
         self.inputs = {"input": torch.rand(N, C, D, H, W, device=device)}
         self.op_func = op_func(kernel, stride=stride)
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the pooling module to input and return the output.
         return self.op_func(input)
 
 

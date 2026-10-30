@@ -1,3 +1,8 @@
+# [MODULE DOC] Operator microbenchmarks for batched matrix multiply ops: bmm (two inputs) and
+# baddbmm (three inputs). Short configs run on CPU with float and bfloat16; long configs run on
+# CUDA with float32, bfloat16 and float16. Tests are registered at import time, including gradient
+# (backward) tests for the long configs. Both benchmark classes override the memory traffic
+# estimate. Running as a script starts the op_bench benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -38,7 +43,12 @@ batched_binary_configs_long = op_bench.cross_product_configs(
 
 
 class BatchedBinaryOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a two-operand batched matmul op taking tensors of shape BxMxN and
+    # BxNxK. Inputs live in the inputs mapping and require gradients when the harness asks for it.
     def init(self, B, M, N, K, device, dtype, op_func):
+        # [FUNCTION DOC] Create random tensors batch1 (B, M, N) and batch2 (B, N, K) on the device
+        # with the dtype; requires_grad follows the harness auto_set flag. Stores them in the
+        # inputs mapping and keeps op_func. Returns nothing.
         self.inputs = {
             "batch1": torch.rand(
                 (B, M, N), device=device, dtype=dtype, requires_grad=self.auto_set()
@@ -50,9 +60,13 @@ class BatchedBinaryOpBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, batch1, batch2):
+        # [FUNCTION DOC] Apply the batched matmul op to batch1 and batch2 and return the result.
         return self.op_func(batch1, batch2)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate bytes moved by one call: elements read from both inputs plus
+        # elements written to the output, times the element size of batch1. Raises AssertionError
+        # if the batch or inner dimensions of the two inputs disagree.
         """Override for bmm: (B, M, N) @ (B, N, K) -> (B, M, K)
         Memory traffic: read(B*M*N + B*N*K) + write(B*M*K)
         """
@@ -90,7 +104,12 @@ batched_ternary_ops = op_bench.op_list(
 
 
 class BatchedTernaryOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for the three-operand baddbmm op: an input of shape BxMxK plus batch1
+    # BxMxN and batch2 BxNxK. Inputs live in the inputs mapping.
     def init(self, B, M, N, K, device, dtype, op_func):
+        # [FUNCTION DOC] Create random tensors input_ (B, M, K), batch1 (B, M, N) and batch2 (B, N,
+        # K) on the device with the dtype; requires_grad follows the harness auto_set flag. Stores
+        # them in the inputs mapping and keeps op_func. Returns nothing.
         self.inputs = {
             "input_": torch.rand(
                 (B, M, K), device=device, dtype=dtype, requires_grad=self.auto_set()
@@ -105,9 +124,13 @@ class BatchedTernaryOpBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, input_, batch1, batch2):
+        # [FUNCTION DOC] Apply the op to input_, batch1 and batch2 and return the result.
         return self.op_func(input_, batch1, batch2)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate bytes moved by one call: elements read from input_, batch1 and
+        # batch2 plus the elements written to the output, times the element size of input_. Raises
+        # AssertionError if batch sizes differ or the M, N, K dimensions are inconsistent.
         """Override for baddbmm: input + (batch1 @ batch2) -> (B, M, K)
         Memory traffic: read(B*M*K + B*M*N + B*N*K) + write(B*M*K)
         """

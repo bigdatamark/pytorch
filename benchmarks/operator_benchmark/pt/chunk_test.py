@@ -1,3 +1,6 @@
+# [MODULE DOC] Operator microbenchmark for torch.chunk on random 2-D tensors, on CPU and CUDA, with
+# short and long config sets. Registers tests at import time. Running as a script starts the
+# op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -26,11 +29,15 @@ chunks_long_configs = op_bench.cross_product_configs(
 
 
 class ChunkBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for splitting a random MxN tensor into a number of chunks.
     def init(self, M, N, chunks, device):
+        # [FUNCTION DOC] Create a random MxN tensor on the device, store it with the chunk count in
+        # the inputs mapping and set the module name to chunk. Returns nothing.
         self.inputs = {"input_one": torch.rand(M, N, device=device), "chunks": chunks}
         self.set_module_name("chunk")
 
     def forward(self, input_one, chunks: int):
+        # [FUNCTION DOC] Split input_one into the requested number of chunks and return them.
         return torch.chunk(input_one, chunks)
 
 

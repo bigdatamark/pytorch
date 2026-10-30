@@ -1,3 +1,7 @@
+# [MODULE DOC] Operator microbenchmark for torch.mm. Short configs run on CPU in float; long
+# configs run on CUDA with half, bfloat16 and float32. Forward tests for all configs and gradient
+# tests for long configs are registered at import time. Includes a memory traffic estimate. Running
+# as a script starts the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -33,7 +37,10 @@ mm_long_configs = op_bench.cross_product_configs(
 
 
 class MmOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a two-operand matrix multiply op on random MxN and NxK matrices.
     def init(self, M, N, K, device, dtype, op_func):
+        # [FUNCTION DOC] Create standard-normal tensors of shape MxN and NxK with the dtype on the
+        # device (requires_grad from auto_set), store them in the inputs mapping and keep op_func.
         self.inputs = {
             "input_one": torch.randn(
                 M, N, device=device, requires_grad=self.auto_set(), dtype=dtype
@@ -45,9 +52,13 @@ class MmOpBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, input_one, input_two):
+        # [FUNCTION DOC] Apply the matrix multiply op to the two inputs and return the result.
         return self.op_func(input_one, input_two)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Estimate bytes moved by one call as elements read from both inputs plus
+        # elements written to the MxK output, times the element size of input_one. Raises
+        # AssertionError if the inner dimensions of the two inputs differ.
         """Override for matmul: (M, N) @ (N, K) -> (M, K)
         Memory traffic: read(M*N + N*K) + write(M*K)
         """

@@ -1,3 +1,7 @@
+# [MODULE DOC] Operator microbenchmarks for normalization modules on CUDA: LayerNorm and RMSNorm,
+# BatchNorm1d/2d/3d (training and eval modes) and GroupNorm. Each has a cross-product config set
+# tagged long; forward and gradient tests are registered at import time. Running as a script starts
+# the op_bench runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -29,7 +33,12 @@ layernorm_configs = op_bench.cross_product_configs(
 
 
 class LayerNormBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for LayerNorm or RMSNorm over the last dimension of a BxMxK tensor.
+    # State: the instantiated module in op_func and the input in the inputs mapping.
     def init(self, op_func, device, B, M, K):
+        # [FUNCTION DOC] Create a random BxMxK input (requires_grad from auto_set) and instantiate
+        # the given norm class with K as normalized size on the device. The module name is the
+        # class name.
         self.inputs = {
             "input": torch.rand(B, M, K, device=device, requires_grad=self.auto_set())
         }
@@ -38,6 +47,7 @@ class LayerNormBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name(op_func.__name__)
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the norm module to input and return the output.
         return self.op_func(input)
 
 
@@ -69,7 +79,11 @@ batchnorm1d_configs = op_bench.cross_product_configs(
 
 
 class BatchNorm1dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a BatchNorm1d module over a BxCxM input, in training or eval mode.
     def init(self, device, B, C, M, training):
+        # [FUNCTION DOC] Create a random BxCxM input (requires_grad from auto_set) and a
+        # BatchNorm1d module with C features on the device, switched to training or eval mode
+        # according to the training flag. Sets the module name to BatchNorm1d.
         self.inputs = {
             "input": torch.rand(B, C, M, device=device, requires_grad=self.auto_set())
         }
@@ -78,6 +92,7 @@ class BatchNorm1dBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("BatchNorm1d")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the batch norm module to input and return the output.
         return self.op_func(input)
 
 
@@ -108,7 +123,12 @@ batchnorm2d_configs = op_bench.cross_product_configs(
 
 
 class BatchNorm2dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a BatchNorm2d module over a BxCxHxW input, in training or
+    # eval mode.
     def init(self, device, B, C, H, W, training):
+        # [FUNCTION DOC] Create a random BxCxHxW input (requires_grad from auto_set) and a
+        # BatchNorm2d module with C features on the device, switched to training or eval mode
+        # according to the training flag. Sets the module name to BatchNorm2d.
         self.inputs = {
             "input": torch.rand(
                 B, C, H, W, device=device, requires_grad=self.auto_set()
@@ -119,6 +139,7 @@ class BatchNorm2dBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("BatchNorm2d")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the batch norm module to input and return the output.
         return self.op_func(input)
 
 
@@ -150,7 +171,12 @@ batchnorm3d_configs = op_bench.cross_product_configs(
 
 
 class BatchNorm3dBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a BatchNorm3d module over a BxCxDxHxW input, in training or
+    # eval mode.
     def init(self, device, B, C, D, H, W, training):
+        # [FUNCTION DOC] Create a random BxCxDxHxW input (requires_grad from auto_set) and a
+        # BatchNorm3d module with C features on the device, switched to training or eval mode
+        # according to the training flag. Sets the module name to BatchNorm3d.
         self.inputs = {
             "input": torch.rand(
                 B, C, D, H, W, device=device, requires_grad=self.auto_set()
@@ -161,6 +187,7 @@ class BatchNorm3dBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("BatchNorm3d")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the batch norm module to input and return the output.
         return self.op_func(input)
 
 
@@ -191,7 +218,11 @@ groupnorm_configs = op_bench.cross_product_configs(
 
 
 class GroupNormBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a GroupNorm module over a BxCxHxW input.
     def init(self, device, B, C, H, W, num_groups):
+        # [FUNCTION DOC] Create a random BxCxHxW input (requires_grad from auto_set) and a
+        # GroupNorm module with num_groups groups over C channels on the device. Sets the module
+        # name to GroupNorm.
         self.inputs = {
             "input": torch.rand(
                 B, C, H, W, device=device, requires_grad=self.auto_set()
@@ -201,6 +232,7 @@ class GroupNormBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("GroupNorm")
 
     def forward(self, input):
+        # [FUNCTION DOC] Apply the group norm module to input and return the output.
         return self.op_func(input)
 
 

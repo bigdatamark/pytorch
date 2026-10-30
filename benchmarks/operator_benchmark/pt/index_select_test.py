@@ -1,3 +1,6 @@
+# [MODULE DOC] Operator microbenchmark for torch.index_select on a random MxNxK tensor along
+# dimension 1, on CPU and CUDA, with short and long configs. Registers tests at import time.
+# Running as a script starts the op_bench runner.
 import numpy
 
 import operator_benchmark as op_bench
@@ -36,7 +39,13 @@ index_select_configs_long = op_bench.cross_product_configs(
 
 
 class IndexSelectBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for index_select with a random integer index vector. State in the
+    # inputs mapping: input_one, dim and index.
     def init(self, M, N, K, dim, device):
+        # [FUNCTION DOC] Seed numpy with a fixed value, create a random MxNxK input on the device
+        # and an index vector of random length (zero up to N minus one) with values below N. Stores
+        # input, dim and index in the inputs mapping and sets the module name to index_select. The
+        # index length can be zero, giving an empty selection.
         max_val = N
         numpy.random.seed((1 << 32) - 1)
         index_dim = numpy.random.randint(0, N)
@@ -50,6 +59,8 @@ class IndexSelectBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("index_select")
 
     def forward(self, input_one, dim, index):
+        # [FUNCTION DOC] Select entries of input_one along dim at the positions in index and
+        # return them.
         return torch.index_select(input_one, dim, index)
 
 

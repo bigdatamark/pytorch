@@ -1,3 +1,8 @@
+# [MODULE DOC] Operator microbenchmarks for quantization-aware-training Embedding and EmbeddingBag
+# modules from torch.ao.nn.qat, using the default embedding QAT qconfig and the shared embedding
+# configs from the pt configs module. EmbeddingBag configs with sparse set are filtered out because
+# QAT does not support them. Forward and gradient tests are registered at import time. Running as a
+# script starts the op_bench runner.
 import numpy
 from pt import configs
 
@@ -14,6 +19,8 @@ Microbenchmarks for QAT Embedding + EmbeddingBag operators.
 
 
 class QATEmbeddingBagBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a QAT EmbeddingBag module. State: the embedding module, plus an
+    # index tensor and an offsets tensor in the inputs mapping.
     def init(
         self,
         embeddingbags,
@@ -25,6 +32,12 @@ class QATEmbeddingBagBenchmark(op_bench.TorchBenchmarkBase):
         include_last_offset,
         device,
     ):
+        # [FUNCTION DOC] Build a QAT EmbeddingBag with the given table size, dim, mode, sparse and
+        # include_last_offset options and the default embedding QAT qconfig on the device. Seeds
+        # numpy, draws random indices below the table size, and builds an offsets tensor from the
+        # first offset followed by the number of indices. Stores both in the inputs mapping and
+        # sets the module name to qatEmbeddingBag. The offsets concatenation mixes a device tensor
+        # with a CPU one, so only CPU configs work.
         qconfig = default_embedding_qat_qconfig
         self.embedding = nnqat.EmbeddingBag(
             num_embeddings=embeddingbags,
@@ -49,6 +62,8 @@ class QATEmbeddingBagBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("qatEmbeddingBag")
 
     def forward(self, input, offset):
+        # [FUNCTION DOC] Look up and reduce the bags of input indices using offset; return
+        # the result.
         return self.embedding(input, offset)
 
 
@@ -66,7 +81,13 @@ op_bench.generate_pt_gradient_test(
 
 
 class QATEmbeddingBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for a QAT Embedding module. State: the embedding module and an index
+    # tensor, also kept as an attribute named input.
     def init(self, num_embeddings, embedding_dim, input_size, device):
+        # [FUNCTION DOC] Build a QAT Embedding of the given size and dim with the default embedding
+        # QAT qconfig on the device (the qconfig is also assigned again afterwards). Seeds numpy,
+        # draws input_size random indices below the table size, stores them in the inputs mapping
+        # and sets the module name to qatEmbedding.
         qconfig = default_embedding_qat_qconfig
         self.embedding = nnqat.Embedding(
             num_embeddings=num_embeddings,
@@ -83,6 +104,7 @@ class QATEmbeddingBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("qatEmbedding")
 
     def forward(self, input):
+        # [FUNCTION DOC] Return the embedding vectors for the input indices.
         return self.embedding(input)
 
 

@@ -1,3 +1,8 @@
+# [MODULE DOC] Operator microbenchmark for the fb clip_ranges custom op. At import time this loads
+# an internal sparsenn operator library through torch.ops, then builds long and short config sets
+# and registers tests.
+# KNOWN ISSUE: the library path is internal to Meta; importing this module elsewhere raises an
+# error because the library cannot be loaded, and the op fb.clip_ranges would be missing.
 import operator_benchmark as op_bench
 
 import torch
@@ -35,7 +40,11 @@ clip_ranges_short_configs = op_bench.config_list(
 
 
 class ClipRangesBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for clip_ranges applied to a random LENGTHxMxN tensor cast to dtype.
     def init(self, LENGTH, M, N, MAX_LENGTH, device, dtype):
+        # [FUNCTION DOC] Create a random tensor of shape LENGTHxMxN on the device and cast it to
+        # dtype, store it with MAX_LENGTH in the inputs mapping and set the module name
+        # to clip_ranges.
         self.inputs = {
             "input": torch.rand(LENGTH, M, N, device=device).type(dtype),
             "max_length": MAX_LENGTH,
@@ -43,6 +52,8 @@ class ClipRangesBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("clip_ranges")
 
     def forward(self, input, max_length: int):
+        # [FUNCTION DOC] Call the custom fb clip_ranges op on input with the maximum length and
+        # return its result.
         return torch.ops.fb.clip_ranges(input, max_length)
 
 
