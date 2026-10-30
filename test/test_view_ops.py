@@ -1,4 +1,11 @@
 # Owner(s): ["module: tests"]
+# [MODULE DOC] Tests for view semantics of tensor operations. TestViewOps checks that ops (dtype
+# view, complex/real views, splits, indexing, transpose, reshape, flatten, etc.) return views
+# sharing storage with their base, or fresh tensors where required, including write propagation
+# and gradients. TestOldViewOps holds older shape-manipulation tests (ravel, expand, reshape,
+# flatten, narrow, split, chunk, broadcast, resize, tensor_split, and more). Both classes are
+# made device-generic by instantiate_device_type_tests at the end of the module; running as a
+# script calls run_tests.
 import random
 import unittest
 from functools import partial
@@ -41,6 +48,11 @@ from torch.testing._internal.common_utils import (
 
 # TODO: replace this with make_tensor() in common_utils.py
 def _generate_input(shape, dtype, device, with_extremal):
+# [FUNCTION DOC] HELPER: Build a random tensor of the given shape, dtype and device. An empty
+# shape tuple yields an empty tensor. Floating and complex dtypes get scaled normal values with
+# about half of the entries zeroed; when with_extremal is true, floating or complex tensors also
+# get random entries set to nan, inf and negative inf. Bool dtype gets random true entries, and
+# other dtypes get random integers from 15 to 99. Returns the tensor.
     if shape == ():
         x = torch.tensor((), dtype=dtype, device=device)
     else:
@@ -68,6 +80,8 @@ def _generate_input(shape, dtype, device, with_extremal):
 
 
 def _rand_shape(dim, min_size, max_size):
+# [FUNCTION DOC] HELPER: Return a tuple of dim random integers, each between min_size and
+# max_size inclusive.
     shape = []
     for _ in range(dim):
         shape.append(random.randint(min_size, max_size))
@@ -78,6 +92,10 @@ def _rand_shape(dim, min_size, max_size):
 # Returns a tensor of the requested shape, dtype, and device.
 # Initialization uses randint for non-float types and randn for float types.
 def _make_tensor(shape, dtype, device, fill_ones=False) -> torch.Tensor:
+# [FUNCTION DOC] HELPER: Return a tensor of the given shape, dtype and device. With fill_ones it
+# is all ones. Otherwise integer dtypes get random integers from 0 to 9, shifted by minus five
+# (to include negatives) unless the dtype is uint8, then cast to dtype; floating and complex
+# dtypes get normal random values.
     # Returns a tensor filled with ones
     if fill_ones:
         return torch.ones(*shape, dtype=dtype, device=device)
@@ -95,9 +113,17 @@ def _make_tensor(shape, dtype, device, fill_ones=False) -> torch.Tensor:
 # Tests ops and indexing to ensure they return views (and new tensors) as
 # appropriate.
 class TestViewOps(TestCase):
+    # [CLASS DOC] Device-generic tests that ops return views (or new tensors) as appropriate.
+    # It carries helpers to check view relationships and to optionally transpose inputs, and
+    # the test methods cover many view-producing ops. exact_dtype is set so dtype mismatches
+    # fail comparisons.
     exact_dtype = True
 
     def is_view_of(self, base, other):
+        # [FUNCTION DOC] HELPER: Return true only if other is a view whose base object is
+        # exactly base, is not base itself, lives on the same device, and (except for lazy and
+        # xla devices, which do not expose storage) shares the same untyped storage data pointer
+        # with base.
         if (
             not other._is_view()
             or other is base
@@ -115,12 +141,17 @@ class TestViewOps(TestCase):
 
     # Returns true if v1 and v2 are views of the same base
     def is_view_of_same_base(self, v1, v2):
+        # [FUNCTION DOC] HELPER: Return true if v1 is a view (and not the same object as v2) and
+        # v2 is a view of the base of v1, i.e. both views share one base.
         if not v1._is_view() or v1 is v2:
             return False
         return self.is_view_of(v1._base, v2)
 
     # Performs transpose if contiguous=True, else returns the input tensor as is
     def _do_transpose(self, x, contiguous=False, dim0=0, dim1=1):
+        # [FUNCTION DOC] HELPER: Return the input unchanged when contiguous is true;
+        # otherwise return the input with the two given dimensions swapped, producing a non-
+        # contiguous view.
         if contiguous:
             return x
         else:
@@ -128,6 +159,8 @@ class TestViewOps(TestCase):
 
     @dtypes(*all_types_and(torch.half, torch.bfloat16))
     def test_conj_self(self, device, dtype):
+        # [FUNCTION DOC] Check that calling conj on a real tensor returns the very same
+        # tensor object.
         t = torch.ones(5, 5, device=device)
         s = t.conj()
         self.assertTrue(s is t)
@@ -137,12 +170,22 @@ class TestViewOps(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool))
     @dtypesIfMPS(*integral_types_and(torch.cfloat, torch.float, torch.half, torch.bool))
     def test_view_dtype_new(self, device, dtype):
+        # [FUNCTION DOC] Check viewing a tensor as another dtype for many input layouts
+        # (contiguous, permuted, expanded, sliced with strides, zero-size, scalar) and every
+        # target dtype. Verifies errors for scalars and non-unit last stride when element sizes
+        # differ, same data pointer, expected size and stride, round trip back to the original
+        # dtype, and agreement with the NumPy dtype view. Also checks that requires_grad is
+        # dropped when viewing float or complex tensors as another float or complex dtype. Bool
+        # is excluded from target dtypes, and float64 is excluded on MPS.
         dtypes = {value: key for (key, value) in numpy_to_torch_dtype_dict.items()}
         if device.startswith("mps"):
             del dtypes[torch.float64]
         del dtypes[torch.bool]
 
         def generate_inputs():
+            # [FUNCTION DOC] HELPER: Generator yielding the test input tensors:
+            # contiguous, two permuted variants, an expanded one, a strided slice, a zero-
+            # size one, and a scalar.
             yield make_tensor((4, 4, 64), dtype=dtype, device=device, low=-5, high=5)
             yield make_tensor(
                 (4, 4, 64), dtype=dtype, device=device, low=-5, high=5
@@ -160,6 +203,11 @@ class TestViewOps(TestCase):
             yield make_tensor((), dtype=dtype, device=device, low=-5, high=5)
 
         def calc_expected_size_and_stride(a, view_dtype):
+            # [FUNCTION DOC] HELPER: Compute the expected size and stride after viewing a
+            # as view_dtype. When element sizes match, return them unchanged. Otherwise
+            # the last size is scaled by the element size ratio (up or down), the other
+            # strides are scaled the same way and the last stride becomes one. Returns the
+            # size and the stride.
             dtype_size = torch._utils._element_size(a.dtype)
             view_dtype_size = torch._utils._element_size(view_dtype)
 
@@ -254,6 +302,9 @@ class TestViewOps(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     @dtypesIfMPS(*all_mps_types_and(torch.bool))
     def test_view_dtype_upsize_errors(self, device, dtype):
+        # [FUNCTION DOC] For every target dtype with a larger element size than the source
+        # dtype, check the error messages: last size not divisible by the ratio, storage offset
+        # not divisible by the ratio, and another stride not divisible by the ratio.
         dtype_size = torch._utils._element_size(dtype)
 
         for view_dtype in all_types_and_complex_and(
@@ -289,7 +340,18 @@ class TestViewOps(TestCase):
 
     @skipLazy
     def test_view_as_complex(self, device):
+        # [FUNCTION DOC] Check view_as_complex: a nested helper handles contiguous and
+        # transposed inputs (expecting errors when the last dim is not of size two or lacks unit
+        # stride). Further cases check errors for a stride that is not divisible by two in non-
+        # last dims, for an empty one-dimensional tensor and for a zero-dimensional tensor; a
+        # tensor with shape zero by two gives a view of shape zero; a singleton dimension stride
+        # need not be even (issue 150050); and a sparse COO tensor yields a view sharing values
+        # storage with the sparse base and the last dimension dropped.
         def fn(contiguous_input=True, dim0=0, dim1=1):
+            # [FUNCTION DOC] HELPER: Check view_as_complex for a random real tensor, optionally
+            # transposed by two dims. Raises the expected error (and returns) if the last dim
+            # size is not two or its stride is not one. Otherwise the result must equal the
+            # matching complex construction and be a view of the original tensor.
             t = torch.randn(3, 2, 2, device=device)
             c_t = t[:, :, 0] + 1j * t[:, :, 1]
 
@@ -378,7 +440,15 @@ class TestViewOps(TestCase):
     @dtypes(*complex_types(), torch.complex32)
     @dtypesIfMPS(torch.cfloat, torch.chalf)
     def test_view_as_real(self, device, dtype):
+        # [FUNCTION DOC] Check view_as_real on complex tensors: contiguous and transposed
+        # inputs, an empty tensor (result shape zero by two), a zero-dimensional tensor (result
+        # shape two), and a sparse COO tensor, where the result must be a view sharing values
+        # storage with the sparse base and have a trailing dimension of size two.
         def fn(contiguous_input=True):
+            # [FUNCTION DOC] HELPER: Build a random complex tensor of the test dtype (via the
+            # matching real dtype), optionally transposed, and check view_as_real: the last
+            # dimension of size two holds the real part then the imaginary part, and the result
+            # is a view of the original tensor.
             # `torch.bcomplex32` doesn't have randn yet
             real_dt = torch.empty((0,), dtype=dtype, device=device).real.dtype
             r = torch.randn(3, 4, dtype=real_dt, device=device)
@@ -425,6 +495,8 @@ class TestViewOps(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     @dtypesIfMPS(*all_mps_types_and(torch.bool))
     def test_view_tensor_split(self, device, dtype):
+        # [FUNCTION DOC] Check that tensor_split into seven pieces along dimension zero and
+        # along dimension one returns views of the input.
         a = make_tensor((40, 30), dtype=dtype, device=device, low=-9, high=9)
         a_split_dim0 = a.tensor_split(7, 0)
         for a_split_dim0_tensor in a_split_dim0:
@@ -437,6 +509,8 @@ class TestViewOps(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     @dtypesIfMPS(*all_mps_types_and(torch.cfloat, torch.bool))
     def test_view_tensor_hsplit(self, device, dtype):
+        # [FUNCTION DOC] Check hsplit returns views of the input, and that writing to the
+        # original element is visible through the second piece.
         t = make_tensor((4, 4, 4), dtype=dtype, device=device, low=-9, high=9)
         t_hsplit = torch.hsplit(t, 2)
         for t_hsplit_tensor in t_hsplit:
@@ -448,6 +522,8 @@ class TestViewOps(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     @dtypesIfMPS(*all_mps_types_and(torch.cfloat, torch.bool))
     def test_view_tensor_vsplit(self, device, dtype):
+        # [FUNCTION DOC] Check vsplit returns views of the input, and that writing to the
+        # original element is visible through the second piece.
         t = make_tensor((4, 4, 4), dtype=dtype, device=device, low=-9, high=9)
         t_vsplit = torch.vsplit(t, 2)
         for t_vsplit_tensor in t_vsplit:
@@ -459,6 +535,8 @@ class TestViewOps(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     @dtypesIfMPS(*all_mps_types_and(torch.cfloat, torch.bool))
     def test_view_tensor_dsplit(self, device, dtype):
+        # [FUNCTION DOC] Check dsplit returns views of the input, and that writing to the
+        # original element is visible through the second piece.
         t = make_tensor((4, 4, 4), dtype=dtype, device=device, low=-9, high=9)
         t_dsplit = torch.dsplit(t, 2)
         for t_dsplit_tensor in t_dsplit:
@@ -470,6 +548,8 @@ class TestViewOps(TestCase):
     @dtypes(*all_types_and(torch.half, torch.bfloat16))
     @dtypesIfMPS(*all_mps_types_and(torch.bool))
     def test_imag_noncomplex(self, device, dtype):
+        # [FUNCTION DOC] Check that taking the imaginary part of a non-complex tensor raises
+        # a RuntimeError.
         t = torch.ones((5, 5), dtype=dtype, device=device)
 
         with self.assertRaises(RuntimeError):
@@ -479,7 +559,13 @@ class TestViewOps(TestCase):
     @dtypes(*complex_types())
     @dtypesIfMPS(torch.cfloat)
     def test_real_imag_view(self, device, dtype):
+        # [FUNCTION DOC] Check real and imaginary parts of complex tensors are views that match
+        # the NumPy parts, for contiguous and transposed inputs, and that the storage offset is
+        # correct for a sliced tensor.
         def compare_with_numpy(contiguous_input=True):
+            # [FUNCTION DOC] HELPER: Build a random complex matrix (optionally transposed), then
+            # compare its real and imaginary parts against NumPy and check each is a view of the
+            # original tensor.
             t = torch.randn(3, 3, dtype=dtype, device=device)
             if not contiguous_input:
                 u = t.T
@@ -511,6 +597,9 @@ class TestViewOps(TestCase):
     @dtypes(*complex_types())
     @dtypesIfMPS(torch.cfloat)
     def test_conj_imag_view(self, device, dtype) -> None:
+        # [FUNCTION DOC] Check that conj of a complex tensor is a view equal to the NumPy
+        # conjugate, and that its imaginary part is a view of the original, matches NumPy and is
+        # flagged negated.
         t = _make_tensor((4, 5), dtype, device)
         t_numpy_conj = torch.from_numpy(t.cpu().numpy().conj()).to(device=device)
         v = t.conj()
@@ -525,6 +614,9 @@ class TestViewOps(TestCase):
 
     @skipLazy
     def test_conj_view_with_shared_memory(self, device) -> None:
+        # [FUNCTION DOC] Check that in-place and out-of-place adds mixing a tensor with its two
+        # lazy conjugate views (which share memory with it) give the same results as the non-
+        # aliased adds.
         a = _make_tensor((4, 5), torch.cfloat, device)
         b = a.conj()
         c = a.conj()
@@ -548,6 +640,9 @@ class TestViewOps(TestCase):
     )
     @suppress_warnings
     def test_set_real_imag(self, device, dtypes):
+        # [FUNCTION DOC] Check assigning to the real and imaginary attributes of a complex
+        # tensor from tensors of various dtypes: the stored parts must match the source (the
+        # real part of a complex source) ignoring exact dtype.
         x = torch.randn(10, dtype=dtypes[0], device=device)
 
         new_real = _make_tensor((10,), dtypes[1], device)
@@ -565,6 +660,8 @@ class TestViewOps(TestCase):
             self.assertEqual(x.imag, new_imag, exact_dtype=False)
 
     def test_diagonal_view(self, device) -> None:
+        # [FUNCTION DOC] Check diagonal returns a view for default and offset diagonals, and
+        # that a write through the view shows up in the base.
         t = torch.ones((5, 5), device=device)
         v = torch.diagonal(t)
         self.assertTrue(self.is_view_of(t, v))
@@ -580,6 +677,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[0, 0, 1], v[0, 0])
 
     def test_select_view(self, device) -> None:
+        # [FUNCTION DOC] Check select returns a view and a write through it shows up in
+        # the base.
         t = torch.ones((5, 5), device=device)
         v = t.select(0, 2)
         self.assertTrue(self.is_view_of(t, v))
@@ -590,6 +689,8 @@ class TestViewOps(TestCase):
     # Lazy hasn't implemented unbind yet.
     @skipLazy
     def test_unbind_view(self, device) -> None:
+        # [FUNCTION DOC] Check unbind returns views of the input and a write through each view
+        # shows up in the base.
         t = torch.zeros((5, 5), device=device)
         tup = torch.unbind(t)
 
@@ -603,6 +704,9 @@ class TestViewOps(TestCase):
     @skipLazy
     @skipMPS  # MPS doesn't support float64
     def test_unbind(self, device):
+        # [FUNCTION DOC] Check unbind autograd: backward through all outputs, through only
+        # one output's gradient (issue 9977), and gradcheck with forward-mode checking on
+        # double input.
         stacked = torch.randn(3, 10, 10, device=device, requires_grad=True)
         x, y, z = stacked.unbind()
         grad = torch.randn(3, 10, 10, device=device)
@@ -628,6 +732,8 @@ class TestViewOps(TestCase):
     # causing asserts to trigger.
     @skipLazy
     def test_expand_view(self, device) -> None:
+        # [FUNCTION DOC] Check expand returns a view and a write through it shows up in
+        # the base.
         t = torch.ones((5, 1), device=device)
         v = t.expand(5, 5)
         self.assertTrue(self.is_view_of(t, v))
@@ -636,6 +742,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[2, 0], v[2, 2])
 
     def test_expand_as_view(self, device):
+        # [FUNCTION DOC] Check expand_as returns a view and a write through it shows up in
+        # the base.
         t = torch.ones((5, 1), device=device)
         e = torch.empty((5, 5), device=device)
         v = t.expand_as(e)
@@ -645,6 +753,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[2, 0], v[2, 2])
 
     def test_narrow_view(self, device):
+        # [FUNCTION DOC] Check narrow returns a view and a write through it shows up in
+        # the base.
         t = torch.ones((5, 5), device=device)
         v = torch.narrow(t, 1, 2, 2)
         self.assertTrue(self.is_view_of(t, v))
@@ -653,6 +763,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[0, 2], v[0, 0])
 
     def test_permute_view(self, device) -> None:
+        # [FUNCTION DOC] Check permute returns a view and a write through it shows up in
+        # the base.
         t = torch.ones((5, 5), device=device)
         v = t.permute(1, 0)
         self.assertTrue(self.is_view_of(t, v))
@@ -661,6 +773,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[1, 0], v[0, 1])
 
     def test_transpose_view(self, device):
+        # [FUNCTION DOC] Check swapdims, swapaxes and transpose each return a view whose writes
+        # show up in the base.
         for fn in (torch.swapdims, torch.swapaxes, torch.transpose):
             t = torch.ones((5, 5), device=device)
             v = fn(t, 0, 1)
@@ -670,6 +784,8 @@ class TestViewOps(TestCase):
             self.assertEqual(t[1, 0], v[0, 1])
 
     def test_transpose_inplace_view(self, device):
+        # [FUNCTION DOC] Check the in-place swapdims, swapaxes and transpose variants applied to
+        # a view of a tensor stay views of the original tensor and writes show up in the base.
         t = torch.ones(5, 5, device=device)
         v = t.view_as(t)
         v = v.swapdims_(0, 1)
@@ -692,6 +808,7 @@ class TestViewOps(TestCase):
         self.assertEqual(t[1, 0], v[0, 1])
 
     def test_t_view(self, device):
+        # [FUNCTION DOC] Check t returns a view and a write through it shows up in the base.
         t = torch.ones((5, 5), device=device)
         v = t.t()
         self.assertTrue(self.is_view_of(t, v))
@@ -700,6 +817,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[1, 0], v[0, 1])
 
     def test_t_inplace_view(self, device):
+        # [FUNCTION DOC] Check the in-place transpose method on a view of a tensor stays a view
+        # of the original and writes show up in the base.
         t = torch.ones(5, 5, device=device)
         v = t.view_as(t)
         v = v.t_()
@@ -708,6 +827,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[1, 0], v[0, 1])
 
     def test_T_view(self, device):
+        # [FUNCTION DOC] Check the attributes T, H, mT and mH each return a view whose writes
+        # show up in the base.
         for op in ("T", "H", "mT", "mH"):
             t = torch.ones((5, 5), device=device)
             v = getattr(t, op)
@@ -717,6 +838,8 @@ class TestViewOps(TestCase):
             self.assertEqual(t[1, 0], v[0, 1])
 
     def test_unfold_view(self, device):
+        # [FUNCTION DOC] Check unfold returns a view and a write through it shows up in
+        # the base.
         t = torch.ones(10, device=device)
         v = t.unfold(0, 3, 2)
         self.assertTrue(self.is_view_of(t, v))
@@ -725,6 +848,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[2], v[1, 0])
 
     def test_squeeze_view(self, device):
+        # [FUNCTION DOC] Check squeeze returns a view and the base equals the tensor after a
+        # write through the view.
         t = torch.ones(5, 1, 5, device=device)
         v = torch.squeeze(t)
         self.assertTrue(self.is_view_of(t, v))
@@ -732,6 +857,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t, v._base)
 
     def test_squeeze_inplace_view(self, device):
+        # [FUNCTION DOC] Check in-place squeeze on a view of a tensor remains a view of
+        # the original.
         t = torch.ones(5, 5, device=device)
         v = t.view_as(t)
         v = v.squeeze_()
@@ -740,6 +867,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t, v._base)
 
     def test_unsqueeze_view(self, device):
+        # [FUNCTION DOC] Check unsqueeze returns a view and a write through it shows up in
+        # the base.
         t = torch.ones(5, 5, device=device)
         v = torch.unsqueeze(t, 1)
         self.assertTrue(self.is_view_of(t, v))
@@ -748,6 +877,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[0, 1], v[0, 0, 1])
 
     def test_unsqueeze_inplace_view(self, device):
+        # [FUNCTION DOC] Check in-place unsqueeze on a view of a tensor remains a view of the
+        # original and writes show up in the base.
         t = torch.ones(5, 5, device=device)
         v = t.view_as(t)
         v = v.unsqueeze_(1)
@@ -756,6 +887,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[0, 1], v[0, 0, 1])
 
     def test_as_strided_view(self, device):
+        # [FUNCTION DOC] Check as_strided returns a view and a write through it shows up in
+        # the base.
         t = torch.ones(5, 5, device=device)
         v = torch.as_strided(t, (25,), (1,))
         self.assertTrue(self.is_view_of(t, v))
@@ -764,6 +897,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[1, 1], v[6])
 
     def test_as_strided_inplace_view(self, device):
+        # [FUNCTION DOC] Check in-place as_strided on a view of a tensor remains a view of the
+        # original and writes show up in the base.
         t = torch.ones(5, 5, device=device)
         v = t.view_as(t)
         v = v.as_strided_((25,), (1,))
@@ -774,7 +909,16 @@ class TestViewOps(TestCase):
     @skipLazy
     @skipMPS  # MPS doesn't support float64
     def test_as_strided_gradients(self, device):
+        # [FUNCTION DOC] Check gradcheck and gradgradcheck of as_strided over several cases:
+        # plain, size-one dims with odd strides, expand-like zero strides, overlapping strides,
+        # transpose, reading outside the input, and select on an expanded input.
         def test(x, prepro_fn, size, strides, offset=None):
+            # [FUNCTION DOC] HELPER: Run gradient checks of the strided view of x in double
+            # precision. First verifies without gradients that the maximum accessed offset does
+            # not exceed the storage length (raises AssertionError "test case resizes storage"
+            # otherwise), then runs gradcheck with forward-mode checking and gradgradcheck on a
+            # closure applying the optional preprocessing function and as_strided with the given
+            # size, strides and offset.
             x = x.to(torch.double).detach().requires_grad_()
 
             # Check that forward will **not** resize storage because it may
@@ -787,6 +931,8 @@ class TestViewOps(TestCase):
                     raise AssertionError("test case resizes storage")
 
             def closure(x):
+                # [FUNCTION DOC] HELPER: Apply the preprocessing function if present, then
+                # as_strided with the captured size, strides and offset.
                 if prepro_fn is not None:
                     x = prepro_fn(x)
                 return x.as_strided(size, strides, offset)
@@ -833,6 +979,7 @@ class TestViewOps(TestCase):
         )
 
     def test_view_view(self, device):
+        # [FUNCTION DOC] Check view returns a view and a write through it shows up in the base.
         t = torch.ones(5, 5, device=device)
         v = t.view(25)
         self.assertTrue(self.is_view_of(t, v))
@@ -841,6 +988,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[1, 1], v[6])
 
     def test_view_as_view(self, device):
+        # [FUNCTION DOC] Check view_as returns a view and a write through it shows up in
+        # the base.
         t = torch.ones(5, 5, device=device)
         e = torch.empty((25,))
         v = t.view_as(e)
@@ -850,6 +999,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[1, 1], v[6])
 
     def test_contiguous_self(self, device):
+        # [FUNCTION DOC] Check contiguous on an already contiguous tensor returns the
+        # same object.
         t = torch.ones(5, 5, device=device)
         s = t.contiguous()
         self.assertTrue(s is t)
@@ -858,6 +1009,8 @@ class TestViewOps(TestCase):
     # self.is_view_of reports false positives for lazy
     @skipLazy
     def test_contiguous_nonview(self, device):
+        # [FUNCTION DOC] Check contiguous on a transposed tensor returns a copy that is not a
+        # view and whose writes do not change the original.
         t = torch.ones(5, 5, device=device)
         nv = t.t().contiguous()
         self.assertTrue(not self.is_view_of(t, nv))
@@ -866,6 +1019,8 @@ class TestViewOps(TestCase):
         self.assertNotEqual(t[0, 0], nv[0, 0])
 
     def test_reshape_view(self, device):
+        # [FUNCTION DOC] Check reshape of a contiguous tensor returns a view and writes show up
+        # in the base.
         t = torch.ones(5, 5, device=device)
         v = torch.reshape(t, (25,))
         self.assertTrue(self.is_view_of(t, v))
@@ -874,6 +1029,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[1, 1], v[6])
 
     def test_reshape_as_view(self, device):
+        # [FUNCTION DOC] Check reshape_as of a contiguous tensor returns a view and writes show
+        # up in the base.
         t = torch.ones(5, 5, device=device)
         e = torch.empty((25,), device=device)
         v = t.reshape_as(e)
@@ -886,6 +1043,8 @@ class TestViewOps(TestCase):
     # self.is_view_of reports false positives for lazy
     @skipLazy
     def test_reshape_nonview(self, device):
+        # [FUNCTION DOC] Check reshape of a transposed tensor (needs a copy) is not a view and
+        # writes do not change the original.
         t = torch.ones(5, 5, device=device)
         nv = torch.reshape(t.t(), (25,))
         self.assertTrue(not self.is_view_of(t, nv))
@@ -898,7 +1057,13 @@ class TestViewOps(TestCase):
     @skipLazy
     @skipXLA
     def test_flatten_view(self, device):
+        # [FUNCTION DOC] Check flatten returns views where possible: all dims, zero-dimensional
+        # input, a partial flatten of a transposed tensor, and an as_strided overlapping-memory
+        # tensor flattened in three nested steps. Writes through each result must propagate to
+        # the source.
         def test_writes_propagate(t, v):
+            # [FUNCTION DOC] HELPER: Write zero through the first element of the view and assert
+            # that the first element of the source tensor changed identically.
             idx_t = (0,) * t.ndim
             idx_v = (0,) * v.ndim
             v[idx_v] = 0
@@ -937,7 +1102,12 @@ class TestViewOps(TestCase):
 
     @skipLazy
     def test_flatten_nonview(self, device):
+        # [FUNCTION DOC] Check flatten that must copy (transposed inputs) gives a non-view whose
+        # writes do not alter the source (the source comparison is skipped on the meta device),
+        # and that flatten of a single dimension range returns the same object.
         def assert_is_nonview(t, nv):
+            # [FUNCTION DOC] HELPER: Assert nv is not a view, write zero to its first element,
+            # and (except on the meta device) assert the source tensor's first element differs.
             idx_t = (0,) * t.ndim
             idx_nv = (0,) * nv.ndim
             self.assertTrue(not nv._is_view())
@@ -959,6 +1129,7 @@ class TestViewOps(TestCase):
         self.assertTrue(t is nv)
 
     def test_basic_indexing_slice_view(self, device):
+        # [FUNCTION DOC] Check basic slicing returns a view and writes show up in the base.
         t = torch.ones(5, 5, device=device)
         v = t[:2, :3]
         self.assertTrue(self.is_view_of(t, v))
@@ -967,6 +1138,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[0, 0], v[0, 0])
 
     def test_basic_indexing_ellipses_view(self, device):
+        # [FUNCTION DOC] Check indexing with an ellipsis returns a view and writes show up in
+        # the base.
         t = torch.ones(5, 5, device=device)
         v = t[..., :2]
         self.assertTrue(self.is_view_of(t, v))
@@ -975,6 +1148,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[0, 0], v[0, 0])
 
     def test_basic_indexing_newaxis_view(self, device):
+        # [FUNCTION DOC] Check indexing with a new axis and an integer returns a view and writes
+        # show up in the base.
         t = torch.ones(5, 5, device=device)
         v = t[None, :2, 3]
         self.assertTrue(self.is_view_of(t, v))
@@ -983,6 +1158,8 @@ class TestViewOps(TestCase):
         self.assertEqual(t[0, 3], v[0, 0])
 
     def test_advanced_indexing_nonview(self, device):
+        # [FUNCTION DOC] Check advanced (tensor) indexing returns a copy, not a view, and writes
+        # to it do not change the source.
         t = torch.ones(3, 3, device=device)
         rows = torch.tensor([[0, 0], [2, 2]], device=device)
         cols = torch.tensor([[0, 1], [2, 2]], device=device)
@@ -996,6 +1173,8 @@ class TestViewOps(TestCase):
         IS_FBCODE, "TorchScript backend not yet supported in FBCODE/OVRSOURCE builds"
     )
     def test_advanced_indexing_assignment(self, device):
+        # [FUNCTION DOC] Check assigning zero through a pair of index tensors writes into the
+        # tensor. Skipped in FBCODE builds where the TorchScript backend is unsupported.
         t = torch.ones(3, 3, device=device)
         rows = torch.tensor([[0, 0], [2, 2]], device=device)
         cols = torch.tensor([[0, 1], [2, 2]], device=device)
@@ -1004,6 +1183,8 @@ class TestViewOps(TestCase):
 
     @skipLazy
     def test_chunk_view(self, device):
+        # [FUNCTION DOC] Check chunk into three pieces returns views of the input and a write
+        # through each piece shows up in the base.
         t = torch.zeros(3, 3, device=device)
         l = torch.chunk(t, 3)
 
@@ -1015,6 +1196,8 @@ class TestViewOps(TestCase):
 
     @skipLazy
     def test_split_view(self, device):
+        # [FUNCTION DOC] Check split with explicit sizes returns views of the input and a write
+        # through each piece shows up in the base.
         t = torch.zeros(3, 3, device=device)
         l = torch.split(t, [1, 1, 1])
 
@@ -1025,7 +1208,13 @@ class TestViewOps(TestCase):
             self.assertEqual(t[idx, 0], v[0, 0])
 
     def test_movedim_view(self, device):
+        # [FUNCTION DOC] Check movedim and moveaxis, with a pair of dims and with single dims,
+        # return views of the input and that random writes through the result show in the
+        # transposed place.
         def run_test(device, op):
+            # [FUNCTION DOC] HELPER: Apply the given op to a zero-filled three by three tensor,
+            # check the result is a view, then three times write a random value at a random
+            # position and compare with the swapped position in the source.
             t = torch.zeros(3, 3, device=device)
             out = op(t)
 
@@ -1048,6 +1237,8 @@ class TestViewOps(TestCase):
 
     # Testing that the generated view_copy kernel and its derivative are implemented correctly
     def test_view_copy(self, device):
+        # [FUNCTION DOC] Check view_copy gives the same result and gradients as view but, unlike
+        # view, is not a view of its input.
         a = torch.randn(4, device=device, requires_grad=True)
         a_ref = a.detach().clone().requires_grad_()
         a_view = a_ref.view(2, 2)
@@ -1066,11 +1257,15 @@ class TestViewOps(TestCase):
 
     # Testing that the output of a view_copy kernel (by default) is contiguous.
     def test_view_copy_output_contiguous(self, device):
+        # [FUNCTION DOC] Check that the default output of slice_copy on a channels-last tensor
+        # is contiguous.
         a = torch.randn(4, 4, 4, 4, device=device).to(memory_format=torch.channels_last)
         b = torch.ops.aten.slice_copy(a, 0, 0, 2)
         self.assertTrue(b.is_contiguous())
 
     def test_view_copy_out(self, device):
+        # [FUNCTION DOC] Check the out variants of diagonal_copy and split_copy write results
+        # equal to those of the non-out versions.
         a = torch.randn(2, 2, device=device)
         out = torch.empty(2, device=device)
 
@@ -1091,11 +1286,19 @@ class TestViewOps(TestCase):
 
     @skipLazy  # Lazy backend has issues with this operation
     def test_maybe_view_chunk_cat(self, device):
+        # [FUNCTION DOC] Check the private chunk-and-concatenate helper from torch._utils
+        # matches chunking along dimension zero then concatenating along the gather dimension,
+        # returns a contiguous result, and is a view of the input exactly when a movedim-based
+        # reference implementation is. Runs several shapes, group sizes and gather dims.
         """Test _maybe_view_chunk_cat is equivalent to torch.cat(torch.chunk(...))"""
         from torch._utils import _maybe_view_chunk_cat
 
         # Helper to test a configuration
         def test_config(shape, group_size, gather_dim):
+            # [FUNCTION DOC] HELPER: For a random tensor of the given shape, compare the helper
+            # result with the chunk-and-cat expectation and with the movedim reference, checking
+            # contiguity and that view status (same data pointer as the input) agrees, with a
+            # descriptive failure message.
             x = torch.randn(shape, device=device)
             result = _maybe_view_chunk_cat(
                 x, group_size=group_size, gather_dim=gather_dim
@@ -1139,12 +1342,26 @@ class TestViewOps(TestCase):
 
 
 class TestOldViewOps(TestCase):
+    # [CLASS DOC] Older shape and view-manipulation tests (ravel, reshape, expand,
+    # flatten, narrow, transposes, split, chunk, broadcast, resize, tensor_split and
+    # others), run per device.
     @skipXPUIf(
         True,
         "NotImplementedError with test_ravel, https://github.com/intel/torch-xpu-ops/issues/2358",
     )
     def test_ravel(self, device):
+        # [FUNCTION DOC] Check ravel: zero-dimensional and strided inputs become one-dimensional
+        # contiguous results; contiguous float and quantized inputs (including empty ones) give
+        # a view whose base is the input; non-contiguous (transposed) inputs give a contiguous
+        # copy. Skipped on XPU.
+        # KNOWN ISSUE: the second one-dimensional flattening is taken from the zero-
+        # dimensional tensor again rather than from the one-dimensional tensor, so it
+        # duplicates the first check.
         def _test_ravel(tensors, size, nc=False):
+            # [FUNCTION DOC] HELPER: For each source tensor, check ravel has the expected size,
+            # equals the flattened view, is contiguous and has the source as base; when nc is
+            # true also check the transposed source gives a contiguous copy with matching values
+            # and a different base.
             for src in tensors:
                 # Continuous Tensor -> View
                 flat = src.ravel()
@@ -1214,6 +1431,9 @@ class TestOldViewOps(TestCase):
 
     # TODO: this should be refactored into the view ops test suite
     def test_empty_reshape(self, device):
+        # [FUNCTION DOC] Check reshape of an empty tensor to an equivalent shape is viewable
+        # (same data pointer), and that reshape with an inferred dimension on an empty tensor
+        # raises RuntimeError, as in NumPy.
         x = torch.randn(0, 6, device=device)
         self.assertEqual((1, 0, 6, 1, 1), x.reshape(1, 0, 6, 1, 1).shape)
         # should be viewable -- i.e. data_ptr is the same.
@@ -1224,6 +1444,11 @@ class TestOldViewOps(TestCase):
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_expand(self, device):
+        # [FUNCTION DOC] Check expand and expand_as to a target shape from singleton and lower-
+        # rank inputs, double expand versus repeat, expansion of a non-contiguous tensor,
+        # consistency with unsqueeze (values and strides), negative one as a keep-size marker (a
+        # leading negative one on a lower-rank tensor raises RuntimeError), and expanding an
+        # empty tensor to itself.
         tensor = torch.rand(1, 8, 1, device=device)
         tensor2 = torch.rand(5, device=device)
         template = torch.rand(4, 8, 5, device=device)
@@ -1262,11 +1487,19 @@ class TestOldViewOps(TestCase):
 
     # TODO: this should be refactored into the view ops test suite
     def test_view_empty(self, device):
+        # [FUNCTION DOC] Check view of an empty tensor to a shape with extra singleton dims
+        # gives the expected shape.
         x = torch.randn(0, 6, device=device)
         self.assertEqual((1, 0, 6, 1, 1), x.view(1, 0, 6, 1, 1).shape)
 
     # TODO: this should be refactored into the view ops test suite
     def test_reshape(self, device):
+        # [FUNCTION DOC] Check reshape: contiguous inputs share the data pointer; two inferred
+        # dims raise RuntimeError; extra positional arguments raise TypeError; a strided slice
+        # is copied (data pointer compare skipped on meta) unless the target shape is
+        # compatible; scalar and empty tensors reshape correctly or raise RuntimeError for
+        # impossible sizes; and reshape_as shares storage for matching element counts and raises
+        # RuntimeError otherwise.
         x = torch.randn(3, 3, device=device)
         self.assertEqual(x.data_ptr(), x.reshape(-1).data_ptr())
         self.assertEqual(x.data_ptr(), x.reshape(1, 9, 1).data_ptr())
@@ -1307,6 +1540,14 @@ class TestOldViewOps(TestCase):
         "NotImplementedError with test_flatten,https://github.com/intel/torch-xpu-ops/issues/2358",
     )
     def test_flatten(self, device):
+        # [FUNCTION DOC] Check flatten on float and quantized tensors: a zero-dimensional input
+        # gives a one-element one-dimensional tensor; many start and end dim pairs (including
+        # negative ones) give the right shape with the same flattened values; a single-dim range
+        # returns an equal tensor; out-of-range dims raise IndexError, and a start dim after the
+        # end dim raises RuntimeError. Skipped on XPU.
+        # KNOWN ISSUE: the second one-dimensional flattening is taken from the zero-
+        # dimensional tensor again rather than from the one-dimensional tensor, so it
+        # duplicates the first check.
         # Test that flatten returns 1-dim tensor when given a 0-dim tensor
         zero_dim_tensor = torch.tensor(123, device=device)
         flat0 = zero_dim_tensor.flatten()
@@ -1367,6 +1608,8 @@ class TestOldViewOps(TestCase):
                 src.flatten(2, 0)
 
     def test_narrow(self, device):
+        # [FUNCTION DOC] Check narrow on a three by three integer tensor for positive and
+        # negative start positions and negative dims against expected sub-tensors.
         x = torch.tensor([[0, 1, 2], [3, 4, 5], [6, 7, 8]], device=device)
         self.assertEqual(x.narrow(0, 0, 1), torch.tensor([[0, 1, 2]], device=device))
         self.assertEqual(
@@ -1387,6 +1630,9 @@ class TestOldViewOps(TestCase):
         self.assertEqual(x.narrow(-2, -1, 1), torch.tensor([[6, 7, 8]], device=device))
 
     def test_narrow_tensor(self, device):
+        # [FUNCTION DOC] Check narrow accepts a zero-dimensional integer tensor as the start
+        # position, and that a float tensor, a one-element one-dimensional tensor and a longer
+        # tensor all raise an exception.
         x = torch.tensor([[0, 1, 2], [3, 4, 5], [6, 7, 8]], device=device)
         self.assertEqual(
             x.narrow(0, torch.tensor(0, device=device), 1),
@@ -1400,6 +1646,9 @@ class TestOldViewOps(TestCase):
             x.narrow(0, torch.tensor([0, 1], device=device), 1)
 
     def test_t(self, device):
+        # [FUNCTION DOC] Check t on zero, one and two dimensional dense and sparse tensors
+        # (equal to the input or to transpose), and that a three-dimensional tensor raises
+        # RuntimeError, with a different message for sparse input.
         # Test 0D tensors
         x = torch.randn((), device=device)
         self.assertEqual(x, x.t())
@@ -1431,6 +1680,9 @@ class TestOldViewOps(TestCase):
             x.t()
 
     def test_split(self, device):
+        # [FUNCTION DOC] Check split with a fixed size (last piece smaller) and with explicit
+        # size lists on dims zero and one: each piece has the expected size and equals the
+        # matching narrow.
         tensor = torch.rand(7, 4, device=device)
         split_size = 3
         dim = 0
@@ -1471,6 +1723,9 @@ class TestOldViewOps(TestCase):
             start = start + target_size[dim]
 
     def test_chunk(self, device):
+        # [FUNCTION DOC] Check chunk into three chunks along dim one gives expected
+        # piece sizes equal to matching narrows, and that zero or a negative chunk
+        # count raises RuntimeError.
         tensor = torch.rand(4, 7, device=device)
         num_chunks = 3
         dim = 1
@@ -1493,6 +1748,8 @@ class TestOldViewOps(TestCase):
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_unsqueeze(self, device) -> None:
+        # [FUNCTION DOC] Check unsqueeze and in-place unsqueeze equal the matching view with an
+        # inserted singleton dim, for a contiguous tensor and a non-contiguous slice.
         x = torch.randn(2, 3, 4, device=device)
         y = x.unsqueeze(1)
         self.assertEqual(y, x.view(2, 1, 3, 4))
@@ -1508,12 +1765,16 @@ class TestOldViewOps(TestCase):
 
     # unit test for special case transposed copy (see ATen/native/Copy.cpp for details)
     def test_big_transpose(self, device):
+        # [FUNCTION DOC] Check the large transposed copy special case: transposing then making
+        # contiguous equals the NumPy transpose of a 456 by 789 matrix.
         t = torch.rand(456, 789, device=device)
         t1 = t.t().contiguous()
         t2 = torch.from_numpy(t.cpu().numpy().transpose())
         self.assertEqual(t1, t2)
 
     def test_T(self, device):
+        # [FUNCTION DOC] Check the T attribute reverses all dims of a three-dimensional tensor
+        # (equal to the full reversing permute) and leaves a one-dimensional tensor unchanged.
         a = torch.randn(2, 3, 4, device=device)
         t1 = a.T
         t2 = a.permute(2, 1, 0)
@@ -1523,6 +1784,9 @@ class TestOldViewOps(TestCase):
 
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     def test_transposes(self, device, dtype):
+        # [FUNCTION DOC] Check the attributes T, H, mT, mH and the adjoint method equal swapping
+        # the last two dims (plus conjugation for H, mH and adjoint), for two-dimensional inputs
+        # and, for batched variants, three-dimensional ones.
         for op in ("T", "H", "mT", "mH", "adjoint"):
             shapes = (
                 ((2, 3), (2, 3, 4)) if op[0] == "m" or op == "adjoint" else ((2, 3),)
@@ -1540,6 +1804,9 @@ class TestOldViewOps(TestCase):
 
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     def test_transposes_errors(self, device, dtype):
+        # [FUNCTION DOC] Check H on a one-dimensional or three-dimensional tensor, and mT, mH
+        # and adjoint on a one-dimensional tensor, raise RuntimeError saying only matrices
+        # are supported.
         for op in ("H", "mT", "mH", "adjoint"):
             shapes = ((2,), (2, 3, 4)) if op == "H" else ((2,),)
             for shape in shapes:
@@ -1550,6 +1817,8 @@ class TestOldViewOps(TestCase):
                         t1 = t1()
 
     def test_python_types(self, device):
+        # [FUNCTION DOC] Check Python float and int types are accepted as dtype arguments to
+        # randn and arange and give the same dtype as float64 and int64.
         a1 = torch.randn((1, 2), device=device, dtype=torch.float64)
         a2 = torch.randn((1, 2), device=device, dtype=float)
         self.assertEqual(a1.dtype, a2.dtype)
@@ -1564,13 +1833,21 @@ class TestOldViewOps(TestCase):
 
     # TODO: is resize best put in test_view_ops?
     def test_resize_as_preserves_strides(self, device):
+        # [FUNCTION DOC] Check that in-place resize_as to its own shape on a transposed empty
+        # tensor keeps the original strides.
         x = torch.empty(2, 3, device=device).t()
         old_strides = x.stride()
         x.resize_as_(x)
         self.assertEqual(x.stride(), old_strides)
 
     def test_memory_format_resize_as(self, device):
+        # [FUNCTION DOC] Check resize_as with the preserve-format option makes a flat tensor
+        # take the channels-last (4D) and channels-last-3d (5D) memory formats of the
+        # reference tensor.
         def test_helper(shape, memory_format, device):
+            # [FUNCTION DOC] HELPER: Make a reference tensor of the given shape in the given
+            # memory format, resize a flat tensor with the same element count to it, and check
+            # the flat tensor is contiguous in that memory format.
             xc = torch.randn(shape, device=device).contiguous(
                 memory_format=memory_format
             )
@@ -1582,7 +1859,12 @@ class TestOldViewOps(TestCase):
         test_helper((3, 10, 3, 32, 32), torch.channels_last_3d, device)
 
     def test_memory_format_resize_(self, device):
+        # [FUNCTION DOC] Check in-place resize of a flat tensor to a 4D and a 5D shape with
+        # the channels-last and channels-last-3d memory formats yields tensors contiguous in
+        # those formats.
         def test_helper(shape, numel, memory_format, device):
+            # [FUNCTION DOC] HELPER: Resize a flat tensor of numel elements to shape using the
+            # given memory format and check it is contiguous in that format.
             flat = torch.randn(numel, device=device)
             flat.resize_(shape, memory_format=memory_format)
             self.assertTrue(flat.is_contiguous(memory_format=memory_format))
@@ -1594,6 +1876,8 @@ class TestOldViewOps(TestCase):
 
     @dtypes(torch.int64, torch.float, torch.complex128)
     def test_transpose_invalid(self, device, dtype):
+        # [FUNCTION DOC] Check swapdims, swapaxes and transpose raise IndexError (dimension out
+        # of range) when either dim is five on a four-dimensional random tensor.
         for fn in (torch.swapdims, torch.swapaxes, torch.transpose):
             shape = _rand_shape(4, min_size=5, max_size=10)
             x = _generate_input(shape, dtype, device, False)
@@ -1607,6 +1891,9 @@ class TestOldViewOps(TestCase):
 
     @dtypes(torch.int64, torch.float, torch.complex128)
     def test_transpose_vs_numpy(self, device, dtype):
+        # [FUNCTION DOC] Compare swapdims, swapaxes and transpose with NumPy swapaxes for
+        # tensors of zero to four dims and all ordered dim pairs, randomly using negative dims,
+        # plus the case of swapping a dim with itself on a fixed five-dimensional tensor.
         for fn in (torch.swapdims, torch.swapaxes, torch.transpose):
             for nd in range(5):
                 shape = _rand_shape(nd, min_size=5, max_size=10)
@@ -1653,6 +1940,11 @@ class TestOldViewOps(TestCase):
             self.compare_with_numpy(torch_fn, np_fn, x, device=None, dtype=None)
 
     def _test_atleast_dim(self, torch_fn, np_fn, device, dtype):
+        # [FUNCTION DOC] HELPER: Compare a torch at-least-N-dim function with its NumPy
+        # counterpart for random shapes of zero to four dims, with and without extremal values,
+        # on the input or its transpose (the flag named contiguous actually triggers the
+        # transpose), and also check that calling with a sequence of three to ten copies returns
+        # matching tuples.
         for ndims in range(5):
             shape = _rand_shape(ndims, min_size=5, max_size=10)
             for _ in range(ndims + 1):
@@ -1681,12 +1973,17 @@ class TestOldViewOps(TestCase):
     # TODO: are these view ops?
     @dtypes(*all_types_and_complex_and(torch.half))
     def test_atleast(self, device, dtype):
+        # [FUNCTION DOC] Compare atleast_1d, atleast_2d and atleast_3d with NumPy for several
+        # dtypes using the shared comparison helper.
         self._test_atleast_dim(torch.atleast_1d, np.atleast_1d, device, dtype)
         self._test_atleast_dim(torch.atleast_2d, np.atleast_2d, device, dtype)
         self._test_atleast_dim(torch.atleast_3d, np.atleast_3d, device, dtype)
 
     # TODO: OpInfo this
     def _test_atleast(self, device, torch_fn):
+        # [FUNCTION DOC] HELPER: Run gradcheck and gradgradcheck on the given at-least-N-
+        # dim function for double tensors of zero to four dims, singly and as a tuple of
+        # five inputs.
         # 0-dim
         s = torch.tensor(0.5, dtype=torch.double, device=device, requires_grad=True)
 
@@ -1711,12 +2008,16 @@ class TestOldViewOps(TestCase):
         gradgradcheck(lambda s, w, x, y, z: torch_fn(s, w, x, y, z), input_tuple)
 
     def test_atleast_gradient(self, device):
+        # [FUNCTION DOC] Check gradients of atleast_1d, atleast_2d and atleast_3d via
+        # the helper.
         self._test_atleast(device, torch.atleast_1d)
         self._test_atleast(device, torch.atleast_2d)
         self._test_atleast(device, torch.atleast_3d)
 
     @dtypes(torch.float)
     def test_broadcast_tensors(self, device, dtype):
+        # [FUNCTION DOC] Check broadcast_tensors of three tensors returns three tensors of the
+        # common broadcast size.
         x0 = torch.randn(2, 1, 3, dtype=dtype, device=device)
         x1 = torch.randn(3, dtype=dtype, device=device)
         x2 = torch.randn(3, 1, dtype=dtype, device=device)
@@ -1728,6 +2029,10 @@ class TestOldViewOps(TestCase):
         self.assertTrue(y2.size() == expected_size)
 
     def test_broadcast_shapes(self, device):
+        # [FUNCTION DOC] Check broadcast_shapes against shapes from broadcast_tensors for
+        # single, pairs and lists of shapes (including plain integer and mixed integer/tuple
+        # inputs). Negative lengths raise ValueError; incompatible shapes raise RuntimeError;
+        # float inputs raise RuntimeError about the input type.
         examples = [(), (1,), (2,), (1, 1), (3, 1), (3, 2), (4, 1, 1), (4, 3, 2)]
         for s0 in examples:
             x0 = torch.randn(s0, device=device)
@@ -1799,7 +2104,13 @@ class TestOldViewOps(TestCase):
     # Skip BFloat16 since numpy does not support it
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool))
     def test_broadcast_to(self, device, dtype):
+        # [FUNCTION DOC] Check broadcast_to against NumPy for all pairs of sample shapes where
+        # broadcasting is possible, and that impossible cases raise RuntimeError about the
+        # expanded size; also that extra positional arguments to the method raise TypeError.
         def can_broadcast(s0, s1):
+            # [FUNCTION DOC] HELPER: Return whether a shape of fewer or equal dims can
+            # broadcast to the other shape by comparing trailing dims (a dim of size one or
+            # equal sizes is allowed).
             # s0.dim() <= s1.dim(), reverse s0 and s1 to compare trailing dimension
             s0 = tuple(reversed(s0))
             s1 = tuple(reversed(s1))
@@ -1829,6 +2140,13 @@ class TestOldViewOps(TestCase):
         self.assertRaises(TypeError, lambda: t.broadcast_to((3, 3), torch.float32))
 
     def test_view(self, device):
+        # [FUNCTION DOC] Check view: target sizes via view_as, sizes, a size object and an
+        # inferred dim; filling a view writes to the base; empty tensors with extra dims and
+        # inferred sizes, with RuntimeError for ambiguous inferred dims or element-count
+        # mismatches; viewing a tensor that is non-contiguous overall but only merges or splits
+        # within contiguous dim chunks (equal to the contiguous clone), with RuntimeError when a
+        # view would cross chunks; expanded (zero-stride) tensors; and TypeError for extra
+        # positional arguments.
         tensor = torch.rand(15, device=device)
         template = torch.rand(3, 5, device=device)
         empty = torch.empty(0, device=device)
@@ -1920,6 +2238,8 @@ class TestOldViewOps(TestCase):
 
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     def test_reshape_view_semantics(self, device, dtype):
+        # [FUNCTION DOC] Check reshape returns a view sharing storage when possible, and a copy
+        # with a different storage when the input is transposed.
         tensor = make_tensor((15, 4), dtype=dtype, device=device)
         target = (20, 3)
 
@@ -1937,6 +2257,8 @@ class TestOldViewOps(TestCase):
         )
 
     def test_contiguous(self, device):
+        # [FUNCTION DOC] Check a tensor whose dim of size one has a changed stride still reports
+        # as contiguous.
         x = torch.randn(1, 16, 5, 5, device=device)
         self.assertTrue(x.is_contiguous())
         stride = list(x.stride())
@@ -1948,6 +2270,12 @@ class TestOldViewOps(TestCase):
     # Skip BFloat16 since numpy does not support it
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool))
     def test_tensor_split_sections(self, device, dtype):
+        # [FUNCTION DOC] Compare tensor_split with an integer section count (as a Python int and
+        # as a tensor) against NumPy array_split for several input sizes, every dim and many
+        # section counts, and check device and dtype of every piece.
+        # KNOWN ISSUE: the comment says the transposed input is also tested for at least 2 dims,
+        # but the condition requires more than 2 dims, so with the listed sizes the transposed
+        # input is never used.
         input_sizes = [
             (0,),
             (10,),
@@ -1980,6 +2308,12 @@ class TestOldViewOps(TestCase):
     # Skip BFloat16 since numpy does not support it
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool))
     def test_tensor_split_indices(self, device, dtype):
+        # [FUNCTION DOC] Compare tensor_split with index lists (as tuples and as tensors)
+        # against NumPy array_split for several input sizes, every dim, and indices including
+        # negative, repeated and out-of-range values, and check device and dtype of every piece.
+        # KNOWN ISSUE: the comment says the transposed input is also tested for at least 2 dims,
+        # but the condition requires more than 2 dims, so with the listed sizes the transposed
+        # input is never used.
         input_sizes = [
             (0,),
             (10,),
@@ -2024,6 +2358,11 @@ class TestOldViewOps(TestCase):
                         self.assertEqual(result_n, result_2, msg=msg)
 
     def test_tensor_split_errors(self, device):
+        # [FUNCTION DOC] Check tensor_split error cases against the expected torch and NumPy
+        # errors: dim out of range, zero-dimensional input, and non-positive section counts (as
+        # numbers and as tensors). Also checks RuntimeError for a floating tensor of indices and
+        # for a two-dimensional indices tensor; the last two checks reuse the tensor and dim
+        # left over from the loop.
         S = 10
         test_cases = [
             # input size, sections or indices, dim, error type, error message, numpy error type
@@ -2089,6 +2428,8 @@ class TestOldViewOps(TestCase):
             torch.tensor_split(torch.rand(S, device=device), torch.tensor(((1,),)), 0)
 
     def test_resize_all_dtypes_and_devices(self, device):
+        # [FUNCTION DOC] Check in-place resize from a three by two to a two by two shape works
+        # for all dtypes on the device.
         shape = (2, 2)
         for dt in all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool):
             x = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=dt, device=device)
@@ -2096,6 +2437,8 @@ class TestOldViewOps(TestCase):
             self.assertEqual(shape, x.shape)
 
     def test_resize_as_all_dtypes_and_devices(self, device):
+        # [FUNCTION DOC] Check in-place resize_as to the shape of another tensor works for
+        # all dtypes.
         for dt in all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool):
             x = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=dt, device=device)
             y = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=dt, device=device)
@@ -2103,6 +2446,8 @@ class TestOldViewOps(TestCase):
             self.assertEqual(y.shape, x.shape)
 
     def test_resize_overflow(self, device):
+        # [FUNCTION DOC] Check resize with enormous sizes raises RuntimeError reporting overflow
+        # of the storage size or stride calculation.
         x = torch.empty((), dtype=torch.float64, device=device)
         with self.assertRaisesRegex(
             RuntimeError, "Storage size calculation overflowed"
@@ -2114,6 +2459,8 @@ class TestOldViewOps(TestCase):
             x.resize_([0, 4, 2305843009213693952])
 
     def test_as_strided_overflow_storage_offset(self, device):
+        # [FUNCTION DOC] Check as_strided with a huge storage offset raises RuntimeError
+        # reporting a storage size overflow.
         t = torch.randn(2, 3, device=device)
         with self.assertRaisesRegex(
             RuntimeError, "Storage size calculation overflowed"
@@ -2125,6 +2472,7 @@ class TestOldViewOps(TestCase):
             torch.as_strided(t, [1], [1], 2**61 - 1)
 
     def test_view_all_dtypes_and_devices(self, device):
+        # [FUNCTION DOC] Check view to a flat shape works for all dtypes on the device.
         for dt in all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool):
             x = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=dt, device=device)
             self.assertEqual(x.view(6).shape, [6])
@@ -2132,6 +2480,9 @@ class TestOldViewOps(TestCase):
     @skipIfTorchDynamo("conj bit not implemented in TensorVariable yet")
     @onlyCPU
     def test_conj_neg_view_numpy_error(self, device):
+        # [FUNCTION DOC] Check, on CPU only, that converting a conjugated or negated complex
+        # tensor to NumPy, or reinterpreting one as a real dtype, raises RuntimeError naming the
+        # set bit.
         self.assertRaisesRegex(
             RuntimeError,
             "has conjugate bit set",
@@ -2154,6 +2505,9 @@ class TestOldViewOps(TestCase):
         )
 
     def test_crow_col_indices(self, device):
+        # [FUNCTION DOC] Check that reading the compressed row and column index tensors of a
+        # sparse CSR tensor works; they must be view ops (otherwise an internal use-count
+        # assertion triggers in debug builds).
         crow_indices = (0, 1, 2)
         col_indices = (1, 0)
         values = (1, 2)
