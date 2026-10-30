@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Test suite for the CUPTI activity monitor (torch.profiler._cupti) and its record
+# codec. Layers covered: pure host-side unit tests of config, external-correlation bookkeeping,
+# metadata joins, CUDA-graph event/host node resolution and chrome/pftrace trace rendering (no GPU
+# needed); direct CuptiMonitor collection and native callbacks on CUDA; and the monitor driven
+# through torch.profiler.profile.
+# Import-time side effects: none beyond imports; setUpModule primes kineto with a CUDA profile
+# when available and then releases the CUPTI subscriber. Many CUDA tests are re-run in a fresh
+# subprocess via the _isolated decorator.
 """Tests for the CUPTI activity monitor and its v2/user-defined-record codec.
 
 Covers the monitor at every layer: the ``records`` field schema + ``decode`` codec
@@ -47,6 +55,12 @@ from torch.testing._internal.common_utils import (
 
 
 def setUpModule():
+    # [FUNCTION DOC] HELPER: Module-level fixture. When kineto, CUDA and the CUDA profiler
+    # activity are all available, it runs one tiny CPU+CUDA profile so kineto initializes with
+    # CUDA support (a CPU-only first init cannot be upgraded later). If libcupti 13.3 or newer is
+    # present it then asks the cupti python wrapper to finalize, releasing the process-wide CUPTI
+    # subscriber kineto holds; any exception from that release is swallowed. Does nothing when
+    # CUDA profiling is unavailable.
     if (
         kineto_available()
         and torch.cuda.is_available()
@@ -74,6 +88,12 @@ def setUpModule():
 
 
 def _isolated(test_fn):
+    # [FUNCTION DOC] HELPER: Decorator that makes a test method run in a fresh child process. The
+    # wrapper runs the test body directly when the environment marks this process as the isolated
+    # child; otherwise it spawns the current interpreter on this file with the test id (class name
+    # dot method name), setting that marker, capturing output with a 600 second timeout. A nonzero
+    # return code fails the test with the child's return code, stdout and stderr. Returns the
+    # wrapper (functools.wraps keeps the name).
     """Run a cupti_monitor test in a fresh subprocess. The monitor needs the single
     process-wide CUPTI subscriber, but libkineto grabs it for the process lifetime once
     any kineto-CUDA profile runs (setUpModule's prime, or another test in a full run),
@@ -83,6 +103,10 @@ def _isolated(test_fn):
 
     @functools.wraps(test_fn)
     def wrapper(self):
+        # [FUNCTION DOC] HELPER: Replacement test method produced by the _isolated decorator; see
+        # that decorator for the run-in-child versus run-directly logic. Takes the TestCase
+        # instance, returns whatever the wrapped test returns when in the child and None
+        # otherwise.
         if os.environ.get("PYTORCH_CUPTI_ISOLATED_CHILD") == "1":
             return test_fn(self)
         test_id = f"{type(self).__name__}.{test_fn.__name__}"
@@ -104,6 +128,10 @@ def _isolated(test_fn):
 
 
 def _fresh_event_node_recorder(test):
+    # [FUNCTION DOC] HELPER: Resets the _EventNodeRecorder singleton (via the module's reset-for-
+    # test hook), registers the same reset as test cleanup, and returns a fresh recorder instance.
+    # Gives each test an unarmed recorder with an empty graph event-node map that does not leak
+    # afterwards.
     """The ``_EventNodeRecorder`` singleton, reset first (and again at teardown) so the test
     starts from an unarmed recorder with an empty map and leaves none behind."""
     from torch.profiler._cupti._event_nodes import _EventNodeRecorder, _reset_for_test
@@ -115,9 +143,16 @@ def _fresh_event_node_recorder(test):
 
 @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
 class TestCuptiRecords(TestCase):
+    # [CLASS DOC] Host-side tests for the CUPTI monitor, its configuration, the external-
+    # correlation id bookkeeping, metadata joins, graph event/host node handling and trace
+    # rendering. Needs only the cupti python bindings (some tests need libcupti 13.3 or newer); no
+    # CUDA device is used. Each test starts from a freshly reset CuptiMonitor singleton.
     """Pure monitor + metadata unit tests (no CUDA)."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Resets the process-wide CuptiMonitor singleton before each test
+        # and registers the reset as cleanup so every test builds its own monitor and none is left
+        # behind.
         # CuptiMonitor is a process-wide singleton; drop it so each test builds a fresh one.
         from torch.profiler._cupti import monitor as _cupti_monitor
 
@@ -126,6 +161,11 @@ class TestCuptiRecords(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_monitor_normalize_activities(self):
+        # [FUNCTION DOC] Checks the monitor's normalization of an activity registration request
+        # into a pair of activity kinds and per-kind field sets. A plain list of kinds expands to
+        # every field in the field registry plus the always-included kind field zero; a mapping
+        # selects the given fields (the Kernel START field here) or the string all for the full
+        # set. Requires libcupti 13.3 or newer.
         # A registration request resolves to (kinds, per-kind field selection): a
         # bare kind iterable means "all fields"; a field map selects fields, with
         # "all"/None expanding; *_FIELD_KIND (0) is always included.
@@ -151,6 +191,11 @@ class TestCuptiRecords(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires the cupti python bindings")
     def test_configure_and_get_config(self):
+        # [FUNCTION DOC] Verifies the module-level configure and get_config pair. Defaults: 4 MiB
+        # buffer, both background cadences -1.0 (caller driven), approximate timestamps off, not
+        # configured. After one configure call the given values are reported, unspecified cadences
+        # stay at default and configured becomes true. A second configure call is ignored (first
+        # call wins). No session or libcupti needed.
         # configure() sets the process-wide config get_config() reports; it is first-come-
         # first-serve. Pure config -- no session, only the cupti python bindings (not
         # libcupti). setUp reset the singleton, so this starts from the defaults: both
@@ -182,6 +227,10 @@ class TestCuptiRecords(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_singleton_snapshots_config(self):
+        # [FUNCTION DOC] Verifies that constructing CuptiMonitor returns one singleton that
+        # snapshots the configure settings (buffer size and the flush and drain cadences). After a
+        # reset with no configure call the cadences are back to -1.0. Requires libcupti 13.3 or
+        # newer.
         # CuptiMonitor() is the process-wide singleton: it returns the one instance,
         # built once from the configure() settings.
         from torch.profiler._cupti import monitor as cupti_monitor
@@ -206,6 +255,10 @@ class TestCuptiRecords(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_monitor_use_approx_timestamps_config(self):
+        # [FUNCTION DOC] Verifies the use_approx_timestamps setting: the monitor's internal
+        # timestamp-callback flag is false by default and true after configure enabled it and the
+        # singleton was rebuilt. Requires libcupti 13.3 or newer since constructing the monitor
+        # loads libcupti.
         # use_approx_timestamps is a configure() setting the singleton snapshots: OFF by
         # default (the per-subscriber callback only times device records correctly when the
         # monitor is the first CUPTI consumer), opt-in on. Constructing loads libcupti (>= 13.3).
@@ -219,6 +272,9 @@ class TestCuptiRecords(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_monitor_external_correlation_not_started(self):
+        # [FUNCTION DOC] Verifies that before the monitor is started, pushing and popping an
+        # external correlation id are no-ops that return None and leave CUPTI's global stack
+        # untouched. Requires libcupti 13.3 or newer.
         # External-correlation push/pop are no-ops until the monitor is started (no
         # subscriber yet), returning None rather than touching CUPTI's global stack.
         from torch.profiler._cupti.monitor import CuptiMonitor
@@ -229,6 +285,10 @@ class TestCuptiRecords(TestCase):
         self.assertIsNone(m.pop_external_correlation_id())
 
     def test_external_correlation_id_mirror(self):
+        # [FUNCTION DOC] Exercises the native per-thread mirror of the external-correlation stack
+        # exposed by the private cupti monitor binding. After draining leftovers, the current id
+        # is 0; pushes of 7 then 9 make the top the innermost push; pops return 9 then 7 and
+        # restore the previous top; popping an empty stack returns 0. Host only.
         # The native per-thread mirror of CUPTI's external-correlation stack lets
         # the current id be read (CUPTI has push/pop but no peek). Pure: the mirror
         # is host-side, no CUDA/CUPTI.
@@ -248,6 +308,12 @@ class TestCuptiRecords(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_external_id_chain_and_gc(self):
+        # [FUNCTION DOC] Tests the monitor's chain of active external ids per id. Chains are
+        # seeded directly in the internal mapping; looking up an id returns its stored chain, or a
+        # one-element tuple of itself when no snapshot exists. The garbage-collect step keeps a
+        # popped id's chain through one pass (pending becomes ready) and drops it on the next,
+        # while an id never marked popped is retained. No CUDA or CUPTI use; requires libcupti
+        # 13.3 or newer.
         # The push-time active-id chain: with one kind CUPTI tags a kernel with only
         # the innermost id, so the monitor snapshots the full active stack per id and
         # exposes external_id_chain(innermost) -> (outermost..innermost) for consumers
@@ -277,6 +343,11 @@ class TestCuptiRecords(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_drain_polls_pm_consumers(self):
+        # [FUNCTION DOC] Regression test that the monitor's drain-and-dispatch step polls
+        # registered performance-monitor (PM) sampling consumers. A fake handle counts polls and
+        # returns a column dict with start times; after one drain the handle was polled once and
+        # the registered callback received one frame with those values. Requires libcupti 13.3 or
+        # newer; no CUDA.
         # Regression: PM-sampling frames must be pulled on the drain path. flush() and
         # the background drain loop both funnel through _drain_and_dispatch, so the PM
         # poll is folded there -- the native self-flush thread never touches the PM ring
@@ -286,10 +357,15 @@ class TestCuptiRecords(TestCase):
         from torch.profiler._cupti.monitor import CuptiMonitor
 
         class _FakeHandle:
+            # [CLASS DOC] HELPER: Fake PM sampling handle for the drain test. Keeps a poll counter
+            # and returns the same single-column frame of start times on every poll.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the poll counter to zero.
                 self.polls = 0
 
             def poll(self):
+                # [FUNCTION DOC] HELPER: Increments the poll counter and returns a mapping from
+                # the column name start_ns to an int64 numpy array of two timestamps.
                 self.polls += 1
                 return {"start_ns": np.array([100, 200], dtype=np.int64)}
 
@@ -305,6 +381,12 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(list(delivered[0]["start_ns"]), [100, 200])
 
     def test_metadata_store_roundtrip(self):
+        # [FUNCTION DOC] Exercises the native metadata store behind the private cupti monitor
+        # binding. With no external id on the stack a metadata put does nothing and the decoded
+        # drain returns an empty record list and empty mapping. With id 42 pushed, two puts of
+        # JSON objects merge recursively (top-level union and nested objects combined) under that
+        # id; the drain returns no record groups plus a mapping from 42 to the merged JSON text,
+        # and a further drain is empty. Host only.
         # The CollTrace-replacement metadata store: producers put a JSON object keyed
         # by the CURRENT external-correlation id on this thread's stack (pushed around
         # the op), so the put takes no id. Repeated puts under the same id MERGE. It
@@ -334,6 +416,11 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(m.drain_decoded(), ([], {}))
 
     def test_attach_metadata_join(self):
+        # [FUNCTION DOC] Tests the helper in the profiler observer that attaches a metadata column
+        # to columnar GPU-op data. A kernel whose correlation id maps through the external-
+        # correlation columns to an external id with a blob gets that blob; rows with no blob or
+        # no mapping get None. With empty metadata and no resolver the helper adds no metadata
+        # column. Host only.
         # The CollTrace-replacement join: a blob keyed by external_id is attached as a
         # "metadata" column onto the GPU-op kinds whose correlation_id maps (via the
         # window's EXTERNAL_CORRELATION columns -- all ours, the monitor is the sole
@@ -373,6 +460,10 @@ class TestCuptiRecords(TestCase):
         self.assertNotIn("metadata", clean["kernel"])
 
     def test_attach_metadata_graph_resolver(self):
+        # [FUNCTION DOC] Tests the graph-resolver path of the metadata attach helper. A replay
+        # kernel with no external correlation gets its blob from the resolver keyed by graph node
+        # id; an unknown node yields None; when both the eager external-id join and the resolver
+        # could answer, the eager blob wins.
         # CUDA-graph-captured collectives have no replay-time external correlation;
         # their blob is resolved by graph_node_id via the metadata resolver (the same
         # mechanism as graph annotation names). Pure host-side, columnar.
@@ -425,20 +516,34 @@ class TestCuptiRecords(TestCase):
         )
 
     def test_recorder_keeps_node_id_order_and_refuses_opaque_bodies(self):
+        # [FUNCTION DOC] Checks that the event-node recorder's instantiate hook keeps event nodes
+        # in node-id (creation) order rather than dependency depth, using a fake graph with a fork
+        # and join shape. A graph without event nodes tracks nothing, and graphs containing child
+        # graph or conditional body nodes are refused (nothing recorded) even with a top-level
+        # event node. Host only.
         # The recorder takes event nodes in the order get_graph_data() returns them (node-id
         # == node-creation order) with no DAG-derived sorting: sync id follows node id, not
         # execution order, so ordering by dependency depth mislabels nodes on any fork/join
         # graph. Graphs with child/conditional bodies are refused outright -- get_graph_data()
         # does not descend into them, so their event nodes are invisible here. Pure host-side.
         def node(ntype, tid, deps):
+            # [FUNCTION DOC] HELPER: Builds one fake graph node description as a mapping with the
+            # node type, tools id and dependency list.
             return {"node_type": ntype, "tools_id": tid, "dependencies": deps}
 
         class FakeGraph:
+            # [CLASS DOC] HELPER: Minimal stand-in for a CUDA graph object as seen by the
+            # recorder: holds a node list, an empty set of recorded exec ids, and reports graph
+            # data on request.
             def __init__(self, nodes):
+                # [FUNCTION DOC] HELPER: Stores the given node list and initializes an empty set
+                # of recorded exec ids.
                 self._nodes = nodes
                 self._recorded_exec_ids: set[int] = set()
 
             def get_graph_data(self):
+                # [FUNCTION DOC] HELPER: Returns a mapping holding the stored nodes and a fixed
+                # exec graph id of 7.
                 return {"nodes": self._nodes, "exec_graph_id": 7}
 
         # Fork/join: the deeper branch's event node is created FIRST (lower node id) but sits
@@ -475,6 +580,9 @@ class TestCuptiRecords(TestCase):
             self.assertNotIn(7, r3.graph_event_nodes, opaque)
 
     def test_event_node_recorder_purge(self):
+        # [FUNCTION DOC] Checks that the event-node recorder's purge of exec ids removes the
+        # entries of a destroyed graph (id 7) while leaving other entries (id 8, whose value is
+        # None) in place.
         # The recorder holds each graph's ordered event nodes; purge drops a destroyed graph.
         r = _fresh_event_node_recorder(self)
         r.graph_event_nodes = {7: [11, 13], 8: None}
@@ -483,6 +591,10 @@ class TestCuptiRecords(TestCase):
         self.assertIn(8, r.graph_event_nodes)
 
     def test_graph_recorders_are_singletons(self):
+        # [FUNCTION DOC] Checks that the event-node recorder and the graph dependency recorder are
+        # process-wide singletons: a second construction returns the same object without re-
+        # initializing it, preserving data (event node list for id 7, dependency list for id 9).
+        # Resets the dependency recorder first and registers its reset as cleanup.
         # Both instantiate-hook recorders are process-wide singletons (like CuptiMonitor): a
         # later construction hands back the one instance WITHOUT re-initializing it, which is
         # what lets an observer created mid-run (at prepare_trace) share the map a recorder
@@ -506,6 +618,12 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(_GraphDependencyRecorder().deps[9], [8])
 
     def test_resolve_window(self):
+        # [FUNCTION DOC] Tests the window resolution function for event nodes. It keys launches by
+        # correlation id to exec graph id from graphed work records, orders each launch's event
+        # records by sync id and maps them positionally to the recorder's nodes for that graph.
+        # Out-of-order input resolves by sync id; recycled event objects do not collapse onto one
+        # node; a launch whose record count mismatches, or with no matching graphed record, yields
+        # None entries. No numpy or CUDA.
         # The window orchestration: keys each launch by correlation id -> exec graph id (from a
         # graphed work record's graph_node_id), orders that launch's event records by sync id,
         # and resolves each record to its node POSITIONALLY. Pure (no numpy/CUDA).
@@ -537,6 +655,11 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(resolve_window(r, [], [(0, 0)]), [None])
 
     def test_add_graph_event_node_spans(self):
+        # [FUNCTION DOC] Tests the helper that adds graph event-node point spans to columnar data.
+        # Of three CUDA event rows only the one that is resolved (nonzero graph node id) and whose
+        # start time lies inside the half-open window from start to boundary survives; the new
+        # graph_event_node frame has graph id equal to the node id shifted right by 32, and
+        # carries start and stream. If no row resolves, no frame is added.
         # The window-bucketed event-node span frame keeps only rows resolved to a graph node
         # (graph_node_id != 0) whose device timestamp is in [start, boundary), and builds point
         # spans with graph_id = node_id >> 32. Pure host-side.
@@ -585,6 +708,9 @@ class TestCuptiRecords(TestCase):
         self.assertNotIn("graph_event_node", cols2)
 
     def test_add_graph_event_node_spans_attaches_lane_columns(self):
+        # [FUNCTION DOC] Tests that the synthesized graph event-node frame attaches its own
+        # logical lane and lane name columns when a lane resolver is supplied (here lane 61 named
+        # DP), keeping the capture stream id, and attaches no lane column without a resolver.
         # The span frame is synthesized after the _COLUMN_BUILDERS lane pass has run, so it must
         # attach its own (logical_lane, lane_name); without them the export's reassignment is
         # gated off and the event node strands on its capture stream while the collective's
@@ -596,6 +722,8 @@ class TestCuptiRecords(TestCase):
         node = (7 << 32) | 11
 
         def cols_for():
+            # [FUNCTION DOC] HELPER: Builds a fresh single-row columnar dict for a cuda_event
+            # frame carrying a resolved graph node on stream 377 within the window.
             return {
                 "cuda_event": {
                     "event_id": np.array([5], dtype=np.int64),
@@ -626,6 +754,10 @@ class TestCuptiRecords(TestCase):
         self.assertNotIn("logical_lane", plain["graph_event_node"])
 
     def test_attach_event_node_ids_uses_installed_resolver(self):
+        # [FUNCTION DOC] Tests that the helper attaching event node ids takes the annotation
+        # column from the supplied resolver (which can return a merged dict) rather than reading
+        # the graph annotation store directly. The resolver is called once with the resolved node
+        # id, and the annotation column holds the resolver's dict.
         # The annotation column must come from the installed resolver (the same one the GPU-op
         # column builders use), not a direct read of torch.cuda._graph_annotations -- an
         # installed resolver may merge a node's annotation list into one dict, and only a dict
@@ -653,6 +785,9 @@ class TestCuptiRecords(TestCase):
         seen: list[int] = []
 
         def resolver(g):
+            # [FUNCTION DOC] HELPER: Fake lane and annotation resolver that records each graph
+            # node id it is asked about in a list and returns a fixed dict with a roofline id and
+            # stream.
             seen.append(g)
             return {"roofline_id": "fsdp.all_gather_collective", "stream": 61}
 
@@ -666,6 +801,10 @@ class TestCuptiRecords(TestCase):
         )
 
     def test_graph_event_node_rendered_and_arrowed(self):
+        # [FUNCTION DOC] Tests chrome-trace rendering of a resolved graph event node: one span
+        # named EventRecord in category graph_event_node on the device lane with stream, graph
+        # node id and the hex cuda event id in its args, and (with graph dependencies supplied) a
+        # dependency flow-finish endpoint landing at the event node's start time. No CUDA.
         # A resolved graph event-record node renders as an "EventRecord" point span under cat
         # "graph_event_node" on its stream lane, and (with graph_deps) is a dependency-arrow
         # endpoint: an arrow flows from the producing kernel to the event node. No CUDA.
@@ -677,6 +816,7 @@ class TestCuptiRecords(TestCase):
         )
 
         def i64(*v):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(v, dtype=np.int64)
 
         KA = (1 << 32) | 101  # producing kernel node
@@ -745,6 +885,10 @@ class TestCuptiRecords(TestCase):
         self.assertIn(2500 / 1000.0, finish_ts)
 
     def test_attach_event_node_ids(self):
+        # [FUNCTION DOC] End-to-end host test of the helper that attaches event node ids to a
+        # window's columns. Event rows arriving out of order are resolved positionally by sync id
+        # and the resulting node ids are realigned to input order; annotation is None for each.
+        # Passing no recorder leaves the frame unchanged (no graph_node_id column).
         # End-to-end host-side: given a window's kernel + cuda_event columns, learn the
         # mapping (records ordered by sync id, launch keyed by correlation id -> exec graph id
         # from the kernel's graph_node_id) and attach graph_node_id + annotation to the
@@ -787,6 +931,11 @@ class TestCuptiRecords(TestCase):
         self.assertNotIn("graph_node_id", plain["cuda_event"])
 
     def test_window_graph_deps_collapses_event_nodes(self):
+        # [FUNCTION DOC] Tests collapsing of dependencies through non-rendered event and wait
+        # nodes. The nearest-present-predecessors helper walks through the event record and wait
+        # nodes to the rendered kernel (root kernels have none), the window-level helper keeps the
+        # resulting arrow for present kernels, plain kernel to kernel edges are unchanged, and
+        # fan-in through two event chains yields both source kernels.
         # A dependency arrow must span a kernel -> event_record -> wait_event -> kernel chain
         # (event/wait nodes never render as spans, so they can't be arrow endpoints). The window
         # dep resolver collapses those non-present nodes to the nearest rendered ancestor.
@@ -829,6 +978,9 @@ class TestCuptiRecords(TestCase):
         )
 
     def test_metadata_blob_rendered_into_trace_args(self):
+        # [FUNCTION DOC] Tests that a JSON metadata blob in the metadata column of a kernel frame
+        # is spread into the chrome-trace kernel event args (function name and count appear).
+        # Drives the window trace entry builder directly with a single-row frame.
         # The comms descriptor blob attached as the "metadata" column is spread into the
         # chrome-trace kernel args (so func/count/... show up), the same way a dict
         # annotation is. Drives the columnar merge directly (no CUDA).
@@ -837,6 +989,8 @@ class TestCuptiRecords(TestCase):
         from torch.profiler._cupti.monitor_trace import _trace_window_entries
 
         def col(v):
+            # [FUNCTION DOC] HELPER: Builds a one-element int64 numpy array holding the given
+            # value.
             return np.array([v], dtype=np.int64)
 
         blob = json.dumps({"func": "AllReduce", "count": 4096})
@@ -876,6 +1030,10 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(args["count"], 4096)
 
     def test_graph_host_node_rendered_in_trace(self):
+        # [FUNCTION DOC] Tests chrome-trace rendering of a graph host node record: one event in
+        # category graph_host_node, named with the resolved host function, on the device lane,
+        # with args for stream, host process and thread, graph id, graph node id (lower 32 bits),
+        # the spread dict annotation, host function and its address in hex.
         # A CUPTI GRAPH_HOST_NODE record (a CPU callback run as a CUDA-graph node) renders as a
         # "HostNode" span under cat "graph_host_node" on the waiting stream's lane, with its
         # graph id / node id and dict annotation patched on like the other graphed ops. When a
@@ -886,6 +1044,8 @@ class TestCuptiRecords(TestCase):
         from torch.profiler._cupti.monitor_trace import _trace_window_entries
 
         def col(v):
+            # [FUNCTION DOC] HELPER: Builds a one-element int64 numpy array holding the given
+            # value.
             return np.array([v], dtype=np.int64)
 
         columns = {
@@ -923,6 +1083,11 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(args["host fn addr"], hex(0x7FABCD))
 
     def test_graph_kernel_reassigned_to_logical_lane(self):
+        # [FUNCTION DOC] Tests lane reassignment in the single-pass trace merge. A graphed kernel
+        # whose logical lane column differs from its stream is placed on that lane with its stream
+        # argument updated and original_stream preserved, the lane named by lane_name, and its
+        # ac2g flow-finish following it; a kernel left on its own lane keeps its stream, gets no
+        # original_stream and the default stream name. No CUDA.
         # A graphed kernel the lane resolver maps to a logical lane is placed on that lane
         # (tid + args["stream"]), its real CUDA stream is preserved as original_stream, the
         # lane is named by the resolver, and its ac2g flow arrow follows -- all in the single
@@ -936,6 +1101,7 @@ class TestCuptiRecords(TestCase):
         from torch.profiler._cupti.monitor_trace import _trace_window_entries
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         columns = {
@@ -1005,6 +1171,10 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(names[(0, 7)].strip(), "stream 7")
 
     def test_gpu_user_annotation_stays_on_capture_stream(self):
+        # [FUNCTION DOC] Tests the GPU user annotation events builder. Annotations stay on the
+        # kernels' capture stream, never on a reassigned logical lane; an annotation whose capture
+        # stream has no remaining non-reassigned work is dropped, while one on a stream that still
+        # has eager work is kept. Checks category and thread id of the kept events. No CUDA.
         # A GPU-side user annotation stays on its kernels' real capture stream, never a lane the
         # resolver reassigned kernels onto. But when a capture stream has no work left to
         # show (all its ops moved to a logical lane), the span would be orphaned on an empty
@@ -1015,6 +1185,7 @@ class TestCuptiRecords(TestCase):
         from torch.profiler._cupti.monitor_trace import _gpu_user_annotation_events
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         columns = {
@@ -1054,6 +1225,12 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(by_name["reduce_scatter"]["tid"], 5)
 
     def test_graph_dependency_flows_json(self):
+        # [FUNCTION DOC] Tests the helper producing graph dependency flow events for the JSON
+        # export: one start and finish per edge per replay (grouped by correlation id), leaving
+        # the predecessor's end on its lane and landing on the successor's start, with distinct
+        # ids per replay and finish binding point e; no dependencies yields no flows. With clock
+        # skew the flow runs backwards (end later than start), documented as a known limitation of
+        # the JSON export.
         # CUDA-graph node->node dependency arrows in the JSON export: one flow per edge from the
         # predecessor's end to the successor's start, resolved within the same replay
         # (correlation_id) so arrows never cross replays, on the ops' display lanes. No CUDA.
@@ -1098,6 +1275,10 @@ class TestCuptiRecords(TestCase):
         )  # end -> start, backwards under skew
 
     def test_cpu_launch_flow_targets_only_graph_roots(self):
+        # [FUNCTION DOC] Tests that with graph dependency arrows present, the CPU-launch to GPU
+        # flow links only to root graph nodes of a diamond-shaped graph, while four dependency
+        # arrows are drawn; with dependencies disabled every kernel keeps its launch flow. No
+        # CUDA.
         # With graph node->node arrows drawn (graph_deps present), the CPU-launch -> GPU-op flow
         # links only to root graph nodes; a non-root node gets its incoming edge from the dep
         # arrow, so the cudaGraphLaunch does not fan out to every replayed kernel. Diamond, one
@@ -1107,6 +1288,7 @@ class TestCuptiRecords(TestCase):
         from torch.profiler._cupti.monitor_trace import _trace_window_entries
 
         def i64(*v):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(v, dtype=np.int64)
 
         A, B, C, D, corr = 1001, 1002, 1003, 1004, 77
@@ -1158,6 +1340,10 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(len(off), 4)
 
     def test_pftrace_render_stages_reassign_lane(self):
+        # [FUNCTION DOC] Tests the pftrace render-stage builder: a graphed kernel is placed on its
+        # named logical lane, a GPU annotation stays on its capture stream lane (not the
+        # reassigned lane), and an eager kernel keeps its default stream lane. Checks the lane
+        # names derived from the stage specs. No CUDA.
         # The pftrace render-stage builder reassigns a graphed kernel onto its logical lane
         # (named by the resolver); a GPU annotation stays on its capture-stream lane (as
         # _window_to_pftrace builds it), not the kernel's reassigned lane. An eager kernel
@@ -1170,6 +1356,7 @@ class TestCuptiRecords(TestCase):
         )
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         columns = {
@@ -1213,6 +1400,12 @@ class TestCuptiRecords(TestCase):
         self.assertIn("stream", lanes[1])  # eager kept its default "stream N" lane
 
     def test_pftrace_graph_event_and_host_nodes_rendered(self):
+        # [FUNCTION DOC] Tests that graph event nodes and graph host nodes become render stages in
+        # the pftrace stage builder. One replay (shared correlation) has kernel A, an event node
+        # waiting on A, and a host node waiting on the event node. Checks stage names EventRecord
+        # and HostNode, stage ids per row, that only the root kernel links to the launch, the
+        # dependency wait lists per row (CSR offsets and ids), and that the host function name and
+        # address ride in the per-row spread blob (none for the kernel row). No CUDA.
         # graph_event_node / graph_host_node are render stages too: an event-record node renders
         # as an "EventRecord" stage and a host-callback node as a "HostNode" stage, both threaded
         # through event-id assignment (so they are dependency-arrow endpoints) and the dependency
@@ -1229,6 +1422,7 @@ class TestCuptiRecords(TestCase):
         )
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         gnid_a, gnid_e, gnid_h, corr = 1001, 1002, 1003, 50
@@ -1284,6 +1478,8 @@ class TestCuptiRecords(TestCase):
         w_off, w_ids = stage_cols[8]
 
         def waits(i):
+            # [FUNCTION DOC] HELPER: Returns, as a list, the slice of the wait ids belonging to
+            # row i according to the CSR offsets of the enclosing test.
             return w_ids[w_off[i] : w_off[i + 1]].tolist()
 
         self.assertEqual(waits(0), [])  # kernel A is the root
@@ -1299,6 +1495,10 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(meta_off[1] - meta_off[0], 0)  # kernel row: no spread blob
 
     def test_pftrace_lane_names_order_by_id(self):
+        # [FUNCTION DOC] Regression test that pftrace hardware-queue lane names sort
+        # lexicographically in the same order as numeric lane id, by prefixing a zero-padded lane
+        # id. A resolver-named lane (id 50, name aaa_comm) must not sort before the lower-id
+        # stream 7 lane; exactly two lanes are produced and the first mentions stream 7. No CUDA.
         # Perfetto sorts GPU hardware-queue lanes lexicographically by name, so lane names must
         # be prefixed with the zero-padded lane id -> the lane order matches the chrome path's
         # numeric lane-id order. A resolver-named lane must not sort ahead of a lower-id stream
@@ -1312,6 +1512,7 @@ class TestCuptiRecords(TestCase):
         )
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         columns = {
@@ -1342,6 +1543,10 @@ class TestCuptiRecords(TestCase):
         self.assertIn("aaa_comm", lane_names[1])  # lane 50 second, despite the name
 
     def test_pftrace_annotation_column_from_window(self):
+        # [FUNCTION DOC] Tests that the pftrace GPU annotation render column is built from the
+        # columnar window: the annotation lands on the kernels' capture stream (7) rather than the
+        # reassigned lane, carrying name and device id; a window without annotations gives None.
+        # No CUDA.
         # pftrace builds its GPU annotation render column from the columnar window (kineto emits
         # no gpu_user_annotation in monitor mode), on the kernels' capture stream not the
         # reassigned lane. Stream 7 keeps eager work, so the span stays there; one whose stream
@@ -1351,6 +1556,7 @@ class TestCuptiRecords(TestCase):
         from torch.profiler._cupti.monitor_trace import _gpu_annotation_render_column
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         trace_window = {
@@ -1388,6 +1594,12 @@ class TestCuptiRecords(TestCase):
         )
 
     def test_chrome_counter_events_from_pm(self):
+        # [FUNCTION DOC] Tests rendering of performance-monitor sampling data as chrome counter
+        # events. Known metric names get friendly labels (unknown ones keep the raw name). Four
+        # samples of one metric yield four counter events on the per-device GPU Counters process
+        # row with the friendly name, microsecond timestamp relative to base and the value in an
+        # args mapping with an empty key; a process sort index metadata event is also emitted. No
+        # device filtering when the active device set is empty. No CUDA.
         # PM counters render as chrome "C" (counter) events in a dedicated per-device
         # "GPU N Counters" process row, separate from the GPU kernel work. No CUDA.
         import numpy as np
@@ -1440,6 +1652,10 @@ class TestCuptiRecords(TestCase):
         )
 
     def test_chrome_counter_events(self):
+        # [FUNCTION DOC] Tests chrome counter rendering from the merged counter tuple form (names,
+        # device ids, start times, counter ids, values): four samples give four counter events on
+        # the device's GPU Counters process row with the counter name, relative microsecond
+        # timestamp and value. No CUDA.
         # GPU counters render as chrome "C" (counter) events in a dedicated per-device
         # "GPU N Counters" process row, separate from the GPU kernel work. No CUDA.
         import numpy as np
@@ -1469,6 +1685,10 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(e["args"], {"": 80.0})
 
     def test_metadata_store_explicit_id(self):
+        # [FUNCTION DOC] Tests the native metadata store when an explicit nonzero external id is
+        # passed: that blob is stored under that id (skipped if the binding does not accept the
+        # extra argument, i.e. raises a type error), then a put with default id while 77 is pushed
+        # merges into the same entry. The drain reports only id 77 with both fields. Host only.
         # put_external(blob, external_id): an explicit non-zero id targets a specific
         # collective rather than the current pushed one -- the seam for a backend to
         # attach metadata outside the push window. external_id 0 (default) still keys
@@ -1488,6 +1708,13 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(json.loads(ext_meta[77]), {"backend": "x", "extra": 1})
 
     def test_pftrace_chrome_gpu_slice_parity(self):
+        # [FUNCTION DOC] Parity test between the chrome JSON and pftrace exports of one synthetic
+        # window (kernels, memcpy, memset, GPU annotation, runtime launch records, external
+        # correlation). The native pftrace encoder is replaced by a capture stub via patch, so
+        # nothing native runs. Asserts that GPU slices (name, device, lane, start, duration) agree
+        # as multisets, that lane names agree after stripping the pftrace id prefix, and that CPU
+        # launch to GPU op arrows connect the same threads and lanes in both formats. Uses a
+        # temporary directory; no CUDA.
         # The .pftrace and chrome-JSON exports are slice-for-slice equivalent for the GPU
         # ops both formats represent (kernels, memcpy, memset, and the GPU-side user
         # annotation). Run the single merge entry point over one synthetic window down both
@@ -1512,6 +1739,7 @@ class TestCuptiRecords(TestCase):
         )
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         # base_ns 0 so chrome ts/dur (us) map to render ns by *1000 with no base offset.
@@ -1648,6 +1876,9 @@ class TestCuptiRecords(TestCase):
                 counters,
                 compression,
             ):
+                # [FUNCTION DOC] HELPER: Stand-in for the native pftrace encoder: stores the
+                # tracks, name table, category table, group tuples and render stages in the
+                # enclosing capture mapping and returns empty bytes. Other arguments are ignored.
                 captured["tracks"] = tracks
                 captured["name_table"] = name_table
                 captured["cat_table"] = cat_table
@@ -1754,6 +1985,11 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(set(chrome_arrows.values()), pftrace_arrows)
 
     def test_pftrace_chrome_lane_order_parity(self):
+        # [FUNCTION DOC] Checks that GPU lane display order agrees between chrome and pftrace
+        # exports and is strictly ascending by lane id (7, 9, 17). The pftrace hardware queue lane
+        # labels carry zero-padded ids, so sorting the labels as text reproduces numeric order,
+        # including the single versus double digit case. The native encoder is stubbed to capture
+        # the render stages. Uses a temporary directory; no CUDA.
         # The GPU lane DISPLAY ORDER matches across formats -- both order by numeric lane id.
         # Chrome orders lanes by tid (numeric); pftrace names its hardware-queue lanes
         # "[<zero-padded id>] <label>" so that Perfetto's lexicographic sort of those labels
@@ -1773,6 +2009,7 @@ class TestCuptiRecords(TestCase):
         )
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         columns = {
@@ -1840,6 +2077,8 @@ class TestCuptiRecords(TestCase):
                 counters,
                 compression,
             ):
+                # [FUNCTION DOC] HELPER: Stand-in for the native pftrace encoder that stores only
+                # the render stages argument in the capture mapping and returns empty bytes.
                 captured["render"] = render
                 return b""
 
@@ -1867,6 +2106,11 @@ class TestCuptiRecords(TestCase):
         )
 
     def test_pftrace_categories_and_time_base(self):
+        # [FUNCTION DOC] Tests two properties of the pftrace export with the encoder stubbed: the
+        # trace's base time reaches the encoder unchanged, and each CPU or runtime slice
+        # references an interned category (cpu_op, user_annotation, cuda_runtime), so the name to
+        # category pairs for the add operator, a user region and the kernel launch call are
+        # exactly as expected. Requires the cupti python runtime callback id enum. Host only.
         # The pftrace export tags each CPU slice with an interned category (cpu_op /
         # user_annotation / cuda_runtime / ...) so the viewer can total by kind, and
         # threads the trace's base time through to the encoder (-> a ClockSnapshot).
@@ -1936,6 +2180,9 @@ class TestCuptiRecords(TestCase):
             counters,
             compression,
         ):
+            # [FUNCTION DOC] HELPER: Stand-in for the native pftrace encoder: records the base
+            # time, name table, category table and group tuples into the enclosing capture mapping
+            # and returns empty bytes.
             captured["base_ns"] = base_ns_arg
             captured["name_table"] = name_table
             captured["cat_table"] = cat_table
@@ -1978,6 +2225,11 @@ class TestCuptiRecords(TestCase):
         )
 
     def test_pftrace_kernel_carries_collective_metadata(self):
+        # [FUNCTION DOC] Runs the real native pftrace encoder on a kernel carrying a collective
+        # descriptor in its metadata column, gunzips the output file and decodes the protobuf with
+        # the local varint scanners, collecting the extra data name and value pairs of GPU render
+        # stage packets. Each descriptor field appears as its own pair; strings keep their value
+        # and numbers are stringified. No CUDA.
         # The per-kernel collective descriptor (metadata column) is spread onto the GPU
         # render stage as extra_data (name/value string pairs), mirroring the chrome path
         # which spreads the same blob into the GPU op's args -- so consumers need no
@@ -1994,6 +2246,7 @@ class TestCuptiRecords(TestCase):
         )
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         descriptor = {"Process Group Name": "0", "dtype": "bf16", "In msg nelems": 1024}
@@ -2028,6 +2281,9 @@ class TestCuptiRecords(TestCase):
         window = {"columns": columns, "user_annotations": {}}
 
         def rv(b, i):  # read a varint at offset i, return (value, next_offset)
+            # [FUNCTION DOC] HELPER: Reads one protobuf varint from the byte buffer b at offset i,
+            # accumulating seven bits per byte until a byte without the continuation bit; returns
+            # the value and the next offset.
             s = r = 0
             while True:
                 x = b[i]
@@ -2038,6 +2294,9 @@ class TestCuptiRecords(TestCase):
                 s += 7
 
         def flds(b):  # scan a message into [(field_no, wire_type, value)]
+            # [FUNCTION DOC] HELPER: Scans a protobuf message buffer into a list of triples of
+            # field number, wire type and value. Varints give integers, length-delimited fields
+            # give byte slices; fixed 32-bit and 64-bit fields are skipped without being recorded.
             i = 0
             o = []
             while i < len(b):
@@ -2094,6 +2353,11 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(extra["In msg nelems"], "1024")
 
     def test_pftrace_render_stage_spreads_graph_annotation(self):
+        # [FUNCTION DOC] Same end-to-end native encode and decode as the collective metadata test,
+        # but for graph-node annotations: the annotation column holds a list of dicts per row and
+        # is spread onto the GPU render stage as extra data, matching the chrome path. One row has
+        # annotation only, the other annotation plus a metadata blob and the two merge. Numbers
+        # are stringified. No CUDA.
         # A graph-node annotation (mark_kernels region -- e.g. a collective's process-group
         # name recorded at capture via annotate_barrier) is spread onto the GPU render stage as
         # extra_data, the same way the collective metadata column is -- closing the parity gap
@@ -2110,6 +2374,7 @@ class TestCuptiRecords(TestCase):
         )
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         # annotation column holds the graph annotation resolver's return: a list of dicts per
@@ -2151,6 +2416,8 @@ class TestCuptiRecords(TestCase):
         window = {"columns": columns, "user_annotations": {}}
 
         def rv(b, i):
+            # [FUNCTION DOC] HELPER: Reads one protobuf varint from the byte buffer b at offset i;
+            # returns the value and the next offset.
             s = r = 0
             while True:
                 x = b[i]
@@ -2161,6 +2428,9 @@ class TestCuptiRecords(TestCase):
                 s += 7
 
         def flds(b):
+            # [FUNCTION DOC] HELPER: Scans a protobuf message buffer into triples of field number,
+            # wire type and value (integers for varints, byte slices for length-delimited fields);
+            # fixed-width fields are skipped.
             i = 0
             o = []
             while i < len(b):
@@ -2227,6 +2497,12 @@ class TestCuptiRecords(TestCase):
         self.assertEqual(per_stage[2]["graph node id"], "11")
 
     def test_pftrace_graph_node_dependency_arrows(self):
+        # [FUNCTION DOC] Runs the real native pftrace encoder on a window with two graphed kernels
+        # of one replay (same correlation, B depends on A via the window's graph dependency
+        # mapping) plus one graph launch runtime record, then decodes the gunzipped protobuf.
+        # Asserts two GPU render stages with exactly one carrying wait ids that point at the other
+        # (the node to node arrow), and that the launch track event's GPU correlation lists only
+        # the root node's event id. Requires the cupti runtime callback id enum. No CUDA.
         # A CUDA-graph replay's node dependency DAG becomes GpuRenderStageEvent.event_wait_ids
         # (node->node flow arrows) and the cudaGraphLaunch's GpuCorrelation lists only its
         # replay's ROOT node event_ids (the rest are reached through the node->node arrows). Two
@@ -2250,6 +2526,7 @@ class TestCuptiRecords(TestCase):
         )
 
         def i64(*vals):
+            # [FUNCTION DOC] HELPER: Builds an int64 numpy array from the given values.
             return np.array(vals, dtype=np.int64)
 
         base_ns = 0
@@ -2305,6 +2582,8 @@ class TestCuptiRecords(TestCase):
         }
 
         def rv(b, i):  # read a varint at offset i, return (value, next_offset)
+            # [FUNCTION DOC] HELPER: Reads one protobuf varint from the byte buffer b at offset i;
+            # returns the value and the next offset.
             s = r = 0
             while True:
                 x = b[i]
@@ -2315,6 +2594,9 @@ class TestCuptiRecords(TestCase):
                 s += 7
 
         def flds(b):  # scan a message into [(field_no, wire_type, value)]
+            # [FUNCTION DOC] HELPER: Scans a protobuf message buffer into triples of field number,
+            # wire type and value (integers for varints, byte slices for length-delimited fields);
+            # fixed-width fields are skipped.
             i = 0
             o = []
             while i < len(b):
@@ -2391,9 +2673,15 @@ class TestCuptiRecords(TestCase):
 
 @unittest.skipIf(not TEST_CUDA, "CUDA required")
 class TestCuptiMonitorCUDA(TestCase):
+    # [CLASS DOC] Tests that need a CUDA device and exercise CuptiMonitor directly (register an
+    # observer, run work, flush, inspect delivered columns and stats), not through
+    # torch.profiler.profile. Most tests need libcupti 13.3 or newer. Each test starts from a
+    # freshly reset monitor singleton.
     """Collection through CuptiMonitor directly (not via torch.profiler.profile)."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Resets the process-wide CuptiMonitor singleton before each test
+        # and registers the reset as cleanup.
         # CuptiMonitor is a process-wide singleton; drop it so each test builds a fresh one.
         from torch.profiler._cupti import monitor as _cupti_monitor
 
@@ -2402,6 +2690,10 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_fence_enables_sync_transiently(self):
+        # [FUNCTION DOC] Checks that a synchronous flush temporarily enables the SYNCHRONIZATION
+        # activity kind for the fence even though no observer asked for it: the kind is absent
+        # from the monitor's enabled set before and after, and the flush returns in under two
+        # seconds after some GPU work. Observer is unregistered by cleanup.
         # flush(sync=True) fences at a SYNCHRONIZATION sync point, enabled only for
         # the fence (even when no observer requested it) and disabled again after.
         from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
@@ -2430,12 +2722,21 @@ class TestCuptiMonitorCUDA(TestCase):
         "requires cudaGraphNodeGetToolsId (cuda-bindings >= 13.1 and CUDA driver >= 13.1)",
     )
     def test_event_node_recorder_arm_before_capture(self):
+        # [FUNCTION DOC] End-to-end test of the event node recorder's arming order. A graph
+        # captured before arming (with an external event, which yields an event-record node) is
+        # never recorded; after arming (a second arm is harmless, handle set) a newly captured and
+        # instantiated graph is recorded with a non-empty list of tools ids whose upper 32 bits
+        # equal the exec graph id. Fails if capture stops producing event-record nodes. Requires
+        # libcupti 13.3 and the graph tools id binding.
         # End-to-end usage, and the ordering contract it depends on: the recorder learns a
         # graph's ordered event-record nodes from a graph-INSTANTIATE hook, so it has to be
         # armed before the graph is captured. Arming afterwards is too late -- that graph's
         # instantiate already fired, it is never recorded, and every CUDA_EVENT record from
         # its launches then resolves to None (resolve_window refuses to guess).
         def capture_graph_with_event_node():
+            # [FUNCTION DOC] HELPER: Warms up on a side stream, then captures a CUDA graph
+            # (keeping the template) containing a matmul, an external event record and a relu,
+            # instantiates it and returns the graph.
             x = torch.randn(8, 8, device="cuda")
             # external=True is what makes capture emit an event-record NODE. A default
             # (internal) event is folded into a plain cross-stream dependency edge and
@@ -2498,6 +2799,12 @@ class TestCuptiMonitorCUDA(TestCase):
         "requires cudaGraphNodeGetToolsId (cuda-bindings >= 13.1 and CUDA driver >= 13.1)",
     )
     def test_event_nodes_on_concurrent_branches_use_node_id_order(self):
+        # [FUNCTION DOC] Checks that for two event nodes on concurrent branches of different
+        # dependency depth, the recorder reports them in node-id (creation) order, which also
+        # equals sorted tools id order, and not in depth order. Builds the graph with two side
+        # streams, verifies graph data nodes are in increasing id order, and verifies the two
+        # branch depths differ so a depth sort would have given a different order. Requires
+        # libcupti 13.3 and the graph tools id binding.
         # The serial-chain case above is the one where every candidate ordering agrees. This
         # is the case that separates them: two event nodes on CONCURRENT branches of differing
         # depth. The recorder must report them in node-id (creation) order, which is what
@@ -2554,6 +2861,9 @@ class TestCuptiMonitorCUDA(TestCase):
         depth: dict[int, int] = {}
 
         def node_depth(i):
+            # [FUNCTION DOC] HELPER: Memoized recursive dependency depth of the node at index i in
+            # the enclosing graph data: zero for a node without dependencies, otherwise one more
+            # than the maximum depth of its dependencies.
             if i in depth:
                 return depth[i]
             deps = nodes[i]["dependencies"]
@@ -2569,6 +2879,12 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_v2_columnar_collection(self):
+        # [FUNCTION DOC] End-to-end columnar collection through CuptiMonitor. Configures both
+        # background cadences off, registers an observer for kernel start, end, correlation id and
+        # name, runs several matmul and relu steps, flushes synchronously, then checks that
+        # records arrived, every requested field column is present with equal lengths, no kernel
+        # has negative duration and at least one name is non-empty. Skipped if the subscribe
+        # raises CuptiError.
         # End-to-end columnar collection: the monitor turns on a per-activity field
         # selection, decodes each buffer against CUPTI's captured layout, and hands
         # the observer the columns for its selection.
@@ -2594,6 +2910,8 @@ class TestCuptiMonitorCUDA(TestCase):
         monitor = CuptiMonitor()
 
         def on_columns(cols):
+            # [FUNCTION DOC] HELPER: Observer callback that appends the kernel column mapping to
+            # the enclosing list under a lock when the delivered columns contain the kernel kind.
             if kind in cols:
                 with lock:
                     columns.append(cols[kind])
@@ -2629,6 +2947,11 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_worker_loop_self_flush_delivers_without_caller_flush(self):
+        # [FUNCTION DOC] Verifies the native decode thread's self flush: with a 5 second flush
+        # period and background drain off, records appear through repeated explicit drain-and-
+        # dispatch calls (polling up to about 20 seconds) without any caller flush, and the
+        # monitor's buffers_completed statistic becomes positive. Skipped if subscribe raises
+        # CuptiError.
         # worker_loop() with a flush period set (self_flush): the native decode thread
         # drives cuptiActivityFlushAll on its cadence and decodes the completed buffers
         # itself, so records surface with NO caller flush(). Background drain is off, so
@@ -2654,6 +2977,8 @@ class TestCuptiMonitorCUDA(TestCase):
         monitor = CuptiMonitor()
 
         def on_columns(cols):
+            # [FUNCTION DOC] HELPER: Observer callback that appends the kernel column mapping to
+            # the enclosing list under a lock when the delivered columns contain the kernel kind.
             if kind in cols:
                 with lock:
                     columns.append(cols[kind])
@@ -2687,6 +3012,10 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_worker_loop_no_self_flush_waits_for_caller_flush(self):
+        # [FUNCTION DOC] Verifies that with both background cadences off nothing is decoded until
+        # the caller flushes: after GPU work and a short sleep, a drain delivers no kernels and
+        # buffers_completed is zero; after a synchronous flush both become positive. Skipped if
+        # subscribe raises CuptiError.
         # worker_loop() with no flush period (self_flush off): the decode thread blocks on
         # get_completed() and never self-flushes, so with a normal buffer nothing is
         # delivered until the caller drives flush(). Both cadences off (caller-driven).
@@ -2706,6 +3035,8 @@ class TestCuptiMonitorCUDA(TestCase):
         monitor = CuptiMonitor()
 
         def on_columns(cols):
+            # [FUNCTION DOC] HELPER: Observer callback that appends the kernel column mapping to
+            # the enclosing list under a lock when the delivered columns contain the kernel kind.
             if kind in cols:
                 with lock:
                     columns.append(cols[kind])
@@ -2739,6 +3070,11 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_approx_timestamp_callback_engages_under_udr(self):
+        # [FUNCTION DOC] Runs a child Python process, started before any CUDA context exists,
+        # which enables approximate timestamps, registers a kernel observer, checks the monitor's
+        # timestamp-callback-active flag, runs kernels, flushes and asserts device kernel start
+        # times are below 1e17 (approx clock, not wall clock nanoseconds). The test requires exit
+        # code 0 and the child's OK marker in its output; child timeout is 300 seconds.
         # use_approx hands CUPTI a per-subscriber timestamp callback so records ride the
         # profiler's approx clock. Runs in a child that subscribes before any CUDA context
         # (use_approx is snapshotted at singleton construction). Assert the callback engaged and
@@ -2781,6 +3117,12 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_approx_timestamp_callback_engages_with_existing_context(self):
+        # [FUNCTION DOC] Same approx-clock check as the child-process variant but with a CUDA
+        # context already established in this process: skips if the libcupti version is below
+        # 130303, resets the singleton, enables approximate timestamps, registers a kernel
+        # observer, asserts the timestamp callback is active, runs kernels, flushes and asserts
+        # all kernel start values are below 1e17. Observer is unregistered in a finally block.
+        # Skipped if subscribe raises CuptiError.
         # With a CUDA context already established, use_approx must still re-time DEVICE records
         # onto the approx clock. Reset the singleton so use_approx (snapshotted at construction)
         # takes effect, establish a context first, then assert the callback engaged and device
@@ -2811,6 +3153,8 @@ class TestCuptiMonitorCUDA(TestCase):
         m = CuptiMonitor()
 
         def on_columns(cols):
+            # [FUNCTION DOC] HELPER: Observer callback that appends the kernel column mapping to
+            # the enclosing list when the delivered columns contain the kernel kind.
             if kind in cols:
                 seen.append(cols[kind])
 
@@ -2837,6 +3181,12 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_noisy_apis_suppressed_at_collection(self):
+        # [FUNCTION DOC] Checks that the noisy runtime and driver API callback ids are suppressed
+        # at collection. Skips if libcupti is older than 130303. Registers observers for kernels
+        # and for runtime and driver callback ids with a 1 MiB buffer, runs 50 matmul and relu
+        # steps, flushes, requires that kernel and runtime records did flow, then asserts none of
+        # the noisy runtime ids (and none of the noisy driver ids, if any driver records were
+        # seen) appear.
         # disable_noisy_runtime_apis / disable_noisy_driver_apis (run inside activity_enable)
         # should keep the pure-noise cbids out of the records. Assert 0 records for them while
         # kernels + other records still flow (so the check is not vacuous).
@@ -2866,6 +3216,9 @@ class TestCuptiMonitorCUDA(TestCase):
         kernels = 0
 
         def cb(cols):
+            # [FUNCTION DOC] HELPER: Observer callback that tallies, per callback id, how many
+            # runtime and driver records arrived (into the enclosing mappings) and adds the number
+            # of kernel records to the enclosing kernel counter.
             nonlocal kernels
             for kind, seen in (
                 (ActivityKind.RUNTIME, runtime_seen),
@@ -2922,6 +3275,11 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_singleton_flush_accessible(self):
+        # [FUNCTION DOC] Verifies that the process-wide monitor singleton is reachable via the
+        # public constructor and flushable: two constructions return the same object, a kernel
+        # observer is registered, and a synchronous flush through a freshly fetched singleton
+        # delivers positive kernel counts. Cleanup unregisters the observer and clears the
+        # singleton instance attribute. Skipped if subscribe raises CuptiError.
         # A user can reach the process-wide monitor singleton through CuptiMonitor()
         # and flush it: CuptiMonitor() constructs/returns the one instance, and
         # flush(sync=True) on it delivers everything collected up to the call.
@@ -2936,6 +3294,8 @@ class TestCuptiMonitorCUDA(TestCase):
         columns: list = []
 
         def on_columns(cols):
+            # [FUNCTION DOC] HELPER: Observer callback that appends the kernel column mapping to
+            # the enclosing list under a lock when the delivered columns contain the kernel kind.
             if kernel in cols:
                 with lock:
                     columns.append(cols[kernel])
@@ -2966,6 +3326,10 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_multiple_observers(self):
+        # [FUNCTION DOC] Verifies multiplexing of one subscriber across two observers on the same
+        # kernel kind with disjoint field selections: the monitor's enabled set covers the union,
+        # each observer sees only its own fields (plus the kind field zero), and both see the same
+        # number of records, greater than zero. Skipped if subscribe raises CuptiError.
         # The monitor is the multiplexer: it enables the union of fields on its one
         # subscriber, then hands each observer only the columns it selected. Two
         # observers on the same kind with disjoint selections each see only their own
@@ -2982,7 +3346,13 @@ class TestCuptiMonitorCUDA(TestCase):
         b_slices: list = []
 
         def collect(sink):
+            # [FUNCTION DOC] HELPER: Builds an observer callback that records, per delivered
+            # kernel column set, a mapping from field id to column length into the given sink list
+            # under a lock.
             def cb(cols):
+                # [FUNCTION DOC] HELPER: Observer callback produced by the collect factory;
+                # appends the field to length mapping of the delivered kernel columns to the sink
+                # if any are present.
                 kc = cols.get(kernel)
                 if kc:
                     with lock:
@@ -3029,6 +3399,12 @@ class TestCuptiMonitorCUDA(TestCase):
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_small_buffer_chain_no_deadlock(self):
+        # [FUNCTION DOC] Stress test with a 1 KiB buffer and a 20 ms background flush: observers
+        # for kernel, external correlation, runtime and driver records while 200 iterations push
+        # and pop external correlation ids (nested every third iteration), run a matmul and relu,
+        # and flush periodically. Completing without a hang is the no-deadlock check; it also
+        # asserts kernel records were counted and buffers_completed is positive. Skipped if
+        # subscribe raises CuptiError.
         # A tiny buffer maximizes buffer-completion churn: the decode worker runs
         # constantly and the foreground + background (20ms) flushes drain, dispatch,
         # and GC the chain back-to-back -- where a flush/decode/lock deadlock would
@@ -3045,6 +3421,8 @@ class TestCuptiMonitorCUDA(TestCase):
         counts: dict[int, int] = {}
 
         def cb(cols):
+            # [FUNCTION DOC] HELPER: Observer callback that adds, for each delivered activity
+            # kind, the length of its first column to a per-kind counter in the enclosing mapping.
             for k, c in cols.items():
                 counts[int(k)] = counts.get(int(k), 0) + (
                     len(next(iter(c.values()))) if c else 0
@@ -3109,21 +3487,31 @@ _CBID_GRAPHNODE_CREATED = 13  # CUPTI_CBID_RESOURCE_GRAPHNODE_CREATED
 # the stubs were not generated (see TEST_CUPTI in common_cuda).
 @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
 class TestCuptiCallbackRegistry(TestCase):
+    # [CLASS DOC] Tests for the monitor's shared subscriber-callback registry, which is
+    # independent of activity records: handlers run synchronously on the application thread inside
+    # the CUDA call. Needs CUDA and libcupti 13.3 or newer (class-level gate because setUp imports
+    # modules generated at build time). Uses the resource domain and graph-node-created callback
+    # id defined at module level.
     """The monitor's shared *subscriber-callback* registry -- a separate axis from activity
     records: handlers fire synchronously on the application thread inside the CUDA call."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Resets the CuptiMonitor singleton before each test and registers
+        # the reset as cleanup.
         from torch.profiler._cupti import monitor as _cupti_monitor
 
         _cupti_monitor._reset_for_test()
         self.addCleanup(_cupti_monitor._reset_for_test)
 
     def _monitor(self):
+        # [FUNCTION DOC] HELPER: Returns the CuptiMonitor singleton (imported lazily).
         from torch.profiler._cupti.monitor import CuptiMonitor
 
         return CuptiMonitor()
 
     def test_capability_flag_advertised(self):
+        # [FUNCTION DOC] Checks that the monitor configuration advertises the
+        # supports_callback_handlers capability as true. Needs no CUDA work or CUPTI session.
         # Consumers (e.g. an out-of-tree CUPTI subscriber) branch on this to stop taking a
         # subscription of their own. Needs no CUDA/CUPTI.
         from torch.profiler._cupti import monitor as _cupti_monitor
@@ -3131,6 +3519,10 @@ class TestCuptiCallbackRegistry(TestCase):
         self.assertTrue(_cupti_monitor.get_config()["supports_callback_handlers"])
 
     def test_register_unregister_handler(self):
+        # [FUNCTION DOC] Tests registering and unregistering callback handlers for one domain and
+        # callback id: two registrations give two stored handlers; unregistering the first leaves
+        # only the second function; unregistering the same handle again is idempotent. Cleanup
+        # removes the second handler.
         monitor = self._monitor()
         key = (_RESOURCE_DOMAIN, _CBID_GRAPHNODE_CREATED)
         first = monitor.register_callback_handler(*key, lambda *a: None)
@@ -3145,6 +3537,10 @@ class TestCuptiCallbackRegistry(TestCase):
         self.assertEqual(monitor._callback_handlers[key], (second.fn,))
 
     def test_arm_refcount_disables_only_at_zero(self):
+        # [FUNCTION DOC] Verifies reference counting of arming a callback: the underlying enable-
+        # callback function (wrapped by a recording stand-in via patch) is called with true only
+        # on the first arm and with false only when the count returns to zero; the armed count is
+        # 2 after two arms, the key is removed at zero, and disarming when not armed is a no-op.
         # Two consumers scoping the same callback to different windows must not disable
         # each other, so cuptiEnableCallback is driven only on the 0->1 and 1->0 edges.
         monitor = self._monitor()
@@ -3156,6 +3552,9 @@ class TestCuptiCallbackRegistry(TestCase):
         real = monitor._cupti.enable_callback
 
         def recording(sub, domain, cbid, enable):
+            # [FUNCTION DOC] HELPER: Recording stand-in for the CUPTI enable-callback function:
+            # appends the enable flag to the enclosing list and delegates to the real function,
+            # returning its result.
             calls.append(enable)
             return real(sub, domain, cbid, enable)
 
@@ -3175,6 +3574,9 @@ class TestCuptiCallbackRegistry(TestCase):
             self.assertEqual(calls, [True, False])
 
     def test_handler_exception_is_isolated(self):
+        # [FUNCTION DOC] Verifies handler exception isolation: with a raising handler registered
+        # before a well-behaved one, dispatching a callback does not propagate the error and still
+        # runs the good handler.
         # A raise must not reach CUPTI's C dispatch, and one bad handler must not silence
         # the others (order-independent, so check both orderings).
         monitor = self._monitor()
@@ -3182,6 +3584,8 @@ class TestCuptiCallbackRegistry(TestCase):
         seen = []
 
         def boom(*_args):
+            # [FUNCTION DOC] HELPER: Callback handler that always raises a RuntimeError with a
+            # fixed message.
             raise RuntimeError("handler blew up")
 
         bad = monitor.register_callback_handler(*key, boom)
@@ -3193,6 +3597,10 @@ class TestCuptiCallbackRegistry(TestCase):
         self.assertEqual(seen, ["good"])
 
     def test_handler_alone_holds_subscription(self):
+        # [FUNCTION DOC] Verifies a callback handler alone holds the CUPTI subscription:
+        # registering one creates a subscriber without starting the activity path (not started,
+        # user-defined callbacks not registered); unregistering it releases the subscriber back to
+        # None.
         # A callback-only consumer must be able to bring CUPTI up and hold it with no
         # activity observers -- the motivating case captures graphs before any profiling.
         monitor = self._monitor()
@@ -3210,6 +3618,10 @@ class TestCuptiCallbackRegistry(TestCase):
         self.assertIsNone(monitor._subscriber)
 
     def test_subscription_survives_activity_session_either_way(self):
+        # [FUNCTION DOC] Verifies the subscription is shared and outlives whichever consumer
+        # leaves first: with a handler and an activity observer registered, removing the observer
+        # stops the activity session but keeps the same subscriber; removing the handler last
+        # releases the subscriber.
         # The subscription is shared, so it must outlive whichever consumer leaves first.
         from cupti.cupti import ActivityKind  # pyrefly: ignore[missing-import]
 
@@ -3236,6 +3648,9 @@ class TestCuptiCallbackRegistry(TestCase):
         self.assertIsNone(monitor._subscriber)
 
     def test_noop_cb_swap_does_not_clobber_dispatch(self):
+        # [FUNCTION DOC] Verifies that replacing the module-level no-op callback in the cupti
+        # python wrapper (via patch) does not affect the monitor: it still has its own callback
+        # trampoline object, distinct from the replacement, after registering a handler.
         # An out-of-tree consumer that swaps cupti_python._NOOP_CB (to route its own
         # subscription to its own callback) must not steal the monitor's dispatch, so the
         # monitor passes its switchboard to subscribe() explicitly.
@@ -3252,6 +3667,9 @@ class TestCuptiCallbackRegistry(TestCase):
             self.assertIsNot(monitor._callback_trampoline, other)
 
     def test_graph_node_callback_fires_during_capture_only(self):
+        # [FUNCTION DOC] End-to-end check on CUDA: a handler for graph-node-created callbacks,
+        # armed only during capture of a graph with four kernels, fires at least that many times;
+        # after disarming, five replays of the graph trigger no further calls.
         # End-to-end proof of the mechanism: GRAPHNODE_CREATED fires once per node while
         # armed during a capture, and not at all once disarmed (so replay pays nothing).
         key = (_RESOURCE_DOMAIN, _CBID_GRAPHNODE_CREATED)
@@ -3288,11 +3706,21 @@ class TestCuptiCallbackRegistry(TestCase):
 
 
 class TestWindowFinalizer(TestCase):
+    # [CLASS DOC] Tests for the cover-and-finalize loop of WindowFinalizerMixin using a fake user
+    # class with a settable native clock and synthetic record buffer. Pure Python, no CUDA or
+    # CUPTI.
     """Cover-and-finalize loop of WindowFinalizerMixin -- pure Python, no CUDA/CUPTI.
     A fake user supplies a settable native clock and a synthetic record buffer."""
 
     class _Fake(WindowFinalizerMixin):
+        # [CLASS DOC] HELPER: Fake window-finalizer user. Holds a settable clock, a list of
+        # delivered record starts, a buffer of collected starts and a list of finalized windows
+        # (id, boundary, selected starts). The observation window is initialized with an hour-long
+        # poll interval so the poll thread never fires; tests call the poll step by hand.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Initializes the clock to zero, empty delivered and collected
+            # lists and finalized log, then initializes the observation window with a poll
+            # interval of 3,600,000 ms.
             self._clock = 0
             self._delivered: list[int] = []  # starts the "monitor" has handed over
             self._buf: list[int] = []  # collected, not-yet-finalized record starts
@@ -3303,24 +3731,39 @@ class TestWindowFinalizer(TestCase):
             self._init_observation_window(poll_interval_ms=3_600_000)
 
         def now_record_ns(self) -> int:
+            # [FUNCTION DOC] HELPER: Returns the settable fake native clock value in nanoseconds.
             return self._clock
 
         def deliver(self, *starts: int) -> None:
+            # [FUNCTION DOC] HELPER: Appends the given record start times to the delivered list
+            # (simulating the monitor handing records over).
             self._delivered.extend(starts)
 
         def _collect_delivered(self, *, sync: bool) -> None:
+            # [FUNCTION DOC] HELPER: Fake collection step: moves all delivered starts into the
+            # collected buffer and clears the delivered list. The sync flag is ignored.
             self._buf.extend(self._delivered)
             self._delivered.clear()
 
         def _window_watermark_ns(self) -> int:
+            # [FUNCTION DOC] HELPER: Returns the largest collected record start, or -1 when the
+            # buffer is empty.
             return max(self._buf) if self._buf else -1
 
         def _finalize_window(self, window_id: int, boundary_ns: int) -> None:
+            # [FUNCTION DOC] HELPER: Fake finalize step: selects collected starts below the
+            # boundary, keeps the rest buffered, and appends the window id, boundary and selected
+            # starts to the finalized log.
             selected = [s for s in self._buf if s < boundary_ns]
             self._buf = [s for s in self._buf if s >= boundary_ns]
             self.finalized.append((window_id, boundary_ns, selected))
 
     def test_boundary_defers_until_covered(self):
+        # [FUNCTION DOC] Verifies a boundary is deferred until covered: with the clock at 100 the
+        # first marked boundary gets id 0. Delivering starts 10 and 20 (watermark below the
+        # boundary) finalizes nothing; delivering 150 then polling finalizes window 0 with
+        # boundary 100 and selected starts 10 and 20, leaving 150 buffered. Stops the observation
+        # window at the end.
         w = self._Fake()
         w._clock = 100
         self.assertEqual(w.mark_boundary(), 0)
@@ -3334,6 +3777,9 @@ class TestWindowFinalizer(TestCase):
         w._stop_observation_window()
 
     def test_boundaries_finalize_in_order_as_covered(self):
+        # [FUNCTION DOC] Verifies boundaries finalize in order as the watermark covers them:
+        # boundaries at clock 100 and 200; starts 50 and 120 finalize only window 0 (selecting 50,
+        # keeping 120); delivering 250 then finalizes window 1 with selection of 120.
         w = self._Fake()
         w._clock = 100
         w.mark_boundary()
@@ -3349,6 +3795,9 @@ class TestWindowFinalizer(TestCase):
         w._stop_observation_window()
 
     def test_drain_all_finalizes_remaining_uncovered(self):
+        # [FUNCTION DOC] Verifies that stopping the observation window drains all boundaries: two
+        # boundaries with only a start of 50 delivered are not finalized by a poll, but stopping
+        # finalizes both, in order 0 then 1, regardless of watermark.
         w = self._Fake()
         w._clock = 100
         w.mark_boundary()
@@ -3361,6 +3810,9 @@ class TestWindowFinalizer(TestCase):
         self.assertEqual([f[0] for f in w.finalized], [0, 1])
 
     def test_poll_thread_starts_once_and_stops(self):
+        # [FUNCTION DOC] Verifies the poll thread lifecycle: marking a boundary starts a poll
+        # thread, a second boundary does not replace it, and stopping the observation window
+        # clears the thread to None.
         w = self._Fake()
         w._clock = 10
         w.mark_boundary()
@@ -3376,10 +3828,19 @@ class TestWindowFinalizer(TestCase):
 @unittest.skipIf(IS_WINDOWS, "Test is flaky on Windows")
 @unittest.skipIf(not TEST_CUDA, "CUDA is required")
 class TestCuptiMonitorProfiler(TestCase):
+    # [CLASS DOC] Tests of the cupti_monitor backend driven through torch.profiler.profile: trace
+    # shape, op and kernel name parity with stock kineto, record_shapes, thread assignment, sync
+    # and async export and config validation. Requires CUDA (skipped on Windows as flaky); many
+    # tests also need libcupti 13.3 or newer and run in an isolated subprocess. Some tests use
+    # child processes with generated scripts.
     """The monitor driven through ``torch.profiler.profile`` (trace shape, op/kernel
     parity, record_shapes, sync/async export, multithread thread-assignment, ...)."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Resets the CuptiMonitor singleton before each test and registers
+        # the reset as cleanup, unless the cupti python bindings are missing (this class also
+        # holds config-validation tests that do not need the monitor), in which case it does
+        # nothing.
         # CuptiMonitor is a process-wide singleton; drop it so each test builds a fresh one.
         # The class also hosts CUPTI-free config-validation tests, so the monitor module
         # (which needs cupti-python) may be unimportable; there is nothing to reset then.
@@ -3395,6 +3856,12 @@ class TestCuptiMonitorProfiler(TestCase):
         SM100OrLater, "hardware event sampling requires GB200+ (sm_100)"
     )
     def test_cupti_monitor_enable_hes_early_guard(self):
+        # [FUNCTION DOC] Verifies the early hardware event sampling enable guard (needs cupti
+        # python and an sm_100 or newer GPU). One child process calls the early-enable function
+        # before any CUDA context and checks hardware sampling reports enabled; a second child
+        # creates a CUDA tensor first and must then exit nonzero with an error message saying the
+        # function must be called before CUDA context creation in its stderr. Child timeout is 60
+        # seconds.
         import subprocess
 
         subprocess.check_call(
@@ -3438,6 +3905,11 @@ _cupti_monitor.enable_hes_early()
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
     def test_cupti_monitor_collection_smoke(self):
+        # [FUNCTION DOC] Smoke test that collection through a NodeTimerObserver works: after small
+        # CUDA work and a synchronous flush, the monitor's native buffer statistics show buffers
+        # allocated and completed, none pending, and the observer's drain returns at least one
+        # kernel start. Guards against the native pool silently doing nothing. Runs in an isolated
+        # subprocess.
         from torch.profiler._cupti import monitor as _cupti_monitor
         from torch.profiler._cupti.observers.node_timer import NodeTimerObserver
 
@@ -3468,6 +3940,13 @@ _cupti_monitor.enable_hes_early()
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
     def test_graph_host_node_collected_on_device(self):
+        # [FUNCTION DOC] End-to-end check that a CUDA graph host node is collected and exported.
+        # Skips without cuda.bindings or with a driver older than 13.2. Captures a graph keeping
+        # its template, grafts a host node calling libc free with a null argument via the runtime
+        # binding, re-instantiates (with the dependency recorder armed first), replays five times
+        # under a cupti_monitor profile with graph dependencies enabled, exports the chrome trace
+        # (reading the gzipped file when present) and asserts at least one graph_host_node event
+        # named after free with host thread and host fn args. Isolated subprocess.
         # End-to-end: a CUDA-graph host node (a CPU callback run as a graph node) is collected
         # as a GRAPH_HOST_NODE record and rendered as a "graph_host_node" span in the exported
         # trace. The graph is captured with torch.cuda.graph (keep_graph so the template stays
@@ -3492,6 +3971,9 @@ _cupti_monitor.enable_hes_early()
             self.skipTest(f"driver {drv} does not emit GRAPH_HOST_NODE (needs >= 13.2)")
 
         def ck(ret):
+            # [FUNCTION DOC] HELPER: Checks a cuda runtime binding return tuple: raises
+            # RuntimeError if the first element is not the success code; otherwise returns the
+            # second element when present, else None.
             if int(ret[0]) != int(cudart.cudaError_t.cudaSuccess):
                 raise RuntimeError(f"cuda err {ret[0]}")
             return ret[1] if len(ret) > 1 else None
@@ -3544,6 +4026,10 @@ _cupti_monitor.enable_hes_early()
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
     def test_cupti_monitor_collection_repeated_lifecycle(self):
+        # [FUNCTION DOC] Checks the monitor restarts correctly: two iterations of creating a
+        # NodeTimerObserver, running a small CUDA op, flushing, draining and closing it, each
+        # asserting kernel starts were collected. The second pass exercises start after stop.
+        # Isolated subprocess.
         from torch.profiler._cupti import monitor as _cupti_monitor
         from torch.profiler._cupti.observers.node_timer import NodeTimerObserver
 
@@ -3568,6 +4054,11 @@ _cupti_monitor.enable_hes_early()
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
     def test_cupti_monitor_multithread_runtime_thread_assignment(self):
+        # [FUNCTION DOC] Profiles two worker threads (each in its own record_function region,
+        # started together by an event) with profile_all_threads and the cupti_monitor backend,
+        # exports the trace and asserts two distinct user annotation thread ids exist, kernel
+        # launch runtime events exist, and their thread ids are a subset of the worker thread ids.
+        # Isolated subprocess.
         x1 = torch.randn(256, 256, device="cuda")
         x2 = torch.randn(256, 256, device="cuda")
         y1 = torch.randn(256, 256, device="cuda")
@@ -3582,6 +4073,8 @@ _cupti_monitor.enable_hes_early()
         start_evt = threading.Event()
 
         def worker(name, x, y):
+            # [FUNCTION DOC] HELPER: Thread body: waits for the shared start event, then inside a
+            # named record_function region runs add, relu, sum with item and a CUDA synchronize.
             start_evt.wait()
             with record_function(name):
                 z = torch.relu(x + y)
@@ -3647,6 +4140,10 @@ _cupti_monitor.enable_hes_early()
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
     def test_cupti_monitor_runtime_thread_without_record_function(self):
+        # [FUNCTION DOC] Regression test that CPU-side runtime records land on the issuing OS
+        # thread even without any record_function region: profiles repeated forward passes of a
+        # small MLP with the cupti_monitor backend and asserts runtime event thread ids are a
+        # subset of cpu_op thread ids (no phantom CUPTI thread lane). Isolated subprocess.
         # Regression: CPU-side CUPTI records (cuda_runtime/cuda_driver) must land on the
         # issuing OS thread -- the same lane as their cpu_ops, matching kineto -- even
         # with NO record_function region. The thread map is otherwise only populated by
@@ -3685,6 +4182,8 @@ _cupti_monitor.enable_hes_early()
                     events = json.load(f)["traceEvents"]
 
         def tids(cat):
+            # [FUNCTION DOC] HELPER: Returns the set of integer thread ids of complete events with
+            # the given category in the loaded trace events.
             return {
                 e["tid"]
                 for e in events
@@ -3704,6 +4203,11 @@ _cupti_monitor.enable_hes_early()
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
     def test_cupti_monitor_trace_has_expected_events(self):
+        # [FUNCTION DOC] Profiles a small CUDA workload inside a record_function region with the
+        # cupti_monitor backend and asserts the exported trace has complete events in categories
+        # kernel, cuda_runtime, gpu_memcpy, cpu_op and user_annotation, kernel durations are
+        # positive, a cudaLaunchKernel runtime event exists and the user region name appears.
+        # Isolated subprocess.
         cfg = _ExperimentalConfig(
             custom_profiler_config='{"backend":"cupti_monitor"}',
         )
@@ -3760,6 +4264,10 @@ _cupti_monitor.enable_hes_early()
 
     @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
     def test_cupti_monitor_observer_registration_failure_is_graceful(self):
+        # [FUNCTION DOC] Checks graceful degradation: with the monitor's register method patched
+        # to raise a RuntimeError, profiling and exporting must not raise; afterwards the
+        # profiler's observer is None or unavailable and export and wait_for_exports skip quietly.
+        # Requires cupti python only.
         # If the per-cycle ProfilerObserver fails to register with the CUPTI monitor (an
         # intermittent CUPTI condition), the profiler must degrade gracefully: with no
         # observer / trace window, stop_trace and export_chrome_trace skip the trace instead
@@ -3793,6 +4301,10 @@ _cupti_monitor.enable_hes_early()
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
     def test_cupti_monitor_sync_export_default(self):
+        # [FUNCTION DOC] Checks default synchronous export: after profiling, the profiler observer
+        # exists with no background poll thread; export_chrome_trace leaves the file on disk
+        # (plain or gzipped path) before returning and wait_for_exports is a no-op. Isolated
+        # subprocess.
         # Default: the cupti_monitor backend exports synchronously -- the merged file is
         # on disk when export_chrome_trace returns, wait_for_exports is a no-op, and no
         # background poll thread is spawned (the finalize runs on the calling thread).
@@ -3818,6 +4330,10 @@ _cupti_monitor.enable_hes_early()
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
     def test_cupti_monitor_async_export_defers(self):
+        # [FUNCTION DOC] Checks asynchronous export when the async export option is set in the
+        # custom profiler config: a background poll thread exists after profiling, and after
+        # export_chrome_trace and wait_for_exports the trace file (plain or gzipped) exists.
+        # Isolated subprocess.
         # cupti_monitor_async_export=true hands the export off: a background poll thread
         # is spawned and the file is written off-thread, joined by wait_for_exports.
         cfg = _ExperimentalConfig(
@@ -3842,6 +4358,9 @@ _cupti_monitor.enable_hes_early()
             )
 
     def test_cupti_monitor_async_export_requires_backend(self):
+        # [FUNCTION DOC] Checks pure config validation: setting the async export option without
+        # selecting the cupti_monitor backend makes profile construction raise ValueError whose
+        # message names the option. No CUDA needed.
         # cupti_monitor_async_export is a cupti_monitor-only option: setting it without
         # the backend is a misconfiguration, not a silent no-op. (Pure config
         # validation -- raises at construction, no CUDA/cupti needed.)
@@ -3856,11 +4375,19 @@ _cupti_monitor.enable_hes_early()
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     @_isolated
     def test_cupti_monitor_record_shapes(self):
+        # [FUNCTION DOC] Checks record_shapes flows through the monitor backend: profiles a matmul
+        # with relu using the cupti_monitor backend with record_shapes off and on, and asserts
+        # that cpu_op events with an Input Dims arg appear only when it is on. Isolated
+        # subprocess.
         cfg = _ExperimentalConfig(
             custom_profiler_config='{"backend":"cupti_monitor"}',
         )
 
         def shaped_cpu_ops(record_shapes):
+            # [FUNCTION DOC] HELPER: Profiles a small CUDA matmul and relu with the given
+            # record_shapes flag under the enclosing config, exports the chrome trace (reading
+            # gzipped output when present) and returns the cpu_op events that have an Input Dims
+            # argument.
             with TemporaryFileName(mode="w+") as trace_path:
                 with profile(
                     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -3892,6 +4419,11 @@ _cupti_monitor.enable_hes_early()
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_cupti_monitor_matches_stock_op_and_kernel_names(self):
+        # [FUNCTION DOC] Runs a fresh child process (timeout 120 seconds) that profiles a small
+        # matmul workload first with stock kineto, then calls the CUPTI finalize hand-off, then
+        # with the cupti_monitor backend. It asserts both produce kernels and identical sets of
+        # aten-prefixed cpu op names, and prints an OK marker; the test requires exit code zero
+        # and the marker. Needs libcupti 13.3 or newer.
         # Run in a FRESH process. This test needs a stock (Kineto) CUDA baseline and
         # then a cupti_monitor session, so it must start from a process that hasn't
         # touched CUPTI -- immune to whatever earlier tests did to this process's
@@ -3969,6 +4501,14 @@ _cupti_monitor.enable_hes_early()
 
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires libcupti >= 13.3")
     def test_cupti_monitor_kineto_parity(self):
+        # [FUNCTION DOC] Parity test run in fresh child processes (timeout 300 seconds each): once
+        # with hardware event sampling off and once on, for an MLP and a transformer layer in
+        # eager and (if graph tools ids are usable) graphed mode. With sampling off the child
+        # compares stock kineto against the monitor on aten op sets, per-kernel launch
+        # configuration multisets and, for eager mode, launch arrow and cudaLaunchKernel counts.
+        # The parent requires each child to succeed and print an OK marker and RESULT line, skips
+        # the sampling-on leg if the child reports it unsupported, and asserts the sampling-on
+        # kernel metadata equals the sampling-off metadata.
         # In a FRESH process (clean CUPTI), profile a couple of representative models
         # under stock (Kineto) and then the cupti_monitor backend, eager AND graphed,
         # and assert the aten-op set + kernel-name multiset are identical between the
@@ -4184,6 +4724,13 @@ _cupti_monitor.enable_hes_early()
         "the runtime API and never surface a DRIVER record",
     )
     def test_cupti_monitor_observed_kinds_present(self):
+        # [FUNCTION DOC] Runs a child process (timeout 300 seconds) that profiles a workload with
+        # host to device and device to host copies, memset, runtime and driver API calls and
+        # record_function regions under the monitor with CUDA sync events enabled, then asserts
+        # the trace contains categories kernel, gpu_memcpy, gpu_memset, cuda_runtime, cuda_driver,
+        # overhead, user_annotation, gpu_user_annotation and cuda_sync, passes the trace
+        # validator, and that cuda_sync is absent without the opt-in. Skipped unless libcupti 13.3
+        # or newer and an sm_100 or newer GPU (driver activity only appears there).
         # Every activity kind the ProfilerObserver subscribes to must surface in the
         # exported chrome trace. One workload exercises kernels, H2D/D2H memcpy, memset,
         # runtime + driver API, CUPTI overhead, record_function annotations (external
@@ -4261,11 +4808,21 @@ _cupti_monitor.enable_hes_early()
 
 
 class TestCuptiMonitorNative(TestCase):
+    # [CLASS DOC] Tests of the monitor's native buffer pool and version 2 record layout callbacks,
+    # driven directly through ctypes against the private cupti monitor binding. Pure C++ behavior,
+    # no CUDA or cupti python needed.
     """The monitor's native buffer-pool / v2-record-layout callbacks driven directly
     via ctypes -- pure C++, no CUDA/cupti-python."""
 
     @skipIfTorchDynamo("native ctypes/CUPTI probe; nothing to compile")
     def test_cupti_monitor_buffer_pool_reuse(self):
+        # [FUNCTION DOC] Drives the native buffer-request and buffer-complete callbacks via ctypes
+        # function pointers to verify buffer recycling. Resets and configures the pool with a 64
+        # KiB buffer size (reset again at cleanup). The first request allocates (one buffer);
+        # completing it makes one pending buffer and the drained item is a tuple of pointer, valid
+        # size 4096, context 0, stream 0 and an empty layout list; after returning the buffer the
+        # next request reuses the same pointer; a second outstanding request allocates a new
+        # buffer (two total). Skipped under Dynamo.
         # The CUPTI monitor's buffer pool is pure C++ (no CUDA/cupti-python), so
         # drive its native buffer-requested / buffer-completed callbacks directly
         # via ctypes to verify returned buffers are recycled rather than
@@ -4299,6 +4856,8 @@ class TestCuptiMonitorNative(TestCase):
         complete = complete_t(pyprof._cupti_monitor.buffer_complete_callback_address())
 
         def do_request():
+            # [FUNCTION DOC] HELPER: Calls the native buffer-request callback through ctypes with
+            # a null info pointer and returns the buffer pointer value and the granted size.
             buf = ctypes.c_void_p()
             size = ctypes.c_size_t()
             max_records = ctypes.c_size_t()
@@ -4311,6 +4870,9 @@ class TestCuptiMonitorNative(TestCase):
             return buf.value, size.value
 
         def do_complete(ptr):
+            # [FUNCTION DOC] HELPER: Calls the native buffer-complete callback through ctypes for
+            # the given buffer pointer with the enclosing buffer size, a valid size of 4096 and a
+            # null info pointer.
             complete(ctypes.c_void_p(ptr), buffer_size, 4096, None)
 
         # First request has an empty free list, so it allocates.
@@ -4339,6 +4901,10 @@ class TestCuptiMonitorNative(TestCase):
         self.assertEqual(pyprof._cupti_monitor.allocated_buffers(), 2)
 
     def test_cupti_monitor_not_imported_without_active_session(self):
+        # [FUNCTION DOC] Runs a fresh child process that uses record_function without any
+        # profiling session and asserts no module whose name begins with the torch profiler cupti
+        # package prefix was imported and that the active cupti profiler observer is None; the
+        # test requires the OK marker in the output. Needs no cupti python.
         # The optional CUPTI monitor import chain (observers.profiler -> monitor ->
         # cupti.cupti) must NOT be pulled in just by using record_function -- only an
         # active cupti_monitor profile imports it. Otherwise a process whose cupti-python
@@ -4365,6 +4931,13 @@ class TestCuptiMonitorNative(TestCase):
 
     @skipIfTorchDynamo("native ctypes/CUPTI probe; nothing to compile")
     def test_cupti_monitor_v2_record_layout_capture(self):
+        # [FUNCTION DOC] Builds CUPTI 13.3 style complete-info and record-layout structures with
+        # ctypes (kind 9 with two fields, then a second buffer with kind 3 and one field) and
+        # passes them to the native buffer-complete callback. The drained item's fifth element
+        # must equal the parsed per-kind list of kind, record size and field triples of field id,
+        # offset and size, showing each completed buffer carries its own layout. Resets and
+        # configures the pool with 64 KiB (reset at cleanup) and returns buffers to the pool.
+        # Skipped under Dynamo.
         # The v2 complete callback parses the CUPTI user-defined record layout
         # (pBufferCompleteInfo->ppRecordLayouts, valid only during the callback) and
         # attaches it to the completed buffer, so the decode thread parses records
@@ -4379,6 +4952,8 @@ class TestCuptiMonitorNative(TestCase):
         pyprof._cupti_monitor.configure_buffers(64 * 1024)
 
         class FieldEntry(ctypes.Structure):
+            # [CLASS DOC] HELPER: ctypes mirror of one CUPTI record layout field entry: struct
+            # size, field id, offset, size and alignment.
             _fields_ = [
                 ("structSize", ctypes.c_size_t),
                 ("fieldId", ctypes.c_int),
@@ -4388,6 +4963,8 @@ class TestCuptiMonitorNative(TestCase):
             ]
 
         class RecordLayout(ctypes.Structure):
+            # [CLASS DOC] HELPER: ctypes mirror of a CUPTI record layout: struct size, pointer to
+            # field entries, number of fields and record size.
             _fields_ = [
                 ("structSize", ctypes.c_size_t),
                 ("pEntries", ctypes.POINTER(FieldEntry)),
@@ -4396,6 +4973,9 @@ class TestCuptiMonitorNative(TestCase):
             ]
 
         class CompleteInfo(ctypes.Structure):
+            # [CLASS DOC] HELPER: ctypes mirror of the CUPTI buffer complete info: struct size,
+            # thread id, pointer to the array of per-kind record layout pointers and the number of
+            # layouts.
             _fields_ = [
                 ("structSize", ctypes.c_size_t),
                 ("threadId", ctypes.c_uint64),
@@ -4490,6 +5070,10 @@ class TestCuptiMonitorNative(TestCase):
 
 @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
 class TestCuptiClock(TestCase):
+    # [CLASS DOC] Tests the clock alignment of the cupti_monitor, converting record timestamps to
+    # unix epoch nanoseconds. Drives the production synchronized clock class with an injected
+    # native-now callable (CLOCK_REALTIME stands in for the CUPTI timestamp), so no CUDA or live
+    # CUPTI session is needed.
     """Clock-alignment math for the cupti_monitor -- record timestamps -> unix-epoch ns on
     kineto's axis. Drives the production _SynchronizedClock directly (its calibrate() reads
     the native clock through an injected callable), so no CUDA / live CUPTI session is needed;
@@ -4497,9 +5081,14 @@ class TestCuptiClock(TestCase):
 
     @staticmethod
     def _realtime():
+        # [FUNCTION DOC] HELPER: Static method returning the current CLOCK_REALTIME in
+        # nanoseconds, used as the injected native clock.
         return time.clock_gettime_ns(time.CLOCK_REALTIME)
 
     def test_realtime_fallback_is_identity(self):
+        # [FUNCTION DOC] Verifies that without the timestamp callback, calibrating against a
+        # realtime native clock makes unix conversion the identity for single values and numpy
+        # arrays, with the zero sentinel unchanged.
         # cuptiGetTimestamp == CLOCK_REALTIME == kineto's unix base: records are already unix
         # ns, so conversion is identity (offset 0) and 0 stays 0.
         import numpy as np
@@ -4514,6 +5103,10 @@ class TestCuptiClock(TestCase):
         np.testing.assert_array_equal(clock.convert_unix_array(col), col)
 
     def test_callback_scales_approx_ticks_to_unix(self):
+        # [FUNCTION DOC] Verifies the timestamp-callback path: calibrate with a real approximate-
+        # clock-to-unix converter, then scalar and array approx conversion at several ticks (from
+        # the approx anchor up to 5 seconds later) agree with the converter within 2 ns, and a
+        # zero entry in an array stays zero.
         # Timestamp-callback path: records are approx ticks. calibrate() recovers the
         # converter's slope from two synthetic evaluations and applies it as a linear map (so
         # it never calls the converter per record); pass calibrate a converter we hold and
@@ -4536,6 +5129,10 @@ class TestCuptiClock(TestCase):
             self.assertLessEqual(abs(int(got[i]) - conv.to_unix_ns(t)), 2)
 
     def test_unix_array_bypasses_callback_scaling(self):
+        # [FUNCTION DOC] Verifies the unix array conversion ignores callback scaling: under an
+        # active callback calibration, converting an array of realtime values keeps zero as zero
+        # and other values within 100 microseconds of the input, while the approx array conversion
+        # of the same column gives different results.
         # PM-sampling frames stay on the unix (CLOCK_REALTIME) domain even under the timestamp
         # callback, which moves *records* to the approx domain. convert_unix_array applies the
         # native->unix offset (~identity here, since native == realtime == unix), so native ns
