@@ -1,4 +1,9 @@
 # Owner(s): ["module: autograd"]
+# [MODULE DOC] Guards the public API surface of torch. Contains one test class that checks (a)
+# no new non-underscore callables get re-exported into the torch namespace, (b) torch._C only
+# exposes allowlisted public names, (c) every module under torch can be imported, and (d) public
+# modules have consistent __module__ and __all__ naming, using the JSON allowlist file
+# allowlist_for_publicAPI.json next to this test. No import-time side effects besides a logger.
 
 import importlib
 import inspect
@@ -25,7 +30,14 @@ log = logging.getLogger(__name__)
 
 
 class TestPublicBindings(TestCase):
+    # [CLASS DOC] Test case holding the public-API hygiene checks for the torch package. Tests
+    # are stateless; they inspect torch, torch._C and all submodules found via pkgutil. Helper
+    # _is_mod_public decides whether a dotted module path has any underscore-prefixed segment.
     def test_no_new_reexport_callables(self):
+        # [FUNCTION DOC] Collects every callable in the torch namespace whose __module__ does
+        # not start with torch, sorted by name, and asserts that all of them have names starting
+        # with an underscore. Fails with the list of offending names if a new public re-export
+        # appears.
         """
         This test aims to stop the introduction of new re-exported callables into
         torch whose names do not start with _. Such callables are made available as
@@ -41,6 +53,11 @@ class TestPublicBindings(TestCase):
         )
 
     def test_no_new_bindings(self):
+        # [FUNCTION DOC] Compares the public (non-underscore) names found in torch._C, minus
+        # TensorBase which is removed explicitly in torch/__init__.py, against a large
+        # fixed allowlist. Passes if the actual bindings are a subset of the allowlist (the
+        # allowlist is a superset since the available bindings depend on build options). Failure
+        # message lists the unexpected names.
         """
         This test aims to stop the introduction of new JIT bindings into torch._C
         whose names do not start with _. Such bindings are made available as
@@ -254,6 +271,8 @@ class TestPublicBindings(TestCase):
 
     @staticmethod
     def _is_mod_public(modname):
+        # [FUNCTION DOC] HELPER: Static method. Returns False if any dot-separated segment of
+        # the module name starts with an underscore, otherwise True.
         split_strs = modname.split(".")
         for elem in split_strs:
             if elem.startswith("_"):
@@ -266,9 +285,18 @@ class TestPublicBindings(TestCase):
     )
     @skipIfTorchDynamo("Broken and not relevant for now")
     def test_modules_can_be_imported(self):
+        # [FUNCTION DOC] Walks all packages and modules under the torch path and imports each
+        # one except those with a main segment, recording failures. Skipped on Windows and macOS
+        # and under Dynamo. Each failure is checked against a hard-coded private allowlist, a
+        # triton-based native-ops rule and a set of prefixes for modules needing optional CUDA
+        # dependencies; allowed ones must have a private-looking name (otherwise an
+        # AssertionError is raised) and are ignored. Remaining failures are reported together in
+        # a single assertion on the joined error text.
         failures = []
 
         def onerror(modname):
+            # [FUNCTION DOC] HELPER: Error callback for the package walker; appends the module
+            # name with a generic ImportError to the enclosing failures list.
             failures.append(
                 (modname, ImportError("exception occurred importing package"))
             )
@@ -445,6 +473,13 @@ class TestPublicBindings(TestCase):
     @unittest.skipIf(IS_WINDOWS or IS_JETSON, "Distributed Attribute Error")
     @skipIfTorchDynamo("Broken and not relevant for now")
     def test_correct_module_names(self):
+        # [FUNCTION DOC] Verifies that public APIs of every public torch module look public and
+        # vice versa: an element is public if listed in __all__ (or, without __all__, if it
+        # lacks a leading underscore), and looks public if its name has no leading underscore
+        # and its __module__ starts with the module path without private segments. Loads the
+        # allowlist JSON (including being_migrated renames, which are copied under their new
+        # names), checks all submodules plus torch itself, and asserts no mismatches remain,
+        # printing fix suggestions for each. Skipped on Windows, Jetson and under Dynamo.
         """
         An API is considered public, if  its  `__module__` starts with `torch.`
         and there is no name in `__module__` or the object itself that starts with "_".
@@ -475,6 +510,11 @@ class TestPublicBindings(TestCase):
                     ]
 
         def test_module(modname):
+            # [FUNCTION DOC] HELPER: Imports one module and runs the public-API check on each
+            # name in it. Silently returns if the name has a main segment, the import fails, or
+            # the module is private. Uses __all__ when defined (is_public means the name is
+            # listed) else all non-underscore names of dir(). Appends human-readable problem
+            # descriptions to the enclosing failure list.
             try:
                 if "__main__" in modname:
                     return
@@ -489,6 +529,12 @@ class TestPublicBindings(TestCase):
             # verifies that each public API has the correct module name and naming semantics
 
             def check_one_element(elem, modname, mod, *, is_public, is_all):
+                # [FUNCTION DOC] HELPER: Checks a single name in a module. Ignores anything that
+                # is not a callable, class or dtype. Computes whether the name looks public from
+                # its __module__ and leading underscore, and if that disagrees with the expected
+                # is_public flag and the entry is not in the allowlist, appends a multi-line
+                # explanation with fix suggestions to the enclosing failure list. Raises
+                # AssertionError if a not-public name is seen without __all__ being used.
                 obj = getattr(mod, elem)
 
                 # torch.dtype is not a class nor callable, so we need to check for it separately
