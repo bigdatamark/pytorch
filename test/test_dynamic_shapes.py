@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: jit"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for symbolic-shape support: SymInt, SymFloat, SymBool and ShapeEnv. Defines a
+# fake wrapper-subclass tensor with registered meta functions, helper constructors for symbolic
+# ints/floats/bools backed by a ShapeEnv, and test classes covering arithmetic and magic methods on
+# symbolic numbers, floor division, DimConstraints solving, guard expressions, unbacked-symbol
+# handling under torch.compile, fast comparison evaluation, and transferring symbols between
+# ShapeEnvs. Import-time side effects: creates the module-level aten alias and the meta_funcs
+# registry, registers meta functions, and applies parametrization to selected test classes. The
+# file runs its tests through run_tests when executed as a script.
 import contextlib
 import copy
 import itertools
@@ -80,8 +88,18 @@ meta_funcs = {}
 
 
 def register_meta(op):
+    # [FUNCTION DOC] HELPER: Decorator factory that registers a meta implementation for one
+    # operator or a pytree of operators. Returns a decorator which stores the decorated
+    # function in the module-level meta_funcs mapping under each given operator and returns the
+    # function unchanged.
     def decorator(f):
+        # [FUNCTION DOC] HELPER: Decorator produced by the factory. Walks the operator argument
+        # with pytree and records the function for every leaf operator, then returns the function
+        # itself so the module-level name still refers to it.
         def add_func(op):
+            # [FUNCTION DOC] HELPER: Pytree leaf callback; stores the enclosed function in
+            # meta_funcs keyed by the given operator overload. Mutates global state and
+            # returns nothing.
             meta_funcs[op] = f
 
         pytree.tree_map_(add_func, op)
@@ -92,11 +110,17 @@ def register_meta(op):
 
 @register_meta([aten.add.Tensor, aten.sub.Tensor])
 def binary_meta(a, b):
+    # [FUNCTION DOC] HELPER: Meta function for elementwise add and sub overloads. Ignores any
+    # broadcasting and returns an empty fake tensor with the shape of the first operand.
     return a.new_empty(a.shape)
 
 
 @register_meta(aten.cat.default)
 def cat_meta(tensors, dim=0):
+    # [FUNCTION DOC] HELPER: Meta function for concatenation. Sums the sizes along the given
+    # dimension across all input tensors, checks every other dimension matches the first tensor,
+    # and returns an empty fake tensor of the combined shape. Raises AssertionError on a size
+    # mismatch in a non-concatenated dimension.
     concat_length = 0
     shape = tensors[0].shape
     for tensor in tensors:
@@ -115,6 +139,9 @@ def cat_meta(tensors, dim=0):
 
 @register_meta([aten.narrow_copy.default])
 def narrow_copy_symint_meta(a, dim, start, length, **kwargs):
+    # [FUNCTION DOC] HELPER: Meta function for narrow_copy with symbolic sizes. Builds the output
+    # shape equal to the input shape except that the narrowed dimension gets the given length;
+    # start and extra keyword arguments are ignored. Returns an empty fake tensor of that shape.
     shape = []
     for i, x in enumerate(a.shape):
         if i == dim:
@@ -126,10 +153,15 @@ def narrow_copy_symint_meta(a, dim, start, length, **kwargs):
 
 @register_meta([aten.expand.default])
 def expand_symint_meta(a, size, implicit=False):
+    # [FUNCTION DOC] HELPER: Meta function for expand. Returns an empty fake tensor with the
+    # requested size, ignoring the implicit flag and the input's own shape.
     return a.new_empty(size)
 
 
 def create_contiguous(shape):
+    # [FUNCTION DOC] HELPER: Computes contiguous strides for a shape (sequence of ints or symbolic
+    # ints). Accumulates running products from the last dimension backward and returns them as a
+    # list ordered to match the dimensions.
     strides = [1]
     for dim in reversed(shape[:-1]):
         strides.append(dim * strides[-1])
@@ -137,6 +169,10 @@ def create_contiguous(shape):
 
 
 class FakeSymbolicTensor(torch.Tensor):
+    # [CLASS DOC] Minimal tensor wrapper subclass used to give tests tensors whose sizes are
+    # symbolic. It holds no storage (created via a wrapper-subclass constructor), disables torch
+    # function interception, and routes all operators through __torch_dispatch__, which only
+    # supports ops with registered meta functions plus new_empty.
     @staticmethod
     def __new__(
         cls,
@@ -148,6 +184,10 @@ class FakeSymbolicTensor(torch.Tensor):
         device,
         storage_offset=0,
     ):
+        # [FUNCTION DOC] Constructs the wrapper tensor from a (possibly symbolic) shape. The
+        # sym_strides argument is ignored: strides are always recomputed as contiguous strides from
+        # the shape (marked as a TODO in the code). Passes dtype, layout, requires_grad, device and
+        # storage offset to the wrapper constructor and returns the new tensor.
         # TODO: this is wrong in general
         sym_stride = create_contiguous(sym_shape)
         r = torch.Tensor._make_wrapper_subclass(
@@ -165,12 +205,19 @@ class FakeSymbolicTensor(torch.Tensor):
     __torch_function__ = _disabled_torch_function_impl
 
     def new_empty(self, shape):
+        # [FUNCTION DOC] HELPER: Creates a new FakeSymbolicTensor of the given shape that copies
+        # this tensor's dtype, layout, requires_grad and device. Strides are not passed.
         return FakeSymbolicTensor(
             shape, None, self.dtype, self.layout, self.requires_grad, self.device
         )
 
     @classmethod
     def __torch_dispatch__(cls, func_overload, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Dispatch hook. If the overload has a registered meta function, calls it
+        # with the given args and kwargs (kwargs must be a mapping in that case). For the new_empty
+        # overload, returns a FakeSymbolicTensor with the requested shape and the source tensor's
+        # dtype, layout, requires_grad and device. Any other overload raises RuntimeError saying
+        # the operator is not supported.
         if func_overload in meta_funcs:
             return meta_funcs[func_overload](*args, **kwargs)
 
@@ -190,6 +237,11 @@ class FakeSymbolicTensor(torch.Tensor):
 
 
 def create_symbolic_tensor(name, arg, shape_env, source=None, dynamic_dims=None):
+    # [FUNCTION DOC] HELPER: Builds a FakeSymbolicTensor whose sizes, strides and storage offset
+    # are symbolic, created by the ShapeEnv from a real tensor. The source defaults to a
+    # ConstantSource with the given name; dynamic_dims defaults to duck-sized for every dimension;
+    # no per-dimension constraints are applied. Returns the fake tensor with the original's dtype,
+    # layout, requires_grad and device.
     from torch._dynamo.source import ConstantSource
 
     if source is None:
@@ -220,6 +272,9 @@ def create_symbolic_tensor(name, arg, shape_env, source=None, dynamic_dims=None)
 
 
 def create_fake_tensor_with_dynamic_size(x, shape_env, dynamic_sizes, dynamic_strides):
+    # [FUNCTION DOC] HELPER: Converts a real tensor into a fake tensor inside a FakeTensorMode that
+    # shares the given ShapeEnv, using a stateless symbolic context with the supplied per-dimension
+    # dynamic sizes and strides. Returns the resulting fake tensor.
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     with FakeTensorMode(shape_env=shape_env) as fake_mode:
@@ -233,6 +288,11 @@ def create_fake_tensor_with_dynamic_size(x, shape_env, dynamic_sizes, dynamic_st
 
 
 def create_symtype(cls, pytype, shape_env, val, duck=True, **kwargs):
+    # [FUNCTION DOC] HELPER: Shared factory for symbolic scalars. Creates a ShapeEnv symbol for the
+    # value (with a testing-only constant source whose name counts existing backed symbols,
+    # duck-sized when duck is true, otherwise dynamic) and wraps it in a SymNode of the given
+    # python type with the value as hint. Returns an instance of the given symbolic class. Extra
+    # keyword arguments go to symbol creation. Side effect: adds a symbol to the shape env.
     from torch._dynamo.source import ConstantSource
 
     symbol = shape_env.create_symbol(
@@ -247,14 +307,20 @@ def create_symtype(cls, pytype, shape_env, val, duck=True, **kwargs):
 
 # TODO: default duck to False
 def create_symint(shape_env, i: int, duck=True, **kwargs) -> SymInt:
+    # [FUNCTION DOC] HELPER: Creates a symbolic int with the given hint in the ShapeEnv; duck
+    # sizing is on by default so equal values share one symbol.
     return create_symtype(SymInt, int, shape_env, i, duck=duck, **kwargs)
 
 
 def create_symbool(shape_env, b: bool) -> SymBool:
+    # [FUNCTION DOC] HELPER: Creates a symbolic bool with the given hint in the ShapeEnv, using
+    # duck sizing.
     return create_symtype(SymBool, bool, shape_env, b)
 
 
 def create_symfloat(shape_env, f: float) -> SymFloat:
+    # [FUNCTION DOC] HELPER: Creates a symbolic float with the given hint in the ShapeEnv, using
+    # duck sizing.
     return create_symtype(SymFloat, float, shape_env, f)
 
 
@@ -262,7 +328,13 @@ def create_symfloat(shape_env, f: float) -> SymFloat:
     "Creating ShapeEnv fails for confusing reasons (also we never expect dynamo to see code like this)"
 )
 class TestPySymInt(TestCase):
+    # [CLASS DOC] Tests for symbolic integers, floats and bools created from a ShapeEnv:
+    # arithmetic, bitwise ops, tracing, guards, expect_true, unbacked substitution and renaming,
+    # simplification and meta-kernel behavior with unbacked sizes. Skipped under TorchDynamo
+    # because ShapeEnv creation is not expected inside traced code.
     def test_arith_ops(self):
+        # [FUNCTION DOC] Checks that add, sub, floordiv, mul and mod of symbolic ints from
+        # different values match the same operations on plain ints for all ordered pairs.
         shape_env = ShapeEnv()
         symints = []
         for i in range(2, 5):
@@ -286,6 +358,8 @@ class TestPySymInt(TestCase):
                     )
 
     def test_reverse_arith_ops(self):
+        # [FUNCTION DOC] Checks that python-int floordiv and multiplication with a symbolic int on
+        # the right produce results equal to the plain int computation.
         shape_env = ShapeEnv()
 
         a = create_symint(shape_env, 2)
@@ -295,6 +369,8 @@ class TestPySymInt(TestCase):
         self.assertTrue(5 * a == 5 * 2)
 
     def test_sympify_symint(self):
+        # [FUNCTION DOC] Verifies sympify of a SymInt, SymFloat and SymBool returns the identical
+        # underlying sympy expression object of its node.
         shape_env = ShapeEnv()
         a = create_symint(shape_env, 2)
         self.assertIs(sympy.sympify(a), a.node.expr)
@@ -304,6 +380,9 @@ class TestPySymInt(TestCase):
         self.assertIs(sympy.sympify(c), c.node.expr)
 
     def test_roundtrip(self):
+        # [FUNCTION DOC] Checks that sizes, strides and storage offset of a symbolic tensor are
+        # SymInt objects (not SymNode), compare equal to the original values, and can be simplified
+        # to python ints after a guard, using both shape and size accessors.
         shape_env = ShapeEnv()
         x = create_symbolic_tensor("x", torch.randn(5, 4, 3), shape_env)
 
@@ -335,6 +414,8 @@ class TestPySymInt(TestCase):
         self.assertTrue(y.storage_offset() == 12)
 
     def test_binary(self):
+        # [FUNCTION DOC] Checks that elementwise add of symbolic tensors, including a broadcast
+        # operand, yields the expected output sizes.
         shape_env = ShapeEnv()
         x = create_symbolic_tensor("x", torch.randn(5, 4, 3), shape_env)
         y = create_symbolic_tensor("y", torch.randn(5, 4, 3), shape_env)
@@ -352,6 +433,8 @@ class TestPySymInt(TestCase):
         self.assertTrue(z.shape[2] == 3)
 
     def test_symint_args(self):
+        # [FUNCTION DOC] Checks narrow_copy accepts a SymInt, a difference of two SymInts, and a
+        # SymInt minus a python int as the length argument, giving the expected resulting size.
         shape_env = ShapeEnv()
         x = create_symbolic_tensor("x", torch.randn(5, 4, 3), shape_env)
         y = create_symbolic_tensor("y", torch.randn(5, 4, 1), shape_env)
@@ -368,6 +451,9 @@ class TestPySymInt(TestCase):
         self.assertTrue(z.shape[2] == 2)
 
     def test_symint_vargs(self):
+        # [FUNCTION DOC] Checks expand with varargs and with shape sequences, with all-symbolic,
+        # mixed symbolic/int and all-int arguments, and with a single dimension, all produce the
+        # expected sizes.
         shape_env = ShapeEnv()
         x = create_symbolic_tensor("x", torch.randn(5, 4, 3), shape_env)
         y = create_symbolic_tensor("y", torch.randn(1, 4, 1), shape_env)
@@ -412,6 +498,9 @@ class TestPySymInt(TestCase):
         z = y.expand(y.shape[1])
 
     def test_symint_bitwise_and(self):
+        # [FUNCTION DOC] Checks bitwise and on SymInt pairs, SymInt with SymBool, SymInt with int
+        # and SymBool pairs: results compare to the expected values, the main result stays a
+        # SymInt, and the recorded guard prints as the expected equality on the bitwise function.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 0b1100)
         b0 = create_symint(shape_env, 0b1010)
@@ -434,6 +523,8 @@ class TestPySymInt(TestCase):
         self.assertEqual(a3 & b3, True)
 
     def test_symint_bitwise_or(self):
+        # [FUNCTION DOC] Checks bitwise or on two SymInts gives the right value, stays a SymInt,
+        # and records the expected guard expression string.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 0b1100)
         b0 = create_symint(shape_env, 0b1010)
@@ -445,6 +536,8 @@ class TestPySymInt(TestCase):
         )
 
     def test_symint_bitwise_xor(self):
+        # [FUNCTION DOC] Checks bitwise xor on two SymInts gives the right value, stays a SymInt,
+        # and records the expected guard expression string.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 0b1100)
         b0 = create_symint(shape_env, 0b1010)
@@ -456,11 +549,14 @@ class TestPySymInt(TestCase):
         )
 
     def test_stride(self):
+        # [FUNCTION DOC] Checks that the stride of a symbolic tensor is a SymInt.
         shape_env = ShapeEnv()
         x = create_symbolic_tensor("x", torch.randn(5, 5), shape_env)
         self.assertIsInstance(x.stride()[0], SymInt)
 
     def test_size_expressions(self):
+        # [FUNCTION DOC] Checks that branching on a comparison of an expanded symbolic size records
+        # a strict-greater-than guard whose recorded size-oblivious flag is false.
         shape_env = ShapeEnv()
         x = create_symbolic_tensor("x", torch.randn(5), shape_env)
         expand_x = x.expand(x.shape[0], x.shape[0])
@@ -477,6 +573,9 @@ class TestPySymInt(TestCase):
         self.assertFalse(is_size_obv)
 
     def test_floordiv_static(self):
+        # [FUNCTION DOC] Triggers several divisibility checks on a symbolic int and asserts that
+        # static-known-true evaluation can prove floor division of the value by half of itself
+        # equals two. The pattern was extracted from an inductor cpp wrapper test.
         shape_env = ShapeEnv()
         s0 = create_symint(shape_env, 8)
         # This was extracted from
@@ -488,6 +587,8 @@ class TestPySymInt(TestCase):
         self.assertTrue(statically_known_true(s0 // (s0 // 2) == 2))
 
     def test_numel(self):
+        # [FUNCTION DOC] Checks numel is a SymInt for symbolic tensors (method and function form)
+        # and a plain int for ordinary tensors.
         shape_env = ShapeEnv()
         x = create_symbolic_tensor("x", torch.randn(5), shape_env)
         self.assertIsInstance(x.numel(), torch.SymInt)
@@ -498,12 +599,15 @@ class TestPySymInt(TestCase):
         self.assertIsInstance(torch.numel(x), int)
 
     def test_int_to_float(self):
+        # [FUNCTION DOC] Checks that converting a symbolic size to float yields a SymFloat.
         shape_env = ShapeEnv()
         x = create_symbolic_tensor("x", torch.randn(5), shape_env)
         r = torch.sym_float(x.shape[0])
         self.assertIsInstance(r, torch.SymFloat, msg=type(r))
 
     def test_aten_ops(self):
+        # [FUNCTION DOC] Smoke test that narrow_copy and expand overloads run on symbolic tensors
+        # with symbolic size arguments without raising.
         shape_env = ShapeEnv()
         x = create_symbolic_tensor("x", torch.randn(5), shape_env)
         torch.ops.aten.narrow_copy.default(x, 0, 0, x.shape[0])
@@ -513,8 +617,15 @@ class TestPySymInt(TestCase):
         torch.ops.aten.expand.default(x, [x.shape[0], x.shape[1], x.shape[2]])
 
     def test_fx_trace_intlist(self):
+        # [FUNCTION DOC] Checks that fx symbolic tracing of a module that unpacks sizes and calls
+        # pad with computed padding does not raise a type error about tuples.
         class CustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward unpacks four input sizes and pads the last
+            # two dims by the parity of width and height.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Unpacks batch, channel, height and width from the input
+                # and returns the input padded by width mod 2 on the right and height mod 2 on
+                # the bottom.
                 bs, c, h, w = x.shape
                 return F.pad(x, (0, w % 2, 0, h % 2, 0, 0))
 
@@ -525,12 +636,16 @@ class TestPySymInt(TestCase):
         torch.fx.symbolic_trace(m)
 
     def test_meta_symint(self):
+        # [FUNCTION DOC] Checks that creating an empty meta tensor from a SymInt gives a size that
+        # is a SymInt.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 2)
         r = torch.empty(a0, device="meta")
         self.assertIsInstance(r.shape[0], SymInt)
 
     def test_hash_size(self):
+        # [FUNCTION DOC] Regression test for issue 168254: hashing a tensor size containing a
+        # symbolic value must raise TypeError.
         # See issue #168254
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 2)
@@ -538,12 +653,16 @@ class TestPySymInt(TestCase):
         self.assertRaises(TypeError, lambda: hash(r.shape))
 
     def test_guard_int(self):
+        # [FUNCTION DOC] Checks guard_int returns the hint value and records an equality guard on
+        # the symbol.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 2)
         self.assertEqual(guard_int(a0), 2)
         self.assertExpectedInline(str(shape_env.guards[0][0]), """Eq(s97, 2)""")
 
     def test_sym_sum(self):
+        # [FUNCTION DOC] Checks that torch sym_sum over symbolic ints gives the same expression as
+        # chained addition.
         shape_env = ShapeEnv()
         s0 = create_symint(shape_env, 2)
         s1 = create_symint(shape_env, 3)
@@ -553,6 +672,9 @@ class TestPySymInt(TestCase):
         )
 
     def test_prefer_deferred_runtime_assertions_over_guards(self):
+        # [FUNCTION DOC] With deferred runtime asserts preferred over guards, checks guard_int
+        # still adds a guard, while expect_true adds no guard and records one deferred runtime
+        # assert with the expected expression.
         shape_env = ShapeEnv(prefer_deferred_runtime_asserts_over_guards=True)
         s0 = create_symint(shape_env, 2)
         self.assertEqual(guard_int(s0), 2)
@@ -568,6 +690,9 @@ class TestPySymInt(TestCase):
         )
 
     def test_sym_int(self):
+        # [FUNCTION DOC] Checks sym_int on a SymInt, on a true division result and on a scaled
+        # float conversion: results are SymInts with the expected values and the recorded guards
+        # are truncation expressions.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 5)
         r = sym_int(a0)
@@ -592,6 +717,8 @@ class TestPySymInt(TestCase):
         )
 
     def test_sym_log2(self):
+        # [FUNCTION DOC] Checks the symbolic log2 produces a SymFloat with the right value and
+        # records an opaque unary function guard.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 4)
         r = torch._sym_log2(a0)
@@ -602,6 +729,8 @@ class TestPySymInt(TestCase):
         )
 
     def test_sym_sqrt(self):
+        # [FUNCTION DOC] Checks the symbolic sqrt produces a SymFloat with the right value and
+        # records an opaque unary function guard.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 4)
         r = torch._sym_sqrt(a0)
@@ -612,6 +741,8 @@ class TestPySymInt(TestCase):
         )
 
     def test_sym_floor(self):
+        # [FUNCTION DOC] Checks math floor of symbolic true division and of float-scaled symbolic
+        # ints returns SymInts with right values and floor-to-int guards.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 5)
         r = math.floor(a0 / 2)
@@ -630,6 +761,8 @@ class TestPySymInt(TestCase):
         )
 
     def test_sym_trunc(self):
+        # [FUNCTION DOC] Checks math trunc of a symbolic true division and sym_int of a symbolic
+        # sqrt return SymInts with the right values and truncation guards.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 5)
         r = math.trunc(a0 / 2)
@@ -647,6 +780,8 @@ class TestPySymInt(TestCase):
         )
 
     def test_sym_ceil(self):
+        # [FUNCTION DOC] Checks math ceil of a symbolic true division gives a SymInt with a
+        # ceil-to-int guard, then floors a float-scaled value and checks its guard.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 5)
         r = math.ceil(a0 / 2)
@@ -666,6 +801,9 @@ class TestPySymInt(TestCase):
         )
 
     def test_sym_ite(self):
+        # [FUNCTION DOC] Checks sym_ite: python bool conditions return the chosen operand object
+        # itself; a symbolic condition yields a result of the same type with the right value and no
+        # extra guard from the condition, and the guard list holds a piecewise expression for it.
         shape_env = ShapeEnv()
         t = create_symint(shape_env, 5)
         f = create_symint(shape_env, 4)
@@ -695,7 +833,12 @@ class TestPySymInt(TestCase):
         )
 
     def test_tracing_sym_ite(self):
+        # [FUNCTION DOC] Traces a function returning sym_ite of a size equality using symbolic
+        # make_fx, asserts no guards were recorded, compares the generated graph code with an
+        # expected string, then runs the graph on two inputs and checks both return int 5.
         def f(x):
+            # [FUNCTION DOC] HELPER: Compares the first size to 5 and returns sym_ite choosing the
+            # first size when equal, otherwise the second size.
             b = x.shape[0] == 5
             ret = torch.sym_ite(b, x.shape[0], x.shape[1])
             return ret
@@ -720,23 +863,32 @@ def forward(self, x_1):
         self.assertEqual(r2, 5)
 
     def test_int_conversion(self):
+        # [FUNCTION DOC] Checks that converting a duck-sized symbolic int to a python int adds an
+        # equality guard on its symbol.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 2)
         int(a0)
         self.assertExpectedInline(str(shape_env.guards[0][0]), """Eq(s97, 2)""")
 
     def test_data_dependent_guard(self):
+        # [FUNCTION DOC] Checks that branching on equality of an unbacked symbolic int
+        # raises GuardOnDataDependentSymNode.
         shape_env = ShapeEnv()
         s0 = shape_env.create_unbacked_symint()
         self.assertRaises(GuardOnDataDependentSymNode, lambda: bool(s0 == 0))
 
     def test_data_dependent_guard_propagate_real_tensors(self):
+        # [FUNCTION DOC] Checks that with a real value (zero) registered for an unbacked symbol,
+        # evaluating an equality to zero as a bool succeeds and returns True rather than raising.
         shape_env = ShapeEnv()
         s0 = shape_env.create_unbacked_symint()
         shape_env.set_real_tensor_prop_unbacked_vals(s0.node.expr, 0)
         self.assertEqual(bool(s0 == 0), True)
 
     def test_expect_true_basic(self):
+        # [FUNCTION DOC] Checks expect_true on an unbacked equality returns true without error,
+        # records a replacement of the symbol by zero in the ShapeEnv, and that the same equality
+        # can then be evaluated as a bool.
         shape_env = ShapeEnv()
         i0 = shape_env.create_unbacked_symint()
         i0_sym = i0.node.expr
@@ -748,6 +900,9 @@ def forward(self, x_1):
         bool(i0 == 0)
 
     def test_expect_true_with_s0(self):
+        # [FUNCTION DOC] Checks expect_true of an unbacked symbol being less than a backed one
+        # stores one deferred runtime assert under the unbacked symbol, after which that comparison
+        # and its implied != hold while the opposite comparisons evaluate false.
         shape_env = ShapeEnv()
         s0 = create_symint(shape_env, 5)
         i0 = shape_env.create_unbacked_symint()
@@ -762,6 +917,9 @@ def forward(self, x_1):
         self.assertFalse(i0 >= s0)
 
     def test_expect_true_prefer_later(self):
+        # [FUNCTION DOC] Checks expect_true of a sum of two unbacked symbols equal to a constant is
+        # filed as a deferred runtime assert under the later symbol, and that the same equality
+        # then evaluates true. The trailing note says the sum is not substituted by the constant.
         shape_env = ShapeEnv()
         i0 = shape_env.create_unbacked_symint()
         i1 = shape_env.create_unbacked_symint()
@@ -780,6 +938,9 @@ def forward(self, x_1):
         # unbacked SymInts.)
 
     def test_unbacked_substitution(self):
+        # [FUNCTION DOC] Checks that expecting equality between a size-constrained unbacked int and
+        # four times another (in both operand orders) leaves the larger multiple printing under its
+        # own name (u0 and u3), i.e. it is not rewritten in terms of the other symbol.
         shape_env = ShapeEnv()
         i0 = shape_env.create_unbacked_symint()
         i1 = shape_env.create_unbacked_symint()
@@ -796,6 +957,9 @@ def forward(self, x_1):
         self.assertExpectedInline(str(i3), """u3""")
 
     def test_rename_unbacked_to_unifies_unbacked_dest(self):
+        # [FUNCTION DOC] Checks the internal rename-unbacked-to routine when the original symbol
+        # already maps to an unbacked destination: afterwards the original maps to the new symbol
+        # and the new symbol maps to that destination.
         shape_env = ShapeEnv()
         orig = shape_env.create_unbacked_symint().node.expr
         new = shape_env.create_unbacked_symint().node.expr
@@ -806,6 +970,8 @@ def forward(self, x_1):
         self.assertEqual(shape_env.replacements[new], dest)
 
     def test_rename_unbacked_to_raises_on_disjoint_ranges(self):
+        # [FUNCTION DOC] Checks the rename routine raises ValueRangeError when the original's
+        # replacement destination has a range (0 to 5) disjoint from the new symbol's (10 to 20).
         shape_env = ShapeEnv()
         orig = shape_env.create_unbacked_symint()
         new = shape_env.create_unbacked_symint()
@@ -817,6 +983,9 @@ def forward(self, x_1):
             shape_env._rename_unbacked_to(orig.node.expr, new.node.expr)
 
     def test_rename_unbacked_to_preserves_existing_backed_replacement(self):
+        # [FUNCTION DOC] Checks the rename routine keeps an existing backed replacement of the new
+        # symbol: the original maps to the new symbol, and both the new symbol and the old
+        # destination end up mapped to the backed symbol.
         shape_env = ShapeEnv()
         orig = shape_env.create_unbacked_symint().node.expr
         new = shape_env.create_unbacked_symint().node.expr
@@ -830,6 +999,9 @@ def forward(self, x_1):
         self.assertEqual(shape_env.replacements[dest], backed)
 
     def test_rename_unbacked_to_unifies_existing_unbacked(self):
+        # [FUNCTION DOC] Checks the rename routine when the new symbol already aliases another
+        # unbacked symbol: the original maps to the new one and the new one and the other alias are
+        # all unified onto the original's destination.
         shape_env = ShapeEnv()
         orig = shape_env.create_unbacked_symint().node.expr
         new = shape_env.create_unbacked_symint().node.expr
@@ -843,6 +1015,9 @@ def forward(self, x_1):
         self.assertEqual(shape_env.replacements[other], dest)
 
     def test_rename_unbacked_to_preserves_transitive_backed_replacement(self):
+        # [FUNCTION DOC] Checks the rename routine with a chain new -> other -> backed: the find of
+        # the new symbol is the backed symbol, and the other symbol and old destination also
+        # resolve to the backed one.
         shape_env = ShapeEnv()
         orig = shape_env.create_unbacked_symint().node.expr
         new = shape_env.create_unbacked_symint().node.expr
@@ -858,6 +1033,9 @@ def forward(self, x_1):
         self.assertEqual(shape_env.replacements[dest], backed)
 
     def test_rename_unbacked_to_unifies_unbacked_alias_onto_backed_dest(self):
+        # [FUNCTION DOC] Checks the rename routine when the original maps to a backed destination
+        # and the new symbol aliases another unbacked symbol: original, new and alias all resolve
+        # to the backed destination.
         shape_env = ShapeEnv()
         orig = shape_env.create_unbacked_symint().node.expr
         new = shape_env.create_unbacked_symint().node.expr
@@ -871,6 +1049,9 @@ def forward(self, x_1):
         self.assertEqual(shape_env._find(alias), backed_dest)
 
     def test_rename_unbacked_to_skips_range_widening_alias(self):
+        # [FUNCTION DOC] Checks that the rename routine does not alias onto a replacement that
+        # would widen ranges: with a wide new symbol aliasing a narrow one, new and original
+        # resolve to the destination while the narrow alias gets no replacement entry.
         shape_env = ShapeEnv()
         orig = shape_env.create_unbacked_symint()
         new = shape_env.create_unbacked_symint()
@@ -887,6 +1068,9 @@ def forward(self, x_1):
         self.assertNotIn(alias.node.expr, shape_env.replacements)
 
     def test_rename_unbacked_to_unifies_two_backed_terminals(self):
+        # [FUNCTION DOC] Checks the rename routine when both the original and new symbols point at
+        # different backed (non-duck) symbols: the new symbol maps to the original's backed
+        # destination, and both resolve to the same representative.
         shape_env = ShapeEnv()
         orig = shape_env.create_unbacked_symint().node.expr
         new = shape_env.create_unbacked_symint().node.expr
@@ -899,11 +1083,20 @@ def forward(self, x_1):
         self.assertEqual(shape_env._find(orig), shape_env._find(new))
 
     def test_rename_unbacked_to_unifies_on_double_propagation(self):
+        # [FUNCTION DOC] Regression test: exports a module that calls unique and uses the unbacked
+        # count, then runs the unbacked-symint propagation interpreter twice over the exported
+        # graph under its fake mode, which previously asserted. Checks the exported module still
+        # equals the eager module on the original input.
         from torch._guards import detect_fake_mode
         from torch.fx.experimental.symbolic_shapes import PropagateUnbackedSymInts
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward returns the sum of unique values of the
+            # input plus the sum of a zeros tensor sized by the number of unique values (an
+            # unbacked size).
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Computes unique values of x, then returns their sum added
+                # to the sum of a new zero tensor with one element per unique value.
                 u = torch.unique(x)  # aten._unique2 -> unbacked count
                 return u.sum() + x.new_zeros(u.shape[0]).sum()
 
@@ -926,6 +1119,9 @@ def forward(self, x_1):
         self.assertEqual(gm(*inp), m(*inp))
 
     def test_avoid_unbacked_substitution(self):
+        # [FUNCTION DOC] Checks that expecting an unbacked symbol equal to a constant minus another
+        # unbacked symbol does not substitute away the first symbol, whose printed form stays the
+        # original name.
         shape_env = ShapeEnv()
         i0 = shape_env.create_unbacked_symint()
         _constrain_range_for_size(i0)
@@ -935,6 +1131,9 @@ def forward(self, x_1):
         self.assertExpectedInline(str(i0), """u0""")
 
     def test_expect_true_double_digits(self):
+        # [FUNCTION DOC] Checks symbol naming with eleven unbacked ints (last is u10) and that
+        # expect_true on their sum equal to twenty files exactly one deferred runtime assert under
+        # the last symbol.
         shape_env = ShapeEnv()
         ia = [shape_env.create_unbacked_symint() for _ in range(11)]  # allocate 10
         self.assertEqual(str(ia[-1]), "u10")
@@ -942,6 +1141,10 @@ def forward(self, x_1):
         self.assertEqual(len(shape_env.deferred_runtime_asserts[ia[-1].node.expr]), 1)
 
     def test_expect_true_refine_range(self):
+        # [FUNCTION DOC] Checks that expect_true on lower bound relations (greater than 4 and
+        # equivalent forms) and upper bound relations (less than 4 and equivalent forms) on fresh
+        # unbacked symbols refines their value ranges, tested via statically-known-true on
+        # inequalities, with a subtest for each form.
         shape_env = ShapeEnv()
         for i, rel in enumerate(
             [lambda x: x > 4, lambda x: 4 < x, lambda x: x >= 5, lambda x: 5 <= x]
@@ -970,6 +1173,9 @@ def forward(self, x_1):
                 self.assertTrue(statically_known_true(i0 <= 5))
 
     def test_guard_refine_range(self):
+        # [FUNCTION DOC] Checks that evaluating bounds relations as booleans on non-duck backed
+        # symints (hints 10 and 2) refines ranges so later inequality queries are statically known
+        # true or false accordingly, for four relation forms in both outcomes, using subtests.
         shape_env = ShapeEnv()
         for i, rel in enumerate(
             [lambda x: x > 4, lambda x: 4 < x, lambda x: x >= 5, lambda x: 5 <= x]
@@ -1024,6 +1230,9 @@ def forward(self, x_1):
                 self.assertTrue(statically_known_true(i0 > 3))
 
     def test_mul_int_oo_nan(self):
+        # [FUNCTION DOC] Regression smoke test: evaluating a product of a symbol and a floor
+        # division by itself compared to another symbol must not raise (integer infinity times nan
+        # case in range analysis).
         shape_env = ShapeEnv()
         s0 = create_symint(shape_env, 5, duck=False)
         s1 = create_symint(shape_env, 6, duck=False)
@@ -1031,12 +1240,17 @@ def forward(self, x_1):
         bool(s0 * (s1 // s0) == s2)
 
     def test_non_overlapping_and_dense_backed(self):
+        # [FUNCTION DOC] Checks the non-overlapping-and-dense operator returns true for a meta
+        # tensor with backed symbolic size and transposed strides.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 5)
         r = torch.empty_strided((a0, 7), (1, a0), device="meta")
         self.assertTrue(torch.ops.aten.is_non_overlapping_and_dense.default(r))
 
     def test_non_overlapping_and_dense_unbacked(self):
+        # [FUNCTION DOC] Checks the non-overlapping-and-dense indicator function and operator on
+        # shapes with an unbacked size: simple 2D, 1D and singleton cases give true, as does a 4D
+        # case with strides built from the maximum of one and the unbacked size.
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
         cf = torch.ops.aten.is_non_overlapping_and_dense.default
@@ -1065,6 +1279,9 @@ def forward(self, x_1):
         )
 
     def test_sympy_interp_is_non_overlapping_and_dense_flat_args(self):
+        # [FUNCTION DOC] Checks the SYMPY_INTERP indicator function accepts flat arguments (sizes
+        # followed by strides) as emitted in guard code: 1D, 2D and 4D dense layouts give 1 and
+        # gapped layouts give 0.
         # SYMPY_INTERP is used as the eval() namespace for guard code strings.
         # Guard code prints IsNonOverlappingAndDenseIndicator(s0, s1, ..., st0, st1, ...)
         # with flat args, so the SYMPY_INTERP function must accept flat args.
@@ -1091,6 +1308,8 @@ def forward(self, x_1):
         self.assertEqual(interp_fn(2, 3, 4, 5, 100, 20, 5, 1), 0)
 
     def test_sympy_interp_guard_eval_simulation(self):
+        # [FUNCTION DOC] Simulates guard evaluation by evaluating guard code strings with the
+        # SYMPY_INTERP namespace: a dense 4D layout compares true and a gapped one compares false.
         # Simulate the actual guard eval() path: guard code strings use
         # IsNonOverlappingAndDenseIndicator as a function name, and SYMPY_INTERP
         # provides the binding in the eval namespace.
@@ -1105,6 +1324,9 @@ def forward(self, x_1):
         self.assertFalse(result_false)
 
     def test_prims_is_non_overlapping_and_dense_or_false(self):
+        # [FUNCTION DOC] Checks the or-false variant of the dense check on meta tensors: true for
+        # backed and unbacked dense layouts, false for a permuted unbacked layout and for layouts
+        # with arbitrary unbacked strides, since it returns false when it cannot prove density.
         shape_env = ShapeEnv()
         cf = torch._prims_common.is_non_overlapping_and_dense_or_false
 
@@ -1161,6 +1383,9 @@ def forward(self, x_1):
         )
 
     def test_sympy_optimized_add_binary_search(self):
+        # [FUNCTION DOC] Checks the sorted-insert helper for symbolic sum arguments: inserting into
+        # an empty list yields a one-item list, inserting an element already present returns None,
+        # and new elements are placed in sorted name order, including at the front.
         import sympy
 
         from torch.fx.experimental.sym_node import _binary_search_insert_arg
@@ -1207,6 +1432,10 @@ def forward(self, x_1):
         self.assertEqual(args, [_a, a, a1, a2, b, c, c1])
 
     def test_floor_clean_div_axioms(self):
+        # [FUNCTION DOC] Checks that an axiom recorded for a floor division by three is still found
+        # after the ShapeEnv learns divisibility: the floor form evaluates true, the clean division
+        # form is not statically known at first, then after asserting the modulus is zero the floor
+        # form simplifies to the clean-division form and both evaluate true.
         # Test that if we add an axiom that have FloorDiv, after which the
         # shapeEnv changed such that it can be simplified it to CleanDiv, then
         # We still correctly replace CleanDiv with the axiom value of FloorDiv.
@@ -1231,6 +1460,9 @@ def forward(self, x_1):
         self.assertTrue(shape_env.evaluate_expr(test2))
 
     def test_sympy_optimized_add(self):
+        # [FUNCTION DOC] Checks the optimized-summation flag on sums of symbolic ints: a sum of
+        # distinct symbols is flagged and stays flagged when a new unique symbol is added; adding a
+        # duplicate symbol, a constant, or combining two long optimized sums clears it.
         shape_env = ShapeEnv()
         s0 = create_symint(shape_env, 2)
         s1 = create_symint(shape_env, 3)
@@ -1240,9 +1472,13 @@ def forward(self, x_1):
         self.assertTrue(sum.node._optimized_summation)
 
         def assert_optimized(sym):
+            # [FUNCTION DOC] HELPER: Asserts the symbolic value's node has the optimized-summation
+            # flag set.
             self.assertTrue(sym.node._optimized_summation)
 
         def assert_not_optimized(sym):
+            # [FUNCTION DOC] HELPER: Asserts the node's optimized-summation flag is absent
+            # or false.
             self.assertFalse(getattr(sym.node, "_optimized_summation", False))
 
         assert_optimized(sum)
@@ -1278,6 +1514,11 @@ def forward(self, x_1):
         assert_not_optimized(b + a + b)
 
     def test_max_of_unique_summation_opt(self):
+        # [FUNCTION DOC] Checks symmetric max over sums of unbacked symbols: max of two sums of
+        # distinct symbols and max with further disjoint sums carry unique-summation symbol info,
+        # while other forms are computed (see known issue below).
+        # KNOWN ISSUE: the not-optimized helper only reads the attribute and never asserts, so the
+        # not-optimized calls in this test verify nothing.
         shape_env = ShapeEnv()
         s0 = shape_env.create_unbacked_symint()
         s1 = shape_env.create_unbacked_symint()
@@ -1288,9 +1529,13 @@ def forward(self, x_1):
         s7 = shape_env.create_unbacked_symint()
 
         def assert_optimized(sym):
+            # [FUNCTION DOC] HELPER: Asserts the expression has unique-summation symbols recorded.
             self.assertTrue(sym.node.expr.unique_summations_symbols is not None)
 
         def assert_not_optimized(sym):
+            # [FUNCTION DOC] HELPER: Intended to check absence of unique-summation symbols but only
+            # reads the attribute and asserts nothing.
+            # KNOWN ISSUE: contains no assertion, so it can never fail.
             getattr(sym.node.expr, "unique_summations_symbols", None)
 
         mx1 = torch.sym_max(s0, s1)
@@ -1309,6 +1554,10 @@ def forward(self, x_1):
         assert_not_optimized(torch.sym_max(mx3, s7 * 2))
 
     def test_build_proxy_for_optimized_add(self):
+        # [FUNCTION DOC] Checks that rebuilding a proxy for a flattened three-argument sum
+        # expression works. With no output given and with an output given, the rebuilt graph must
+        # sum all three inputs; an fx graph module built from placeholder proxies is executed on 2,
+        # 3, 4 and must return 9.
         """
         Test that _build_proxy_for_sym_expr correctly handles flattened
         sympy.Add expressions with more than 2 arguments.
@@ -1391,6 +1640,9 @@ def forward(self, x_1):
         self.assertEqual(result, 9)
 
     def test_build_proxy_for_nary_min_max(self):
+        # [FUNCTION DOC] Checks that rebuilding proxies for flattened three-argument max and min
+        # expressions of unbacked symints works with no output and with an output given; the
+        # resulting graph executed on 2, 3, 4 must return 4 for max and 2 for min. Uses subtests.
         """
         Test that _build_proxy_for_sym_expr correctly handles flattened
         sympy.Max/sympy.Min expressions with more than 2 arguments.
@@ -1453,6 +1705,9 @@ def forward(self, x_1):
                 self.assertEqual(gm(2, 3, 4), expected)
 
     def test_build_proxy_for_pow(self):
+        # [FUNCTION DOC] Checks that rebuilding proxies for a product containing a power of an
+        # unbacked symbol (exponents 2 and 3) works with no output and with an output given; the
+        # resulting graph executed on 2 and 3 must equal the plain integer product.
         """
         Test that _build_proxy_for_sym_expr correctly handles sympy.Pow.
 
@@ -1516,6 +1771,8 @@ def forward(self, x_1):
                 self.assertEqual(gm(2, 3), 2 * 3**exp)
 
     def test_sym_max_multi_max_simplify(self):
+        # [FUNCTION DOC] Checks that max of one and max of 257 and an unbacked symbol is statically
+        # known equal to max of 257 and that symbol.
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
         self.assertTrue(
@@ -1525,6 +1782,9 @@ def forward(self, x_1):
         )
 
     def test_min_max_simplify_with_value_ranges(self):
+        # [FUNCTION DOC] Checks that simplify removes redundant min/max terms using value ranges
+        # established by checks (upper bound 5 on one symbol, lower bound 10 on another), and
+        # leaves an unconstrained symbol's min/max unchanged.
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
         u1 = shape_env.create_unbacked_symint()
@@ -1544,6 +1804,8 @@ def forward(self, x_1):
         self.assertEqual(shape_env.simplify(Max(u2_expr, 5)), Max(5, u2_expr))
 
     def test_numpy_sym_max(self):
+        # [FUNCTION DOC] Checks sym_max with numpy scalar and python int/float mixes returns the
+        # larger value (floats where a float is involved).
         self.assertEqual(torch.sym_max(np.int64(10), 12), 12)
         self.assertEqual(torch.sym_max(np.int64(12), 10), 12)
         self.assertEqual(torch.sym_max(np.int64(10), 12.5), 12.5)
@@ -1552,6 +1814,8 @@ def forward(self, x_1):
         self.assertEqual(torch.sym_max(np.float64(14.0), 16), 16.0)
 
     def test_numpy_sym_min(self):
+        # [FUNCTION DOC] Checks sym_min with numpy scalar and python int/float mixes returns the
+        # smaller value (floats where a float is involved).
         self.assertEqual(torch.sym_min(np.int64(10), 12), 10)
         self.assertEqual(torch.sym_min(np.int64(12), 10), 10)
         self.assertEqual(torch.sym_min(np.int64(10), 12.5), 10.0)
@@ -1560,6 +1824,9 @@ def forward(self, x_1):
         self.assertEqual(torch.sym_min(np.float64(14.0), 16), 14.0)
 
     def test_debug_has_internal_overlap_unbacked(self):
+        # [FUNCTION DOC] Checks the internal-overlap debug function on meta tensors with unbacked
+        # sizes: values 0 for non-overlapping layouts and 2 (too hard to tell) for broadcast-like
+        # strides or layouts depending on unbacked sizes.
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
         cf = torch._debug_has_internal_overlap
@@ -1584,6 +1851,8 @@ def forward(self, x_1):
         self.assertEqual(cf(torch.empty_strided((2, u0), (1, 3), device="meta")), 2)
 
     def test_specialize_zero_one(self):
+        # [FUNCTION DOC] Checks the specialize-zero-one option: comparing a size 5 to one adds no
+        # guard when enabled, and adds one guard when disabled.
         shape_env = ShapeEnv(specialize_zero_one=True)
         a0 = create_symint(shape_env, 5)
         if a0 == 1:
@@ -1597,6 +1866,8 @@ def forward(self, x_1):
         self.assertEqual(len(shape_env.guards), 1)
 
     def test_duck_shape(self):
+        # [FUNCTION DOC] Checks duck shaping: two sizes with equal value compare equal with no
+        # guard when duck shaping is on, and need one guard when it is off.
         shape_env = ShapeEnv(duck_shape=True)
         a0 = create_symint(shape_env, 5)
         a1 = create_symint(shape_env, 5)
@@ -1612,6 +1883,8 @@ def forward(self, x_1):
         self.assertEqual(len(shape_env.guards), 1)
 
     def test_int_bool(self):
+        # [FUNCTION DOC] Regression test for issue 95981: truthiness of a duck-sized symbolic int
+        # works and adds no guard.
         # See https://github.com/pytorch/pytorch/issues/95981
         shape_env = ShapeEnv(duck_shape=True)
         a0 = create_symint(shape_env, 5)
@@ -1620,13 +1893,21 @@ def forward(self, x_1):
         self.assertEqual(len(shape_env.guards), 0)
 
     def test_symint_as_scalar(self):
+        # [FUNCTION DOC] Checks that a SymInt passed as a scalar argument (alpha) of add reaches
+        # the dispatch mode with the same node, by recording that fact in an outer flag.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 2)
 
         sym_int_encountered = False
 
         class TestSymInt(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Dispatch mode that intercepts add, records whether the alpha
+            # keyword holds the original symbolic node, then calls the op with alpha zeroed.
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Raises AssertionError if the op is not the aten add Tensor
+                # overload. Sets the enclosing flag from comparing the alpha node identity,
+                # overwrites alpha with 0 in the kwargs mapping, and calls the op with positional
+                # args only.
                 if func != torch.ops.aten.add.Tensor:
                     raise AssertionError(
                         f"expected torch.ops.aten.add.Tensor, got {func}"
@@ -1646,6 +1927,8 @@ def forward(self, x_1):
         self.assertTrue(sym_int_encountered)
 
     def test_deepcopy(self):
+        # [FUNCTION DOC] Checks deep-copying a ShapeEnv after one guard was recorded preserves that
+        # guard in the copy.
         shape_env = ShapeEnv()
         a0 = create_symint(shape_env, 2)
         if not (a0 < 4):
@@ -1654,7 +1937,13 @@ def forward(self, x_1):
         self.assertEqual(len(new_shape_env.guards), 1)
 
     def test_print_readable_with_symints(self):
+        # [FUNCTION DOC] Traces a function with symbolic make_fx on two tensors, prints the graph
+        # readable form without output, and compares it with an expected string containing symbolic
+        # size annotations.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Builds a new empty tensor sized by the sums of both
+            # inputs' sizes and applies native dropout (training mode) to it, returning the
+            # dropout outputs.
             dim0 = a.shape[0] + b.shape[0]
             dim1 = a.shape[1] + b.shape[1]
             d = a.new_empty(dim0, dim1)
@@ -1684,6 +1973,9 @@ class f(torch.nn.Module):
         )
 
     def test_statically_known_true(self):
+        # [FUNCTION DOC] Checks statically_known_true on symbolic expressions: true only for facts
+        # provable without hints, false for facts that are false, or true/false only for the hint
+        # values; also asserts no guards were recorded.
         shape_env = ShapeEnv()
         s2, s3, s4 = (create_symint(shape_env, i) for i in range(2, 5))
 
@@ -1714,6 +2006,9 @@ class f(torch.nn.Module):
         self.assertEqual(len(shape_env.guards), 0)
 
     def test_statically_known_false(self):
+        # [FUNCTION DOC] Mirror of the statically-known-true test for statically_known_false: true
+        # only for facts provably false without hints; hint-only truths or falsities are not
+        # enough. Also asserts no guards were recorded.
         shape_env = ShapeEnv()
         s2, s3, s4 = (create_symint(shape_env, i) for i in range(2, 5))
 
@@ -1744,6 +2039,10 @@ class f(torch.nn.Module):
         self.assertEqual(len(shape_env.guards), 0)
 
     def test_ephemeral_source_simplification(self):
+        # [FUNCTION DOC] For each combination of which tensor gets an ephemeral source and the
+        # order of comparison, creates two dynamic symbolic tensors, checks the ephemeral tensor
+        # has symbols with ephemeral sources, asserts equality of sizes, strides and storage offset
+        # via torch check, and verifies no ephemeral-source symbols remain.
         from torch._dynamo.source import EphemeralSource
 
         # For full robustness, ensure the ephemeral source symbols are simplified out regardless
@@ -1771,6 +2070,9 @@ class f(torch.nn.Module):
             t_with_ephemeral = x if construct_ephemeral_first else y
 
             def _get_ephemeral_source_symbols(t):
+                # [FUNCTION DOC] HELPER: Returns the sympy expressions of all symbolic sizes,
+                # strides and storage offset of a tensor whose symbols have at least one ephemeral
+                # source in the shape env's source table.
                 return [
                     s.node.expr
                     for s in itertools.chain(t.shape, t.stride(), (t.storage_offset(),))
@@ -1796,6 +2098,9 @@ class f(torch.nn.Module):
             self.assertEqual(len(_get_ephemeral_source_symbols(t_with_ephemeral)), 0)
 
     def test_ephemeral_source_unified_with_non_ephemeral_source(self):
+        # [FUNCTION DOC] With duck sizing and equal shapes, creates two symbolic tensors, one with
+        # an ephemeral source, in both construction orders. Checks the first source of every symbol
+        # is non-ephemeral and that sizes, strides and storage offsets compare equal.
         from torch._dynamo.source import EphemeralSource
 
         for construct_ephemeral_first in (False, True):
@@ -1828,6 +2133,8 @@ class f(torch.nn.Module):
             self.assertEqual(x.storage_offset(), y.storage_offset())
 
     def test_tensor_factory_with_symint(self):
+        # [FUNCTION DOC] Checks torch tensor and the legacy tensor constructors accept a list of
+        # SymInts for every dtype tried and produce values equal to those from plain ints.
         args = list(range(3))
         expected = torch.tensor(args)
 
@@ -1855,10 +2162,15 @@ class f(torch.nn.Module):
             self.assertEqual(res, expected, exact_dtype=False)
 
     def test_backed_size_oblivious_01_spec(self):
+        # [FUNCTION DOC] Under the backed-size-oblivious config, checks a compiled function that
+        # branches on a size-oblivious equality of a size to 1 takes the other branch even when the
+        # size is 1 (returns 20 rather than 10).
         from torch.fx.experimental.symbolic_shapes import guard_size_oblivious
 
         @torch.compile(dynamic=True, fullgraph=True)
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Returns b times 10 if the size-oblivious check says the first
+            # size of a equals one, else b times 20.
             if guard_size_oblivious(a.size(0) == 1):
                 return b * 10
             else:
@@ -1872,14 +2184,20 @@ class f(torch.nn.Module):
 
     @fresh_cache()
     def test_slice_backed_size_oblivious(self):
+        # [FUNCTION DOC] Compiles slicing the first five rows with dynamic shapes through inductor
+        # under the backed-size-oblivious config and runs it on a ten by ten input, expecting no
+        # error. Uses a fresh inductor cache.
         @torch.compile(backend="inductor", fullgraph=True, dynamic=True)
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the first five rows of x.
             return x[:5]
 
         with torch.fx.experimental._config.patch(backed_size_oblivious=True):
             f(torch.randn(10, 10))
 
     def test_baddbmm_symint(self):
+        # [FUNCTION DOC] Smoke test: baddbmm on meta tensors whose batch and matrix dimensions are
+        # unbacked symbols under a fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1895,6 +2213,8 @@ class f(torch.nn.Module):
             _ = torch.baddbmm(bias3, A, Bmat)
 
     def test_lu_unpack_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: lu_unpack on a meta tensor with unbacked sizes under a fake
+        # mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1907,6 +2227,8 @@ class f(torch.nn.Module):
             P, L, U = torch.lu_unpack(LU, pivots)
 
     def test_linalg_qr_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: QR decomposition on a meta tensor with unbacked sizes under a
+        # fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1918,9 +2240,12 @@ class f(torch.nn.Module):
             Q, R = torch.linalg.qr(A)
 
     def _make_unbacked_size(self, shape_env):
+        # [FUNCTION DOC] HELPER: Returns a fresh unbacked symbolic int from the given shape env.
         return shape_env.create_unbacked_symint()
 
     def test_avg_pool2d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: avg_pool2d with unbacked spatial sizes on a meta tensor under
+        # a fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1931,6 +2256,8 @@ class f(torch.nn.Module):
             torch.ops.aten.avg_pool2d(x, [2, 2], [2, 2], [0, 0])
 
     def test_max_pool2d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: max_pool2d with indices and unbacked spatial sizes under a
+        # fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1941,6 +2268,8 @@ class f(torch.nn.Module):
             torch.ops.aten.max_pool2d_with_indices(x, [2, 2], [2, 2])
 
     def test_avg_pool3d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: avg_pool3d with three unbacked spatial sizes under a fake mode
+        # must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1953,6 +2282,8 @@ class f(torch.nn.Module):
             torch.ops.aten.avg_pool3d(x, [2, 2, 2], [2, 2, 2])
 
     def test_max_pool3d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: max_pool3d with indices and three unbacked spatial sizes under
+        # a fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1965,6 +2296,8 @@ class f(torch.nn.Module):
             torch.ops.aten.max_pool3d_with_indices(x, [2, 2, 2], [2, 2, 2])
 
     def test_avg_pool1d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: avg_pool1d with an unbacked length under a fake mode must
+        # not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1975,6 +2308,8 @@ class f(torch.nn.Module):
             torch.ops.aten.avg_pool1d(x, [2], [2])
 
     def test_pixel_shuffle_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: pixel_shuffle with an unbacked channel count (upscale factor
+        # 1) under a fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1985,6 +2320,8 @@ class f(torch.nn.Module):
             torch.ops.aten.pixel_shuffle(x, 1)
 
     def test_pdist_forward_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: pairwise distance forward on a matrix with an unbacked row
+        # count under a fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -1994,6 +2331,8 @@ class f(torch.nn.Module):
             torch.ops.aten._pdist_forward(x, 2.0)
 
     def test_reflection_pad2d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: 2D reflection padding with unbacked spatial sizes under a fake
+        # mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -2004,6 +2343,8 @@ class f(torch.nn.Module):
             torch.ops.aten.reflection_pad2d(x, [1, 1, 1, 1])
 
     def test_replication_pad2d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: 2D replication padding with unbacked spatial sizes under a
+        # fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -2014,6 +2355,8 @@ class f(torch.nn.Module):
             torch.ops.aten.replication_pad2d(x, [1, 1, 1, 1])
 
     def test_reflection_pad1d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: 1D reflection padding with an unbacked length under a fake
+        # mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -2023,6 +2366,8 @@ class f(torch.nn.Module):
             torch.ops.aten.reflection_pad1d(x, [1, 1])
 
     def test_replication_pad1d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: 1D replication padding with an unbacked length under a fake
+        # mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -2032,6 +2377,8 @@ class f(torch.nn.Module):
             torch.ops.aten.replication_pad1d(x, [1, 1])
 
     def test_reflection_pad3d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: 3D reflection padding with three unbacked spatial sizes under
+        # a fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -2044,6 +2391,8 @@ class f(torch.nn.Module):
             torch.ops.aten.reflection_pad3d(x, [1, 1, 1, 1, 1, 1])
 
     def test_replication_pad3d_unbacked_symint(self):
+        # [FUNCTION DOC] Smoke test: 3D replication padding with three unbacked spatial sizes under
+        # a fake mode must not raise.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         shape_env = ShapeEnv()
@@ -2060,11 +2409,25 @@ class f(torch.nn.Module):
     "Creating ShapeEnv fails for confusing reasons (also we never expect dynamo to see code like this)"
 )
 class TestSymNumberMagicMethods(TestCase):
+    # [CLASS DOC] Tests that magic methods (arithmetic, comparison, bitwise, math functions) on
+    # symbolic ints, floats and bools agree with the plain python results, over a grid of small
+    # values, with the symbolic value on the left, on the right or on both sides. Test methods are
+    # expanded per magic method name by the parametrization call below the class. Also covers
+    # hashing, deep copy and constant/nested-int symbolic nodes.
     def _do_test(self, fn, inp1, inp2, shape_env, is_unary_fn):
+        # [FUNCTION DOC] HELPER: Runs the comparison for one function and input pair inside a
+        # subtest labelled with the function and inputs; returns whatever the worker returns.
         with self.subTest(fn=fn, inp1=inp1, inp2=inp2, is_unary_fn=is_unary_fn):
             return self._do_test2(fn, inp1, inp2, shape_env, is_unary_fn)
 
     def _do_test2(self, fn, inp1, inp2, shape_env, is_unary_fn):
+        # [FUNCTION DOC] HELPER: Core check for one magic method. Computes the reference result on
+        # plain values, then repeats with the first input made symbolic, the second made symbolic,
+        # and both symbolic (the latter two skipped for unary functions), asserting each result is
+        # a symbolic number and that its guarded value equals the reference. Expected python errors
+        # are tolerated through an exception-expecting context. Some function and input
+        # combinations (negative base for float pow, negative exponent for natural pow) return
+        # early without checking.
         # Helper function
         # NB: don't use one as that will get specialized
         # TODO: We don't have to circuitously create the float, can just
@@ -2073,6 +2436,9 @@ class TestSymNumberMagicMethods(TestCase):
         bool_seed_node = (create_symint(shape_env, 2) == 2).node
 
         def get_sym_inp(inp):
+            # [FUNCTION DOC] HELPER: Wraps a python value into a symbolic node of the matching
+            # kind (SymBool for bool, SymInt for int, otherwise SymFloat) reusing the seed node's
+            # shape env.
             # NB: this must come before int
             if isinstance(inp, bool):
                 return torch.SymBool(to_node(bool_seed_node, inp))
@@ -2092,6 +2458,11 @@ class TestSymNumberMagicMethods(TestCase):
                 return
 
         def maybe_xfail(inp1, inp2):
+            # [FUNCTION DOC] HELPER: Returns the context manager for one call: an assertRaises
+            # context for the error python is expected to raise (math domain error for negative
+            # square root, zero division for division, modulo and zero base with negative exponent,
+            # a runtime error for complex pow results, TypeError for shifts on non-ints, ValueError
+            # for negative shift counts), otherwise a null context.
             if fn == "sym_sqrt" and inp1 < 0:
                 # ValueError: math domain error
                 return self.assertRaises((ValueError,))
@@ -2131,6 +2502,8 @@ class TestSymNumberMagicMethods(TestCase):
         lambda_apply = method_to_operator(fn)
 
         def guard_fn(v):
+            # [FUNCTION DOC] HELPER: Converts a symbolic or plain value to a plain python value by
+            # calling the guard function matching its type (bool, float, or int).
             if type(v) in (SymBool, bool):
                 return guard_bool(v)
             elif type(v) in (SymFloat, float):
@@ -2176,6 +2549,9 @@ class TestSymNumberMagicMethods(TestCase):
 
     @parametrize("fn", list(sym_node.magic_methods.keys()))
     def test_bool_method(self, fn):
+        # [FUNCTION DOC] Parametrized over every magic method name. Skips methods that are not
+        # boolean magic methods and sym_ite; otherwise checks the method with the bool inputs true
+        # and false on a fresh shape env.
         # sym_ite has its own tests
         if fn not in sym_node.bool_magic_methods or fn == "sym_ite":
             self.skipTest(f"{fn} is non-bool")
@@ -2188,6 +2564,11 @@ class TestSymNumberMagicMethods(TestCase):
     @parametrize("first_type", ["int", "float"])
     @parametrize("second_type", ["int", "float"])
     def test_method(self, fn, first_type, second_type):
+        # [FUNCTION DOC] Parametrized over magic method name and the input types. Skips every case
+        # with a float first type, float-only methods with an int argument, mod with a float second
+        # argument, bitwise ops with float inputs, repeated unary cases and bool methods. Otherwise
+        # runs the check on all pairs of values from zero, one and a middle value (with negatives)
+        # on a fresh shape env, converting to int when the type is int.
         if first_type == "float":
             # TODO: Hmm, this looks like we skip all floats
             self.skipTest(f"{fn} is not a float magic method")
@@ -2237,14 +2618,21 @@ class TestSymNumberMagicMethods(TestCase):
             self._do_test(fn, inp1, inp2, shape_env, is_unary_fn)
 
     def get_constant_bool(self, val):
+        # [FUNCTION DOC] HELPER: Returns a SymBool wrapping a constant boolean symbolic node.
         return SymBool(torch._C._get_constant_bool_symnode(val))
 
     @unittest.expectedFailure
     def test_symint_hashing(self):
+        # [FUNCTION DOC] Expected-failure test: hashing a symbolic int backed by a ShapeEnv is
+        # meant to fail, so the test passes only if hashing raises.
         shape_env = ShapeEnv()
         hash(create_symint(shape_env, 3))
 
     def test_symnode_hashing(self):
+        # [FUNCTION DOC] Checks hashing behavior: symbolic bool and float hashing is allowed (and
+        # specializes); nested ints and constant symbolic bools with equal value compare equal
+        # and hash equal, different ones compare unequal and hash differently; symbolic nodes can
+        # be hashed.
         shape_env = ShapeEnv()
 
         # These all trigger specialization when hashed
@@ -2276,6 +2664,8 @@ class TestSymNumberMagicMethods(TestCase):
         hash(m)
 
     def test_symint_deepcopy(self):
+        # [FUNCTION DOC] Checks that deep-copying a tuple holding a nested int gives an
+        # equal tuple.
         shape_env = ShapeEnv()
 
         symnodes = (torch._C._get_nested_int(1, 1),)
@@ -2283,6 +2673,10 @@ class TestSymNumberMagicMethods(TestCase):
         self.assertEqual(symnodes, deepcopied_symnodes)
 
     def test_non_symbolic_symnode(self):
+        # [FUNCTION DOC] Checks nested ints and constant symbolic bools: nested ints are SymInt but
+        # not int, support equality but raise RuntimeError on addition or ordering; constant
+        # SymBool supports not and logical and with bools and symbolic bools (results stay symbolic
+        # and guard to True); torch.Size objects holding nested ints compare as expected.
         j1 = torch._C._get_nested_int(1, 1)
         j2 = torch._C._get_nested_int(1, 1)
         j3 = torch._C._get_nested_int(3, 1)
@@ -2347,6 +2741,10 @@ class TestSymNumberMagicMethods(TestCase):
         self.assertIs(sz1 != sz2, False)
 
     def test_stride_symnode(self):
+        # [FUNCTION DOC] Checks combinations of static, dynamic and inferred sizes and strides on
+        # fake tensors: all-static gives plain ints; dynamic sizes with inferred strides give
+        # symbolic strides tied to the sizes; static sizes with a dynamic stride give one symbolic
+        # stride; dynamic sizes and strides give a stride symbol different from the size symbol.
         shape_env = ShapeEnv()
 
         # check everything static
@@ -2432,12 +2830,19 @@ class TestSymNumberMagicMethods(TestCase):
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @parametrize("backend", ["inductor", "eager"])
     def test_dynamic_int_basic_compile(self, backend):
+        # [FUNCTION DOC] Parametrized over inductor and eager backends with scalar-output capture
+        # enabled and a fresh cache. Compiles a function taking scalar ints, some wrapped as
+        # dynamic ints, and checks results against eager across different values with a single
+        # frame (no recompiles) while one case recompiles; then compiles a module holding a dynamic
+        # int attribute, overrides it, and checks results and frame count.
         from torch.fx.experimental.sym_node import DynamicInt
 
         cnt = CompileCounterWithBackend(backend)
 
         # test scalar inputs to function
         def f(x, y, z):
+            # [FUNCTION DOC] HELPER: Builds a tensor holding the sum of three scalars and adds the
+            # sum of a zeros tensor sized by the absolute value of the first scalar plus two.
             out = torch.tensor([x + y + z])
             out = out + torch.zeros(abs(x) + 2).sum()  # test out tensor construction
             return out
@@ -2455,11 +2860,16 @@ class TestSymNumberMagicMethods(TestCase):
 
         # test nn module property
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module storing a dynamic int attribute; forward returns a tensor
+            # holding the input plus that attribute.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Initializes the module and sets the attribute i to a
+                # dynamic int with value one.
                 super().__init__()
                 self.i = DynamicInt(1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a one-element tensor with x plus the attribute i.
                 return torch.tensor([x + self.i])
 
         cnt.clear()
@@ -2472,6 +2882,11 @@ class TestSymNumberMagicMethods(TestCase):
         self.assertEqual(cnt.frame_count, 1)
 
     def test_dynamic_int_eager_usage(self):
+        # [FUNCTION DOC] Checks DynamicInt used eagerly: arithmetic, shifts, bitwise or, min, pow
+        # (including three-argument pow) keep the DynamicInt type and expected values; modulo by
+        # zero raises ZeroDivisionError; math, numpy and torch functions (arange, add with alpha,
+        # Linear sizes, sum) accept it as a plain number; int/float/bool conversions behave as for
+        # ints, and true division returns a plain float.
         from torch.fx.experimental.sym_node import DynamicInt
 
         w = DynamicInt(-1)
@@ -2480,6 +2895,8 @@ class TestSymNumberMagicMethods(TestCase):
         z = DynamicInt(2)
 
         def check(l, r):
+            # [FUNCTION DOC] HELPER: Asserts the left value is a DynamicInt and equals the
+            # right value.
             self.assertTrue(isinstance(l, DynamicInt))
             self.assertEqual(l, r)
 
@@ -2530,12 +2947,18 @@ instantiate_parametrized_tests(TestSymNumberMagicMethods)
 
 
 class TestFloorDiv(TestCase):
+    # [CLASS DOC] Tests that the symbolic FloorDiv function agrees with python floor division on
+    # integer inputs of both signs, simplifies and evaluates constants, avoids non-integer
+    # rationals, and has the expected integer/real assumptions.
     @staticmethod
     def python_floordiv(x, y):
+        # [FUNCTION DOC] HELPER: Static method returning python floor division of x by y.
         return x // y
 
     @staticmethod
     def torch_floordiv(x, y):
+        # [FUNCTION DOC] HELPER: Static method that creates a fresh ShapeEnv and fully evaluates
+        # the FloorDiv expression for x and y, returning the result.
         # Note: we fully evaluate here since FloorDiv might not always do
         # that.
         shape_env = ShapeEnv()
@@ -2543,6 +2966,8 @@ class TestFloorDiv(TestCase):
 
     @staticmethod
     def yield_test_cases(values, negate=True):
+        # [FUNCTION DOC] HELPER: Generator over input pairs: yields each (x, y) pair, and when
+        # negate is true also the three sign-flipped variants of it.
         for x, y in values:
             yield (x, y)
             if negate:
@@ -2551,6 +2976,8 @@ class TestFloorDiv(TestCase):
                 yield (-x, -y)
 
     def test_floordiv_float_int(self):
+        # [FUNCTION DOC] Checks the symbolic FloorDiv matches python floor division for 7 and 2 and
+        # their sign-flipped variants.
         values = ((7, 2),)
 
         for x, y in TestFloorDiv.yield_test_cases(values):
@@ -2559,6 +2986,8 @@ class TestFloorDiv(TestCase):
             )
 
     def test_floordiv_div_by_one(self):
+        # [FUNCTION DOC] Checks the symbolic FloorDiv matches python floor division when dividing 2
+        # by 1 and for sign-flipped variants.
         values = ((2, 1),)
 
         for x, y in TestFloorDiv.yield_test_cases(values):
@@ -2567,6 +2996,9 @@ class TestFloorDiv(TestCase):
             )
 
     def test_floordiv_div_does_not_generate_non_int_rational(self):
+        # [FUNCTION DOC] Builds a nested FloorDiv expression with positive integer symbols
+        # and checks every rational number in the result has denominator one (no
+        # non-integer rationals).
         s14 = sympy.Symbol("s14", integer=True, positive=True)
         s37 = sympy.Symbol("s37", integer=True, positive=True)
 
@@ -2580,6 +3012,9 @@ class TestFloorDiv(TestCase):
         self.assertTrue(all_rationals_ints)
 
     def test_floordiv_simplify(self):
+        # [FUNCTION DOC] Checks that an expression containing FloorDiv of constants equals 21 and
+        # evaluates to 21 via equality, doit (shallow and deep), sympy simplify, ShapeEnv simplify
+        # and ShapeEnv evaluate.
         # Tests how we simplify or evaluate FloorDiv without free variables
         shape_env = ShapeEnv()
         result = 21
@@ -2594,6 +3029,11 @@ class TestFloorDiv(TestCase):
             self.assertEqual(shape_env.evaluate_expr(expr), result)
 
     def test_floordiv_assumptions(self):
+        # [FUNCTION DOC] For every pair of integer symbols, checks FloorDiv construction and its
+        # assumptions: complex-typed operands are expected to raise TypeError with a specific
+        # message (no symbol in the list is complex, so that branch is not taken); otherwise the
+        # result is integer and real when both are integers or the operands are the identical
+        # symbol, else real with unknown integer-ness.
         cases = (
             sympy.Symbol("i1", integer=True),
             sympy.Symbol("i2", integer=True),
@@ -2602,9 +3042,13 @@ class TestFloorDiv(TestCase):
         for base, divisor in itertools.product(cases, repeat=2):
 
             def op():
+                # [FUNCTION DOC] HELPER: Builds the FloorDiv of the enclosing loop's base
+                # and divisor.
                 return FloorDiv(base, divisor)
 
             def is_complex(x):
+                # [FUNCTION DOC] HELPER: True if the sympy value is known non-integer, non-real
+                # and complex.
                 return x.is_integer is False and x.is_real is False and x.is_complex
 
             if is_complex(base) or is_complex(divisor):
@@ -2635,13 +3079,23 @@ class TestFloorDiv(TestCase):
 
 
 class TestDimConstraints(TestCase):
+    # [CLASS DOC] Tests for DimConstraints, the dynamic-dimension constraint solver: simplifying
+    # max expressions, congruence reduction, inequality reduction, printing errors and a large
+    # end-to-end solve.
     @skipIfTorchDynamo("mark_dynamic not supported")
     def test_simplify_max_1_0(self):
+        # [FUNCTION DOC] Marks a tensor dimension dynamic with bounds 5 to 20, compiles a function
+        # that asserts statically_known_true on a max expression for argument values 0 and 1 and
+        # branches on it; checks both calls give the multiplied-by-400 result without a constraint
+        # violation error. Skipped under TorchDynamo.
         x = torch.rand(10)
         torch._dynamo.mark_dynamic(x, 0, max=20, min=5)
 
         @torch.compile(fullgraph=True)
         def func(x, v):
+            # [FUNCTION DOC] HELPER: Raises AssertionError if v is 0 or 1 and the max expression is
+            # not statically known equal to the half-size expression; then returns x times 400 if
+            # the comparison holds, else x times 1000.
             # test that statically_known_true
             if (v == 0 or v == 1) and not statically_known_true(
                 max(v, (-1 + x.size()[0] // 2)) == (-1 + x.size()[0] // 2)
@@ -2658,6 +3112,8 @@ class TestDimConstraints(TestCase):
         self.assertEqual(func(x, 0), x * 400)
 
     def test_dim_constraints_reduce_congruences_simple(self):
+        # [FUNCTION DOC] Fills the congruence set of a symbol with several modular constraints and
+        # checks the reduction merges them into the single congruence modulo 64 with offset 32.
         from sympy import Symbol
 
         s = Symbol("s", positive=True, integer=True)
@@ -2673,6 +3129,9 @@ class TestDimConstraints(TestCase):
         self.assertEqual(congruences[s], {(s + 32) % 64})
 
     def test_dim_constraints_reduce_inequalities_simple(self):
+        # [FUNCTION DOC] Checks that sympy inequality reduction of a set of bounds and not-equal
+        # constraints gives the half-open interval from 4 to 16, and gives the set containing 8
+        # once an equality is added.
         from sympy import Eq, Interval, Ne, Symbol
         from sympy.solvers.inequalities import reduce_inequalities
 
@@ -2697,6 +3156,9 @@ class TestDimConstraints(TestCase):
         self.assertEqual(solution, {8})
 
     def test_dim_constraints_reduce_inequalities_error(self):
+        # [FUNCTION DOC] Reduces cubic inequalities to a solution and prints it with the dynamic
+        # dimension printer; expects AssertionError about an unknown symbol created by the
+        # constraints solver.
         from collections import defaultdict
 
         from sympy import Symbol
@@ -2732,6 +3194,11 @@ class TestDimConstraints(TestCase):
             dcp.doprint(answer)
 
     def test_dim_constraints_solve_full(self):
+        # [FUNCTION DOC] End-to-end solve: builds a source table for four symbols covering many
+        # tensor size sources, registers equalities (including constants) and a long list of
+        # inequality, not-equal and modular constraints involving nested floor divisions, runs the
+        # solver, and checks the exact sets of static results (fixed sizes) and dynamic results
+        # (lower bound and equalities for the remaining symbol).
         from sympy import Eq, Integer, Ne, Symbol
 
         from torch._dynamo.source import (
@@ -3644,11 +4111,17 @@ class TestDimConstraints(TestCase):
 
 
 class TestGuardsExpressions(TestCase):
+    # [CLASS DOC] Tests for producing and evaluating guard expression strings from a ShapeEnv (as
+    # used by the inductor FX graph cache) and for guard_or_true / guard_or_false behavior and
+    # recompilation under torch.compile. Has no state of its own beyond TestCase.
     """
     Tests the guards-related methods used by the inductor FX graph cache.
     """
 
     def test_guards_gt_lt(self):
+        # [FUNCTION DOC] Records guards from comparisons on a symbolic int, produces the combined
+        # guard expression, and checks it evaluates true for the original hint and false for hints
+        # that violate either bound.
         shape_env = ShapeEnv()
         s0 = create_symint(shape_env, 6)
         s1 = create_symint(shape_env, 7)
@@ -3670,6 +4143,8 @@ class TestGuardsExpressions(TestCase):
         )
 
     def test_guards_float_print(self):
+        # [FUNCTION DOC] Records a guard on a float division and checks the produced expression
+        # text can be evaluated and holds for the original hint.
         shape_env = ShapeEnv()
         s0 = create_symint(shape_env, 3)
         guard_bool(2 / s0 == 2 / 3)
@@ -3681,9 +4156,15 @@ class TestGuardsExpressions(TestCase):
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_guard_or_true(self):
+        # [FUNCTION DOC] Tests guard_or_true with a scalar item: eager gives each branch by value;
+        # compiled with unbacked data the true branch is always taken; a statically true
+        # self-inequality makes the false branch always taken; under backed-size-oblivious mode the
+        # compiled function takes the true branch for a size of 9 where eager takes the other.
         from torch.fx.experimental.symbolic_shapes import guard_or_true
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Reads a scalar item from a; returns b times 10 when the
+            # guard_or_true of equality to one holds, else b times 20.
             x = a.item()
             if guard_or_true(x == 1):
                 return b * 10
@@ -3710,6 +4191,8 @@ class TestGuardsExpressions(TestCase):
 
         # Test that statically known true works.
         def func2(a, b):
+            # [FUNCTION DOC] HELPER: Reads a scalar item from a; returns b times 10 when
+            # guard_or_true of the item differing from itself holds, else b times 20.
             x = a.item()
             if guard_or_true(x != x):
                 return b * 10
@@ -3732,6 +4215,8 @@ class TestGuardsExpressions(TestCase):
         with torch.fx.experimental._config.patch("backed_size_oblivious", True):
 
             def func3(a, b):
+                # [FUNCTION DOC] HELPER: Returns b times 10 when guard_or_true says the first size
+                # of a is not 9, else b times 20.
                 if guard_or_true(a.size()[0] != 9):
                     return b * 10
                 else:
@@ -3747,9 +4232,15 @@ class TestGuardsExpressions(TestCase):
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_guard_or_false(self):
+        # [FUNCTION DOC] Tests guard_or_false with a scalar item: eager gives each branch by value;
+        # compiled with unbacked data the false branch is always taken; a statically true
+        # self-equality makes the true branch always taken; under backed-size-oblivious mode the
+        # compiled function takes the false branch for a size of 9 where eager takes the true one.
         from torch.fx.experimental.symbolic_shapes import guard_or_false
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Reads a scalar item from a; returns b times 10 when
+            # guard_or_false of equality to one holds, else b times 20.
             x = a.item()
             if guard_or_false(x == 1):
                 return b * 10
@@ -3776,6 +4267,8 @@ class TestGuardsExpressions(TestCase):
 
         # Test that statically known true works.
         def func2(a, b):
+            # [FUNCTION DOC] HELPER: Reads a scalar item from a; returns b times 10 when
+            # guard_or_false of the item equal to itself holds, else b times 20.
             x = a.item()
             if guard_or_false(x == x):
                 return b * 10
@@ -3798,6 +4291,8 @@ class TestGuardsExpressions(TestCase):
         with torch.fx.experimental._config.patch("backed_size_oblivious", True):
 
             def func3(a, b):
+                # [FUNCTION DOC] HELPER: Returns b times 10 when guard_or_false says the first size
+                # of a is 9, else b times 20.
                 if guard_or_false(a.size()[0] == 9):
                     return b * 10
                 else:
@@ -3811,6 +4306,9 @@ class TestGuardsExpressions(TestCase):
             self.assertEqual(compiled(a, b), b * 20)
 
     def test_guards_float_div(self):
+        # [FUNCTION DOC] Records a guard on a truncated float division, and checks the guard string
+        # contains truncation and float conversion, is true for the original hint and false for
+        # another value.
         shape_env = ShapeEnv()
         s0 = create_symint(shape_env, 8)
         s1 = create_symint(shape_env, 7)
@@ -3833,6 +4331,9 @@ class TestGuardsExpressions(TestCase):
     @skipIfTorchDynamo("Attempt to trace generator")
     @torch.fx.experimental._config.patch("use_duck_shape", False)
     def test_size_comparison_no_recompile(self):
+        # [FUNCTION DOC] Compiles a function that compares the whole sizes of two tensors with duck
+        # shaping disabled, calls it twice with different shapes and checks only one compilation
+        # happened. Skipped on XPU and under TorchDynamo.
         """
         Test that size comparisons don't cause recompilation.
         When comparing x.size() == b.size() with different sizes,
@@ -3843,6 +4344,7 @@ class TestGuardsExpressions(TestCase):
 
         @torch.compile(fullgraph=True, dynamic=True, backend=cnt)
         def f(x, b):
+            # [FUNCTION DOC] HELPER: Returns x if its size equals the size of b, else x doubled.
             if x.size() == b.size():
                 return x
             return x * 2
@@ -3863,6 +4365,9 @@ class TestGuardsExpressions(TestCase):
 
     @skipIfTorchDynamo("Test uses torch.compile")
     def test_python_mod_padding_no_recompile(self):
+        # [FUNCTION DOC] Compiles a function that pads a tensor to a multiple of four and slices
+        # the padding off before a view; checks two different input sizes compile once, then after
+        # a dynamo reset, with unbacked dimensions, checks results and a total of two frames.
         """
         Test that padding with PythonMod and slicing back to original size
         doesn't cause guards or recompilation.
@@ -3871,6 +4376,9 @@ class TestGuardsExpressions(TestCase):
 
         @torch.compile(backend=cnt, dynamic=True)
         def func(x):
+            # [FUNCTION DOC] HELPER: Allocates an empty tensor padded along the first dimension up
+            # to a multiple of four, multiplies it by 100, slices back to the input's first size,
+            # and returns a view with the input's size.
             # Padding to align to multiple of 4
             padding = (-x.size()[0]) % 4
             aligned_size = x.size()[0] + padding
@@ -3913,6 +4421,9 @@ class TestGuardsExpressions(TestCase):
         self.assertEqual(cnt.frame_count, 2)
 
     def test_remove_symbols_without_guarding(self):
+        # [FUNCTION DOC] Checks the partitioner helper that replaces symbolic sizes and strides of
+        # a fake tensor with their hint values: a fake tensor printing symbolic sizes and strides
+        # prints concrete (5, 8) and strides (8, 1) after cleaning.
         from torch._functorch.partitioners import _remove_symbols_without_guarding
 
         shape_env = ShapeEnv()
@@ -3940,6 +4451,9 @@ class TestGuardsExpressions(TestCase):
 
 
 def custom_pass(graph: torch.fx.Graph) -> torch.fx.Graph:
+    # [FUNCTION DOC] HELPER: Inductor pre-pass hook used by a test. Scans graph nodes for the one
+    # named arg3_1 and raises AssertionError if its fake value's first size is not 2. Returns the
+    # graph unchanged.
     for node in graph.nodes:
         if node.name == "arg3_1":
             if node.meta["val"].size()[0] != 2:
@@ -3950,7 +4464,13 @@ def custom_pass(graph: torch.fx.Graph) -> torch.fx.Graph:
 
 
 class TestUnbacked(TestCase):
+    # [CLASS DOC] Tests of unbacked symbol handling: rebinding, deferred runtime asserts under
+    # torch.compile for several backends, unbacked input marking, division simplification with
+    # equal sizes, ignorable fresh unbacked symbols and related regressions.
     def test_rebind_unbacked_to_symbolic_expression(self):
+        # [FUNCTION DOC] Creates an unbacked binding annotation on a graph node and calls
+        # rebind_unbacked with a symbolic expression, then checks the old unbacked symbol is
+        # replaced by that expression in the ShapeEnv replacements.
         shape_env = ShapeEnv()
         fake_mode = torch._subclasses.FakeTensorMode(
             allow_non_fake_inputs=True, shape_env=shape_env
@@ -3975,8 +4495,12 @@ class TestUnbacked(TestCase):
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @parametrize("backend", ["inductor", "eager"])
     def test_deferred_neq_assert(self, backend):
+        # [FUNCTION DOC] Parametrized over inductor and eager backends. A compiled function checks
+        # an item is not 5; passing 100 works, passing 5 raises RuntimeError.
         @torch.compile(fullgraph=True, backend=backend)
         def func(a):
+            # [FUNCTION DOC] HELPER: Asserts via torch check that the scalar item is not 5 and
+            # returns the item times ten.
             torch._check(a.item() != 5)
             return a.item() * 10
 
@@ -3988,8 +4512,13 @@ class TestUnbacked(TestCase):
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @parametrize("backend", ["inductor", "eager"])
     def test_deferred_symfloat_assert(self, backend):
+        # [FUNCTION DOC] Parametrized over inductor and eager. A compiled function checks a float
+        # item times two equals 11; 5.5 passes and returns 55, while 1.8 raises RuntimeError whose
+        # message matches the failed float equality expression.
         @torch.compile(fullgraph=True, backend=backend)
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Checks the float item of b doubled equals 11 and returns b
+            # times 10.
             torch._check(b.item() * 2 == 11)
             return b * 10
 
@@ -4003,8 +4532,12 @@ class TestUnbacked(TestCase):
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @parametrize("backend", ["inductor", "eager"])
     def test_deferred_symfloat_eq_assert(self, backend):
+        # [FUNCTION DOC] Parametrized over inductor and eager. A compiled function checks a float
+        # item equals 5.5; 5.5 passes and returns a times ten, while 1.5 raises RuntimeError whose
+        # message mentions a lower-bound float expression.
         @torch.compile(fullgraph=True, backend=backend)
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Checks the float item of b equals 5.5 and returns a times 10.
             torch._check(b.item() == 5.5)
             return a * 10
 
@@ -4020,8 +4553,13 @@ class TestUnbacked(TestCase):
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @parametrize("backend", ["inductor", "eager"])
     def test_post_specialize_runtime_assert1(self, backend):
+        # [FUNCTION DOC] Parametrized over backends. A dynamic-shape compiled function asserts an
+        # item plus both sizes sums to 102 and expects the first size to specialize to 2; passing
+        # 50 works, passing 51 raises RuntimeError.
         @torch.compile(dynamic=True, backend=backend)
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads y's item, checks item plus both sizes of x equals 102,
+            # raises AssertionError if the first size is not 2, returns x times 10.
             u0 = y.item()
             s0 = x.size()[0]
             s1 = x.size()[1]
@@ -4038,8 +4576,13 @@ class TestUnbacked(TestCase):
     @torch._inductor.config.patch(post_grad_custom_pre_pass=custom_pass)
     @parametrize("backend", ["inductor", "eager"])
     def test_post_specialize_runtime_assert2(self, backend):
+        # [FUNCTION DOC] Same scenario as the first post-specialization test, but with the custom
+        # inductor pre-pass installed which verifies the first size of arg3_1 is 2. Passing 50
+        # works, passing 51 raises RuntimeError.
         @torch.compile(dynamic=True, backend=backend)
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads y's item, checks item plus both sizes of x equals 102,
+            # returns x times 10.
             u0 = y.item()
             s0 = x.size()[0]
             s1 = x.size()[1]
@@ -4054,8 +4597,12 @@ class TestUnbacked(TestCase):
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @parametrize("backend", ["inductor", "eager"])
     def test_deferred_sym_or_assert(self, backend):
+        # [FUNCTION DOC] Parametrized over backends. A compiled function checks that either of two
+        # items equals 5; both calls with one item equal to 5 must pass.
         @torch.compile(fullgraph=True, backend=backend)
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Checks the logical or of two item equalities to 5 and returns
+            # a's item times ten.
             torch._check(operator.or_(a.item() == 5, b.item() == 5))
             return a.item() * 10
 
@@ -4063,6 +4610,8 @@ class TestUnbacked(TestCase):
         func(torch.tensor([100]), torch.tensor([5]))
 
     def test_has_free_symbols(self):
+        # [FUNCTION DOC] Checks has_free_symbols returns false for constants and true for
+        # expressions containing named symbols.
         self.assertFalse(has_free_symbols(sympy.S.true))
         self.assertFalse(has_free_symbols(sympy.Max(1, 10, evaluate=False)))
 
@@ -4073,6 +4622,9 @@ class TestUnbacked(TestCase):
         self.assertTrue(has_free_symbols(sympy.sympify("a+b")))
 
     def test_iterate_exprs_dict(self):
+        # [FUNCTION DOC] Checks the expression iterator handles dictionaries: a dict with a
+        # concrete tensor value yields nothing, a dict with sympy keys yields both keys, free
+        # symbols are collected from keys, and an empty dict yields nothing.
         """Test that _iterate_exprs handles dict values (e.g. from triton_kernel_wrapper_functional)."""
         a, b = sympy.symbols("a b")
 
@@ -4098,8 +4650,11 @@ class TestUnbacked(TestCase):
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @parametrize("backend", ["inductor", "eager"])
     def test_deferred_sym_eq_assert(self, backend):
+        # [FUNCTION DOC] Parametrized over backends. A compiled function checks an item equals 5;
+        # passing 5 works, passing 1 raises RuntimeError.
         @torch.compile(fullgraph=True, backend=backend)
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Checks the item of b equals 5 and returns a times 10.
             torch._check(b.item() == 5)
             return a * 10
 
@@ -4111,8 +4666,13 @@ class TestUnbacked(TestCase):
     @parametrize("backend", ["inductor", "eager"])
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_deferred_with_unbacked_input(self, backend):
+        # [FUNCTION DOC] Parametrized over backends. Two inputs are marked unbacked in dim zero and
+        # a compiled function checks their first sizes equal; a mismatching second call must raise
+        # AssertionError or RuntimeError (inductor may raise its own assertion).
         @torch.compile(fullgraph=True, dynamic=True, backend=backend)
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Checks the first sizes of a and b are equal and returns a
+            # times 10.
             torch._check(a.size()[0] == b.size()[0])
             return a * 10
 
@@ -4138,8 +4698,14 @@ class TestUnbacked(TestCase):
     )
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_do_not_guard_unbacked_inputs(self):
+        # [FUNCTION DOC] Compiles through inductor with both inputs fully unbacked, runs it, and
+        # checks no symbolic shape guard appears in the guard log. Effectively disabled: the
+        # skip condition is true on Linux, macOS, Windows and several other configs, so it only
+        # runs elsewhere.
         @torch.compile(fullgraph=True, dynamic=True, backend="inductor")
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Expands a to the shape of b, discarding the result, and
+            # returns a times 10.
             a.expand(b.shape)
             return a * 10
 
@@ -4161,8 +4727,12 @@ class TestUnbacked(TestCase):
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_div_unbacked_eq_input_tensors(self):
+        # [FUNCTION DOC] Two unbacked-marked inputs are checked to have equal first sizes inside a
+        # compiled function that divides sizes; compilation must succeed.
         @torch.compile(fullgraph=True)
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Checks first sizes of a and b are equal, then multiplies a by
+            # 10 if the size ratio is 1 and by 20 if twice the size over the other equals 2.
             x = a.size()[0]
             y = b.size()[0]
             torch._check(x == y)
@@ -4181,8 +4751,12 @@ class TestUnbacked(TestCase):
 
     @torch.compiler.config.patch(unbacked_sources="L['x'],L['y']")
     def test_div_unbacked_eq_input_ints(self):
+        # [FUNCTION DOC] With integer arguments treated as unbacked via config, a compiled function
+        # checks equality and divides; compilation and a call with 10 and 10 must succeed.
         @torch.compile(fullgraph=True)
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Checks x equals y, then scales a fresh random tensor by 10 if
+            # the integer quotient is 1 and by 20 if twice x over y is 2.
             a = torch.rand(1)
             torch._check(x == y)
             if x // y == 1:
@@ -4196,11 +4770,17 @@ class TestUnbacked(TestCase):
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     @torch.compiler.config.patch(unbacked_sources="L['y']")
     def test_div_unbacked_eq_globals(self):
+        # [FUNCTION DOC] Marks a global tensor dimension unbacked and sets a global int as
+        # unbacked via config; a compiled function checks they are equal and divides; it must
+        # compile and run.
         tensor = torch.rand(10, 44)
         y = 10
 
         @torch.compile(fullgraph=True, dynamic=True)
         def func():
+            # [FUNCTION DOC] HELPER: Checks the global tensor's first size equals global y, then
+            # scales a fresh random tensor by 10 if the integer quotient is 1 and by 20 if twice x
+            # over y is 2.
             a = torch.rand(1)
             x = tensor.size()[0]
             torch._check(x == y)
@@ -4215,8 +4795,13 @@ class TestUnbacked(TestCase):
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_div_unbacked_eq_item(self):
+        # [FUNCTION DOC] With scalar capture enabled, a compiled function reads two items, checks
+        # they are equal and that quotients equal expected values, and branches on them; must
+        # compile and run with items 1 and 1.
         @torch.compile(fullgraph=True)
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Reads items x and y from a and b, checks relations between
+            # them, then scales a by 10 and 20 depending on the integer quotients.
             x = a.item()
             y = b.item()
             torch._check(x == y)
@@ -4234,6 +4819,10 @@ class TestUnbacked(TestCase):
         func(a, b)
 
     def test_ignorable_fresh_unbacked_symbols(self):
+        # [FUNCTION DOC] Defines a scoped custom op whose fake kernel creates a dynamic size and
+        # returns a clone; with the flag true the fresh symbol creation is wrapped in the ignore
+        # context, with false it is not. The compiled flag-true function runs and returns its input
+        # while the flag-false one raises an error about pending unbacked symbols not in outputs.
         # Test that symbols created during fake tensor tracing but not returned
         # can be marked as ignorable to avoid unbound symbol errors
 
@@ -4247,6 +4836,8 @@ class TestUnbacked(TestCase):
 
             @torch.library.register_fake("test_ignorable::custom_op", lib=lib)
             def custom_op_fake(x, y):
+                # [FUNCTION DOC] HELPER: Fake kernel: creates a dynamic size, inside the ignore
+                # context when y is true, and returns a clone of x without using the new size.
                 ctx = torch._custom_op.impl.get_ctx()
                 # Create a symint during fake tensor tracing
                 if y:
@@ -4263,14 +4854,17 @@ class TestUnbacked(TestCase):
                 lib=lib,
             )
             def custom_op_impl(x, y):
+                # [FUNCTION DOC] HELPER: Real kernel of the custom op; returns a clone of x.
                 return x.clone()
 
             @torch.compile(fullgraph=True)
             def func_positive(x):
+                # [FUNCTION DOC] HELPER: Calls the custom op with the ignore flag true.
                 return torch.ops.test_ignorable.custom_op(x, True)
 
             @torch.compile(fullgraph=True)
             def func_negative(x):
+                # [FUNCTION DOC] HELPER: Calls the custom op with the ignore flag false.
                 return torch.ops.test_ignorable.custom_op(x, False)
 
             x = torch.randn(3, 4)
@@ -4286,6 +4880,8 @@ class TestUnbacked(TestCase):
                 func_negative(x)
 
     def test_meta_copy(self):
+        # [FUNCTION DOC] Checks the meta implementation of copy_ accepts self and source tensors
+        # with different unbacked first sizes under a fake mode without raising.
         """
         Test that meta_copy_ does not raise when self and src have different
         unbacked symint sizes.
@@ -4306,6 +4902,10 @@ class TestUnbacked(TestCase):
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_symbool_propagate_real_tensors(self):
+        # [FUNCTION DOC] Regression test: with real-tensor propagation on, a compiled function
+        # branches on a boolean item. Calling it with a false item gives the else-branch result;
+        # calling it later with a true item must raise RuntimeError about a failed runtime
+        # assertion on an inequality, instead of silently taking the wrong branch.
         """
         Test that propagate_real_tensors properly handles SymBool from boolean .item() calls.
 
@@ -4320,6 +4920,7 @@ class TestUnbacked(TestCase):
 
         @torch.compile(backend="eager", fullgraph=True)
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns x if any element equals 0.1, else x plus one.
             if x.eq(0.1).any().item():
                 return x
             return x + 1
@@ -4341,6 +4942,9 @@ class TestUnbacked(TestCase):
     @torch._dynamo.config.patch("capture_dynamic_output_shape_ops", True)
     @torch._dynamo.config.patch("suppress_errors", True)
     def test_sparse_csr_tensor_no_data_dependent_guard(self):
+        # [FUNCTION DOC] Compiles (allowing graph breaks) a model constructing a sparse CSR tensor
+        # with scalar capture, dynamic-shape-op capture and error suppression enabled, and checks
+        # layout, shape and values match eager (no data-dependent-guard error from printing).
         """
         Test that sparse CSR tensor construction doesn't trigger
         GuardOnDataDependentSymNode errors due to str() being called
@@ -4348,7 +4952,11 @@ class TestUnbacked(TestCase):
         """
 
         class MinimalSparseModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward builds a sparse CSR tensor from fixed row
+            # pointers and column indices and the given values for a two by two size.
             def forward(self, values):
+                # [FUNCTION DOC] HELPER: Builds fixed int64 row and column index tensors and
+                # returns the CSR sparse tensor made from them and values with size two by two.
                 crow_indices = torch.tensor([0, 2, 4], dtype=torch.int64)
                 col_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int64)
                 size = (2, 2)
@@ -4370,15 +4978,28 @@ class TestUnbacked(TestCase):
 
 
 class TestUbackedOps(TestCase):
+    # [CLASS DOC] Tests of view, reshape, slice, select, narrow, split and related operators
+    # compiled with unbacked sizes or indices (data-dependent values from scalar capture or
+    # mark_unbacked), checking results against eager, recompilation counts and, in several tests,
+    # the exact graph produced. Also covers mark_dynamic/unbacked/static recompilation behavior and
+    # shape ids.
     @fresh_cache()
     @skipIfTorchDynamo("not allowed to trace mark_unbacked")
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_reshape1(self):
+        # [FUNCTION DOC] Compiles a function doing view, reshape and view_copy of a non-contiguous
+        # unbacked 1D input to a square shape given by an item. Checks results match eager, the
+        # generated AOT graph against an expected string for the strided case and again for a
+        # contiguous input (which recompiles for a total of two frames), and that a later call with
+        # another contiguous size does not recompile.
         cnt = CompileCounterWithBackend("inductor")
 
         # Reshape happens in place reshape (no-clone)
         # reshape u1 -> (u0*u0)
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads the item f from y, then returns the input viewed to f by
+            # f and multiplied by 10, the same via reshape multiplied by 10, and a view copy to
+            # that shape.
             f = y.item()
             t1 = x.view((f, f))
             t2 = x.reshape((f, f))
@@ -4394,6 +5015,9 @@ class TestUbackedOps(TestCase):
         # create a non-contiguous with data being even numbers in [0:cnt-1]
         # and reshape it into sqrt(cnt)*sqrt(cnt)
         def make_non_contiguous_tensor_and_test(cnt):
+            # [FUNCTION DOC] HELPER: Builds a strided 1D tensor taking every second element of a
+            # range of twice the count, marks its dimension unbacked, runs compiled and eager with
+            # the square root of the count as the target size, and asserts equal results.
             # create a non-contiguous tensor x that is skipping odd indices.
             x = torch.arange(cnt * 2)
             x = x.as_strided((x.size()[0] // 2,), (2,))
@@ -4482,11 +5106,17 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
     @skipIfTorchDynamo("not allowed to trace mark_unbacked")
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_reshape2(self):
+        # [FUNCTION DOC] Compiles a reshape from a transposed (non-contiguous) tensor with both
+        # dimensions unbacked to a shape given by two items. Checks the AOT graph (a clone then a
+        # view with a runtime size-equality assertion), results versus eager over several inputs
+        # with one frame, then that a contiguous input triggers a second compilation.
         cnt = CompileCounterWithBackend("inductor")
 
         # This reshape requires a clone when the input is not contiguous and we can't compute strides.
         # reshape (u2, u3) -> (u0, u1)
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads two ints from y and returns the input reshaped to them
+            # times 10.
             u0, u1 = y.tolist()
 
             result1 = torch.reshape(x, (u0, u1))
@@ -4591,7 +5221,14 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @fresh_cache()
     @skipIfTorchDynamo("test inspects inner torch.compile/AOT backend graph")
     def test_user_check_input_shape_bound_preserved_in_aot_graph(self):
+        # [FUNCTION DOC] Compiles a function with a user shape check carrying a custom message
+        # using the AOT-eager recording backend and checks the forward graph keeps exactly one
+        # assertion node with that message, runs correctly for size 4, and raises RuntimeError with
+        # that message for size 6. Also checks a lazy message callable that raises is not called
+        # when the check passes at trace time.
         def f(x):
+            # [FUNCTION DOC] HELPER: Checks the first size is at most 5 with a custom message
+            # callable and returns x plus one.
             torch._check(x.shape[0] <= 5, lambda: "custom shape check failed")
             return x + 1
 
@@ -4615,7 +5252,11 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
             fw_graph(6, torch.ones(6))
 
         def g(x):
+            # [FUNCTION DOC] HELPER: Same check as the first function but with a message callable
+            # that raises if invoked; returns x plus one.
             def lazy_message():
+                # [FUNCTION DOC] HELPER: Message callable that always raises RuntimeError; used to
+                # verify the message is evaluated lazily.
                 raise RuntimeError("message should be lazy")
 
             torch._check(x.shape[0] <= 5, lazy_message)
@@ -4629,10 +5270,18 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_slice(self):
+        # [FUNCTION DOC] Compiles three slicing cases with unbacked bounds: a range with checks
+        # proving the size equals end minus start (statically known), a negative start with a
+        # proven size, and an unchecked general slice whose post-grad graph is compared to an
+        # expected string over negative, out-of-bounds and mixed inputs with one frame. Also checks
+        # violated checks raise RuntimeError.
         from torch.fx.experimental.symbolic_shapes import statically_known_true
 
         # standard slice
         def f1(x, xs):
+            # [FUNCTION DOC] HELPER: Reads start and stop from a tensor, adds torch checks bounding
+            # them, slices, raises AssertionError unless the output size is statically known to be
+            # stop minus start, and returns the slice.
             u0, u1 = xs.tolist()
             # in this test we add the torch checks not to avoid DDE but to ensure
             # that we pick specific path during compilation.
@@ -4657,6 +5306,9 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
         # known negative slice
         def f2(x, n):
+            # [FUNCTION DOC] HELPER: Reads n, checks it is greater than 1 and within the size,
+            # slices the last n items, raises AssertionError unless the size is statically known to
+            # be n, and returns the slice.
             u0 = n.item()
             torch._check(u0 > 1)
             torch._check(u0 <= x.size(0))
@@ -4676,6 +5328,8 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
         # general case: no known info
         def f3(x, xs):
+            # [FUNCTION DOC] HELPER: Reads start and stop from a tensor and returns the slice with
+            # no other information.
             u0, u1 = xs.tolist()
             return x[u0:u1]
 
@@ -4720,12 +5374,17 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._inductor.config.patch("cpp_wrapper", True)
     def test_unbacked_slice_cpp_wrapper(self):
+        # [FUNCTION DOC] Reruns the unbacked slice test with the C++ wrapper config enabled.
         self.test_unbacked_slice()
 
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_slice_with_step(self):
+        # [FUNCTION DOC] Compiles slicing with unbacked bounds and a step of 5 through inductor and
+        # checks the result matches eager for a negative stop.
         def f1(x, xs):
+            # [FUNCTION DOC] HELPER: Reads start and stop from a tensor and returns the
+            # strided slice.
             u0, u1 = xs.tolist()
             out = x[u0:u1:5]
             return out
@@ -4738,17 +5397,23 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._inductor.config.patch("cpp_wrapper", True)
     def test_unbacked_slice_with_step_cpp_wrapper(self):
+        # [FUNCTION DOC] Reruns the unbacked slice-with-step test with the C++ wrapper
+        # config enabled.
         self.test_unbacked_slice_with_step()
 
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_slice_noop_with_unbacked_bindings(self):
+        # [FUNCTION DOC] Regression test: slicing from zero to an unbacked end followed by checks
+        # that make the slice a no-op at lowering time must still compile and equal eager.
         # Regression test: the no-op early return in slice_ lowering
         # (start==0, size<=end, step==1) must register DynamicSliceSize
         # for unbacked bindings created at trace time.
         # torch._check after the slice adds facts to ShapeEnv that make
         # statically_known_leq(size, end) True at lowering time.
         def f(x, n):
+            # [FUNCTION DOC] HELPER: Slices x up to the item n, then checks n is non-negative and
+            # at least the first size, and returns the slice.
             u0 = n.item()
             result = x[:u0]
             torch._check(u0 >= 0)
@@ -4768,11 +5433,15 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_slice_with_tensor_indices(self):
+        # [FUNCTION DOC] For both dynamic and static compilation, checks slicing with zero-dim
+        # tensors as start, stop and step (combinations of them, negative start, and a 2D case)
+        # compile through inductor and match eager results.
         for d in [True, False]:
             # Test slicing with tensor start/stop/step on RHS (reading)
 
             # Test 1: Basic slice with tensor start and stop
             def f1(x, start_t, stop_t):
+                # [FUNCTION DOC] HELPER: Returns x sliced by tensor start and stop.
                 return x[start_t:stop_t]
 
             x = torch.randn(20)
@@ -4785,6 +5454,7 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
             # Test 2: Slice with tensor step
             def f2(x, start_t, stop_t, step_t):
+                # [FUNCTION DOC] HELPER: Returns x sliced by tensor start, stop and step.
                 return x[start_t:stop_t:step_t]
 
             step_t = torch.tensor(2)
@@ -4797,6 +5467,7 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
             # Test 3: Slice with only tensor start
             def f3(x, start_t):
+                # [FUNCTION DOC] HELPER: Returns x sliced from tensor start to the end.
                 return x[start_t:]
 
             fn3 = torch.compile(f3, fullgraph=True, dynamic=d, backend="inductor")
@@ -4804,6 +5475,7 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
             # Test 4: Slice with only tensor stop
             def f4(x, stop_t):
+                # [FUNCTION DOC] HELPER: Returns x sliced from the beginning to tensor stop.
                 return x[:stop_t]
 
             fn4 = torch.compile(f4, fullgraph=True, dynamic=d, backend="inductor")
@@ -4811,6 +5483,8 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
             # Test 5: Negative indices with tensors
             def f5(x, start_t):
+                # [FUNCTION DOC] HELPER: Returns x sliced from tensor start up to the last
+                # element exclusive.
                 return x[start_t:-1]
 
             start_t_neg = torch.tensor(-10)
@@ -4819,6 +5493,8 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
             # Test 6: Multidimensional slice with tensor indices
             def f6(x, start_t, stop_t):
+                # [FUNCTION DOC] HELPER: Returns x sliced on dimension one by tensor start
+                # and stop.
                 return x[:, start_t:stop_t]
 
             x_2d = torch.randn(10, 20)
@@ -4831,12 +5507,18 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._inductor.config.patch("cpp_wrapper", True)
     def test_slice_with_tensor_indices_cpp_wrapper(self):
+        # [FUNCTION DOC] Reruns the tensor-index slice test with the C++ wrapper config enabled.
         self.test_slice_with_tensor_indices()
 
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_tensor_split(self):
+        # [FUNCTION DOC] Compiles tensor_split with split points taken from a tensor and
+        # checks each output piece matches eager for sorted, partly negative and all negative
+        # index tensors.
         def f1(x, xs):
+            # [FUNCTION DOC] HELPER: Converts the index tensor through a list back to a tensor and
+            # returns tensor_split of x at those indices.
             xs = torch.tensor(xs.tolist())
             return torch.tensor_split(x, xs)
 
@@ -4845,6 +5527,8 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
         fn = torch.compile(f1, fullgraph=True, backend="inductor")
 
         def compare(x, xs):
+            # [FUNCTION DOC] HELPER: Compares each piece from eager and compiled tensor_split
+            # for equality.
             for i, j in zip(f1(x, xs), fn(x, xs)):
                 self.assertTrue(torch.allclose(i, j))
 
@@ -4858,13 +5542,17 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._inductor.config.patch("cpp_wrapper", True)
     def test_tensor_split_cpp_wrapper(self):
+        # [FUNCTION DOC] Reruns the tensor_split test with the C++ wrapper config enabled.
         self.test_tensor_split()
 
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._dynamo.config.patch("capture_dynamic_output_shape_ops", True)
     def test_nonzero_slice(self):
+        # [FUNCTION DOC] Compiles taking nonzero indices and slicing off the last row
+        # (data-dependent size) and checks equality with eager for random and all-zero input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the nonzero index matrix without its last row.
             nz = x.nonzero()
             return nz[:-1]
 
@@ -4879,13 +5567,18 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @torch._dynamo.config.patch("capture_dynamic_output_shape_ops", True)
     @torch._inductor.config.patch("cpp_wrapper", True)
     def test_nonzero_slice_cpp_wrapper(self):
+        # [FUNCTION DOC] Reruns the nonzero slice test with the C++ wrapper config enabled.
         self.test_nonzero_slice()
 
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._dynamo.config.patch("capture_dynamic_output_shape_ops", True)
     def test_nonzero_select(self):
+        # [FUNCTION DOC] Compiles selecting the last and first rows of a nonzero index matrix and
+        # checks the sum equals eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of the last and first rows of the nonzero
+            # index matrix.
             nz = x.nonzero()
             return nz[-1] + nz[0]
 
@@ -4898,15 +5591,20 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @torch._dynamo.config.patch("capture_dynamic_output_shape_ops", True)
     @torch._inductor.config.patch("cpp_wrapper", True)
     def test_nonzero_select_cpp_wrapper(self):
+        # [FUNCTION DOC] Reruns the nonzero select test with the C++ wrapper config enabled.
         self.test_nonzero_select()
 
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._dynamo.config.patch("capture_dynamic_output_shape_ops", True)
     def test_padnd(self):
+        # [FUNCTION DOC] Compiles padding a matrix by item amounts followed by a matrix multiply
+        # with unbacked padding; only checks it compiles and runs.
         import torch.nn.functional as F
 
         def f(x, xs, y):
+            # [FUNCTION DOC] HELPER: Reads two pad amounts from xs, checks both non-negative, pads
+            # x on all four sides, and returns the padded matrix multiplied by y.
             u0, u1 = xs.tolist()
             for u in [u0, u1]:
                 torch._check(u >= 0)
@@ -4922,10 +5620,13 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @unittest.skip("this test fails due to inductor/autograd issue #153041")
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_non_contigious_reshape_failing(self):
+        # [FUNCTION DOC] Skipped test (inductor/autograd issue): view and reshape of a
+        # non-contiguous unbacked tensor to a square, compared to eager.
         # reshape u1 -> (u0*u0)
         # this result in the tensor "i64[u0, u0][s7*u0, s7].
         # reshape happens in place reshape (no-clone)
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads item f, returns the input viewed and reshaped to f by f.
             f = y.item()
             t1 = x.view((f, f))
             t2 = x.reshape((f, f))
@@ -4933,6 +5634,8 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
         # create a non-contiguous with data being even numbers in [0:cnt-1]
         def make_non_contiguous_tensor(cnt):
+            # [FUNCTION DOC] HELPER: Returns a tensor that takes every second element of a range of
+            # twice the count.
             # create a non-contiguous tensor x that is skipping odd indices.
             x = torch.arange(cnt * 2)
             x = x.as_strided((x.size()[0] // 2,), (2,))
@@ -4952,11 +5655,16 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @skipIfTorchDynamo("not allowed to trace mark_unbacked")
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_invalid_view_unbacked_view(self):
+        # [FUNCTION DOC] Checks that an invalid view of a transposed unbacked tensor to two
+        # item sizes cannot be compiled: calling raises torch dynamo UserError for the
+        # data-dependent error.
         cnt = CompileCounterWithBackend("inductor")
 
         # This view (u2, u3) -> (u0, u1) can't happen in general unless we know that input is contiguous or we have
         # hints to compute strides.
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads two ints from y and returns the input viewed to them
+            # times 10.
             u0, u1 = y.tolist()
             result2 = x.view(u0, u1) * 10
             return result2
@@ -4974,10 +5682,14 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
     @skipIfTorchDynamo()
     def test_unbind_not_dynamic(self):
+        # [FUNCTION DOC] Checks that unbind along dimension 2 under dynamic compilation keeps that
+        # dimension static: changing other sizes does not recompile, but changing dim 2 recompiles
+        # (frame counts 1, 1 and then 3).
         cnt = CompileCounter()
 
         @torch.compile(fullgraph=True, dynamic=True, backend=cnt)
         def func(y):
+            # [FUNCTION DOC] HELPER: Returns the unbind of y along dimension two and y times 10.
             return y.unbind(dim=2), y * 10
 
         func(torch.ones(5, 6, 7, 8))
@@ -4993,9 +5705,13 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @skipIfTorchDynamo("not allowed to trace mark_unbacked")
     @fresh_cache()
     def test_unbacked_contiguous(self):
+        # [FUNCTION DOC] Compiles contiguous plus arithmetic on a transposed unbacked input, checks
+        # the post-grad graph with a clone, another call without recompiling, then a contiguous
+        # unbacked input that recompiles (two frames) and produces a graph without the clone.
         cnt = CompileCounterWithBackend("inductor")
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Makes the input contiguous, adds one and multiplies by 100.
             contig = x.contiguous()
             return (contig + 1) * 100
 
@@ -5062,9 +5778,15 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_select_index(self):
+        # [FUNCTION DOC] Compiles selects with an item index on three dimensions, checks the
+        # post-grad graph, and that zero, positive and negative indices run in one frame; then
+        # compiles a static version selecting with a sum of two items and checks results for all
+        # signs with a second frame.
         cnt = CompileCounterWithBackend("inductor")
 
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads item u0 and returns selects of x at that index on
+            # dims 0,1,2.
             u0 = y.item()
             return (
                 torch.select(x, 0, u0),
@@ -5101,6 +5823,8 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
         self.assertEqual(cnt.frame_count, 1)
 
         def func2(x, y):
+            # [FUNCTION DOC] HELPER: Reads two items and returns the select of x on dim 0 at
+            # their sum.
             u0, u1 = y.tolist()
             return torch.select(x, 0, u0 + u1)
 
@@ -5118,8 +5842,13 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_select_2(self):
+        # [FUNCTION DOC] Compiles a module that selects the last row of a nonzero result and checks
+        # equality with eager.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward returns the last row of the nonzero
+            # index matrix.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the last row of the nonzero index matrix of x.
                 nz = x.nonzero()
                 return nz[-1]
 
@@ -5129,7 +5858,11 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_select_index_with_check(self):
+        # [FUNCTION DOC] Compiles select with an item index after a non-negativity check and
+        # compares to eager for positive and zero index. Also prints one compiled result.
         def func3(x, y):
+            # [FUNCTION DOC] HELPER: Reads item u0, checks it is non-negative, returns a tuple with
+            # the select at dim 1 and that index.
             u0 = y.item()
             # Test that taking the non-unbacked path works fine also.
             torch._check(u0 >= 0)
@@ -5150,11 +5883,16 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._inductor.config.patch("cpp_wrapper", True)
     def test_unbacked_select_index_cpp_wrapper(self):
+        # [FUNCTION DOC] Reruns the unbacked select index test with the C++ wrapper config enabled.
         self.test_unbacked_select_index()
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_select2(self):
+        # [FUNCTION DOC] Compiles selecting a matrix by an item index and squaring it by matrix
+        # multiply, comparing to eager.
         def f(idx, x):
+            # [FUNCTION DOC] HELPER: Selects index idx from dim 0 of x and returns the matrix
+            # product of the result with itself.
             x = x.select(0, idx.item())
             return x @ x
 
@@ -5164,8 +5902,12 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
         self.assertEqual(out, f(idx, x))
 
     def test_trunc_int_div_true(self):
+        # [FUNCTION DOC] Compiles with dynamic shapes a function with checks on three int arguments
+        # and a branch on an integer-truncated expression; only checks it compiles and runs.
         @torch.compile(backend="inductor", dynamic=True, fullgraph=True)
         def f(x, s13, s57, s77):
+            # [FUNCTION DOC] HELPER: Checks three ints non-negative, then returns x times 2 if the
+            # truncated value of a mixed division expression is at least 1, else x times 100.
             torch._check(s13 >= 0)
             torch._check(s57 >= 0)
             torch._check(s77 >= 0)
@@ -5181,7 +5923,11 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @skipIfTorchDynamo("not allowed to trace mark_unbacked")
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_reshape3(self):
+        # [FUNCTION DOC] Compiles viewing a strided input of unbacked first size with extra
+        # dimension, comparing with eager.
         def func(x):
+            # [FUNCTION DOC] HELPER: Restrides x to a fixed second size of 1536 with outer stride
+            # 2048, views it with a trailing size of 128, and multiplies by 10.
             x = x.as_strided([x.size()[0], 1536], [2048, 1])
             result1 = x.view(x.size()[0], -1, 128)
             return result1 * 10
@@ -5196,11 +5942,15 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
     @skipIfTorchDynamo("not allowed to trace mark_unbacked")
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_reshape_copy(self):
+        # [FUNCTION DOC] Same scenario as the first reshape test but for reshape copy: checks the
+        # AOT graph for a non-contiguous unbacked input, compile counts for a second strided and a
+        # contiguous input, and the graph for the contiguous case.
         cnt = CompileCounterWithBackend("inductor")
 
         # Reshape happens in place reshape (no-clone)
         # reshape u1 -> (u0*u0)
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads item f and returns the reshape-copy of x to f by f.
             f = y.item()
             t3 = torch._ops.ops.aten._reshape_copy(x, (f, f))
             return t3
@@ -5214,6 +5964,9 @@ def forward(self, arg0_1: "i64[2][1]cpu", arg1_1: "Sym(u2)", arg2_1: "Sym(u3)", 
         # create a non-contiguous with data being even numbers in [0:cnt-1]
         # and reshape it into sqrt(cnt)*sqrt(cnt)
         def make_non_contiguous_tensor_and_test(cnt):
+            # [FUNCTION DOC] HELPER: Builds a strided unbacked 1D tensor from a range, runs
+            # compiled and eager reshape with the square root of the count as size, and asserts
+            # equal results.
             # create a non-contiguous tensor x that is skipping odd indices.
             x = torch.arange(cnt * 2)
             x = x.as_strided((x.size()[0] // 2,), (2,))
@@ -5291,7 +6044,12 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_item(self):
+        # [FUNCTION DOC] Compiles a function that selects a masked element from a small tensor and
+        # returns its item, with dynamic shapes, and checks the compiled result equals eager.
         def func():
+            # [FUNCTION DOC] HELPER: Builds a two-element int64 tensor and a boolean mask that
+            # is true only for the first element, selects the masked element and returns its
+            # python scalar.
             _x_ms = torch.tensor([True, False], dtype=torch.int64)
             _mask_ms = torch.zeros_like(_x_ms, dtype=torch.bool)
             _mask_ms[:1] = True
@@ -5305,7 +6063,12 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         self.assertEqual(result_original, result_compiled)
 
     def test_unbacked_item_set_item(self):
+        # [FUNCTION DOC] Compiles a histogram-like loop that reads item indices from an int tensor
+        # and increments positions of a zeros tensor; checks the compiled result equals eager.
         def my_arithmetic(a, b):
+            # [FUNCTION DOC] HELPER: For each position of a, reads the index item from b at
+            # that position and adds one to that position of a zeros work tensor; returns the
+            # work tensor.
             wrk = torch.zeros(a.size(0))
             for i in range(a.size(0)):
                 idx = b[i].item()
@@ -5321,7 +6084,11 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_item_set_item2(self):
+        # [FUNCTION DOC] Compiles an accumulation reading a start item and adding three following
+        # rows to the row at start; checks equality with eager for start 1.
         def accumulate(X0, start):
+            # [FUNCTION DOC] HELPER: Converts start to a python scalar, takes the row at start,
+            # adds the next three rows to it in place, and returns it.
             start = start.item()
             N = 3
             result = X0[start]
@@ -5337,7 +6104,11 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_unbacked_item_set_item3(self):
+        # [FUNCTION DOC] Compiles an in-place assignment of zero into a tensor at an item index and
+        # checks the compiled result equals eager.
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads item u0 from y, sets x at that index to zero in place,
+            # and returns x.
             u0 = y.item()
             x[u0] = 0
             return x
@@ -5351,7 +6122,11 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_select_scatter_unbacked_index(self):
+        # [FUNCTION DOC] Compiles select_scatter of a scalar value at an item index with dynamic
+        # shapes through inductor and checks equality with eager.
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Reads item u0 from y and returns x with the scalar 42
+            # scattered at that index of dimension zero.
             u0 = y.item()
             # Create a scalar tensor to scatter into the selected index
             scalar_src = torch.tensor(42, dtype=x.dtype)
@@ -5366,7 +6141,12 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
     @fresh_cache()
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_narrow_unbacked_start(self):
+        # [FUNCTION DOC] Compiles narrow with an item as start and a python length through inductor
+        # and compares against eager over twelve start and length cases covering negative starts,
+        # positive starts and edge cases, using subtests.
         def func(x, start, length):
+            # [FUNCTION DOC] HELPER: Reads the start as an item and returns the narrow of x on
+            # dimension zero from that start for the given length.
             # unbacked start
             u0 = start.item()
             return torch.narrow(x, 0, u0, length)
@@ -5411,13 +6191,19 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._inductor.config.patch("cpp_wrapper", True)
     def test_narrow_unbacked_start_cpp_wrapper(self):
+        # [FUNCTION DOC] Reruns the narrow unbacked start test with the C++ wrapper config enabled.
         """Test narrow with unbacked start with cpp_wrapper"""
         self.test_narrow_unbacked_start()
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_narrow_with_tensor_start(self):
+        # [FUNCTION DOC] Compiles narrow with a zero-dim tensor start and zero length
+        # through inductor and checks the result has shape of a single zero. Uses a CUDA
+        # tensor if available.
         @torch.compile(backend="inductor", fullgraph=True)
         def f(x, start, end):
+            # [FUNCTION DOC] HELPER: Returns narrow of x on dimension zero with the given start
+            # and length.
             return torch.narrow(x, 0, start, end)
 
         x = torch.tensor(
@@ -5429,13 +6215,19 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked not supported")
     def test_unbacked_norm_no_dde(self):
+        # [FUNCTION DOC] With all dimensions of the inputs marked unbacked, compiles vector norm,
+        # distance and Frobenius norm each with the eager backend after a dynamo reset; the test
+        # passes if none raise a data-dependent error.
         def vector_norm(x):
+            # [FUNCTION DOC] HELPER: Returns the linear algebra vector norm of x.
             return torch.linalg.vector_norm(x)
 
         def dist_fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns the distance between x and y.
             return torch.dist(x, y)
 
         def norm_fro(x):
+            # [FUNCTION DOC] HELPER: Returns the Frobenius norm of x.
             return torch.norm(x, p="fro")
 
         x = torch.randn(4, 5)
@@ -5456,15 +6248,21 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
     @skipIfTorchDynamo()
     @torch.fx.experimental._config.patch("backed_size_oblivious", True)
     def test_backed_size_oblivious_expand(self):
+        # [FUNCTION DOC] With backed-size-oblivious on, compiles expand with a shape argument and
+        # checks compile counts: matching dims compile once; an input dimension of 1 expanded to
+        # larger sizes specializes and reuses the graph until a non-1 input forces a recompile;
+        # multi-dimension broadcast is also reused.
         cnt = CompileCounterWithBackend("inductor")
         torch._dynamo.reset()
 
         def func(a, shape):
+            # [FUNCTION DOC] HELPER: Returns a expanded to the given shape.
             return a.expand(*shape)
 
         compiled = torch.compile(func, fullgraph=True, backend=cnt, dynamic=True)
 
         def run(a, shape):
+            # [FUNCTION DOC] HELPER: Asserts compiled and eager expand results are equal.
             self.assertEqual(compiled(a, shape), func(a, shape))
 
         # No specialization - matching dimensions
@@ -5496,16 +6294,24 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
     @skipIfTorchDynamo()
     @torch.fx.experimental._config.patch("backed_size_oblivious", True)
     def test_backed_size_oblivious_broadcast(self):
+        # [FUNCTION DOC] With backed-size-oblivious on, compiles an add after a broadcast-shapes
+        # call and checks compile counts across inputs: equal shapes share one compile, a broadcast
+        # later forces a second; specialization of first-input or second-input dimension to 1
+        # recompiles when that dimension changes. The code notes duck sizing may be a problem in
+        # the last scenario.
         cnt = CompileCounterWithBackend("inductor")
         torch._dynamo.reset()
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Calls broadcast shapes on the sizes of a and b (result
+            # discarded) and returns their sum.
             torch.broadcast_shapes(a.size(), b.size())
             return a + b
 
         compiled = torch.compile(func, fullgraph=True, backend=cnt, dynamic=True)
 
         def run(a, b):
+            # [FUNCTION DOC] HELPER: Asserts compiled and eager results are equal.
             self.assertEqual(compiled(a, b), func(a, b))
 
         # No 0/1 specializations, no broadcasts.
@@ -5543,7 +6349,12 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @torch._dynamo.config.patch("capture_dynamic_output_shape_ops", True)
     def test_unbacked_view_extra(self):
+        # [FUNCTION DOC] With dynamic output shape capture, compiles a function building a zeros
+        # tensor sized by the count of nonzero elements and viewing it with an inferred dimension;
+        # checks equality with eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Counts nonzeros in x, builds zeros of that many rows by 192,
+            # and returns a view of shape 12, inferred, 192.
             i0 = x.nonzero().size(0)
             y = torch.zeros((i0, 192))
             return y.view([12, -1, 192])
@@ -5554,8 +6365,14 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_dynamic not supported")
     def test_hint_override_consistent_stride1(self):
+        # [FUNCTION DOC] Marks two dimensions dynamic with hint overrides (2 and 6) on a three
+        # dimensional tensor and compiles a function that reads the guarding hints of sizes and
+        # strides, asserting via checks they are consistent (6 and 120). Runs it once.
         @torch.compile(fullgraph=True, dynamic=True)
         def func(x):
+            # [FUNCTION DOC] HELPER: Reads guarding hints of the third size and second stride,
+            # checks both equal 6, then hints of the product of second and third sizes and first
+            # stride and checks both equal 120; returns the two hints and x times 100.
             a = torch.fx.experimental.symbolic_shapes.guarding_hint_or_throw(
                 x.size()[2]
             )
@@ -5585,8 +6402,13 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_dynamic not supported")
     def test_hint_override_consistent_stride2(self):
+        # [FUNCTION DOC] Marks all three dimensions dynamic with hint overrides 2, 4 and 6 and
+        # compiles a function that checks the product of the last two sizes equals the first stride
+        # and equals 24; runs it once.
         @torch.compile(fullgraph=True, dynamic=True)
         def func(x):
+            # [FUNCTION DOC] HELPER: Reads guarding hints of the product of the last two sizes and
+            # of the first stride, checks both equal 24, returns the two hints and x times 100.
             # only one of the sizes has hint overridden.
             a = torch.fx.experimental.symbolic_shapes.guarding_hint_or_throw(
                 x.size()[1] * x.size()[2]
@@ -5607,8 +6429,14 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         func(x)
 
     def test_optimization_hint(self):
+        # [FUNCTION DOC] Compiles a function that checks optimization hints: for a size from an
+        # item the fallback 300 is returned, for a size twice another item the hint is 600. Runs
+        # with 33.
         @torch.compile(fullgraph=True)
         def func(x):
+            # [FUNCTION DOC] HELPER: Builds ones tensors sized by an item and by twice the item,
+            # checks the optimization hint of the first size is the fallback 300 and of the second
+            # is 600, returns the first times 10.
             u0 = x.item()
             a = torch.ones([u0])
             torch._check(
@@ -5630,8 +6458,12 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         func(torch.tensor([33]))
 
     def test_guarding_hint_or_throw(self):
+        # [FUNCTION DOC] Checks that calling the guarding hint helper on an unbacked size raises
+        # GuardOnDataDependentSymNode when running a compiled function.
         @torch.compile(fullgraph=True)
         def func(x):
+            # [FUNCTION DOC] HELPER: Builds a ones tensor sized by an item and asserts its guarding
+            # hint is 300 (which raises for unbacked sizes), returns the tensor times 10.
             u0 = x.item()
             a = torch.ones([u0])
             torch._check(
@@ -5647,12 +6479,20 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_shape_id_unifies_unbacked_symbols(self):
+        # [FUNCTION DOC] Compares sizes of two tensors with the first dimension marked unbacked and
+        # expects a UserError when compiling with full graph. The second part of the test compiles
+        # on two plain tensors and checks the add result is chosen.
+        # KNOWN ISSUE: the second section is commented as using shape_id to share one symbol, but
+        # it never marks the tensors with shape_id (or as unbacked), so it only exercises ordinary
+        # static compilation and does not test shape_id unification.
         """
         Test that shape_id parameter in mark_unbacked causes tensors to share
         the same unbacked symbol, allowing equality comparisons without DDE.
         """
 
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Returns the sum if the first sizes are equal, else
+            # the difference.
             if x.size()[0] == y.size()[0]:
                 return x + y
             else:
@@ -5681,6 +6521,9 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_shape_id_runtime_assertion_on_mismatch(self):
+        # [FUNCTION DOC] Compiles an add with the first dimension of both inputs marked unbacked
+        # with one shape id; a call with equal sizes works and matches eager. A second call with
+        # the same shape id but different batch sizes (4 and 5) must raise AssertionError.
         """
         Test that shape_id with different actual sizes at runtime
         raises an assertion error during tracing. This ensures that duck shaping
@@ -5688,6 +6531,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         """
 
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Returns the sum of x and y.
             return x + y
 
         torch._dynamo.reset()
@@ -5715,12 +6559,16 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_shape_id_recompilation(self):
+        # [FUNCTION DOC] Counts compilations while changing the shape id annotation: first call
+        # with a shape id compiles once, same id reuses the frame, and a call without an id
+        # recompiles (two frames).
         """
         Test that changing _dynamo_shape_ids triggers recompilation.
         """
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -5745,6 +6593,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_shape_id_no_recompile_without_unbacked_indices(self):
+        # [FUNCTION DOC] Checks a plain tensor without unbacked annotations reuses the frame
+        # compiled for a tensor annotated with a shape id (one frame).
         """
         Test that passing a tensor without _dynamo_unbacked_indices after
         compiling with shape_ids does NOT trigger recompilation.
@@ -5754,6 +6604,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -5772,6 +6623,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_shape_id_recompile_with_different_id(self):
+        # [FUNCTION DOC] Checks that changing the shape id string between calls of an unbacked
+        # tensor triggers a recompilation (two frames).
         """
         Test that passing a tensor with same _dynamo_dynamic_indices but
         different shape_id DOES trigger recompilation.
@@ -5779,6 +6632,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -5797,12 +6651,15 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_unbacked_bounds_recompilation(self):
+        # [FUNCTION DOC] Checks recompilation on unbacked bounds: same min and max reuses the
+        # frame, no bounds recompiles, and different max recompiles again (three frames total).
         """
         Test that changing _dynamo_unbacked_bounds triggers recompilation.
         """
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -5833,6 +6690,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_unbacked_bounds_no_recompile_without_unbacked_indices(self):
+        # [FUNCTION DOC] Checks a plain tensor reuses the frame compiled with an unbacked tensor
+        # that had bounds (still one frame).
         """
         Test that passing a tensor without _dynamo_unbacked_indices after
         compiling with bounds does NOT trigger recompilation.
@@ -5842,6 +6701,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -5860,6 +6720,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_unbacked_no_bounds_then_bounds(self):
+        # [FUNCTION DOC] Checks a function compiled for unbacked without bounds is reused for the
+        # same marking but recompiled when bounds are then supplied (two frames).
         """
         Test that compiling without bounds then calling with bounds
         triggers recompilation.
@@ -5867,6 +6729,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -5892,6 +6755,10 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_unbacked_indices_recompilation(self):
+        # [FUNCTION DOC] Checks subset matching of unbacked indices: after compiling with indices 0
+        # and 1, same, subset, plain tensor and empty list inputs reuse the frame; a three
+        # dimension tensor with indices 0, 1, 2 recompiles; an empty list afterwards does not set
+        # the attribute and reuses the new frame.
         """
         Test that changing _dynamo_unbacked_indices triggers recompilation.
         Uses subset match semantics: runtime indices must be a subset of compiled indices,
@@ -5900,6 +6767,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -5944,6 +6812,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_unbacked_indices_no_recompile_to_unbacked(self):
+        # [FUNCTION DOC] Checks that a tensor with no unbacked annotation compiles once, and an
+        # unbacked-annotated tensor afterwards recompiles (two frames).
         """
         Test that compiling without _dynamo_unbacked_indices and then passing
         a tensor with _dynamo_unbacked_indices DOES trigger recompilation.
@@ -5951,6 +6821,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -5968,6 +6839,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_unbacked_no_shape_id_then_shape_id(self):
+        # [FUNCTION DOC] Checks that after compiling unbacked tensors with no shape id, repeating
+        # reuses the frame but giving a shape id recompiles (two frames).
         """
         Test that compiling without shape_id then calling with shape_id
         triggers recompilation.
@@ -5975,6 +6848,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -6000,6 +6874,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_mark_unbacked_empty_list_is_noop(self):
+        # [FUNCTION DOC] Checks that marking unbacked with an empty list sets no attribute on a
+        # fresh tensor and does not clear an already marked dimension.
         """
         Test that mark_unbacked(x, []) is a no-op:
         - On a fresh tensor, no attribute is set.
@@ -6019,6 +6895,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_dynamic is not traceable")
     def test_mark_dynamic_empty_list_is_noop(self):
+        # [FUNCTION DOC] Checks that marking dynamic with an empty list sets no attribute on a
+        # fresh tensor and does not clear an already marked dimension.
         """
         Test that mark_dynamic(x, []) is a no-op:
         - On a fresh tensor, no attribute is set.
@@ -6038,6 +6916,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_mark_unbacked_to_mark_static_recompilation(self):
+        # [FUNCTION DOC] Checks that after compiling with an unbacked mark, a tensor marked static
+        # triggers a recompilation (two frames).
         """
         Test that compiling with mark_unbacked and then calling with mark_static
         triggers recompilation.
@@ -6045,6 +6925,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -6063,6 +6944,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_static is not traceable")
     def test_mark_static_to_mark_unbacked_recompilation(self):
+        # [FUNCTION DOC] Checks that after compiling with a static mark, a tensor marked unbacked
+        # triggers a recompilation (two frames).
         """
         Test that compiling with mark_static and then calling with mark_unbacked
         triggers recompilation.
@@ -6070,6 +6953,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -6088,6 +6972,8 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_dynamic is not traceable")
     def test_mark_dynamic_to_mark_static_recompilation(self):
+        # [FUNCTION DOC] Checks that after compiling with a dynamic mark, a tensor marked static
+        # triggers a recompilation (two frames).
         """
         Test that compiling with mark_dynamic and then calling with mark_static
         triggers recompilation.
@@ -6095,6 +6981,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -6113,6 +7000,9 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_dynamic is not traceable")
     def test_dynamic_indices_exact_match_recompilation(self):
+        # [FUNCTION DOC] Checks subset matching for dynamic indices: after marking dims 0 and 1
+        # dynamic, same marks, a subset, a plain tensor, and an empty-list marking all reuse the
+        # single frame.
         """
         Test that dynamic indices use subset match semantics.
         - Compile with mark_dynamic(x, [0, 1]) then call with mark_dynamic(x, [0]) → no recompile (subset)
@@ -6122,6 +7012,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -6163,6 +7054,9 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("maybe_mark_dynamic is not traceable")
     def test_weak_dynamic_indices_exact_match_recompilation(self):
+        # [FUNCTION DOC] Checks subset matching for weakly dynamic indices (maybe mark dynamic):
+        # after marking dims 0 and 1, same marks, a subset, a plain tensor and an empty-list
+        # marking all reuse the single frame.
         """
         Test that weak dynamic indices (from maybe_mark_dynamic) use subset match semantics.
         - Compile with maybe_mark_dynamic(x, [0, 1]) then call with maybe_mark_dynamic(x, [0]) → no recompile (subset)
@@ -6171,6 +7065,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -6212,6 +7107,9 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_static is not traceable")
     def test_static_indices_exact_match_recompilation(self):
+        # [FUNCTION DOC] Checks subset matching for static indices: after marking dims 0 and 1
+        # static, same marks, a subset, a plain tensor and an empty-list marking all reuse the
+        # single frame.
         """
         Test that static indices use subset match semantics.
         - Compile with mark_static(x, [0, 1]) then call with mark_static(x, [0]) → no recompile (subset)
@@ -6220,6 +7118,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         counter = CompileCounter()
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         compiled_func = torch.compile(func, backend=counter)
@@ -6261,6 +7160,9 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_unbacked_exec_fft_reshape_no_dde(self):
+        # [FUNCTION DOC] Compiles an FFT of a complex tensor whose batch dimension is unbacked with
+        # the eager backend and full graph, and checks no data-dependent error is raised and the
+        # result matches eager.
         """
         Test that view/reshape operations from with in meta python function
         on tensors with unbacked dimensions do not raise GuardOnDataDependentSymNode
@@ -6269,6 +7171,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         """
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the FFT of x.
             # FFT triggers _exec_fft which calls reshape with unbacked batch dims
             return torch.fft.fft(x)
 
@@ -6284,9 +7187,16 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_inductor_issue_164428(self):
+        # [FUNCTION DOC] Regression test for issue 164428: runs a fuzzed program (division, matmul,
+        # flatten, subtraction, contiguous view) with strided float64 inputs and a sentinel tensor
+        # that requires grad; compiled with dynamic shapes must match the eager result.
         torch.manual_seed(6804)
 
         def fuzzed_program(arg_0, arg_1, arg_2, sentinel):
+            # [FUNCTION DOC] HELPER: Fuzzer-generated pipeline: divides a broadcast-strided input
+            # by a constant tensor, flattens it, subtracts the difference of a matrix product and
+            # arg_2, makes the result contiguous, views it as sixteen by fourteen, multiplies by
+            # the sentinel, and returns the real part if the result is complex.
             var_node_4 = arg_0
             var_node_5 = torch.full((7, 1, 32), -1.195053522845565, dtype=torch.float64)
             var_node_3 = torch.div(var_node_4, var_node_5)
@@ -6320,12 +7230,20 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         self.assertTrue(torch.allclose(result_compiled, result_original))
 
     def test_inductor_view_issue_172693(self):
+        # [FUNCTION DOC] Regression test for issue 172693: a module reshaping a strided key with an
+        # inferred dimension, then a graph break, then adding one is compiled with dynamic shapes
+        # in inference mode; the compiled output must match eager.
         class MinimalBugModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a head count attribute whose forward reshapes the key
+            # to batch, heads and an inferred last dim, forces a graph break, and adds one.
             def __init__(self, num_heads: int = 8):
+                # [FUNCTION DOC] HELPER: Stores the number of heads (default 8) on the module.
                 super().__init__()
                 self.num_heads = num_heads
 
             def forward(self, key):
+                # [FUNCTION DOC] HELPER: Reshapes key to its first size by num_heads by inferred,
+                # calls a dynamo graph break, and returns the reshaped tensor plus one.
                 reshaped_key = key.reshape(key.shape[0], self.num_heads, -1)
                 torch._dynamo.graph_break()
                 return reshaped_key + 1
@@ -6345,12 +7263,16 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_view_as_complex_unbacked_no_dde(self):
+        # [FUNCTION DOC] Compiles view-as-complex on a tensor whose batch dimension is unbacked
+        # with the eager backend and full graph; no data-dependent error must be raised and the
+        # real view of the result must match eager.
         """
         Test that view_as_complex does not raise GuardOnDataDependentSymNode
         when operating on tensors with unbacked dimensions.
         """
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns x viewed as complex.
             return torch.view_as_complex(x)
 
         # Create a tensor with shape [..., 2] where batch dim is unbacked
@@ -6368,6 +7290,9 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_view_as_real_backward_unbacked_no_dde(self):
+        # [FUNCTION DOC] Compiles a function summing view-as-real of a complex tensor requiring
+        # grad with an unbacked batch dimension, then runs backward; must not raise a
+        # data-dependent error.
         """
         Test that view_as_real backward (which calls view_as_complex) does not
         raise GuardOnDataDependentSymNode when operating on tensors with
@@ -6375,6 +7300,7 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
         """
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of the real view of x.
             y = torch.view_as_real(x)
             return y.sum()
 
@@ -6389,8 +7315,11 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_mark_unbacked_view_input(self):
+        # [FUNCTION DOC] Marks a tensor's dims unbacked, passes a slice view of it to a compiled
+        # function and checks the output shape is one by one.
         @torch.compile()
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns x times 100 plus 1.
             return x * 100 + 1
 
         x = torch.rand(10, 10)
@@ -6405,9 +7334,14 @@ instantiate_parametrized_tests(TestUnbacked)
 
 
 class TestMaybeFastEvalComparison(TestCase):
+    # [CLASS DOC] Tests for the ShapeEnv fast path for comparing sums of non-negative symbols to
+    # zero, plus printing of min/max expressions for guards and an unbacked slice assignment
+    # regression test.
     """Tests for _maybe_fast_eval_comparison fast path optimization."""
 
     def test_sum_of_nonneg_ge_zero(self):
+        # [FUNCTION DOC] Checks the fast comparison returns the true expression for the sum of two
+        # non-negative unbacked symbols being at least zero.
         """Test that sum of non-negative symbols >= 0 returns True."""
         shape_env = ShapeEnv()
         # Create unbacked symbols and constrain them to be positive
@@ -6422,6 +7356,8 @@ class TestMaybeFastEvalComparison(TestCase):
         self.assertEqual(result, sympy.true)
 
     def test_single_nonneg_symbol_ge_zero(self):
+        # [FUNCTION DOC] Checks the fast comparison returns true for a single non-negative unbacked
+        # symbol being at least zero.
         """Test that a single non-negative symbol >= 0 returns True."""
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
@@ -6433,6 +7369,8 @@ class TestMaybeFastEvalComparison(TestCase):
         self.assertEqual(result, sympy.true)
 
     def test_zero_le_sum_of_nonneg(self):
+        # [FUNCTION DOC] Checks the fast comparison returns true for zero being at most the sum of
+        # two non-negative symbols.
         """Test that 0 <= sum of non-negative symbols returns True."""
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
@@ -6446,6 +7384,8 @@ class TestMaybeFastEvalComparison(TestCase):
         self.assertEqual(result, sympy.true)
 
     def test_nonneg_constant_in_sum(self):
+        # [FUNCTION DOC] Checks the fast comparison returns true when a non-negative symbol plus
+        # the constant 5 is compared to zero.
         """Test that sum with non-negative constant >= 0 returns True."""
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
@@ -6457,6 +7397,8 @@ class TestMaybeFastEvalComparison(TestCase):
         self.assertEqual(result, sympy.true)
 
     def test_negative_constant_returns_none(self):
+        # [FUNCTION DOC] Checks the fast comparison returns None when a negative constant is added
+        # since the result is undecidable.
         """Test that sum with negative constant returns None (undecidable)."""
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
@@ -6468,6 +7410,10 @@ class TestMaybeFastEvalComparison(TestCase):
         self.assertIsNone(result)
 
     def test_sympy_interp_min_max_are_symbol_safe(self):
+        # [FUNCTION DOC] Prints max and min expressions with the guard printer and checks the text
+        # uses the symbol-safe two-argument max and min calls; evaluates them in the interpreter
+        # namespace on an unbacked symbolic int and compares the sympy results; also checks a
+        # three-argument max prints as nested binary calls and evaluates to the right expression.
         from torch._dynamo.source import LocalSource
         from torch.fx.experimental.symbolic_shapes import ShapeGuardPythonPrinter
         from torch.utils._sympy.functions import Max, Min
@@ -6508,6 +7454,8 @@ class TestMaybeFastEvalComparison(TestCase):
         self.assertEqual(max3_result, Max(1, sym, sym1))
 
     def test_non_zero_rhs_returns_none(self):
+        # [FUNCTION DOC] Checks the fast comparison returns None when the right side is a
+        # nonzero constant.
         """Test that comparison with non-zero RHS returns None."""
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
@@ -6519,6 +7467,8 @@ class TestMaybeFastEvalComparison(TestCase):
         self.assertIsNone(result)
 
     def test_unhandled_expr_type_returns_none(self):
+        # [FUNCTION DOC] Checks the fast comparison returns None for an equality expression, which
+        # it does not handle.
         """Test that unhandled expression types return None."""
         shape_env = ShapeEnv()
         u0 = shape_env.create_unbacked_symint()
@@ -6530,6 +7480,8 @@ class TestMaybeFastEvalComparison(TestCase):
         self.assertIsNone(result)
 
     def test_unbacked_symbol_with_default_range_returns_none(self):
+        # [FUNCTION DOC] Checks the fast comparison returns None for an unbacked symbol with the
+        # default unbounded range.
         """Test that unbacked symbols with default range [-inf, inf] return None."""
         shape_env = ShapeEnv()
         # Default unbacked symint has range [-int_oo, int_oo]
@@ -6542,11 +7494,19 @@ class TestMaybeFastEvalComparison(TestCase):
 
     @torch._dynamo.config.patch(capture_scalar_outputs=True)
     def test_unbacked_slice_assignment_same_bounds(self):
+        # [FUNCTION DOC] Regression test (MoE sequential expert matmul pattern): compiles with
+        # scalar capture and the eager backend a loop that slices rows by data-dependent start and
+        # end tensors, multiplies, and writes the result into the same slice of an output; must not
+        # fail with a data-dependent guard and must match eager.
         # Repro from sequential_experts_gemm (MoE pattern in HuggingFace Aria).
         # output[start:end] = out should not fail with a data-dependent guard
         # because `out` was produced from token_states[start:end], so both
         # slices share the same (start, end) and thus the same size.
         def sequential_experts_gemm(token_states, expert_weights, tokens_per_expert):
+            # [FUNCTION DOC] HELPER: Allocates a zeros output, computes cumulative token offsets
+            # with a leading zero, and for each expert multiplies its slice of tokens by that
+            # expert's weights and writes the result back into the same slice of the output;
+            # returns the output.
             num_tokens = token_states.shape[0]
             out_features = expert_weights.shape[-1]
             output = torch.zeros(
@@ -6592,15 +7552,22 @@ class TestMaybeFastEvalComparison(TestCase):
 
 
 class TestTransferSymbolsFromForeignShapeEnv(TestCase):
+    # [CLASS DOC] Tests for transferring symbols from a foreign ShapeEnv into another one, covering
+    # backed, static and unbacked symbols, derived expressions, hints, and a flex attention
+    # end-to-end case. Helper methods build sources, transfer values and create symbols.
     """Tests for ShapeEnv.transfer_symbols_from_foreign_shape_env."""
 
     def _make_source(self, name="t"):
+        # [FUNCTION DOC] HELPER: Returns a constant source with the given name (default t).
         from torch._dynamo.source import ConstantSource
 
         return ConstantSource(name)
 
     @staticmethod
     def _transfer_symint(env, value, source):
+        # [FUNCTION DOC] HELPER: Static method mimicking how a raw foreign unbacked SymInt input is
+        # wrapped: transfers the expression as an unbacked symbol into the given env and returns a
+        # SymInt node in that env, without a hint, built with the given source.
         """Test helper that mirrors what builder.py does when wrapping a raw
         foreign unbacked SymInt input: transfer the expression and wrap as a
         SymInt in the local env."""
@@ -6608,6 +7575,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         return env.create_symintnode(new_expr, hint=None, source=source)
 
     def _create_backed_symbols(self, shape_env, tensor, source_name="foreign"):
+        # [FUNCTION DOC] HELPER: Creates backed symbolic sizes, strides and storage offset for a
+        # real tensor in the given shape env using duck sizes and inferred strides with a constant
+        # source of the given name (default foreign). Returns the three results of the env call.
         """Create backed symbolic sizes/strides/offset using _create_symbolic_sizes_strides_storage_offset."""
         src = self._make_source(source_name)
         return shape_env._create_symbolic_sizes_strides_storage_offset(
@@ -6623,6 +7593,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         )
 
     def test_backed_symbols_transferred_as_duck(self):
+        # [FUNCTION DOC] Creates backed symbols in a foreign env for a 4 by 8 tensor, transfers
+        # them into a new env, and checks the new sizes are symbolic nodes owned by the new env
+        # with hints 4 and 8.
         """Backed (guarding-hinted) symbols should become DUCK dims in the new env."""
         foreign_env = ShapeEnv()
         x = torch.randn(4, 8)
@@ -6649,6 +7622,8 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(guarding_hint_or_throw(new_sizes[1].node), 8)
 
     def test_static_dims_stay_static(self):
+        # [FUNCTION DOC] Transfers plain int sizes and strides into a new env and checks sizes stay
+        # plain ints equal to the inputs.
         """Non-symbolic (plain int) sizes should remain static ints."""
         local_env = ShapeEnv()
 
@@ -6670,6 +7645,8 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(new_sizes, (3, 5))
 
     def test_unbacked_symbols_transferred(self):
+        # [FUNCTION DOC] Transfers two foreign unbacked symbols and checks the new sizes are
+        # symbolic, owned by the new env, and have no guarding hint.
         """Unbacked symbols should become UNBACKED dims in the new env."""
         foreign_env = ShapeEnv()
         u0 = foreign_env.create_unbacked_symint()
@@ -6697,6 +7674,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
             self.assertFalse(local_env.has_guarding_hint(s.node.expr))
 
     def test_shared_unbacked_symbol_preserved(self):
+        # [FUNCTION DOC] Transfers sizes that reuse one foreign unbacked symbol twice, with that
+        # symbol also as a stride, and checks both new sizes share one symbol and the stride equals
+        # the shared size symbol.
         """When two dims share the same unbacked symbol (e.g. size=[u0, u0]),
         the transfer preserves that sharing."""
         foreign_env = ShapeEnv()
@@ -6733,6 +7713,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         )
 
     def test_foreign_stride_symbol_not_in_sizes(self):
+        # [FUNCTION DOC] Transfers a tensor whose stride is a foreign unbacked symbol absent from
+        # the sizes and checks both size and stride become symbols owned by the new env, and they
+        # are different symbols.
         """If a stride references a foreign unbacked symbol not in any size dim
         (e.g. from as_strided), a fresh unbacked symbol should be created."""
         foreign_env = ShapeEnv()
@@ -6762,6 +7745,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertNotEqual(new_sizes[0].node.expr, new_strides[0].node.expr)
 
     def test_derived_unbacked_expression_preserved(self):
+        # [FUNCTION DOC] Transfers a size and a floor-half derived size of the same foreign
+        # symbol and checks the derived dimension is built from the new base symbol rather
+        # than independent.
         """If a size is a derived expression (e.g., u0 // 2) from a base symbol
         that appears in another dim, it should be expressed in terms of the
         new symbol rather than creating an independent fresh symbol."""
@@ -6792,6 +7778,8 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertIn(new_u0, new_sizes[1].node.expr.free_symbols)
 
     def test_unbacked_hint_overrides_transferred(self):
+        # [FUNCTION DOC] Sets a hint override of 42 on a foreign unbacked symbol and checks the
+        # transferred symbol in the new env has the same override.
         """Hint overrides on unbacked symbols in the foreign env should be
         transferred to the new env."""
         foreign_env = ShapeEnv()
@@ -6819,6 +7807,10 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(local_env.var_to_hint_override[new_sym.node.expr], 42)
 
     def test_mixed_static_backed_unbacked(self):
+        # [FUNCTION DOC] Transfers a static size, a backed symbol and an unbacked symbol with a
+        # hint override of 99 together and checks each is handled: static stays an int, the backed
+        # one is symbolic with hint 4 in the new env, and the unbacked one has no guarding hint but
+        # carries the override.
         """A mix of static, backed, and unbacked dims should all be handled correctly."""
         foreign_env = ShapeEnv()
         # Create a backed symbol
@@ -6859,6 +7851,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(local_env.var_to_hint_override[new_sizes[2].node.expr], 99)
 
     def test_raw_unbacked_symint_transfer_shares_tensor_symbol(self):
+        # [FUNCTION DOC] Transfers a tensor dimension and then raw symbolic ints (the same symbol
+        # and that symbol plus one) from one foreign env and checks they share the same new symbol
+        # (plus one for the derived one) and the hint override 32 is carried over.
         """Tensor dims and raw SymInts from one foreign ShapeEnv share transfer."""
         foreign_env = ShapeEnv()
         u0 = foreign_env.create_unbacked_symint()
@@ -6882,6 +7877,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(local_env.var_to_hint_override[tensor_symbol], 32)
 
     def test_raw_unbacked_symint_transfer_preserves_multi_symbol_expr(self):
+        # [FUNCTION DOC] Transfers two foreign unbacked symbols and their sum as tensor sizes, then
+        # transfers the sum as a raw symbolic int, and checks the sum expression is rebuilt from
+        # the new base symbols in both paths and hint overrides 32 and 16 are carried over.
         """Derived raw SymInts are rebuilt from transferred base symbols."""
         foreign_env = ShapeEnv()
         u0 = foreign_env.create_unbacked_symint()
@@ -6908,6 +7906,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(local_env.var_to_hint_override[new_u1], 16)
 
     def test_raw_unbacked_symint_transfer_falls_back_for_backed_leftover(self):
+        # [FUNCTION DOC] Transfers a raw symbolic int mixing a foreign unbacked and backed
+        # symbol and checks the result is a fresh unbacked local symbol with only local unbacked
+        # free symbols.
         """Mixed backed+unbacked foreign expr falls back to fresh local unbacked."""
         foreign_env = ShapeEnv()
         u0 = foreign_env.create_unbacked_symint()
@@ -6933,6 +7934,8 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
             self.assertTrue(local_env.is_unbacked_symint(sym))
 
     def test_transfer_is_self_short_circuit(self):
+        # [FUNCTION DOC] Checks transferring an expression already owned by the same env returns it
+        # unchanged and adds nothing to the foreign unbacked symbol cache.
         """When the SymInt already belongs to this ShapeEnv,
         _transfer_foreign_expr_as_unbacked is a no-op (returns the input expr
         unchanged, no new symbol minted)."""
@@ -6950,6 +7953,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         )
 
     def test_transfer_constrains_size_on_cache_hit(self):
+        # [FUNCTION DOC] Transfers a foreign symbol as a raw symbolic int (not size-like), then as
+        # a tensor size dimension, and checks the cached local symbol is reused and now appears in
+        # the env's size-like set.
         """When is_size=True and the expression resolves to a single Symbol
         from the cache (cached via a non-size path earlier),
         _constrain_range_for_size is still applied; the symbol ends up in
@@ -6976,6 +7982,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertIn(raw, local_env.size_like)
 
     def test_foreign_unbacked_transfer_preserves_derived_tensor_expr(self):
+        # [FUNCTION DOC] Transfers derived tensor dims (a halved symbol) and strides from a foreign
+        # env with hint overrides, then transfers the same derived expression as a raw int, and
+        # checks it reuses the same local symbol and the stride equals the second size.
         """Derived tensor dims are minted as opaque symbols; raw SymInt with
         the same expression reuses that symbol via the (env, expr) cache."""
         foreign_env = ShapeEnv()
@@ -7006,6 +8015,11 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         self.assertEqual(local_env.var_to_hint_override[new_sizes[1].node.expr], 128)
 
     def test_foreign_unbacked_transfer_preserves_shared_token_grid(self):
+        # [FUNCTION DOC] Transfers three overlapping tensor shapes (token grid, labels, derived
+        # activation using a halved sequence and hidden size) and two raw symbolic ints from one
+        # foreign env into a new env, and checks that shared batch, sequence and hidden symbols are
+        # the same across transfers, strides follow sizes, and the derived raw expressions reuse
+        # the symbols created for the tensor dims.
         """Separate tensor transfers preserve shared token-grid symbols."""
         foreign_env = ShapeEnv()
         batch = foreign_env.create_unbacked_symint()
@@ -7065,6 +8079,12 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     def test_flex_attention_foreign_fake_e2e(self):
+        # [FUNCTION DOC] End-to-end test, skipped without CUDA. Builds a flex attention block mask
+        # with unbacked index dimensions and a CUDA mask function, makes fake tensors in an outer
+        # fake mode, then traces a compiled flex attention call with make_fx inside that mode
+        # (nested-compile error disabled temporarily). Checks tracing works and the captured graph
+        # placeholders keep at least four unbacked, hint-free symbolic dimensions. Registers pytree
+        # support for BlockMask and the mask wrapper if missing (global side effect).
         """E2E test: trace flex_attention with BlockMask containing unbacked dims
         through a fresh FakeTensorMode, exercising the foreign ShapeEnv transfer path."""
         from contextlib import contextmanager
@@ -7099,6 +8119,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
 
         @contextmanager
         def skip_nested_compile():
+            # [FUNCTION DOC] HELPER: Context manager that turns off the dynamo config error on
+            # nested fx tracing for its body and restores the previous value afterward, even
+            # on exceptions.
             prev = torch._dynamo.config.error_on_nested_fx_trace
             torch._dynamo.config.error_on_nested_fx_trace = False
             try:
@@ -7107,6 +8130,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
                 torch._dynamo.config.error_on_nested_fx_trace = prev
 
         def copy_marks(src, dst):
+            # [FUNCTION DOC] HELPER: Copies dynamo marking attributes (unbacked indices, strict
+            # unbacked indices, bounds, shape ids, hint overrides, specialize-on) that exist on the
+            # source tensor onto the destination tensor and returns the destination.
             for key in (
                 "_dynamo_unbacked_indices",
                 "_dynamo_strict_unbacked_indices",
@@ -7120,6 +8146,10 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
             return dst
 
         def _symbolic_context(t):
+            # [FUNCTION DOC] HELPER: Builds a stateless symbolic context for a tensor from its
+            # dynamo marks: returns None if no dimension is marked unbacked or strictly unbacked;
+            # otherwise dimensions are static except marked ones, which are unbacked (strict ones
+            # also get a relaxed unspecialized constraint), carrying shape ids and bounds.
             marked = getattr(t, "_dynamo_unbacked_indices", set())
             strict = getattr(t, "_dynamo_strict_unbacked_indices", set())
             if not marked and not strict:
@@ -7141,6 +8171,10 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
             )
 
         def fakeify(fake_mode, x, name):
+            # [FUNCTION DOC] HELPER: Converts a value to a fake tensor in the given fake mode.
+            # Non-tensors are returned unchanged. A tensor with unbacked marks is faked with an
+            # input local source and its symbolic context, and recorded in the shape env's tracked
+            # fakes; any other tensor is faked with static shapes.
             if not isinstance(x, torch.Tensor):
                 return x
             from torch._dynamo.source import LocalSource
@@ -7177,6 +8211,8 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         document_ids = torch.zeros(ntoks, dtype=torch.int32, device="cuda")
 
         def mask_mod(b, h, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Block mask function combining causal order with equal
+            # attention region and equal document id; returns the combined boolean mask.
             return (
                 (q_idx >= kv_idx)
                 & (attn_regions[q_idx] == attn_regions[kv_idx])
@@ -7216,6 +8252,9 @@ class TestTransferSymbolsFromForeignShapeEnv(TestCase):
         )
 
         def wrapped(*flat):
+            # [FUNCTION DOC] HELPER: Unflattens the arguments into query, key, value and block
+            # mask, runs the compiled flex attention requesting max scores, and returns the
+            # detached sum of the output and the detached maximum of the max scores.
             q1, k1, v1, mask1 = pytree.tree_unflatten(list(flat), spec)
             out, aux = cflex(
                 q1,
