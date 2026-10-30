@@ -1,5 +1,11 @@
 # Owner(s): ["module: tensor creation"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for tensor creation ops: eye, arange, linspace, logspace, empty, full,
+# zeros, ones, the random creation functions, the like-functions, cat, roll, diag helpers,
+# complex/polar, tril/triu indices, tensor construction from data, and DLPack interop.
+# Defines device-generic test classes instantiated per device type at import time; view ops
+# and most numpy interop live elsewhere. Also holds two small random input generators used by
+# several tests.
 
 import torch
 import numpy as np
@@ -51,6 +57,10 @@ from torch.utils.dlpack import to_dlpack
 
 # TODO: replace with make_tensor
 def _generate_input(shape, dtype, device, with_extremal):
+    # [FUNCTION DOC] HELPER: Build a random test tensor of the given shape, dtype and device. An
+    # empty shape tuple yields an empty 1-D tensor. Floating and complex dtypes get scaled normal
+    # values with about half zeroed; with_extremal also sprinkles nan and +/-inf. Bool gets
+    # random True entries, other dtypes get random integers from 15 to 99. Returns the tensor.
     if shape == ():
         x = torch.tensor((), dtype=dtype, device=device)
     else:
@@ -82,6 +92,8 @@ def _generate_input(shape, dtype, device, with_extremal):
 
 # TODO: replace with make_tensor
 def _rand_shape(dim, min_size, max_size):
+    # [FUNCTION DOC] HELPER: Return a tuple of dim random integers, each between min_size and
+    # max_size inclusive, usable as a random tensor shape.
     shape = []
     for _ in range(dim):
         shape.append(random.randint(min_size, max_size))
@@ -97,11 +109,16 @@ def _rand_shape(dim, min_size, max_size):
 # See https://pytorch.org/docs/main/torch.html#creation-ops
 
 class TestTensorCreation(TestCase):
+    # [CLASS DOC] Device-generic tests for tensor creation and joining ops (cat, roll, diag
+    # helpers, complex, polar, and similar). exact_dtype is True so assertEqual checks
+    # dtypes strictly.
     exact_dtype = True
 
     @onlyCPU
     @dtypes(torch.float)
     def test_diag_embed(self, device, dtype):
+        # [FUNCTION DOC] Check diag_embed on a 2-D CPU float tensor against stacking per-row diag
+        # results, for the default call and for a call with an offset and explicit dim1/dim2.
         x = torch.arange(3 * 4, dtype=dtype, device=device).view(3, 4)
         result = torch.diag_embed(x)
         expected = torch.stack([torch.diag(r) for r in x], 0)
@@ -112,6 +129,8 @@ class TestTensorCreation(TestCase):
         self.assertEqual(result, expected)
 
     def test_cat_mem_overlap(self, device):
+        # [FUNCTION DOC] Check that cat with an out argument that is an expanded (overlapping
+        # memory) tensor raises a RuntimeError about an unsupported operation.
         x = torch.rand((1, 3), device=device).expand((6, 3))
         y = torch.rand((3, 3), device=device)
         with self.assertRaisesRegex(RuntimeError, 'unsupported operation'):
@@ -119,6 +138,8 @@ class TestTensorCreation(TestCase):
 
     @onlyNativeDeviceTypes
     def test_vander(self, device):
+        # [FUNCTION DOC] Check vander edge cases: an empty input with zero columns gives shape
+        # (0, 0), a negative N raises RuntimeError, and a non-1-D input raises RuntimeError.
         x = torch.tensor([1, 2, 3, 5], device=device)
 
         self.assertEqual((0, 0), torch.vander(torch.tensor([]), 0).shape)
@@ -134,6 +155,9 @@ class TestTensorCreation(TestCase):
             torch.float, torch.double,
             torch.cfloat, torch.cdouble)
     def test_vander_types(self, device, dtype):
+        # [FUNCTION DOC] Compare vander against numpy for bool, uint8, integer, float and complex
+        # dtypes over several inputs, column counts (including default) and both orderings. Uses
+        # loose absolute tolerance and does not require equal dtypes.
         if dtype is torch.uint8:
             # Note: no negative uint8 values
             X = [[1, 2, 3, 5], [0, 1 / 3, 1, math.pi, 3 / 7]]
@@ -166,6 +190,9 @@ class TestTensorCreation(TestCase):
                 exact_dtype=False)
 
     def test_cat_all_dtypes_and_devices(self, device):
+        # [FUNCTION DOC] For many dtypes (including half, bool, bfloat16, chalf and float8
+        # variants), check that cat of a 2x2 tensor with itself along dim 0 and dim 1 gives the
+        # expected values.
         for dt in all_types_and_complex_and(
             torch.half,
             torch.bool,
@@ -185,6 +212,9 @@ class TestTensorCreation(TestCase):
             self.assertEqual(torch.cat((x, x), 1), expected2)
 
     def test_fill_all_dtypes_and_devices(self, device):
+        # [FUNCTION DOC] For many dtypes, fill small and large (10000 element) tensors in place
+        # with a range of integer values (smaller range for 8-bit types) and check contents and
+        # dtype remain correct.
         for dt in all_types_complex_float8_and(torch.half, torch.bool, torch.bfloat16, torch.chalf):
             for x in [torch.tensor((10, 10), dtype=dt, device=device),
                       torch.empty(10000, dtype=dt, device=device)]:  # large tensor
@@ -198,6 +228,10 @@ class TestTensorCreation(TestCase):
                     self.assertEqual(dt, x.dtype)
 
     def test_roll(self, device):
+        # [FUNCTION DOC] Exercise roll: positive and negative shifts, multi-dimensional data,
+        # full-loop rolls returning the original, non-contiguous input, no dims (flatten then
+        # roll), multiple shifts and dims, error cases for empty or misaligned shifts and dims,
+        # and bool and complex tensors.
         numbers = torch.arange(1, 9, device=device)
 
         single_roll = numbers.roll(1, 0)
@@ -261,6 +295,8 @@ class TestTensorCreation(TestCase):
         self.assertEqual(expected, t.roll(1, 0))
 
     def test_diagflat(self, device):
+        # [FUNCTION DOC] Check diagflat against diag of the flattened input: 1-D input, an
+        # offset, a multi-dimensional input, a non-contiguous input, and complex128 input.
         dtype = torch.float32
         # Basic sanity test
         x = torch.randn((100,), dtype=dtype, device=device)
@@ -293,7 +329,14 @@ class TestTensorCreation(TestCase):
         self.assertEqual(result, expected)
 
     def test_block_diag(self, device):
+        # [FUNCTION DOC] Check block_diag against a manual reference for mixed 0-D, 1-D and 2-D
+        # inputs, the single-tensor cases, the no-argument case (empty 1x0 on cpu), type
+        # promotion over all pairs of dtypes, errors for inputs with more than 2 dims, and
+        # (non-cpu) mixed-device inputs.
         def block_diag_workaround(*arrs):
+            # [FUNCTION DOC] HELPER: Reference block_diag built by hand. Promotes each 1-D or 0-D
+            # input to 2-D, allocates a zero matrix with summed shapes in the first input's
+            # dtype, and copies each block along the diagonal. Returns that matrix.
             arrs_expanded = []
             for a in arrs:
                 if a.dim() == 2:
@@ -387,6 +430,10 @@ class TestTensorCreation(TestCase):
     @skipCPUIf(TEST_WITH_TORCHDYNAMO, "test doesn't currently work with dynamo on CPU")
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found")
     def test_block_diag_scipy(self, device):
+        # [FUNCTION DOC] Compare block_diag with scipy block_diag on several nested-list inputs
+        # (scalars, empty lists, mixed int/float/complex). Checks result dtypes of both (they
+        # differ in float width) and that values match after casting scipy output to the torch
+        # dtype. Skipped without scipy.
         import scipy.linalg
         scipy_tensors_list = [
             [
@@ -440,6 +487,8 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.half, torch.float32, torch.float64)
     def test_torch_complex(self, device, dtype):
+        # [FUNCTION DOC] Check torch.complex builds a complex tensor from matching real and
+        # imaginary half, float or double tensors, with the corresponding complex dtype.
         real = torch.tensor([1, 2], device=device, dtype=dtype)
         imag = torch.tensor([3, 4], device=device, dtype=dtype)
         z = torch.complex(real, imag)
@@ -449,6 +498,8 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.half, torch.float32, torch.float64)
     def test_torch_polar(self, device, dtype):
+        # [FUNCTION DOC] Check torch.polar from magnitude and angle tensors against precomputed
+        # complex values; half precision uses a looser tolerance.
         abs = torch.tensor([1, 2, -3, -4.5, 1, 1], device=device, dtype=dtype)
         angle = torch.tensor([math.pi / 2, 5 * math.pi / 4, 0, -11 * math.pi / 6, math.pi, -math.pi],
                              device=device, dtype=dtype)
@@ -465,6 +516,8 @@ class TestTensorCreation(TestCase):
     @dtypes(torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
             torch.complex64, torch.complex128, torch.bool)
     def test_torch_complex_floating_dtype_error(self, device, dtype):
+        # [FUNCTION DOC] Check that complex and polar raise a RuntimeError when inputs are not
+        # half, float or double (integer, complex or bool dtypes).
         for op in (torch.complex, torch.polar):
             a = torch.tensor([1, 2], device=device, dtype=dtype)
             b = torch.tensor([3, 4], device=device, dtype=dtype)
@@ -476,8 +529,12 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.float32, torch.float64)
     def test_torch_complex_same_dtype_error(self, device, dtype):
+        # [FUNCTION DOC] Check that complex and polar raise a RuntimeError naming both dtypes
+        # when the two inputs have different float dtypes.
 
         def dtype_name(dtype):
+            # [FUNCTION DOC] HELPER: Return the error-message name, Float for float32 and
+            # Double otherwise.
             return 'Float' if dtype == torch.float32 else 'Double'
 
         for op in (torch.complex, torch.polar):
@@ -492,11 +549,17 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.float32, torch.float64)
     def test_torch_complex_out_dtype_error(self, device, dtype):
+        # [FUNCTION DOC] Check that complex and polar raise a RuntimeError when the out tensor
+        # has a real dtype instead of the matching complex dtype.
 
         def dtype_name(dtype):
+            # [FUNCTION DOC] HELPER: Return the error-message name, Float for float32 and
+            # Double otherwise.
             return 'Float' if dtype == torch.float32 else 'Double'
 
         def complex_dtype_name(dtype):
+            # [FUNCTION DOC] HELPER: Return the error-message name, ComplexFloat for complex64
+            # and ComplexDouble otherwise.
             return 'ComplexFloat' if dtype == torch.complex64 else 'ComplexDouble'
 
         for op in (torch.complex, torch.polar):
@@ -510,6 +573,9 @@ class TestTensorCreation(TestCase):
                 op(a, b, out=out)
 
     def test_cat_empty_legacy(self, device):
+        # [FUNCTION DOC] Legacy behavior: cat of a 4-D tensor with an empty 1-D tensor on either
+        # side along dim 1 works and gives equal results; cat of two such empties returns the
+        # empty tensor.
         # FIXME: this is legacy behavior and should be removed
         # when we support empty tensors with arbitrary sizes
         dtype = torch.float32
@@ -525,6 +591,8 @@ class TestTensorCreation(TestCase):
         self.assertEqual(res1, empty)
 
     def test_cat_empty(self, device):
+        # [FUNCTION DOC] Check cat of a 4-D tensor with a size-zero-in-dim-1 tensor on either
+        # side gives equal results, and cat of two such empties returns the empty tensor.
         dtype = torch.float32
 
         x = torch.randn((4, 3, 32, 32), dtype=dtype, device=device)
@@ -538,6 +606,8 @@ class TestTensorCreation(TestCase):
         self.assertEqual(res1, empty)
 
     def test_concat_empty_list_error(self, device):
+        # [FUNCTION DOC] Regression test: concat and concatenate of an empty list raise
+        # ValueError with a message about needing a non-empty list of Tensors.
         # Regression test for https://github.com/pytorch/pytorch/issues/155306
         msg = "expected a non-empty list of Tensors"
         with self.assertRaisesRegex(ValueError, msg):
@@ -546,6 +616,9 @@ class TestTensorCreation(TestCase):
             torch.concatenate([], dim=0)
 
     def test_cat_out(self, device):
+        # [FUNCTION DOC] Check cat with out pointing at a slice of a larger tensor writes the
+        # right values without disturbing neighbours, then check out being a contiguous or
+        # non-contiguous narrowed view along dim 0 and dim 1 of a 3-D tensor.
         x = torch.zeros((0), device=device)
         y = torch.randn((4, 6), device=device)
 
@@ -584,6 +657,10 @@ class TestTensorCreation(TestCase):
 
     @dtypes(*all_types_and_complex(), torch.uint16, torch.uint32, torch.uint64)
     def test_cat_out_fast_path_dim0_dim1(self, device, dtype):
+        # [FUNCTION DOC] Check cat fast paths on dim 0 and dim 1 for many dtypes: results with
+        # and without out and with contiguous inputs agree, slices of tensor_split work, and for
+        # non-integer dtypes the backward pass gives all-ones gradients (compared by magnitude
+        # for complex).
         int_types = integral_types_and(torch.uint16, torch.uint32, torch.uint64)
         x = torch.zeros((0), device=device, dtype=dtype)
         if dtype in int_types:
@@ -646,6 +723,8 @@ class TestTensorCreation(TestCase):
                 self.assertEqual(d.grad, expected_d_grad)
 
     def test_cat_out_channels_last(self, device):
+        # [FUNCTION DOC] Check cat with out given as a channels_last tensor gives the same values
+        # as cat without out.
         x = torch.randn((4, 3, 8, 8))
         y = torch.randn(x.shape)
         res1 = torch.cat((x, y))
@@ -655,6 +734,9 @@ class TestTensorCreation(TestCase):
 
     @onlyNativeDeviceTypes
     def test_cat_in_channels_last(self, device):
+        # [FUNCTION DOC] Check cat of channels_last inputs along every dim, for small and
+        # large sizes, keeps the channels_last format and matches the result of the
+        # default-format inputs.
         for dim in range(4):
             x = torch.randn((4, 15, 8, 8), device=device)
             y = torch.randn(x.shape, device=device)
@@ -677,6 +759,8 @@ class TestTensorCreation(TestCase):
 
     @onlyNativeDeviceTypes
     def test_cat_preserve_channels_last(self, device):
+        # [FUNCTION DOC] Check cat of channels_last inputs preserves channels_last memory format
+        # and values, including slices that are discontiguous in that format.
         x = torch.randn((4, 3, 8, 8), device=device)
         y = torch.randn(x.shape, device=device)
         res1 = torch.cat((x, y))
@@ -694,6 +778,8 @@ class TestTensorCreation(TestCase):
 
     @onlyCUDA
     def test_cat_channels_last_large_inputs(self, device):
+        # [FUNCTION DOC] CUDA only: cat of 130 channels_last tensors along dim 1 matches the CPU
+        # result and stays channels_last.
         num_tensors = 130
         inputs_cuda = [
             torch.randn((2, 3, 4, 4), device=device).contiguous(memory_format=torch.channels_last)
@@ -709,6 +795,10 @@ class TestTensorCreation(TestCase):
 
     @onlyCUDA
     def test_cat_out_memory_format(self, device):
+        # [FUNCTION DOC] CUDA only: check memory format of cat with out for CUDA and CPU inputs.
+        # A correctly shaped out keeps its own contiguous format; an empty out is resized and
+        # gets channels_last only when all inputs are channels_last, otherwise the default
+        # contiguous format.
         inp_size = (4, 4, 4, 4)
         expected_size = (8, 4, 4, 4)
         a_cuda = torch.randn(inp_size, device=device).contiguous(memory_format=torch.channels_last)
@@ -750,6 +840,8 @@ class TestTensorCreation(TestCase):
 
     @onlyCUDA
     def test_cat_stack_cross_devices(self, device):
+        # [FUNCTION DOC] CUDA only: stack of a CUDA tensor and a CPU tensor, in either order,
+        # raises a RuntimeError saying all tensors must be on the same device.
         cuda = torch.randn((3, 3), device=device)
         cpu = torch.randn((3, 3), device='cpu')
 
@@ -765,6 +857,9 @@ class TestTensorCreation(TestCase):
     # TODO: Compare with a NumPy reference instead of CPU
     @onlyCUDA
     def test_cat(self, device):
+        # [FUNCTION DOC] CUDA only: cat of three transposed random tensors along each dim from -3
+        # to 2 places each input in the right narrow slice; also cat of split and chunk pieces
+        # rebuilds the original, and cat with an extra row gives the expected size.
         SIZE = 10
         for dim in range(-3, 3):
             pos_dim = dim if dim >= 0 else 3 + dim
@@ -790,6 +885,8 @@ class TestTensorCreation(TestCase):
     @dtypesIfCUDA(torch.half, torch.float, torch.double)
     @dtypes(torch.float, torch.double)
     def test_device_rounding(self, device, dtype):
+        # [FUNCTION DOC] CUDA only: round on device values uses half-to-even and matches the
+        # expected values computed as a CPU tensor.
         # test half-to-even
         a = [-5.8, -3.5, -2.3, -1.5, -0.5, 0.5, 1.5, 2.3, 3.5, 5.8]
         res = [-6., -4., -2., -2., 0., 0., 2., 2., 4., 6.]
@@ -802,12 +899,18 @@ class TestTensorCreation(TestCase):
     #       doesn't support overlapping sizes/strides in XLA impl
     @onlyNativeDeviceTypes
     def test_like_fn_stride_proparation_vs_tensoriterator_unary_op(self, device):
+        # [FUNCTION DOC] Check that zeros_like, ones_like, randint_like (both forms), randn_like,
+        # rand_like, full_like and empty_like give the same size and stride as the unary op exp
+        # does, for many dense, sliced, gapped, zero-stride and overlapping layouts under every
+        # dim permutation.
         # Test like functions against tensoriterator based unary operator (exp) to
         # make sure the returned tensor from like function follows the same stride propergation
         # rule as what tensoriterator does for unary operator. The like function's  output strides
         # is computed on CPU side always, no need to test GPU here.
 
         def compare_helper_(like_fn, t):
+            # [FUNCTION DOC] HELPER: Apply exp and the given like function to tensor t and assert
+            # that the strides and sizes of the two results are equal.
             te = torch.exp(t)
             tl = like_fn(t)
             self.assertEqual(te.stride(), tl.stride())
@@ -850,6 +953,11 @@ class TestTensorCreation(TestCase):
                     compare_helper_(like_fn, tp)
 
     def _hvd_split_helper(self, torch_fn, np_fn, op_name, inputs, device, dtype, dim):
+        # [FUNCTION DOC] HELPER: Shared driver for hsplit, vsplit and dsplit tests. For each pair
+        # of shape and split argument, decides whether an error is expected (too few dims, or an
+        # integer split that does not divide the size). Without error, compares the torch result
+        # with numpy; with error, checks torch raises RuntimeError (with the matching message),
+        # and numpy raises ValueError.
         dimension_error_message = op_name + " requires a tensor with at least "
         divisibiliy_error_message = op_name + " attempted to split along dimension "
 
@@ -872,6 +980,9 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.long, torch.float32, torch.complex64)
     def test_hsplit(self, device, dtype):
+        # [FUNCTION DOC] Run the split helper for hsplit (split dimension 1) over scalar, 1-D,
+        # 2-D and 3-D inputs, integer and list split arguments, including empty dims and
+        # out-of-range indices.
         inputs = (
             ((), 3),
             ((), [2, 4, 6]),
@@ -893,6 +1004,8 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.long, torch.float32, torch.complex64)
     def test_vsplit(self, device, dtype):
+        # [FUNCTION DOC] Run the split helper for vsplit (split dimension 0) over 1-D to 3-D
+        # inputs with integer and list split arguments.
         inputs = (
             ((6,), 2),
             ((6,), 4),
@@ -909,6 +1022,8 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.long, torch.float32, torch.complex64)
     def test_dsplit(self, device, dtype):
+        # [FUNCTION DOC] Run the split helper for dsplit (split dimension 2) over 1-D to 3-D
+        # inputs with integer and list split arguments, including empty dims.
         inputs = (
             ((6,), 4),
             ((6, 6), 3),
@@ -924,6 +1039,11 @@ class TestTensorCreation(TestCase):
         self._hvd_split_helper(torch.dsplit, np.dsplit, "torch.dsplit", inputs, device, dtype, 2)
 
     def _test_special_stacks(self, dim, at_least_dim, torch_fn, np_fn, device, dtype):
+        # [FUNCTION DOC] HELPER: Shared driver for hstack, column_stack, vstack, row_stack and
+        # dstack tests. Checks a TypeError for a bare tensor argument, 0-D inputs against numpy,
+        # then for random shapes differing along one axis: if valid (given the concatenating dim
+        # and the minimum dims) compares with numpy, otherwise expects RuntimeError from torch
+        # and ValueError from numpy.
         # Test error for non-tuple argument
         t = torch.randn(10)
         with self.assertRaisesRegex(TypeError, "must be tuple of Tensors, not Tensor"):
@@ -979,6 +1099,8 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(*all_types_and_complex_and(torch.half))
     def test_hstack_column_stack(self, device, dtype):
+        # [FUNCTION DOC] Run the special stack driver for hstack and column_stack against numpy,
+        # then compare column_stack of mixed 1-D and 2-D inputs with numpy.
         ops = ((torch.hstack, np.hstack), (torch.column_stack, np.column_stack))
         for torch_op, np_op in ops:
             self._test_special_stacks(1, 1, torch_op, np_op, device, dtype)
@@ -998,6 +1120,8 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(*all_types_and_complex_and(torch.half))
     def test_vstack_row_stack(self, device, dtype):
+        # [FUNCTION DOC] Run the special stack driver for vstack and row_stack against numpy, and
+        # check vstack handles a 1-D tensor together with a 1-row 2-D tensor.
         ops = ((torch.vstack, np.vstack), (torch.row_stack, np.vstack))
         for torch_op, np_op in ops:
             self._test_special_stacks(0, 2, torch_op, np_op, device, dtype)
@@ -1015,6 +1139,8 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(*all_types_and_complex_and(torch.half))
     def test_dstack(self, device, dtype):
+        # [FUNCTION DOC] Run the special stack driver for dstack against numpy, and check dstack
+        # of mixed 1-D, 2-D and 3-D inputs, repeated several times with random sizes.
         self._test_special_stacks(2, 3, torch.dstack, np.dstack, device, dtype)
         for _ in range(5):
             # Test dimension change for 1D tensor of size (N), 2D tensor of size (1, N), and 3D tensor of size (1, N, 1)
@@ -1041,6 +1167,9 @@ class TestTensorCreation(TestCase):
 
     @dtypes(torch.int32, torch.int64)
     def test_large_linspace(self, device, dtype):
+        # [FUNCTION DOC] Check linspace between the min and a large max of int32 or int64
+        # gives a first step larger than the exact fractional step (no truncation toward zero
+        # of the step).
         start = torch.iinfo(dtype).min
         end = torch.iinfo(dtype).max & ~0xfff
         steps = 15
@@ -1049,6 +1178,9 @@ class TestTensorCreation(TestCase):
 
     @dtypes(torch.float32, torch.float64)
     def test_unpack_double(self, device, dtype):
+        # [FUNCTION DOC] Regression test: build float32 or float64 tensors from big Python
+        # numbers (above 2 to the 24 or 53, integer limits, and out-of-range floats) and compare
+        # with numpy conversions.
         # Reference: https://github.com/pytorch/pytorch/issues/33111
         vals = (2 ** 24 + 1, 2 ** 53 + 1,
                 np.iinfo(np.int64).max, np.iinfo(np.uint64).max, np.iinfo(np.uint64).max + 1,
@@ -1059,6 +1191,9 @@ class TestTensorCreation(TestCase):
             self.assertEqual(t, torch.from_numpy(a))
 
     def _float_to_int_conversion_helper(self, vals, device, dtype, refs=None):
+        # [FUNCTION DOC] HELPER: Convert values to a float tensor then to the target dtype and
+        # compare on CPU with the reference. If no reference is given, it is numpy casting of a
+        # float32 array to the matching numpy dtype.
         if refs is None:
             a = np.array(vals, dtype=np.float32).astype(torch_to_numpy_dtype_dict[dtype])
             refs = torch.from_numpy(a)
@@ -1075,6 +1210,9 @@ class TestTensorCreation(TestCase):
     @unittest.skipIf(IS_PPC, "Test is broken on PowerPC, see https://github.com/pytorch/pytorch/issues/39671")
     @dtypes(torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
     def test_float_to_int_conversion_finite(self, device, dtype):
+        # [FUNCTION DOC] Check finite float to integer or bool casts against numpy references.
+        # The value list is trimmed per device and dtype where conversion of out-of-range values
+        # is divergent, and uint8 on CPU uses hand-written expected results.
         min = torch.finfo(torch.float).min
         max = torch.finfo(torch.float).max
 
@@ -1120,6 +1258,9 @@ class TestTensorCreation(TestCase):
     @unittest.skipIf(IS_S390X, "Test fails for int16 on s390x. Needs investigation.")
     @dtypes(torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
     def test_float_to_int_conversion_nonfinite(self, device, dtype):
+        # [FUNCTION DOC] CPU only: check casts of negative infinity, positive infinity and nan
+        # to integer types against references that depend on platform (arm64 or not) and on
+        # the dtype.
         vals = (float('-inf'), float('inf'), float('nan'))
 
         if dtype == torch.bool:
@@ -1136,6 +1277,9 @@ class TestTensorCreation(TestCase):
 
     @onlyNativeDeviceTypes
     def test_complex_type_conversions(self, device):
+        # [FUNCTION DOC] Check converting random tensors among float, complex64 and complex128:
+        # complex to real keeps the real part, real to complex has zero imaginary part, otherwise
+        # values are equal.
         dtypes = [torch.float, torch.complex64, torch.complex128]
         for from_type in dtypes:
             for to_type in dtypes:
@@ -1152,6 +1296,8 @@ class TestTensorCreation(TestCase):
     @slowTest
     @onlyCPU
     def test_cat_big(self, device):
+        # [FUNCTION DOC] Slow CPU test: cat of two huge uint8 tensors gives a result whose first
+        # dimension is the sum of the inputs.
         SIZE1 = 6500
         SIZE2 = 4500
         concat_list = []
@@ -1163,6 +1309,9 @@ class TestTensorCreation(TestCase):
     @onlyCPU
     @dtypes(torch.half, torch.double, torch.int)
     def test_cat2(self, device, dtype):
+        # [FUNCTION DOC] CPU only: cat of transposed random integer-valued tensors for half,
+        # double and int along each dim from -3 to 2 puts each input in its slice; also cat of
+        # split and chunk pieces.
         SIZE = 10
         for dim in range(-3, 3):
             pos_dim = dim if dim >= 0 else 3 + dim
@@ -1185,6 +1334,8 @@ class TestTensorCreation(TestCase):
 
     @dtypes(torch.float)
     def test_cat_size1(self, device, dtype):
+        # [FUNCTION DOC] Check cat of single-element slices (aligned stride, unaligned slice)
+        # along the last dim matches cat of copies with fresh strides.
         # create a tensor that has aligned stride along dim - 1 dimension
         # but catted slice size is not aligned
         x1 = torch.randn(16, 16, device=device, dtype=dtype)[:1, :1]
@@ -1196,6 +1347,8 @@ class TestTensorCreation(TestCase):
 
     @dtypes(torch.float)
     def test_cat_trailing_dim(self, device, dtype):
+        # [FUNCTION DOC] Check cat along dim 1 of two 3-D tensors with a trailing dim of 23
+        # matches the CPU result.
         x1 = torch.randn(16, 16, 23, device=device, dtype=dtype)
         x2 = torch.rand_like(x1)
         res = torch.cat([x1, x2], dim=1)
@@ -1204,6 +1357,8 @@ class TestTensorCreation(TestCase):
 
     @dtypes(torch.float)
     def test_cat_misaligned(self, device, dtype):
+        # [FUNCTION DOC] Check cat of two misaligned (offset start) 1-D slices matches the
+        # CPU result.
         x1 = torch.randn(14, device=device, dtype=dtype)[2:]
         x2 = torch.rand_like(x1)
         res = torch.cat([x1, x2], dim=-1)
@@ -1212,6 +1367,8 @@ class TestTensorCreation(TestCase):
 
     @dtypes(torch.float)
     def test_cat_multi_batch(self, device, dtype):
+        # [FUNCTION DOC] Check cat of 130 tensors (many kernel batches) along the last dim and
+        # along dim 0, with two differently sized trailing inputs, matches the CPU result.
         xs = [torch.randn(16, 16, device=device, dtype=dtype) for _ in range(130)]
         xs_cpu = [x.cpu() for x in xs]
         res = torch.cat(xs, dim=-1)
@@ -1228,6 +1385,8 @@ class TestTensorCreation(TestCase):
     @dtypes(torch.float)
     @largeTensorTest("16GB")
     def test_cat_large_tensor(self, device, dtype):
+        # [FUNCTION DOC] Large tensor test requiring 16GB: cat of a tensor with 2 to the 32 bytes
+        # of data and a much smaller one matches the CPU result.
         N = 2 ** 32 // dtype.itemsize
         inps = [torch.randn(N, device=device, dtype=dtype), torch.randn(N // 128, device=device, dtype=dtype)]
         res = torch.cat(inps, dim=0)
@@ -1238,6 +1397,8 @@ class TestTensorCreation(TestCase):
     #   creation methods and verify all dtypes and layouts
     @dtypes(torch.bool, torch.uint8, torch.int16, torch.int64, torch.float16, torch.float32, torch.complex64)
     def test_zeros_dtype_layout_device_match(self, device, dtype):
+        # [FUNCTION DOC] Check zeros with explicit dtype, strided layout and device produces a
+        # tensor whose dtype, layout and device match what was requested.
         layout = torch.strided
         t = torch.zeros((2, 3), device=device, dtype=dtype, layout=layout)
         self.assertIs(dtype, t.dtype)
@@ -1245,6 +1406,9 @@ class TestTensorCreation(TestCase):
         self.assertEqual(torch.device(device), t.device)
 
     def test_stack(self, device):
+        # [FUNCTION DOC] Check stack of three tensors for half, double and int along every
+        # positive and negative dim: matches, has an inserted size-3 axis, and selecting each
+        # index recovers the input.
         for dtype in (torch.half, torch.double, torch.int):
             x = torch.randint(low=-100, high=100, size=(2, 3, 4), device=device, dtype=dtype)
             y = torch.randint(low=-100, high=100, size=(2, 3, 4), device=device, dtype=dtype)
@@ -1260,6 +1424,9 @@ class TestTensorCreation(TestCase):
                 self.assertEqual(res.select(dim, 2), z, atol=0, rtol=0)
 
     def test_stack_out(self, device):
+        # [FUNCTION DOC] Check stack with an out tensor for positive and negative dims: results
+        # equal, size is correct, the out storage pointer is unchanged, and each slice matches
+        # its input.
         for dtype in (torch.half, torch.double, torch.int):
             x = torch.randint(low=-100, high=100, size=(2, 3, 4), device=device, dtype=dtype)
             y = torch.randint(low=-100, high=100, size=(2, 3, 4), device=device, dtype=dtype)
@@ -1281,6 +1448,10 @@ class TestTensorCreation(TestCase):
                 self.assertEqual(res_out.select(dim, 2), z, atol=0, rtol=0)
 
     def test_repeat_interleave(self, device):
+        # [FUNCTION DOC] Check repeat_interleave: repeats-only form, errors for
+        # multi-dimensional, float or negative repeats, negative repeats rejected even with
+        # output_size (CPU only), scalar and tensor repeats with and without dim, mismatched
+        # repeats length errors, and zero-sized inputs.
         x = torch.tensor([0, 1, 2, 3], device=device)
         expected = torch.tensor([1, 2, 2, 3, 3, 3], device=device)
         self.assertEqual(torch.repeat_interleave(x), expected)
@@ -1347,6 +1518,9 @@ class TestTensorCreation(TestCase):
         self.assertEqual(y, x)
 
     def test_new_methods_requires_grad(self, device):
+        # [FUNCTION DOC] Check new_full, new_empty, new_zeros and new_ones honor requires_grad
+        # True and False on a float tensor, and raise RuntimeError when requires_grad is set on
+        # an integer tensor.
         size = (10,)
         test_cases = [
             # method name, args
@@ -1367,18 +1541,29 @@ class TestTensorCreation(TestCase):
                 x_new = x.__getattribute__(method_name)(*args, requires_grad=True)
 
     def test_tensor_from_sequence(self, device):
+        # [FUNCTION DOC] Check torch.tensor on a user-defined sequence: one whose item access
+        # raises a TypeError fails with ValueError about not determining the shape; a working one
+        # equals a list.
         class MockSequence:
+            # [CLASS DOC] HELPER: Sequence stub holding a list, reporting its length but whose
+            # item access always raises TypeError, so torch cannot read its elements.
             def __init__(self, lst):
+                # [FUNCTION DOC] HELPER: Store the given list in the lst attribute.
                 self.lst = lst
 
             def __len__(self):
+                # [FUNCTION DOC] HELPER: Return the length of the stored list.
                 return len(self.lst)
 
             def __getitem__(self, item):
+                # [FUNCTION DOC] HELPER: Always raises TypeError regardless of the index.
                 raise TypeError
 
         class GoodMockSequence(MockSequence):
+            # [CLASS DOC] HELPER: Subclass of the mock sequence whose item access works and
+            # returns the stored list element, so torch can build a tensor from it.
             def __getitem__(self, item):
+                # [FUNCTION DOC] HELPER: Return the stored list element at the given index.
                 return self.lst[item]
 
         bad_mock_seq = MockSequence([1.0, 2.0, 3.0])
@@ -1388,6 +1573,9 @@ class TestTensorCreation(TestCase):
         self.assertEqual(torch.tensor([1.0, 2.0, 3.0], device=device), torch.tensor(good_mock_seq, device=device))
 
     def test_simple_scalar_cast(self, device):
+        # [FUNCTION DOC] Check int, float and complex conversion of one-element tensors, complex
+        # of a complex scalar, ValueError for multi-element or empty tensors, and RuntimeError
+        # when converting a complex tensor to int or float.
         ok = [torch.tensor([1.5], device=device), torch.zeros(1, 1, 1, 1, device=device)]
         ok_values = [1.5, 0]
 
@@ -1409,43 +1597,58 @@ class TestTensorCreation(TestCase):
         self.assertRaises(RuntimeError, lambda: int(torch.tensor(1.5j)))
 
     def test_offset_scalar_cast(self, device):
+        # [FUNCTION DOC] Check int conversion of a one-element slice view that has a
+        # storage offset.
         x = torch.tensor([1., 2., 3.], device=device)
         y = x[2:]
         self.assertEqual(int(y), 3)
 
     def test_meshgrid_empty(self):
+        # [FUNCTION DOC] Check meshgrid with no arguments raises RuntimeError about a
+        # non-empty list.
         with self.assertRaisesRegex(RuntimeError,
                                     'expects a non-empty TensorList'):
             torch.meshgrid()
 
     def test_meshgrid_unsupported_indexing(self):
+        # [FUNCTION DOC] Check meshgrid with an empty indexing string raises RuntimeError saying
+        # indexing must be xy or ij.
         with self.assertRaisesRegex(RuntimeError,
                                     'indexing must be one of "xy" or "ij"'):
             torch.meshgrid(torch.tensor([1, 2]), indexing='')
 
     def test_meshgrid_non_1d_tensor(self):
+        # [FUNCTION DOC] Check meshgrid of a 2-D tensor raises RuntimeError expecting 0-D or
+        # 1-D tensors.
         with self.assertRaisesRegex(RuntimeError,
                                     'Expected 0D or 1D tensor'):
             torch.meshgrid(torch.tensor([[1, 2], [3, 4]]))
 
     def test_meshgrid_inconsistent_dtype(self):
+        # [FUNCTION DOC] Check meshgrid of tensors with different dtypes raises RuntimeError.
         with self.assertRaisesRegex(
                 RuntimeError, 'expects all tensors to have the same dtype'):
             torch.meshgrid(torch.tensor([1], dtype=torch.int),
                            torch.tensor([2], dtype=torch.float))
 
     def test_meshgrid_inconsistent_device(self):
+        # [FUNCTION DOC] Check meshgrid of a cpu tensor and a meta tensor raises RuntimeError
+        # about differing devices.
         with self.assertRaisesRegex(
                 RuntimeError, 'expects all tensors to have the same device'):
             torch.meshgrid(torch.tensor([1], device='cpu'),
                            torch.tensor([2], device='meta'))
 
     def test_meshgrid_warns_if_no_indexing(self):
+        # [FUNCTION DOC] Check meshgrid without the indexing argument emits a UserWarning (once)
+        # saying the argument will be required.
         with self.assertWarnsOnceRegex(
                 UserWarning, '.*will be required to pass the indexing arg.*'):
             torch.meshgrid(torch.tensor([1, 2]))
 
     def test_meshgrid_default_indexing(self, device):
+        # [FUNCTION DOC] Check meshgrid without indexing on a 0-D and two 1-D tensors, passed as
+        # a list or as separate arguments, gives ij-style grids of the expected shape and values.
         a = torch.tensor(1, device=device)
         b = torch.tensor([1, 2, 3], device=device)
         c = torch.tensor([1, 2], device=device)
@@ -1472,6 +1675,9 @@ class TestTensorCreation(TestCase):
         self.assertTrue(grid_c2.equal(expected_grid_c))
 
     def test_meshgrid_xy_indexing(self, device):
+        # [FUNCTION DOC] Same as the default-indexing check but with xy indexing: the first
+        # two axes are swapped, giving shape 3x1x2 with the expected values, for list and
+        # varargs calls.
         a = torch.tensor(1, device=device)
         b = torch.tensor([1, 2, 3], device=device)
         c = torch.tensor([1, 2], device=device)
@@ -1498,6 +1704,8 @@ class TestTensorCreation(TestCase):
         self.assertTrue(grid_c2.equal(expected_grid_c))
 
     def test_meshgrid_ij_indexing(self, device):
+        # [FUNCTION DOC] Same as the default-indexing check but with explicit ij indexing, giving
+        # shape 1x3x2 with the expected values, for list and varargs calls.
         a = torch.tensor(1, device=device)
         b = torch.tensor([1, 2, 3], device=device)
         c = torch.tensor([1, 2], device=device)
@@ -1524,6 +1732,8 @@ class TestTensorCreation(TestCase):
         self.assertTrue(grid_c2.equal(expected_grid_c))
 
     def test_meshgrid_ij_indexing_is_default(self, device):
+        # [FUNCTION DOC] Check that meshgrid results with explicit ij indexing equal those
+        # without the indexing argument.
         a = torch.tensor(1, device=device)
         b = torch.tensor([1, 2, 3], device=device)
         c = torch.tensor([1, 2], device=device)
@@ -1535,6 +1745,8 @@ class TestTensorCreation(TestCase):
 
     @skipMeta
     def test_meshgrid_vs_numpy(self, device):
+        # [FUNCTION DOC] Compare meshgrid with numpy meshgrid over 0-D and 1-D inputs (including
+        # empty cases) and for the matching indexing-argument pairs; each case runs as a subtest.
         # Shapes to the random tensors. Each line is a test case, and
         # each list within that line is the shape of a single
         # tensor. The shapes are restricted to 0D (represented by [])
@@ -1578,6 +1790,8 @@ class TestTensorCreation(TestCase):
 
 
     def test_cartesian_prod(self, device):
+        # [FUNCTION DOC] Check cartesian_prod against itertools product for three tensors, an
+        # empty input (result has shape 0 by 4), and a single input (returned unchanged).
         a = torch.tensor([1], device=device)
         b = torch.tensor([1, 2, 3], device=device)
         c = torch.tensor([1, 2], device=device)
@@ -1596,6 +1810,9 @@ class TestTensorCreation(TestCase):
         self.assertEqual(b, prod)
 
     def test_combinations(self, device):
+        # [FUNCTION DOC] Check combinations for r from 0 to 5, with and without replacement,
+        # against itertools results, with r larger than the length giving an empty result, and
+        # for empty input.
         a = torch.tensor([1, 2, 3], device=device)
 
         c = torch.combinations(a, r=0)
@@ -1640,6 +1857,8 @@ class TestTensorCreation(TestCase):
 
     @skipMeta
     def test_linlogspace_mem_overlap(self, device):
+        # [FUNCTION DOC] Check linspace and logspace with out set to an expanded (overlapping)
+        # tensor raise RuntimeError about an unsupported operation.
         x = torch.rand(1, device=device).expand(10)
         with self.assertRaisesRegex(RuntimeError, 'unsupported operation'):
             torch.linspace(1, 10, 10, out=x)
@@ -1648,6 +1867,8 @@ class TestTensorCreation(TestCase):
             torch.logspace(1, 10, 10, out=x)
 
     def test_ctor_with_numpy_array(self, device):
+        # [FUNCTION DOC] Check legacy DoubleTensor, FloatTensor and HalfTensor constructors
+        # accept numpy arrays of several dtypes and preserve element values.
         correct_dtypes = [
             np.double,
             float,
@@ -1682,6 +1903,9 @@ class TestTensorCreation(TestCase):
 
     @dtypes(torch.float, torch.double, torch.int8, torch.int16, torch.int32, torch.int64)
     def test_random(self, device, dtype):
+        # [FUNCTION DOC] Check random_ with a lower and upper bound, and with only an upper
+        # bound, yields values spanning exactly the range of lower to upper minus one, for float
+        # and integer dtypes.
         # This test is flaky with p<=(2/(ub-lb))^200=6e-36
         t = torch.empty(200, dtype=dtype, device=device)
         lb = 1
@@ -1698,6 +1922,8 @@ class TestTensorCreation(TestCase):
         self.assertEqual(t.max(), ub - 1)
 
     def test_random_bool(self, device):
+        # [FUNCTION DOC] Check random_ on a bool tensor produces both values with roughly equal
+        # frequency, starting from all-False and from all-True.
         size = 2000
         t = torch.empty(size, dtype=torch.bool, device=device)
 
@@ -1714,6 +1940,9 @@ class TestTensorCreation(TestCase):
         self.assertTrue(0.4 < (t.eq(True)).to(torch.int).sum().item() / size < 0.6)
 
     def test_random_from_to_bool(self, device):
+        # [FUNCTION DOC] Check random_ with from and to arguments on bool tensors: out-of-range
+        # from or to minus one, and from not less than to, raise RuntimeError with specific
+        # messages; valid ranges produce values within bounds.
         size = 2000
 
         int64_min_val = torch.iinfo(torch.int64).min
@@ -1758,6 +1987,9 @@ class TestTensorCreation(TestCase):
     # int64_t, but this is what random expects
     @dtypes(*all_types_and(torch.bfloat16, torch.half, torch.uint16, torch.uint32))
     def test_random_full_range(self, device, dtype):
+        # [FUNCTION DOC] Check random_ with only a from argument spans the whole representable
+        # range (limited by float mantissa for floating dtypes) by checking min and max fall near
+        # both ends.
         size = 2000
         alpha = 0.1
 
@@ -1794,6 +2026,10 @@ class TestTensorCreation(TestCase):
     # int64_t, but this is what random expects
     @dtypes(*all_types_and(torch.bfloat16, torch.half, torch .uint16, torch.uint32))
     def test_random_from_to(self, device, dtype):
+        # [FUNCTION DOC] Check random_ with from and to arguments for each dtype over lists of
+        # candidate bounds. Out-of-range from or to minus one raise RuntimeError; from not below
+        # to raises RuntimeError; floating dtypes whose bounds exceed exact integer range only
+        # warn; valid cases check min and max fall near the ends (looser for bfloat16).
         size = 2000
         alpha = 0.1
 
@@ -1883,6 +2119,10 @@ class TestTensorCreation(TestCase):
 
     @dtypes(*all_types_and(torch.bfloat16, torch.half, torch.uint16, torch.uint32))
     def test_random_to(self, device, dtype):
+        # [FUNCTION DOC] Check random_ with a single upper bound (from defaults to 0) for each
+        # dtype: an upper bound whose last value is out of range raises RuntimeError, a
+        # non-positive bound raises RuntimeError about from not below to, and valid bounds give
+        # min and max near the range ends.
         size = 2000
         alpha = 0.1
 
@@ -1941,6 +2181,9 @@ class TestTensorCreation(TestCase):
 
     @dtypes(*all_types_and(torch.bfloat16, torch.half))
     def test_random_default(self, device, dtype):
+        # [FUNCTION DOC] Check random_ with no arguments spans from zero up to the largest
+        # exactly representable integer for the dtype (mantissa limited for floats), checking min
+        # and max.
         size = 2000
         alpha = 0.1
 
@@ -1963,6 +2206,9 @@ class TestTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyNativeDeviceTypes
     def test_empty_full(self, device):
+        # [FUNCTION DOC] Run the shared empty and full helper for all dtypes (without half and
+        # bfloat16 but with complex32) on the strided layout, with the device given as a device
+        # object, and on cuda also with no device.
         torch_device = torch.device(device)
         device_type = torch_device.type
 
@@ -1978,6 +2224,9 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @deviceCountAtLeast(1)
     def test_tensor_device(self, devices):
+        # [FUNCTION DOC] Check the device of tensors made by tensor and ones for cpu, and on cuda
+        # for the explicit index and string forms, current device context, error moving to cpu
+        # through the cuda method, and the second device when available. Warnings are suppressed.
         device_type = torch.device(devices[0]).type
         if device_type == 'cpu':
             self.assertEqual('cpu', torch.tensor(5).device.type)
@@ -2028,6 +2277,8 @@ class TestTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyNativeDeviceTypes
     def test_as_strided_neg(self, device):
+        # [FUNCTION DOC] Check as_strided with a negative stride raises RuntimeError with the
+        # message that negative strides are not supported, for two different inputs.
         error = r'as_strided: Negative strides are not supported at the ' \
                 r'moment, got strides: \[-?[0-9]+(, -?[0-9]+)*\]'
         with self.assertRaisesRegex(RuntimeError, error):
@@ -2037,6 +2288,8 @@ class TestTensorCreation(TestCase):
 
     # TODO: this test should be updated
     def test_zeros(self, device):
+        # [FUNCTION DOC] Check zeros with out, and zeros of bool, half, bfloat16, complex64 and
+        # complex32 dtypes equal the expected zero tensors.
         res1 = torch.zeros(100, 100, device=device)
         res2 = torch.tensor((), device=device)
         torch.zeros(100, 100, device=device, out=res2)
@@ -2065,12 +2318,17 @@ class TestTensorCreation(TestCase):
         self.assertEqual(complexHalfTensor, expected)
 
     def test_zeros_bounds_checking(self, device):
+        # [FUNCTION DOC] Check zeros with a huge negative size raises RuntimeError saying the
+        # dimension size must be non-negative.
         # Test negative large integer
         with self.assertRaisesRegex(RuntimeError, r"zeros: Dimension size must be non-negative."):
             torch.zeros(-6744789213055875072, device=device)
 
     # TODO: this test should be updated
     def test_zeros_out(self, device):
+        # [FUNCTION DOC] Check zeros with out: changing dtype or using sparse layout with an
+        # existing dense out raises RuntimeError, while leaving dtype, layout and shape
+        # matching works.
         shape = (3, 4)
         out = torch.zeros(shape, device=device)
         torch.zeros(shape, device=device, out=out)
@@ -2091,6 +2349,8 @@ class TestTensorCreation(TestCase):
 
     # TODO: this test should be updated
     def test_ones(self, device):
+        # [FUNCTION DOC] Check ones with out, as a bool tensor, and with chalf dtype versus
+        # complex64 values (dtype check relaxed).
         res1 = torch.ones(100, 100, device=device)
         res2 = torch.tensor((), device=device)
         torch.ones(100, 100, device=device, out=res2)
@@ -2108,6 +2368,11 @@ class TestTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyCPU
     def test_constructor_dtypes(self, device):
+        # [FUNCTION DOC] CPU only: check default dtypes of the legacy tensor types and storages
+        # under context managers that set the default tensor type or dtype (including cuda when
+        # available); setting a non-float legacy type or a dtype object as tensor type raises
+        # TypeError, and only half, float, double and bfloat16 are accepted as default dtype,
+        # others raise TypeError.
         self.assertIs(torch.tensor([]).dtype, torch.get_default_dtype())
 
         self.assertIs(torch.uint8, torch.ByteTensor.dtype)
@@ -2158,6 +2423,9 @@ class TestTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyCPU
     def test_constructor_device_legacy(self, device):
+        # [FUNCTION DOC] CPU only: legacy tensor constructors and new called with a mismatched
+        # device argument (cuda from cpu types, or cpu from cuda types when available) or with a
+        # tensor and a device raise RuntimeError.
         self.assertRaises(RuntimeError, lambda: torch.FloatTensor(device='cuda'))
         self.assertRaises(RuntimeError, lambda: torch.FloatTensor(torch.Size([2, 3, 4]), device='cuda'))
         self.assertRaises(RuntimeError, lambda: torch.FloatTensor((2.0, 3.0), device='cuda'))
@@ -2203,6 +2471,9 @@ class TestTensorCreation(TestCase):
     @suppress_warnings
     @onlyCPU
     def test_tensor_factory(self, device):
+        # [FUNCTION DOC] CPU only: check torch.tensor from lists with and without dtype, copy
+        # semantics for tensors and numpy arrays, and bool conversion of floats, nan, huge ints,
+        # complex and infinity. Warnings are suppressed.
         # TODO: This test probably doesn't make too much sense now that
         # torch.tensor has been established for a while; it makes more
         # sense to test the legacy behavior in terms of the new behavior
@@ -2267,7 +2538,14 @@ class TestTensorCreation(TestCase):
     @suppress_warnings
     @onlyCPU
     def test_tensor_factory_copy_var(self, device):
+        # [FUNCTION DOC] CPU only: check copy semantics of tensor, new_tensor and as_tensor on a
+        # leaf double tensor that requires grad: copies are leaves with the requested
+        # requires_grad, as_tensor without a dtype change shares storage and graph state, and
+        # with a dtype change copies and keeps the graph. Warnings are suppressed.
         def check_copy(copy, is_leaf, requires_grad, data_ptr=None):
+            # [FUNCTION DOC] HELPER: Assert that a tensor equals the outer source tensor and has
+            # the given leaf and requires_grad flags, and that its data_ptr attribute equals the
+            # expected value (its own when none is given).
             if data_ptr is None:
                 data_ptr = copy.data_ptr
             self.assertEqual(copy, source, exact_dtype=False)
@@ -2294,7 +2572,13 @@ class TestTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyCPU
     def test_tensor_factory_type_inference(self, device):
+        # [FUNCTION DOC] CPU only: check the dtype of tensors built from Python scalars and
+        # sequences under different default dtypes, via a nested helper.
         def test_inference(default_dtype):
+            # [FUNCTION DOC] HELPER: For a given default dtype, assert the dtype inferred by
+            # torch.tensor for empty, float, int, bool, explicit dtype, mixed int/float, complex,
+            # and numpy-derived inputs (numpy scalars keep their own dtype; mixed numpy and
+            # Python values follow promotion rules).
             default_complex_dtype = torch.complex64 if default_dtype == torch.float32 else torch.complex128
             self.assertIs(default_dtype, torch.tensor(()).dtype)
             self.assertIs(default_dtype, torch.tensor(5.).dtype)
@@ -2325,6 +2609,10 @@ class TestTensorCreation(TestCase):
     @suppress_warnings
     @onlyCPU
     def test_new_tensor(self, device):
+        # [FUNCTION DOC] CPU only: check new_tensor on a byte tensor: values and dtype override,
+        # copy semantics for tensors and numpy arrays (later source edits do not show through),
+        # and when two cuda devices exist, that the result stays on the source device unless a
+        # device is given. Warnings are suppressed.
         expected = torch.autograd.Variable(torch.ByteTensor([1, 1]))
         # test data
         res1 = expected.new_tensor([1, 1])
@@ -2376,6 +2664,10 @@ class TestTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyCPU
     def test_as_tensor(self, device):
+        # [FUNCTION DOC] CPU only: check as_tensor against tensor: equal for Python data,
+        # TypeError for mixed-type or self-referential lists, no copy for a tensor of unchanged
+        # dtype and device, shared memory with numpy arrays of several dtypes, and a copy when
+        # dtype changes (or device, with cuda).
         # from python data
         x = [[0, 1], [2, 3]]
         self.assertEqual(torch.tensor(x), torch.as_tensor(x))
@@ -2437,6 +2729,9 @@ class TestTensorCreation(TestCase):
     @dtypesIfCPU(torch.float, torch.bfloat16, torch.float16)
     @dtypes(torch.float)
     def test_range(self, device, dtype):
+        # [FUNCTION DOC] Check the deprecated range function (inclusive end): equal to the out
+        # form, writing into a non-contiguous narrowed out view, negative step, and equal bounds.
+        # Warnings are suppressed; also runs for bfloat16 and float16 on CPU.
         res1 = torch.range(0, 1, device=device, dtype=dtype)
         res2 = torch.tensor((), device=device, dtype=dtype)
         torch.range(0, 1, device=device, dtype=dtype, out=res2)
@@ -2464,12 +2759,18 @@ class TestTensorCreation(TestCase):
 
     # TODO: this test should be updated
     def test_range_warning(self, device):
+        # [FUNCTION DOC] Check calling range emits exactly one warning.
         with warnings.catch_warnings(record=True) as w:
             torch.range(0, 10, device=device)
             self.assertEqual(len(w), 1)
 
     # TODO: this test should be updated
     def test_arange(self, device):
+        # [FUNCTION DOC] Broad arange check: matches Python range for 10000 elements, out into
+        # non-contiguous views, one-argument form, negative and equal bounds, float steps, bool
+        # inputs (giving int64), exclusive end semantics, rounding cases, resize warning for out,
+        # RuntimeError for an overlapping out, unsupported range for nan or infinite bounds,
+        # overflow error, and a stable length for a tricky float step.
         res = torch.tensor(range(10000), device=device)
         res1 = torch.arange(0, 10000, device=device)  # Use a larger number so vectorized code can be triggered
         res2 = torch.tensor([], dtype=torch.int64, device=device)
@@ -2605,6 +2906,9 @@ class TestTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyCPU
     def test_arange_inference(self, device):
+        # [FUNCTION DOC] CPU only: check the dtype arange infers from Python numbers and 0-D
+        # tensors: float32 if any argument is floating (even float64 tensors), otherwise int64
+        # (even int16 tensors).
         # end only
         self.assertIs(torch.float32, torch.arange(1.).dtype)
         self.assertIs(torch.float32, torch.arange(torch.tensor(1.)).dtype)
@@ -2637,6 +2941,9 @@ class TestTensorCreation(TestCase):
     # cannot call storage() on meta tensor
     @skipMeta
     def test_empty_strided(self, device):
+        # [FUNCTION DOC] Check empty_strided has the same shape and strides as an as_strided view
+        # over a storage of the same size, for several odd shape and stride pairs. Skipped for
+        # meta tensors.
         for shape in [(2, 3, 4), (0, 2, 0)]:
             # some of these cases are pretty strange, just verifying that if as_strided
             # allows them then empty_strided can as well.
@@ -2651,7 +2958,13 @@ class TestTensorCreation(TestCase):
                 self.assertEqual(empty_strided.stride(), as_strided.stride())
 
     def test_new_empty_strided(self, device):
+        # [FUNCTION DOC] Check new_empty_strided matches empty_strided on shape, stride, dtype
+        # and device for assorted sizes and strides, and raises RuntimeError when sizes and
+        # strides lengths differ.
         def _test(sizes, strides, dtype):
+            # [FUNCTION DOC] HELPER: Make a zeros source tensor of the dtype, call
+            # new_empty_strided with the sizes and strides and assert the result has the same
+            # shape, strides, dtype and device as empty_strided with the source dtype and device.
             x = torch.zeros(5, 5, dtype=dtype, device=device)
             result = x.new_empty_strided(sizes, strides)
             expected = torch.empty_strided(sizes, strides, dtype=x.dtype, device=x.device)
@@ -2681,6 +2994,8 @@ class TestTensorCreation(TestCase):
             x.new_empty_strided(size, stride, dtype=dtype, device=device)
 
     def test_strided_mismatched_stride_shape(self, device):
+        # [FUNCTION DOC] Check as_strided and as_strided_ raise RuntimeError about a mismatch in
+        # the length of strides and shape when the two lengths differ.
         for shape, strides in [((1, ), ()), ((1, 2), (1, ))]:
             with self.assertRaisesRegex(RuntimeError, "mismatch in length of strides and shape"):
                 torch.tensor(0.42, device=device).as_strided(shape, strides)
@@ -2689,6 +3004,8 @@ class TestTensorCreation(TestCase):
                 torch.tensor(0.42, device=device).as_strided_(shape, strides)
 
     def test_empty_tensor_props(self, device):
+        # [FUNCTION DOC] Check empty tensors with zero-size dims are contiguous, have the
+        # requested shape, and have the same strides as a tensor with zero sizes replaced by one.
         sizes = [(0,), (0, 3), (5, 0), (5, 0, 3, 0, 2), (0, 3, 0, 2), (0, 5, 0, 2, 0)]
         for size in sizes:
             x = torch.empty(tuple(size), device=device)
@@ -2700,6 +3017,8 @@ class TestTensorCreation(TestCase):
 
     @onlyNativeDeviceTypes
     def test_empty_overflow(self, device):
+        # [FUNCTION DOC] Check empty and empty_strided raise RuntimeError for sizes whose storage
+        # size or strides overflow.
         with self.assertRaisesRegex(RuntimeError, 'Storage size calculation overflowed'):
             torch.empty([2, 4, 2**29, 2**29], dtype=torch.float64)
         with self.assertRaisesRegex(RuntimeError, 'Storage size calculation overflowed'):
@@ -2710,6 +3029,9 @@ class TestTensorCreation(TestCase):
             torch.empty([0, 4, 2305843009213693952], dtype=torch.float32)
 
     def test_eye(self, device):
+        # [FUNCTION DOC] Check eye for all dtypes except bfloat16: negative n or m raises
+        # RuntimeError, and one-argument and two-argument forms equal a zero matrix with ones on
+        # the diagonal, also through the out form.
         for dtype in all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16):
             if dtype == torch.bfloat16:
                 continue
@@ -2745,6 +3067,9 @@ class TestTensorCreation(TestCase):
     @precisionOverride({torch.float: 1e-8, torch.double: 1e-10})
     @dtypes(*floating_and_complex_types())
     def test_linspace_vs_numpy(self, device, dtype):
+        # [FUNCTION DOC] Compare linspace with numpy for floating and complex dtypes over many
+        # step counts (up to 4 million), requiring exact first and last values, with tight
+        # tolerance overrides.
         start = -0.0316082797944545745849609375 + (0.8888888888j if dtype.is_complex else 0)
         end = .0315315723419189453125 + (0.444444444444j if dtype.is_complex else 0)
 
@@ -2758,6 +3083,8 @@ class TestTensorCreation(TestCase):
 
     @dtypes(*integral_types())
     def test_linspace_vs_numpy_integral(self, device, dtype):
+        # [FUNCTION DOC] Compare linspace with numpy for integer dtypes between 1 and 127 with 25
+        # and 50 steps, requiring exact first and last values.
         start = 1
         end = 127
 
@@ -2770,10 +3097,17 @@ class TestTensorCreation(TestCase):
             self.assertTrue(t[steps - 1].item() == a[steps - 1])
 
     def _test_linspace_logspace_complex_helper(self, torch_fn, np_fn, device, dtype):
+        # [FUNCTION DOC] HELPER: Pick a random complex start and an end shifted by a random
+        # amount, then for many step counts compare the given torch function with the given numpy
+        # function using a nested comparison helper. Only linspace is passed by the caller in
+        # this file.
         start = torch.randn(1, dtype=dtype).item()
         end = (start + torch.randn(1, dtype=dtype) + random.randint(5, 15)).item()
 
         def test_fn(torch_fn, numpy_fn, steps):
+            # [FUNCTION DOC] HELPER: Call the torch and numpy functions with the outer start and
+            # end and the given step count, move the torch result to CPU and assert it equals the
+            # numpy result.
             t = torch_fn(start, end, steps, device=device)
             a = numpy_fn(start, end, steps, dtype=torch_to_numpy_dtype_dict[dtype])
             t = t.cpu()
@@ -2784,17 +3118,24 @@ class TestTensorCreation(TestCase):
 
     @dtypes(torch.complex64)
     def test_linspace_vs_numpy_complex(self, device, dtype):
+        # [FUNCTION DOC] Run the linspace complex helper for complex64 using linspace and
+        # numpy linspace.
         self._test_linspace_logspace_complex_helper(torch.linspace, np.linspace,
                                                     device, dtype)
 
     @dtypes(torch.complex64)
     def test_logspace_vs_numpy_complex(self, device, dtype):
+        # [FUNCTION DOC] Run the linspace complex helper for complex64 using logspace and
+        # numpy logspace.
         self._test_linspace_logspace_complex_helper(torch.logspace, np.logspace,
                                                     device, dtype)
 
     @precisionOverride({torch.float: 1e-6, torch.double: 1e-10})
     @dtypes(*floating_types())
     def test_logspace_vs_numpy(self, device, dtype):
+        # [FUNCTION DOC] Compare logspace with numpy for floating dtypes over many step counts
+        # (up to 4 million) with tight precision overrides, also requiring matching first and
+        # last elements.
         start = -0.0316082797944545745849609375
         end = .0315315723419189453125
 
@@ -2809,6 +3150,10 @@ class TestTensorCreation(TestCase):
     @onlyCUDA
     @largeTensorTest('16GB')
     def test_range_factories_64bit_indexing(self, device):
+        # [FUNCTION DOC] CUDA only, needs 16GB: check arange, linspace and logspace with more
+        # than 2 to the 31 elements return the right last value (index math must be 64-bit). On
+        # ROCm, also tries sizes just above and far above 2 to the 32 when free memory allows,
+        # checking the int32 wrapped trailing values.
         bigint = 2 ** 31 + 1
         t = torch.arange(bigint, dtype=torch.long, device=device)
         self.assertEqual(t[-1].item(), bigint - 1)
@@ -2841,6 +3186,9 @@ class TestTensorCreation(TestCase):
     @expectedFailureMeta  # RuntimeError: The tensor has a non-zero number of elements
     @onlyNativeDeviceTypes
     def test_tensor_ctor_device_inference(self, device):
+        # [FUNCTION DOC] Check that tensor, as_tensor and sparse_coo_tensor keep the device of
+        # tensor inputs unless a cpu input is given under a cuda device context, in which case
+        # the result stays on cpu. Expected to fail on meta device.
         torch_device = torch.device(device)
         values = torch.tensor((1, 2, 3), device=device)
 
@@ -2877,6 +3225,9 @@ class TestTensorCreation(TestCase):
     @onlyCUDA
     @onlyNativeDeviceTypes
     def test_new_tensor_device(self, device):
+        # [FUNCTION DOC] CUDA only: check new_tensor's device for all combinations of cpu and
+        # device data as source and as argument: no device argument keeps the source tensor's
+        # device, an explicit device argument wins.
         torch_device = torch.device(device)
         cpu_device = torch.device('cpu')
         tensor = torch.tensor((1, 2, 3), device=device)
@@ -2892,6 +3243,11 @@ class TestTensorCreation(TestCase):
                     self.assertEqual(left.new_tensor(right, device=device_arg).device, device_arg)
 
     def _test_signal_window_functions(self, name, dtype, device, **kwargs):
+        # [FUNCTION DOC] HELPER: Compare a torch window function (named by prefix plus window)
+        # against scipy signal windows for several sizes in periodic and symmetric forms.
+        # Non-floating dtypes must raise RuntimeError mentioning floating point; sparse layout
+        # raises RuntimeError; requires_grad is honored. Extra keyword arguments are forwarded
+        # and also used as scipy parameters.
         import scipy.signal as signal
 
         torch_method = getattr(torch, name + '_window')
@@ -2929,6 +3285,8 @@ class TestTensorCreation(TestCase):
     @dtypes(torch.float, torch.double, torch.long)
     @parametrize("window", ['hann', 'hamming', 'bartlett', 'blackman'])
     def test_signal_window_functions(self, device, dtype, window):
+        # [FUNCTION DOC] Run the signal window helper for hann, hamming, bartlett and
+        # blackman windows.
         self._test_signal_window_functions(window, dtype, device)
 
     @onlyNativeDeviceTypes
@@ -2937,10 +3295,16 @@ class TestTensorCreation(TestCase):
     @dtypesIfCUDA(torch.float, torch.double, torch.bfloat16, torch.half, torch.long)
     @dtypes(torch.float, torch.double, torch.long, torch.bfloat16, torch.float16)
     def test_kaiser_window(self, device, dtype):
+        # [FUNCTION DOC] Run the signal window helper fifty times for the kaiser window with a
+        # random beta between 0 and 30.
         for _ in range(50):
             self._test_signal_window_functions('kaiser', dtype, device, beta=random.random() * 30)
 
     def _test_signal_windows_functions(self, name, dtype, device, **kwargs):
+        # [FUNCTION DOC] HELPER: Same idea as the window helper above but for functions in the
+        # signal windows module, which take a symmetric flag (opposite of periodic). Checks
+        # non-floating dtypes raise RuntimeError, values match scipy without requiring equal
+        # dtype, and requires_grad works.
         import scipy.signal as signal
 
         torch_method = getattr(torch.signal.windows, name)
@@ -2963,6 +3327,8 @@ class TestTensorCreation(TestCase):
     @dtypes(torch.float, torch.double)
     @parametrize("window", ['bartlett', 'blackman', 'cosine', 'hamming', 'hann', 'nuttall'])
     def test_signal_windows_functions(self, device, dtype, window):
+        # [FUNCTION DOC] Run the signal windows helper for bartlett, blackman, cosine, hamming,
+        # hann and nuttall windows.
         self._test_signal_windows_functions(window, dtype, device)
 
     # torch.signal.windows.kaiser
@@ -2970,10 +3336,16 @@ class TestTensorCreation(TestCase):
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found")
     @dtypes(torch.float, torch.double)
     def test_kaiser(self, device, dtype):
+        # [FUNCTION DOC] Run the signal windows helper fifty times for kaiser with a random beta.
         for _ in range(50):
             self._test_signal_windows_functions('kaiser', dtype, device, beta=random.random() * 30)
 
     def test_tensor_factories_empty(self, device):
+        # [FUNCTION DOC] Check that every factory (zeros, full, ones, empty, empty_strided,
+        # randint, rand, randn, their like variants, arange, eye, linspace, logspace,
+        # randperm, window functions, and tensor from nested empty lists) creates empty
+        # tensors of the right shape for zero-size shapes and many dtypes, with errors for
+        # unsupported dtype combinations.
         # ensure we can create empty tensors from each factory function
         shapes = [(5, 0, 1), (0,), (0, 0, 1, 0, 2, 0, 0)]
 
@@ -3025,6 +3397,8 @@ class TestTensorCreation(TestCase):
 
     @onlyCUDA
     def test_tensor_factory_gpu_type_inference(self, device):
+        # [FUNCTION DOC] CUDA only: tensor dtype follows set_default_dtype and device is cuda
+        # while the default tensor type is a cuda double type.
         with set_default_tensor_type(torch.cuda.DoubleTensor):
             with set_default_dtype(torch.float32):
                 self.assertIs(torch.float32, torch.tensor(0.).dtype)
@@ -3035,6 +3409,8 @@ class TestTensorCreation(TestCase):
 
     @onlyCUDA
     def test_tensor_factory_gpu_type(self, device):
+        # [FUNCTION DOC] CUDA only: zeros uses the dtype and cuda device of the default tensor
+        # type set to a cuda float or double type.
         with set_default_tensor_type(torch.cuda.FloatTensor):
             x = torch.zeros((5, 5))
             self.assertIs(torch.float32, x.dtype)
@@ -3047,12 +3423,16 @@ class TestTensorCreation(TestCase):
     @skipCPUIf(True, 'compares device with cpu')
     @dtypes(torch.int, torch.long, torch.float, torch.double)
     def test_arange_device_vs_cpu(self, device, dtype):
+        # [FUNCTION DOC] Non-CPU only: arange on the device equals arange on cpu for int, long,
+        # float and double.
         cpu_tensor = torch.arange(0, 10, dtype=dtype, device='cpu')
         device_tensor = torch.arange(0, 10, dtype=dtype, device=device)
         self.assertEqual(cpu_tensor, device_tensor)
 
     @dtypes(torch.bfloat16, torch.float16)
     def test_arange_lowp(self, device, dtype):
+        # [FUNCTION DOC] Check arange for bfloat16 and float16, with and without a step, against
+        # explicit tensors.
         ref_tensor = torch.tensor([0, 1, 2, 3], dtype=dtype, device=device)
         f16_tensor = torch.arange(0, 4, dtype=dtype, device=device)
         self.assertEqual(ref_tensor, f16_tensor)
@@ -3065,6 +3445,11 @@ class TestTensorCreation(TestCase):
     @dtypes(*all_types_and_complex_and(torch.bfloat16))
     @dtypesIfCUDA(*all_types_and_complex_and(torch.bfloat16))
     def test_linspace(self, device, dtype):
+        # [FUNCTION DOC] Broad linspace check across dtypes: matches out form, small and large
+        # exact integer ranges, non-contiguous vectorized output, negative steps error, one and
+        # zero steps, missing steps TypeError, inferred-dtype RuntimeError for float with complex
+        # endpoints, value accuracy with device tolerances, start above end, monotonic result for
+        # a million steps, and writing to a narrowed out view.
         _from = random.random()
         to = _from + random.random()
         res1 = torch.linspace(_from, to, 137, device=device, dtype=dtype)
@@ -3144,6 +3529,9 @@ class TestTensorCreation(TestCase):
         self.assertEqual(x, torch.tensor(((0, 0, 1), (0, 2, 3)), device=device, dtype=dtype), atol=0, rtol=0)
 
     def _test_linspace_logspace_deduction_helper(self, fn, device):
+        # [FUNCTION DOC] HELPER: For several real and complex start and end pairs, check the
+        # function (linspace or logspace) returns complex64 if either endpoint is complex,
+        # otherwise float32.
         for start, end in [(1, 2), (1., 2), (1., -2.), (1j, 2j), (0., 2j), (1j, 2)]:
             dtype = torch.float32
             if isinstance(start, complex) or isinstance(end, complex):
@@ -3152,10 +3540,12 @@ class TestTensorCreation(TestCase):
             self.assertEqual(fn(start, end, steps=100, device=device).dtype, dtype)
 
     def test_linspace_deduction(self, device):
+        # [FUNCTION DOC] Check dtype deduction of linspace from its endpoints.
         # Test deduction from input parameters.
         self._test_linspace_logspace_deduction_helper(torch.linspace, device)
 
     def test_logspace_deduction(self, device):
+        # [FUNCTION DOC] Check dtype deduction of logspace from its endpoints.
         # Test deduction from input parameters.
         self._test_linspace_logspace_deduction_helper(torch.logspace, device)
 
@@ -3173,6 +3563,8 @@ class TestTensorCreation(TestCase):
 
     # Compares linspace device vs. cpu
     def _test_linspace(self, device, dtype, steps):
+        # [FUNCTION DOC] HELPER: Compare linspace from zero to ten on the device versus default
+        # cpu, with dtype not required to match.
         a = torch.linspace(0, 10, steps=steps, dtype=dtype, device=device)
         b = torch.linspace(0, 10, steps=steps)
         self.assertEqual(a, b, exact_dtype=False)
@@ -3182,22 +3574,30 @@ class TestTensorCreation(TestCase):
     @precisionOverride({torch.half: 0.0039 + LINSPACE_LOGSPACE_EXTRA_EPS})
     @dtypes(*floating_and_complex_types_and(torch.half, torch.bfloat16))
     def test_linspace_device_vs_cpu(self, device, dtype):
+        # [FUNCTION DOC] Compare device and cpu linspace for ten steps across float, complex,
+        # half and bfloat16; skipped on cpu. Uses a precision override for half.
         self._test_linspace(device, dtype, steps=10)
 
     @skipCPUIf(True, "compares with CPU")
     @dtypes(*floating_and_complex_types_and(torch.half, torch.bfloat16))
     def test_linspace_special_steps(self, device, dtype):
+        # [FUNCTION DOC] Compare device and cpu linspace for the special step counts zero and
+        # one; skipped on cpu.
         for steps in self.LINSPACE_LOGSPACE_SPECIAL_STEPS:
             self._test_linspace(device, dtype, steps=steps)
 
     # Compares logspace device vs cpu
     def _test_logspace(self, device, dtype, steps):
+        # [FUNCTION DOC] HELPER: Compare logspace with default base from 1 to 1.1 on the device
+        # versus cpu, with dtype not required to match.
         a = torch.logspace(1, 1.1, steps=steps, dtype=dtype, device=device)
         b = torch.logspace(1, 1.1, steps=steps)
         self.assertEqual(a, b, exact_dtype=False)
 
     # Compares logspace device vs cpu
     def _test_logspace_base2(self, device, dtype, steps):
+        # [FUNCTION DOC] HELPER: Compare logspace with base 2 from 1 to 1.1 on the device versus
+        # cpu, with dtype not required to match.
         a = torch.logspace(1, 1.1, steps=steps, base=2, dtype=dtype, device=device)
         b = torch.logspace(1, 1.1, steps=steps, base=2)
         self.assertEqual(a, b, exact_dtype=False)
@@ -3208,6 +3608,8 @@ class TestTensorCreation(TestCase):
     @dtypesIfCUDA(torch.half, torch.float, torch.double)
     @dtypes(torch.float, torch.double)
     def test_logspace_device_vs_cpu(self, device, dtype):
+        # [FUNCTION DOC] Compare device and cpu logspace for ten steps (half also on cuda);
+        # skipped on cpu.
         self._test_logspace(device, dtype, steps=10)
 
     # See NOTE [Linspace+Logspace precision override]
@@ -3216,12 +3618,16 @@ class TestTensorCreation(TestCase):
     @dtypesIfCUDA(torch.half, torch.float, torch.double)
     @dtypes(torch.float, torch.double)
     def test_logspace_base2(self, device, dtype):
+        # [FUNCTION DOC] Compare device and cpu logspace with base 2 for ten steps; skipped
+        # on cpu.
         self._test_logspace_base2(device, dtype, steps=10)
 
     @skipCPUIf(True, "compares with CPU")
     @dtypesIfCUDA(torch.half, torch.float, torch.double)
     @dtypes(torch.float, torch.double)
     def test_logspace_special_steps(self, device, dtype):
+        # [FUNCTION DOC] Compare device and cpu logspace, default and base 2, for the special
+        # step counts zero and one; skipped on cpu.
         for steps in self.LINSPACE_LOGSPACE_SPECIAL_STEPS:
             self._test_logspace(device, dtype, steps=steps)
             self._test_logspace_base2(device, dtype, steps=steps)
@@ -3230,6 +3636,10 @@ class TestTensorCreation(TestCase):
     @dtypesIfCUDA(*integral_types_and(torch.half, torch.bfloat16, torch.float32, torch.float64) if TEST_WITH_ROCM else
                   all_types_and(torch.half, torch.bfloat16))
     def test_logspace(self, device, dtype):
+        # [FUNCTION DOC] Broad logspace check across dtypes: matches out form, negative steps
+        # error, missing steps TypeError, one step, inferred-dtype RuntimeError for float
+        # with complex endpoints, exact values for base 2 (tolerance only off cpu), and
+        # non-default bases.
         _from = random.random()
         to = _from + random.random()
         res1 = torch.logspace(_from, to, 137, device=device, dtype=dtype)
@@ -3281,6 +3691,9 @@ class TestTensorCreation(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.half, torch.float, torch.double)
     def test_full_inference(self, device, dtype):
+        # [FUNCTION DOC] With each of half, float and double set as the default dtype, check full
+        # infers bool for a bool fill, int64 for an int fill, the default dtype for a float fill,
+        # and the matching complex dtype for a complex fill.
         size = (2, 2)
 
         with set_default_dtype(dtype):
@@ -3302,6 +3715,9 @@ class TestTensorCreation(TestCase):
             self.assertEqual(t.dtype, ctype)
 
     def test_full_out(self, device):
+        # [FUNCTION DOC] Check full with out: a dtype that conflicts with out raises
+        # RuntimeError, and without explicit dtype the result takes out's dtype instead of the
+        # inferred one.
         size = (5,)
         o = torch.empty(size, device=device, dtype=torch.long)
 
@@ -3317,6 +3733,8 @@ class TestTensorCreation(TestCase):
     # when a copy of it is being created.
     # see issue #47160
     def test_tensor_from_non_writable_numpy(self, device):
+        # [FUNCTION DOC] Regression test: building a tensor from a non-writable numpy array emits
+        # no warnings, because a copy is made.
         with warnings.catch_warnings(record=True) as w:
             a = np.arange(5.)
             a.flags.writeable = False
@@ -3327,6 +3745,10 @@ class TestTensorCreation(TestCase):
     @parametrize('shared', [True, False])
     @unittest.skipIf(IS_WINDOWS, "NamedTemporaryFile on windows")
     def test_from_file(self, device, shared):
+        # [FUNCTION DOC] CPU only, parametrized on shared: write a float64 array to a
+        # temporary file, map it with from_file and check the storage filename is set only
+        # when shared, the values match, and UntypedStorage from_file reports the same
+        # filename. Skipped on Windows.
         dtype = torch.float64
         t = torch.randn(2, 5, dtype=dtype, device=device)
         with tempfile.NamedTemporaryFile() as f:
@@ -3341,23 +3763,37 @@ class TestTensorCreation(TestCase):
 
     @onlyCPU
     def test_storage_filename(self, device):
+        # [FUNCTION DOC] CPU only: check a regular tensor's storage has no filename.
         t = torch.randn(2, 5, device=device)
         self.assertIsNone(t.untyped_storage().filename)
 
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     def test_refs_tensor(self, device, dtype):
+        # [FUNCTION DOC] Check the reference implementation of tensor given an empty list gives
+        # the same result as torch.tensor, for many dtypes.
         self.assertEqual(torch._refs.tensor([], device=device, dtype=dtype), torch.tensor([], device=device, dtype=dtype))
 
 
 # Class for testing random tensor creation ops, like torch.randint
 class TestRandomTensorCreation(TestCase):
+    # [CLASS DOC] Device-generic tests for random tensor creation ops: normal, uniform_, random_
+    # with negative values, randint, randn, rand and randperm. exact_dtype is True.
     exact_dtype = True
 
     # TODO: add torch.complex64, torch.complex128
     @dtypes(torch.float, torch.double)
     def test_normal(self, device, dtype):
+        # [FUNCTION DOC] Check normal sampling for float and double through a nested helper,
+        # using real parts and imaginary parts for complex dtypes; the in-place, tensor mean,
+        # tensor std, scalar forms, out forms, zero std, empty tensors and full-shape forms are
+        # covered. For complex dtypes also check that a complex std raises RuntimeError.
+        # Statistical checks use loose tolerances.
 
         def helper(self, device, dtype, ptype, t_transform, std_transform):
+            # [FUNCTION DOC] HELPER: Run normal_ and torch.normal in all mean and std argument
+            # combinations (tensor or scalar, with and without out, zero std) and assert dtype,
+            # device, sample mean and sample std using the supplied transform for the tested
+            # component and std scaling function.
             q = torch.empty(100, 100, dtype=dtype, device=device)
 
             q.normal_()
@@ -3505,6 +3941,8 @@ class TestRandomTensorCreation(TestCase):
 
     # Ensure that normal raises appropriate error when `std` < 0
     def test_normal_std_error(self, device):
+        # [FUNCTION DOC] Check normal raises RuntimeError for a negative scalar std, and for a
+        # negative tensor std unless on GPU where the error is raised asynchronously.
         a = torch.tensor(0, dtype=torch.float32, device=device)
         std = torch.tensor(-1, dtype=torch.float32, device=device)
 
@@ -3521,6 +3959,11 @@ class TestRandomTensorCreation(TestCase):
     @dtypes(torch.float, torch.double, torch.half)
     @dtypesIfCUDA(torch.float, torch.double, torch.half, torch.bfloat16)
     def test_uniform_from_to(self, device, dtype):
+        # [FUNCTION DOC] Check uniform_ over pairs of bounds from huge negative to huge positive
+        # values: bounds outside the dtype range are skipped, reversed bounds and an overflowing
+        # range raise RuntimeError, and otherwise min and max land within a tenth of the range at
+        # each end (skipped for bfloat16, half on cpu, and all-nan results). Expected failure
+        # under Dynamo.
         size = 2000
         alpha = 0.1
 
@@ -3573,6 +4016,8 @@ class TestRandomTensorCreation(TestCase):
                             self.assertTrue((to_ - delta) <= double_t.max() < to_)
 
     def test_random_neg_values(self, device):
+        # [FUNCTION DOC] Check random_ with negative bounds on signed dtypes keeps values between
+        # the lower bound and the upper bound minus one.
         SIZE = 10
         signed_dtypes = [torch.double, torch.float, torch.long, torch.int, torch.short]
         for dtype in signed_dtypes:
@@ -3584,6 +4029,9 @@ class TestRandomTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyCPU
     def test_randint_inference(self, device):
+        # [FUNCTION DOC] CPU only: check randint output dtype is int64 by default and with layout
+        # or generator, follows dtype or out when given; check errors for empty or reversed
+        # ranges, float bound (TypeError), and bounds out of range for int16 and uint32.
         size = (2, 1)
         for args in [(3,), (1, 3)]:  # (low,) and (low, high)
             self.assertIs(torch.int64, torch.randint(*args, size=size).dtype)
@@ -3616,9 +4064,14 @@ class TestRandomTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyCPU
     def test_randint(self, device):
+        # [FUNCTION DOC] CPU only: with the default generator and a new generator, check randint
+        # results with the same seed are identical for the low/high and high-only forms and for
+        # out forms, and that values lie within zero and five.
         SIZE = 100
 
         def seed(generator):
+            # [FUNCTION DOC] HELPER: Seed the global generator when none is given, otherwise seed
+            # the given generator, with a fixed seed; returns the generator.
             if generator is None:
                 torch.manual_seed(123456)
             else:
@@ -3648,11 +4101,16 @@ class TestRandomTensorCreation(TestCase):
 
     @unittest.skipIf(IS_FBCODE or IS_SANDCASTLE, "For fb compatibility random not changed in fbcode")
     def test_randint_distribution(self, device):
+        # [FUNCTION DOC] Check that randint over a range of three quarters of 2 to the 32, with a
+        # million samples, is evenly spread over eight bins within a statistical error bound.
+        # Skipped in fbcode.
         size = 1_000_000
         n_max = int(0.75 * 2 ** 32)
         n_bins = 8
 
         def bin(index, max_size):
+            # [FUNCTION DOC] HELPER: Map an index to its bin number by integer division of the
+            # range into the outer number of bins.
             return index // (max_size // n_bins)
         res = torch.randint(n_max, (size,), device=device)
         # histogram implemented for float only
@@ -3667,6 +4125,8 @@ class TestRandomTensorCreation(TestCase):
     @dtypes(torch.half, torch.float, torch.bfloat16, torch.double,
             torch.complex32, torch.complex64, torch.complex128)
     def test_randn(self, device, dtype):
+        # [FUNCTION DOC] Check randn with the same seed gives the same values through the out
+        # form, for sizes 0 and 100 and half, bfloat16, float, double and complex dtypes.
         SIZE = 100
         for size in [0, SIZE]:
             torch.manual_seed(123456)
@@ -3678,6 +4138,8 @@ class TestRandomTensorCreation(TestCase):
 
     @dtypes(torch.float, torch.double, torch.complex32, torch.complex64, torch.complex128)
     def test_rand(self, device, dtype):
+        # [FUNCTION DOC] Check rand with the same seed gives the same values through the out
+        # form, for sizes 0 and 100 and float, double and complex dtypes.
         SIZE = 100
         for size in [0, SIZE]:
             torch.manual_seed(123456)
@@ -3688,6 +4150,10 @@ class TestRandomTensorCreation(TestCase):
             self.assertEqual(res1, res2)
 
     def test_randperm(self, device):
+        # [FUNCTION DOC] Broad randperm check: for several n and dtypes values equal the out form
+        # under a forked RNG and form a permutation, default dtype is long, n of zero gives an
+        # empty tensor, RuntimeError when n is too large for the dtype, and out being
+        # non-contiguous works.
         if device == 'cpu' or device == 'meta':
             rng_device = None
         else:
@@ -3750,10 +4216,15 @@ class TestRandomTensorCreation(TestCase):
     @largeTensorTest("40GB", "cuda")
     @slowTest
     def test_randperm_large(self, device):
+        # [FUNCTION DOC] Large-memory slow test: randperm of 700 million items is checked to be
+        # evenly distributed by deciles for the first million entries (to detect skew from 32-bit
+        # random numbers).
         # Test even distribution where rand32 might produce skewed "uniform" distribution
         # n_items is chosen to not evenly divide 2**32 and be sufficiently large
         # to easily detect skew
         def decile(index, collection_size):
+            # [FUNCTION DOC] HELPER: Map an index to its decile by integer division of the
+            # collection size into ten parts.
             return index // (collection_size // 10)
 
         n_items = 700_000_000
@@ -3772,6 +4243,10 @@ class TestRandomTensorCreation(TestCase):
     @onlyCUDA
     @unittest.skipIf(IS_FBCODE or IS_SANDCASTLE, "Produces inconsistent errors when run in fbcode.")
     def test_randperm_device_compatibility(self, device):
+        # [FUNCTION DOC] CUDA only: check randperm and randint accept generators on matching
+        # device types (including a different cuda index) and for n of zero any generator; a cpu
+        # generator for a cuda output or a cuda generator for a cpu output raises RuntimeError
+        # about device type, also with out. Skipped in fbcode.
         cuda_gen = torch.Generator(device='cuda')
         cpu_gen = torch.Generator(device='cpu')
 
@@ -3806,10 +4281,14 @@ class TestRandomTensorCreation(TestCase):
 
 # Class for testing *like ops, like torch.ones_like
 class TestLikeTensorCreation(TestCase):
+    # [CLASS DOC] Device-generic tests for the like creation ops (ones_like, zeros_like,
+    # empty_like, full_like, rand_like, randn_like, randint_like). exact_dtype is True.
     exact_dtype = True
 
     # TODO: this test should be updated
     def test_ones_like(self, device):
+        # [FUNCTION DOC] Check ones_like of a float tensor and of a bool tensor equals the
+        # expected ones.
         expected = torch.ones(100, 100, device=device)
 
         res1 = torch.ones_like(expected)
@@ -3823,6 +4302,8 @@ class TestLikeTensorCreation(TestCase):
     # TODO: this test should be updated
     @onlyCPU
     def test_empty_like(self, device):
+        # [FUNCTION DOC] CPU only: check empty_like keeps shape and type string for an empty
+        # tensor, a float matrix and an int tensor (wrapped in the legacy Variable wrapper).
         x = torch.autograd.Variable(torch.tensor([]))
         y = torch.autograd.Variable(torch.randn(4, 4))
         z = torch.autograd.Variable(torch.IntTensor([1, 2, 3]))
@@ -3831,6 +4312,7 @@ class TestLikeTensorCreation(TestCase):
             self.assertEqualTypeString(torch.empty_like(a), a)
 
     def test_zeros_like(self, device):
+        # [FUNCTION DOC] Check zeros_like of a zeros tensor equals the expected zeros.
         expected = torch.zeros((100, 100,), device=device)
 
         res1 = torch.zeros_like(expected)
@@ -3838,6 +4320,8 @@ class TestLikeTensorCreation(TestCase):
 
     @deviceCountAtLeast(2)
     def test_zeros_like_multiple_device(self, devices):
+        # [FUNCTION DOC] With at least two devices, check zeros_like of a tensor on the second
+        # device is equal to zeros created on the first device.
         expected = torch.zeros(100, 100, device=devices[0])
         x = torch.randn(100, 100, device=devices[1], dtype=torch.float32)
         output = torch.zeros_like(x)
@@ -3845,6 +4329,8 @@ class TestLikeTensorCreation(TestCase):
 
     @deviceCountAtLeast(2)
     def test_ones_like_multiple_device(self, devices):
+        # [FUNCTION DOC] With at least two devices, check ones_like of a tensor on the second
+        # device is equal to ones created on the first device.
         expected = torch.ones(100, 100, device=devices[0])
         x = torch.randn(100, 100, device=devices[1], dtype=torch.float32)
         output = torch.ones_like(x)
@@ -3854,6 +4340,8 @@ class TestLikeTensorCreation(TestCase):
     # tensor.
     @onlyNativeDeviceTypes
     def test_full_like_inference(self, device):
+        # [FUNCTION DOC] Check full_like uses the dtype of the like tensor (long) even for a
+        # float fill value, unless an explicit dtype (complex64) is given.
         size = (2, 2)
         like = torch.empty((5,), device=device, dtype=torch.long)
 
@@ -3862,9 +4350,14 @@ class TestLikeTensorCreation(TestCase):
                          torch.complex64)
 
     def test_rand_like(self, device):
+        # [FUNCTION DOC] Check rand_like with the global and a device generator: same seed gives
+        # equal results, values lie in zero to one, shapes match; separate generators with equal
+        # seeds agree and a different seed or an advanced generator gives different values.
         like_tensor = torch.zeros(100, 100, device=device)
 
         def seed(generator):
+            # [FUNCTION DOC] HELPER: Seed the global generator when none is given, otherwise seed
+            # the given generator, with a fixed seed; returns the generator.
             if generator is None:
                 torch.manual_seed(123456)
             else:
@@ -3902,9 +4395,14 @@ class TestLikeTensorCreation(TestCase):
         self.assertNotEqual(tensor0, tensor1)
 
     def test_randn_like(self, device):
+        # [FUNCTION DOC] Check randn_like with the global and a device generator: same seed gives
+        # equal results with matching shapes; generators with equal seeds agree and differently
+        # seeded or advanced generators differ.
         like_tensor = torch.zeros(100, 100, device=device)
 
         def seed(generator):
+            # [FUNCTION DOC] HELPER: Seed the global generator when none is given, otherwise seed
+            # the given generator, with a fixed seed; returns the generator.
             if generator is None:
                 torch.manual_seed(123456)
             else:
@@ -3941,9 +4439,15 @@ class TestLikeTensorCreation(TestCase):
 
 
     def test_randint_like(self, device):
+        # [FUNCTION DOC] Check randint_like (low and high form, and high only form) with the
+        # global and a device generator: same seed gives equal results in the range zero to
+        # ten, shapes match; equal seeded generators agree, differently seeded or advanced
+        # generators differ.
         like_tensor = torch.zeros(100, 100, device=device, dtype=torch.long)
 
         def seed(generator):
+            # [FUNCTION DOC] HELPER: Seed the global generator when none is given, otherwise seed
+            # the given generator, with a fixed seed; returns the generator.
             if generator is None:
                 torch.manual_seed(123456)
             else:
@@ -3999,13 +4503,23 @@ SIZE = 5
 SHAPE = (SIZE,)
 
 def may_require_grad(dtype):
+    # [FUNCTION DOC] HELPER: Return True if the dtype is floating point or complex, meaning a
+    # tensor of that dtype may require gradients.
     return dtype.is_floating_point or dtype.is_complex
 
 def get_dtype_size(dtype):
+    # [FUNCTION DOC] HELPER: Return the size in bytes of one element of the dtype, as an integer.
     return int(torch.empty((), dtype=dtype).element_size())
 
 class TestBufferProtocol(TestCase):
+    # [CLASS DOC] Tests for frombuffer, which builds a tensor sharing memory with a Python buffer
+    # object. Each test compares against numpy frombuffer using the module-level SIZE and SHAPE.
     def _run_test(self, shape, dtype, count=-1, first=0, offset=None, **kwargs):
+        # [FUNCTION DOC] HELPER: Create a random numpy array of the shape and dtype, wrap it in a
+        # memoryview, and call both frombuffer functions with the count and offset (offset
+        # defaults to the first element index times the element size; extra keywords go to the
+        # torch version only). Asserts equal values and the same data address; returns the numpy
+        # array and the torch tensor.
         numpy_dtype = torch_to_numpy_dtype_dict[dtype]
 
         if offset is None:
@@ -4024,13 +4538,19 @@ class TestBufferProtocol(TestCase):
 
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_same_type(self, device, dtype):
+        # [FUNCTION DOC] Check frombuffer matches numpy for scalar, 1-D and 2-D arrays of
+        # each dtype.
         self._run_test((), dtype)
         self._run_test((4,), dtype)
         self._run_test((10, 10), dtype)
 
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_requires_grad(self, device, dtype):
+        # [FUNCTION DOC] Check frombuffer honors the requires_grad keyword for arrays of each
+        # dtype: true is only valid for floating or complex dtypes, and false works for all.
         def _run_test_and_check_grad(requires_grad, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Run the buffer test helper with requires_grad added to the
+            # keywords and assert the resulting tensor has that requires_grad value.
             kwargs["requires_grad"] = requires_grad
             _, tensor = self._run_test(*args, **kwargs)
             self.assertTrue(tensor.requires_grad == requires_grad)
@@ -4045,6 +4565,7 @@ class TestBufferProtocol(TestCase):
 
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_with_offset(self, device, dtype):
+        # [FUNCTION DOC] Check frombuffer with every valid element offset in a short array.
         # Offset should be valid whenever there is, at least,
         # one remaining element
         for i in range(SIZE):
@@ -4052,6 +4573,8 @@ class TestBufferProtocol(TestCase):
 
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_with_count(self, device, dtype):
+        # [FUNCTION DOC] Check frombuffer with every valid count from minus one to the array
+        # length, except zero.
         # Count should be valid for any valid in the interval
         # [-1, len(input)], except for 0
         for i in range(-1, SIZE + 1):
@@ -4060,6 +4583,8 @@ class TestBufferProtocol(TestCase):
 
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_with_count_and_offset(self, device, dtype):
+        # [FUNCTION DOC] Check frombuffer with explicit counts, explicit offsets, and every valid
+        # pair of count and offset.
         # Explicit default count [-1, 1, 2, ..., len]
         for i in range(-1, SIZE + 1):
             if i != 0:
@@ -4076,6 +4601,9 @@ class TestBufferProtocol(TestCase):
 
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_invalid_positional_args(self, device, dtype):
+        # [FUNCTION DOC] Check frombuffer raises ValueError with specific messages for an empty
+        # buffer, count zero, a negative offset, an offset at the buffer end, a non-multiple
+        # offset, and a count that runs past the buffer end.
         bytes = get_dtype_size(dtype)
         in_bytes = SIZE * bytes
         # Empty array
@@ -4113,6 +4641,9 @@ class TestBufferProtocol(TestCase):
 
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_shared_buffer(self, device, dtype):
+        # [FUNCTION DOC] Check the tensor from frombuffer shares memory with the array: writing
+        # through the tensor changes the array (full range and for many counts and offsets), and
+        # changing an array element is visible in the tensor.
         x = make_tensor((1,), dtype=dtype, device=device)
         # Modify the whole tensor
         arr, tensor = self._run_test(SHAPE, dtype)
@@ -4140,12 +4671,16 @@ class TestBufferProtocol(TestCase):
 
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_not_a_buffer(self, device, dtype):
+        # [FUNCTION DOC] Check frombuffer on a plain list raises ValueError saying the object
+        # does not implement the buffer protocol.
         with self.assertRaisesRegex(ValueError,
                                     r"object does not implement Python buffer protocol."):
             torch.frombuffer([1, 2, 3, 4], dtype=dtype)
 
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_non_writable_buffer(self, device, dtype):
+        # [FUNCTION DOC] Check frombuffer on a read-only bytes object emits a UserWarning (once)
+        # saying the buffer is not writable.
         numpy_arr = make_tensor((1,), dtype=dtype, device=device).numpy()
         byte_arr = numpy_arr.tobytes()
         with self.assertWarnsOnceRegex(UserWarning,
@@ -4153,6 +4688,8 @@ class TestBufferProtocol(TestCase):
             torch.frombuffer(byte_arr, dtype=dtype)
 
     def test_byte_to_int(self):
+        # [FUNCTION DOC] Check frombuffer reinterprets eight bytes as two int32 values of 255
+        # each, using byte order matching the platform.
         byte_array = np.array([-1, 0, 0, 0, -1, 0, 0, 0], dtype=np.byte) if sys.byteorder == 'little' \
             else np.array([0, 0, 0, -1, 0, 0, 0, -1], dtype=np.byte)
         tensor = torch.frombuffer(byte_array, dtype=torch.int32)
@@ -4160,25 +4697,34 @@ class TestBufferProtocol(TestCase):
         self.assertSequenceEqual(tensor, [255, 255])
 
 class TestFromBlob(TestCase):
+    # [CLASS DOC] Tests for the private from_blob wrapper, which builds a tensor over a raw
+    # memory address supplied as an integer, using numpy arrays as the memory owner.
     def _make_data(self, dtype, numel):
+        # [FUNCTION DOC] HELPER: Build a numpy array holding one through numel in the dtype's
+        # numpy equivalent; return the array and the address of its data.
         numpy_dtype = torch_to_numpy_dtype_dict[dtype]
         arr = np.arange(1, numel + 1, dtype=numpy_dtype)
         return arr, arr.ctypes.data
 
     @dtypes(*all_types_and_complex_and(torch.half))
     def test_basic(self, device, dtype):
+        # [FUNCTION DOC] Check from_blob over six elements gives a tensor equal to the
+        # numpy array.
         arr, ptr = self._make_data(dtype, 6)
         t = torch._from_blob(ptr, [6], dtype=dtype)
         self.assertEqual(t, torch.from_numpy(arr))
 
     @dtypes(*all_types_and_complex_and(torch.half))
     def test_2d(self, device, dtype):
+        # [FUNCTION DOC] Check from_blob with a 2 by 3 shape equals the reshaped numpy array.
         arr, ptr = self._make_data(dtype, 6)
         t = torch._from_blob(ptr, [2, 3], dtype=dtype)
         self.assertEqual(t, torch.from_numpy(arr.reshape(2, 3)))
 
     @dtypes(torch.float32, torch.float64, torch.int32, torch.int64)
     def test_strides(self, device, dtype):
+        # [FUNCTION DOC] Check from_blob with explicit strides one and two on a 2 by 3 shape
+        # equals the numpy array reshaped in Fortran order.
         arr, ptr = self._make_data(dtype, 6)
         t = torch._from_blob(ptr, [2, 3], [1, 2], dtype=dtype)
         expected = torch.from_numpy(arr.reshape(2, 3, order="F"))
@@ -4186,6 +4732,8 @@ class TestFromBlob(TestCase):
 
     @dtypes(torch.float32, torch.int64)
     def test_shared_memory(self, device, dtype):
+        # [FUNCTION DOC] Check memory is shared in both directions between a numpy array and a
+        # from_blob tensor.
         numpy_dtype = torch_to_numpy_dtype_dict[dtype]
         arr = np.array([1, 2, 3, 4], dtype=numpy_dtype)
         t = torch._from_blob(arr.ctypes.data, [4], dtype=dtype)
@@ -4195,12 +4743,16 @@ class TestFromBlob(TestCase):
         self.assertEqual(arr[1], 77)
 
     def test_explicit_device(self, device):
+        # [FUNCTION DOC] Check from_blob with an explicit cpu device gives a cpu tensor equal to
+        # the array.
         arr = np.array([1.0, 2.0], dtype=np.float32)
         t = torch._from_blob(arr.ctypes.data, [2], dtype=torch.float32, device="cpu")
         self.assertEqual(t.device, torch.device("cpu"))
         self.assertEqual(t, torch.from_numpy(arr))
 
     def test_default_dtype(self, device):
+        # [FUNCTION DOC] Check from_blob without dtype takes the current default dtype, for
+        # float32 and float64 defaults.
         arr = np.array([1.0, 2.0], dtype=np.float32)
         with set_default_dtype(torch.float32):
             t = torch._from_blob(arr.ctypes.data, [2])
@@ -4211,6 +4763,8 @@ class TestFromBlob(TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
     def test_invalid_device(self, device):
+        # [FUNCTION DOC] Only when CUDA is available: check from_blob over host memory with a
+        # cuda device raises RuntimeError.
         arr = np.array([1.0, 2.0], dtype=np.float32)
         with self.assertRaises(RuntimeError):
             torch._from_blob(arr.ctypes.data, [2], dtype=torch.float32, device="cuda")
@@ -4226,6 +4780,9 @@ class TestFromBlob(TestCase):
 #   The implementation itself is based on the Python Array API:
 #   https://data-apis.org/array-api/latest/API_specification/creation_functions.html
 def get_another_device(device):
+    # [FUNCTION DOC] HELPER: Return a device type name different from the given one: cpu
+    # for any non-cpu device, otherwise the current accelerator type, or None when there is
+    # no accelerator.
     device = torch.device(device)
 
     if device.type != "cpu":
@@ -4236,14 +4793,27 @@ def get_another_device(device):
     return acc.type if acc is not None else None
 
 def identity(tensor):
+    # [FUNCTION DOC] HELPER: Return the tensor unchanged (an identity converter for
+    # asarray tests).
     return tensor
 def to_numpy(tensor):
+    # [FUNCTION DOC] HELPER: Convert a tensor to a numpy array sharing its memory.
     return tensor.numpy()
 def to_memview(tensor):
+    # [FUNCTION DOC] HELPER: Convert a tensor to a memoryview over its numpy array.
     return memoryview(to_numpy(tensor))
 
 class TestAsArray(TestCase):
+    # [CLASS DOC] Tests for torch.asarray, which builds a tensor from a tensor, numpy array,
+    # DLPack capsule, buffer object or list, aliasing the memory where possible. Helper methods
+    # verify aliasing, dtype, device and requires_grad of the result.
     def _check(self, original, cvt=lambda t: t, is_alias=True, same_dtype=True, same_device=True, **kwargs):
+        # [FUNCTION DOC] HELPER: Convert the original tensor with cvt, call asarray with the
+        # extra keyword arguments, and assert: the result is a tensor; it shares memory with the
+        # original only when is_alias is set; values are equal when same_dtype (else only shape
+        # and requested dtype); the device type and index match the original device when
+        # same_device (else the requested device, default cpu); and requires_grad equals the
+        # keyword or the converted tensor's flag.
         """Check the output of 'asarray', given its input and assertion information.
 
         Besides calling 'asarray' itself, this function does 4 different checks:
@@ -4290,9 +4860,15 @@ class TestAsArray(TestCase):
         self.assertEqual(result.requires_grad, kwargs.get("requires_grad", original_requires_grad))
 
     def _test_alias_with_cvt(self, cvt, device, dtype, shape=(5, 5), only_with_dtype=False):
+        # [FUNCTION DOC] HELPER: Make a random tensor, then check asarray results are aliases
+        # through the converter for several keyword combinations (copy false, device, dtype,
+        # requires_grad). When only_with_dtype is set, the combinations that omit dtype are
+        # skipped (needed for buffers).
         original = make_tensor(shape, dtype=dtype, device=device)
 
         def check(**kwargs):
+            # [FUNCTION DOC] HELPER: Run the alias check on the outer original tensor and
+            # converter with the given asarray keyword arguments.
             self._check(original, cvt=cvt, **kwargs)
 
         if not only_with_dtype:
@@ -4313,28 +4889,42 @@ class TestAsArray(TestCase):
     @skipMeta
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     def test_alias_from_tensor(self, device, dtype):
+        # [FUNCTION DOC] Check asarray aliases a tensor input across dtypes. Skipped for meta
+        # tensors since their data pointers are all zero.
         self._test_alias_with_cvt(identity, device, dtype)
 
     @onlyCPU
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_alias_from_numpy(self, device, dtype):
+        # [FUNCTION DOC] CPU only: check asarray aliases a numpy array input for all
+        # numpy dtypes.
         self._test_alias_with_cvt(to_numpy, device, dtype)
 
     # Skipping 'meta', since 'to_dlpack' does not work for them.
     @skipMeta
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16))
     def test_alias_from_dlpack(self, device, dtype):
+        # [FUNCTION DOC] Check asarray aliases a DLPack capsule input across dtypes. Skipped
+        # for meta.
         self._test_alias_with_cvt(to_dlpack, device, dtype)
 
     @onlyCPU
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_alias_from_buffer(self, device, dtype):
+        # [FUNCTION DOC] CPU only: check asarray aliases a memoryview input for numpy dtypes,
+        # always passing dtype.
         self._test_alias_with_cvt(to_memview, device, dtype, shape=(5,), only_with_dtype=True)
 
     def _test_copy_with_cvt(self, cvt, device, dtype, shape=(5, 5), only_with_dtype=False):
+        # [FUNCTION DOC] HELPER: Make a random tensor and check that asarray with copy forced (or
+        # forced by a differing device or dtype) never shares memory. Covers requires_grad and
+        # dtype keywords, a different device (skipping the test if the other accelerator lacks
+        # the dtype), and every other dtype (skipped when only_with_dtype is set).
         original = make_tensor(shape, dtype=dtype, device=device)
 
         def check(**kwargs):
+            # [FUNCTION DOC] HELPER: Run the shared check on the outer original tensor and
+            # converter, expecting no aliasing, with the given asarray keyword arguments.
             self._check(original, cvt=cvt, is_alias=False, **kwargs)
 
         if not only_with_dtype:
@@ -4370,29 +4960,42 @@ class TestAsArray(TestCase):
     @skipMeta
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     def test_copy_tensor(self, device, dtype):
+        # [FUNCTION DOC] Check asarray copies a tensor input in the copy-forced scenarios.
+        # Skipped for meta.
         self._test_copy_with_cvt(identity, device, dtype)
 
     @onlyCPU
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_copy_from_numpy(self, device, dtype):
+        # [FUNCTION DOC] CPU only: check asarray copies a numpy array input in the
+        # copy-forced scenarios.
         self._test_copy_with_cvt(to_numpy, device, dtype)
 
     @skipMeta
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16))
     def test_copy_from_dlpack(self, device, dtype):
+        # [FUNCTION DOC] Check asarray copies a DLPack capsule input in the copy-forced
+        # scenarios. Skipped for meta.
         self._test_copy_with_cvt(to_dlpack, device, dtype)
 
     @onlyCPU
     @dtypes(*set(numpy_to_torch_dtype_dict.values()))
     def test_copy_from_buffer(self, device, dtype):
+        # [FUNCTION DOC] CPU only: check asarray copies a memoryview input in the copy-forced
+        # scenarios, always passing dtype.
         self._test_copy_with_cvt(to_memview, device, dtype, shape=(5,), only_with_dtype=True)
 
     def _test_copy_mult_devices(self, devices, dtype, cvt):
+        # [FUNCTION DOC] HELPER: Make a tensor on the first device and check asarray to the
+        # second device (through the converter) copies, with no keyword, with copy true, and with
+        # dtype given.
         cuda1 = devices[0]
         cuda2 = devices[1]
         original = make_tensor((5, 5), dtype=dtype, device=cuda1)
 
         def check(**kwargs):
+            # [FUNCTION DOC] HELPER: Run the shared check on the outer tensor expecting a copy
+            # onto the second device, with the given asarray keyword arguments.
             self._check(original, cvt, is_alias=False, same_device=False, device=cuda2, **kwargs)
 
         check()
@@ -4403,19 +5006,27 @@ class TestAsArray(TestCase):
     @deviceCountAtLeast(2)
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16))
     def test_copy_from_tensor_mult_devices(self, devices, dtype):
+        # [FUNCTION DOC] CUDA, two devices: check asarray of a tensor to the other cuda
+        # device copies.
         self._test_copy_mult_devices(devices, dtype, identity)
 
     @onlyCUDA
     @deviceCountAtLeast(2)
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16))
     def test_copy_from_dlpack_mult_devices(self, devices, dtype):
+        # [FUNCTION DOC] CUDA, two devices: check asarray of a DLPack capsule to the other cuda
+        # device copies.
         self._test_copy_mult_devices(devices, dtype, to_dlpack)
 
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     def test_copy_list(self, device, dtype):
+        # [FUNCTION DOC] Check asarray of a nested list built from a cpu tensor copies, producing
+        # the requested dtype and device with default, explicit requires_grad and copy settings.
         original = make_tensor((5, 5), dtype=dtype, device=torch.device("cpu"))
 
         def check(**kwargs):
+            # [FUNCTION DOC] HELPER: Run the shared check with the tolist converter on the outer
+            # original tensor, expecting no aliasing, with the given asarray keyword arguments.
             self._check(original, torch.Tensor.tolist, is_alias=False, **kwargs)
 
         same_device = torch.device("cpu") == device
@@ -4426,6 +5037,8 @@ class TestAsArray(TestCase):
 
     @dtypes(torch.float32)
     def test_unsupported_alias(self, device, dtype):
+        # [FUNCTION DOC] Check asarray with copy disabled raises ValueError when it would need a
+        # device change, a dtype change, or when the input is an arbitrary list.
         original = make_tensor((5, 5), dtype=dtype, device=device)
 
         other_device = get_another_device(device)
@@ -4446,6 +5059,8 @@ class TestAsArray(TestCase):
     @deviceCountAtLeast(2)
     @dtypes(torch.float32)
     def test_unsupported_alias_mult_devices(self, devices, dtype):
+        # [FUNCTION DOC] CUDA, two devices: check asarray with copy disabled across cuda devices
+        # raises ValueError naming both devices.
         dev1, dev2 = devices[:2]
         original = make_tensor((5, 5), dtype=dtype, device=dev1)
         with self.assertRaisesRegex(ValueError,
@@ -4454,11 +5069,17 @@ class TestAsArray(TestCase):
 
     @dtypes(torch.float32, torch.complex64)
     def test_retain_autograd_history(self, device, dtype):
+        # [FUNCTION DOC] Check asarray of a non-leaf tensor keeps requires_grad from the input by
+        # default, honors an explicit flag, and only retains autograd history when the result
+        # requires grad.
         original = make_tensor((5, 5), dtype=dtype, device=device, requires_grad=True)
         # 'cloned' has 'grad_fn=<CloneBackwards>'
         cloned = original.clone()
 
         def check(**kwargs):
+            # [FUNCTION DOC] HELPER: Call asarray on the outer non-leaf tensor with the keywords
+            # and assert requires_grad equals the keyword or the input's flag, and the grad_fn is
+            # absent exactly when requires_grad is false.
             a = torch.asarray(cloned, **kwargs)
             requires_grad = kwargs.get("requires_grad", cloned.requires_grad)
             self.assertEqual(a.requires_grad, requires_grad)
@@ -4474,6 +5095,8 @@ class TestAsArray(TestCase):
 
     @onlyCPU
     def test_astensor_consistency(self, device):
+        # [FUNCTION DOC] CPU only: check asarray gives results equal to as_tensor for Python
+        # scalars, homogeneous and mixed lists (bool, int, float, complex) and a range.
         # See issue: https://github.com/pytorch/pytorch/pull/71757
 
         examples = [
@@ -4505,6 +5128,10 @@ class TestAsArray(TestCase):
     @xfailIfTorchDynamo
     @onlyCPU
     def test_numpy_scalars(self, device):
+        # [FUNCTION DOC] CPU only, expected to fail under Dynamo: check asarray with copy
+        # disabled on a numpy scalar raises RuntimeError; with default copy it gives a 0-D
+        # float64 tensor; a 0-D numpy array with dtype int32 gives a 0-D int32 tensor (regression
+        # test for a reported issue).
         scalar = np.float64(0.5)
 
         with self.assertRaisesRegex(RuntimeError, "can't alias NumPy scalars."):
@@ -4522,6 +5149,9 @@ class TestAsArray(TestCase):
         self.assertEqual(tensor.dtype, torch.int32)
 
     def test_default_device(self, device):
+        # [FUNCTION DOC] Check asarray under a default-device context places the result on that
+        # device, for an integer, a tensor, a numpy array and a memoryview, and that contents
+        # are preserved.
         original = torch.arange(5)
 
         examples: list[tuple[Any, dict]] = [
@@ -4544,6 +5174,8 @@ class TestAsArray(TestCase):
 
     @onlyAccelerator
     def test_device_without_index(self, device):
+        # [FUNCTION DOC] Accelerator only: check asarray with a device without index aliases the
+        # input unless copy is requested, which gives a different data address.
         original = torch.arange(5, device=device)
 
         tensor = torch.asarray(original, device=device)
