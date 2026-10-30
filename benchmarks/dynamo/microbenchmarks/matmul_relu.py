@@ -1,3 +1,10 @@
+# [MODULE DOC] Script comparing eager matmul, eager matmul plus relu, and an Inductor compiled
+# matmul (CUDA float16) over torchbench shapes and two large artificial shapes. Import-time side
+# effect: sets the Inductor triton matmul option to triton and defines a compiled function.
+# Results from an A100 machine are left in comment lines and a trailing string literal.
+# KNOWN ISSUE: the main block passes a string identifier keyword to the timing helper, which
+#     does not accept one, so running the script raises a type error; the helper also returns
+#     the result instead of printing it. The Inductor triton config has no matmul option either.
 from benchmark_helper import time_with_torch_timer
 
 import torch
@@ -10,14 +17,18 @@ inductor_config.triton.mm = "triton"
 
 @torch._dynamo.optimize("inductor", nopython=True)
 def inductor_mm(a, b):
+    # [FUNCTION DOC] Matmul of a and b compiled by Dynamo with Inductor and no graph breaks
+    # allowed.
     return torch.mm(a, b)
 
 
 def torch_mm_relu(a, b):
+    # [FUNCTION DOC] Eager matmul of a and b followed by relu; returns the activated result.
     return torch.nn.functional.relu(torch.mm(a, b))
 
 
 def torch_mm(a, b):
+    # [FUNCTION DOC] Eager matmul of a and b; baseline.
     return torch.mm(a, b)
 
 

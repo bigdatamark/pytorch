@@ -1,9 +1,16 @@
+# [MODULE DOC] Script comparing a CUDA convolution on a default-layout input against the same
+# convolution on a channels-last copy, with profiler trace export and a numeric check. Importing
+# has no side effects.
 import torch
 from torch._inductor import ir
 from torch._inductor.runtime.benchmarking import benchmarker
 
 
 def to_channels_last(x):
+    # [FUNCTION DOC] Return a copy of a four dimensional tensor laid out in channels-last memory
+    # order, built by cloning, viewing with strides derived from Inductor's flexible layout
+    # stride ordering and copying the values in. Raises an AssertionError if the input is not 4D
+    # or the copy differs from the input.
     if x.dim() != 4:
         raise AssertionError(f"Expected 4D tensor, but got {x.dim()}D")
 
@@ -20,6 +27,11 @@ def to_channels_last(x):
 
 
 def bench_conv(with_stack=True):
+    # [FUNCTION DOC] Benchmark convolution of a random 256x3x224x224 input with 64 7x7 kernels
+    # (stride 2, padding 3), both in default and channels-last layout. Warms up, runs both under
+    # the profiler (with Python stacks if requested) and exports a Chrome trace to a fixed
+    # temporary path as a side effect. Raises an AssertionError if outputs differ beyond
+    # tolerance, then times each with the GPU benchmarker and prints times and speedup.
     x = torch.rand(256, 3, 224, 224).cuda()
     weight = torch.rand(64, 3, 7, 7).cuda()
 
@@ -35,9 +47,13 @@ def bench_conv(with_stack=True):
     }
 
     def baseline_fn():
+        # [FUNCTION DOC] HELPER: Convolution of the default layout input and weight with the
+        # shared options.
         return torch.convolution(x, weight, bias=None, **kwargs)
 
     def test_fn():
+        # [FUNCTION DOC] HELPER: Convolution of the channels-last input and weight with the
+        # shared options.
         return torch.convolution(x_chan, weight_chan, bias=None, **kwargs)
 
     # warmup
@@ -63,6 +79,7 @@ def bench_conv(with_stack=True):
 
 
 def main():
+    # [FUNCTION DOC] Run the convolution layout benchmark with its defaults.
     bench_conv()
 
 

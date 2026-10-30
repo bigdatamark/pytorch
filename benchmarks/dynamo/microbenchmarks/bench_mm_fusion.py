@@ -1,3 +1,8 @@
+# [MODULE DOC] Script benchmarking Inductor-generated Triton matmul against the ATen matmul,
+# with and without fused bias add and relu epilogues, on layer shapes from alexnet, BERT and
+# hf_GPT2. Requires CUDA. Import-time side effects: enables dense indexing in the Inductor
+# triton config, seeds the RNG, allows TF32 matmul, and runs the whole benchmark, printing a
+# PrettyTable of TFLOPS per shape; there is no main guard.
 from prettytable import PrettyTable
 
 import torch
@@ -16,33 +21,55 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 
 class Func:
+    # [CLASS DOC] Namespace of four Dynamo-optimized (Inductor backend) matmul variants, each
+    # decorated at definition time: plain matmul, matmul plus bias, matmul then relu, and matmul
+    # plus bias then relu. They take no self argument and are accessed on the class itself,
+    # never on instances.
     # mm
     @torch._dynamo.optimize("inductor")
     def mm(a, b, bias):
+        # [FUNCTION DOC] Compute the matrix product of a and b. The bias argument is accepted
+        # for a uniform signature and ignored. Returns the product.
         y = torch.mm(a, b)
         return y
 
     # mm+bias
     @torch._dynamo.optimize("inductor")
     def mm_add(a, b, bias):
+        # [FUNCTION DOC] Compute the matrix product of a and b and add bias to the result.
+        # Returns the sum.
         y = torch.mm(a, b)
         return y + bias
 
     # relu(mm)
     @torch._dynamo.optimize("inductor")
     def mm_relu(a, b, bias):
+        # [FUNCTION DOC] Compute the matrix product of a and b, then apply relu. The bias
+        # argument is unused. Returns the activated result.
         y = torch.mm(a, b)
         return torch.relu(y)
 
     # relu(mm+bias)
     @torch._dynamo.optimize("inductor")
     def mm_add_relu(a, b, bias):
+        # [FUNCTION DOC] Compute the matrix product of a and b, add bias in place to the
+        # product, then apply relu. Returns the activated result.
         y = torch.mm(a, b)
         y += bias
         return torch.relu(y)
 
 
 def bench(shape, layer_id, p, fusion_types=None):
+    # [FUNCTION DOC] Benchmark one matmul shape and append one row to the table. The shape is a
+    # pair of operand shapes; layer_id labels the row; p is the PrettyTable; fusion_types lists
+    # variants (empty string for plain, otherwise a suffix selecting a Func method; default is
+    # plain only). Enables inductor metrics logging and restores default logging at the end. For
+    # each variant it times the ATen configuration, then resets Dynamo and metrics, times the
+    # Triton configuration, and appends both TFLOPS values. Raises an error if the Triton run
+    # did not generate exactly one kernel. Uses float16 CUDA tensors.
+    # KNOWN ISSUE: the benchmarker GPU method returns a single float, but the code unpacks three
+    #     values from it, which fails at run time; the Inductor triton config also has no option
+    #     named mm, so the aten versus triton toggle likely has no effect.
     torch._logging.set_logs(inductor_metrics=True)
     if fusion_types is None:
         fusion_types = [""]
@@ -55,6 +82,9 @@ def bench(shape, layer_id, p, fusion_types=None):
     b = torch.randn(shape[1], device="cuda", dtype=dtype)
 
     def tflops(ms):
+        # [FUNCTION DOC] HELPER: Convert a time in milliseconds to throughput using the
+        # enclosing matrix sizes (M times K times N divided by the time, scaled by one
+        # billionth). Note this counts multiply-accumulates, not two operations per element.
         return M * K * N / ms * 1e-9
 
     row = [layer_id]
@@ -72,6 +102,9 @@ def bench(shape, layer_id, p, fusion_types=None):
         args = (a, b, bias)
 
         def fn():
+            # [FUNCTION DOC] HELPER: Call the currently selected Dynamo-optimized variant on the
+            # captured argument tuple and return its result; used as the zero-argument callable
+            # for the GPU benchmarker.
             return fn_mm(*args)
 
         torch._inductor.config.triton.mm = "aten"

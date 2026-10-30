@@ -1,3 +1,7 @@
+# [MODULE DOC] Script comparing eager and Inductor-compiled scatter_add on CPU for two shapes
+# and two dtypes, including a worst case where all indices are the same column. Prints semicolon
+# separated millisecond timings. A results table from one machine is left in a trailing string
+# literal. Defines a Dynamo-optimized function at import.
 import itertools
 
 from benchmark_helper import time_with_torch_timer
@@ -8,14 +12,24 @@ import torch._dynamo
 
 @torch._dynamo.optimize("inductor", nopython=True)
 def inductor_scatter_add(dst, src, index):
+    # [FUNCTION DOC] scatter_add along dimension one of src into dst at the given index,
+    # compiled by Dynamo with the Inductor backend and no graph breaks allowed. Returns the
+    # result.
     return torch.scatter_add(dst, 1, index, src)
 
 
 def torch_scatter_add(dst, src, index):
+    # [FUNCTION DOC] Eager scatter_add along dimension one of src into dst at the given
+    # index; baseline. Returns the result.
     return torch.scatter_add(dst, 1, index, src)
 
 
 def test_total_time(shapes, types):
+    # [FUNCTION DOC] For every combination of shape and dtype, build random src, dst (random
+    # floats, or random integers below the row length for integer dtypes) and a random int64
+    # index plus a worst case index of all zeros, check eager and Inductor results agree with
+    # assert_close (raises on mismatch), then print mean milliseconds for eager and Inductor on
+    # both indices and reset Dynamo. Seeds the RNG first.
     print(
         "shape; type; torch scatter_add; inductor scatter_add; torch scatter_add (worst case); inductor scatter_add (worst case)"
     )

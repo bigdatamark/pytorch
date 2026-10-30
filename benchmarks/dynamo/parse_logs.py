@@ -1,3 +1,13 @@
+# [MODULE DOC] Command line script, run at import with no main guard, that parses a combined
+# benchmark log (for example from the torchbench driver) named by the single argument and writes
+# a CSV summary to standard output: one row per benchmark with suite, name, pass or fail result,
+# failing component and context, error text, compile times, graph and op counts and graph break
+# counts. First row carries only a gist URL if the log mentions one. Prints a count of
+# unclassified entries to standard error. Raises an AssertionError if not exactly one argument
+# is given.
+# KNOWN ISSUE: the sample entry in a comment shows a graph count message in a different format
+#     than the regular expression used for graph counts, so those columns may stay empty; the
+#     parsed STATS line and the counter variable i are never used.
 import csv
 import os
 import re
@@ -35,6 +45,8 @@ entries = re.split(
 
 
 def chunker(seq, size):
+    # [FUNCTION DOC] HELPER: Return a generator over consecutive slices of the sequence, each of
+    # at most the given size; used to group the regex split output into triples.
     return (seq[pos : pos + size] for pos in range(0, len(seq), size))
 
 
@@ -66,6 +78,9 @@ out.writerow({"explain": gist_url})
 # Sometimes backtraces will be in third party code, which results
 # in very long file names.  Delete the absolute path in this case.
 def normalize_file(f):
+    # [FUNCTION DOC] HELPER: Shorten a file path for the report. If it lies inside a site-
+    # packages directory, return the part after the first such marker; otherwise return the path
+    # relative to the current directory.
     if "site-packages/" in f:
         return f.split("site-packages/", 2)[1]
     else:

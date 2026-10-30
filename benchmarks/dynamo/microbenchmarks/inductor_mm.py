@@ -1,3 +1,10 @@
+# [MODULE DOC] Script comparing matmul timings (CUDA float16) of eager, a Triton library matmul,
+# and two Inductor compiled variants, on alexnet, BERT and hf_GPT2 shapes, measuring both total
+# wall time via the Timer helper and GPU time via the benchmarker. Import-time side effects:
+# enables TF32 for matmul and cuDNN and defines two Dynamo-optimized functions. A results table
+# is left in a trailing string literal.
+# KNOWN ISSUE: the Inductor triton config has no option named mm, so the toggle used to pick
+#     aten versus Triton likely has no effect.
 import triton
 from benchmark_helper import time_with_torch_timer
 
@@ -16,23 +23,33 @@ torch.backends.cudnn.allow_tf32 = True
 
 @torch._dynamo.optimize("inductor", nopython=True)
 def inductor_aten_mm(a, b):
+    # [FUNCTION DOC] Matmul of a and b compiled by Dynamo with Inductor and no graph breaks
+    # allowed; intended to run with the aten selection.
     return torch.mm(a, b)
 
 
 @torch._dynamo.optimize("inductor", nopython=True)
 def inductor_triton_mm(a, b):
+    # [FUNCTION DOC] Same computation as the aten variant, a separate compiled function intended
+    # to be first called with the Triton selection.
     return torch.mm(a, b)
 
 
 def torch_mm(a, b):
+    # [FUNCTION DOC] Eager matmul of a and b; baseline.
     return torch.mm(a, b)
 
 
 def triton_mm(a, b):
+    # [FUNCTION DOC] Matmul using the matmul operator provided by the Triton package ops
+    # module, so the Triton package must expose it.
     return triton.ops.matmul(a, b)
 
 
 def test_total_time(shapes):
+    # [FUNCTION DOC] For each pair of operand shapes, create random float16 CUDA inputs, warm up
+    # both Inductor variants under their settings, time the four implementations with the Timer
+    # helper and print mean milliseconds on one line, then reset Dynamo.
     print("shape; torch mm; triton mm; inductor aten mm; inductor triton mm")
     for i in range(len(shapes)):
         a_shape, b_shape = shapes[i]
@@ -62,6 +79,11 @@ def test_total_time(shapes):
 
 
 def test_GPU_time(shapes):
+    # [FUNCTION DOC] Same as the total time benchmark but measures GPU kernel time with the
+    # Inductor benchmarker over lambdas wrapping each implementation, printing the four results
+    # per shape and resetting Dynamo after each.
+    # KNOWN ISSUE: the benchmarker GPU method returns a single float, but the code unpacks three
+    #     values from it, which fails at run time.
     print("shape; torch mm; triton mm; inductor aten mm; inductor triton mm")
     for i in range(len(shapes)):
         a_shape, b_shape = shapes[i]

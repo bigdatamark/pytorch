@@ -1,3 +1,9 @@
+# [MODULE DOC] Command line tool that analyzes the JSON log written by Inductor matmul
+# autotuning (the file named by the TORCHINDUCTOR_MM_LOGGING_FILE environment variable). For
+# each allowed number of Triton templates it solves an integer linear program (pulp, CBC solver)
+# choosing which template configurations to keep so the occurrence-weighted total matmul time is
+# minimal, with cuBLAS always available as a fallback. Prints results per template count.
+# Importing has no side effects; requires the click and pulp packages.
 """
 This script uses linear programming to analyze outputs of triton mm config tuning.
 To generate output that can be fed into this script set the env varTORCHINDUCTOR_MM_LOGGING_FILE.
@@ -12,6 +18,11 @@ import pulp
 
 
 def parse_log_file(file_path):
+    # [FUNCTION DOC] Load the JSON log file at the given path, which must hold a list of
+    # entries. An entry containing the key invoke counts one occurrence of the shape named by
+    # its value. Any other entry is a mapping from shape to a list of timing records, which are
+    # appended to that shape's list. Returns a pair: shape to occurrence count, and shape to
+    # accumulated timing records. Raises on missing or invalid JSON files.
     with open(file_path) as f:
         logs = json.load(f)
 
@@ -35,6 +46,17 @@ def parse_log_file(file_path):
 
 
 def optimize_templates(N, occurrence_count, benchmark_logs, verbose=False):
+    # [FUNCTION DOC] Solve for the best set of exactly N Triton template configurations.
+    # Templates are the distinct tuples of block sizes, stage count and warp count seen in
+    # triton-type timing records. Per shape, exactly one option is chosen (cuBLAS using its
+    # minimum time, or one allowed template using its minimum time for that shape); the
+    # objective is the sum over shapes of occurrence count times chosen time. Args are N, the
+    # occurrence counts, the benchmark logs, and a verbose flag that prints the model,
+    # constraints, variable values and per-shape details. Returns the selected templates and the
+    # weighted total time.
+    # KNOWN ISSUE: min of cuBLAS times raises if a shape has no cuBLAS record, and the verbose
+    #     section reuses the loop variable from the last shape for the cuBLAS time, so it prints
+    #     the wrong value for other shapes.
     # Set of all possible Triton templates keyed by their attributes
     triton_templates = set()
     for timings in benchmark_logs.values():
@@ -203,6 +225,11 @@ def optimize_templates(N, occurrence_count, benchmark_logs, verbose=False):
 @click.option("--max-templates", default=10, help="Maximum number of templates.")
 @click.option("--verbose", is_flag=True, help="Enable verbose output.")
 def main(filename, min_templates, max_templates, verbose):
+    # [FUNCTION DOC] Click entry point. Parses the log file named by the filename argument, then
+    # for every template count from the minimum to the maximum option (inclusive) runs the
+    # optimizer, printing the count, selected templates and weighted total time, and finally
+    # prints the list of all totals. Options: minimum templates (default 0), maximum templates
+    # (default 10), verbose flag passed through.
     occurrence_count, benchmark_logs = parse_log_file(filename)
     times = []
     for N in range(min_templates, max_templates + 1):

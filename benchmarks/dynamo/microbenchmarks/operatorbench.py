@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Click command line tool that benchmarks individual ATen operators: it replays
+# recorded operator inputs (timm, huggingface or torchbench logs, or a custom file), builds a
+# one-op graph per input, compiles it with Inductor under optional config variants, optionally
+# compares to CUDA-graphed TorchScript, and reports median speedup quantiles versus the eager
+# graph on the console and optionally in a CSV file. Import-time side effects: creates the
+# global profile flag (off) and the table of named Inductor config presets (halide and
+# autotune).
+# KNOWN ISSUE: with the all-operators option the CSV file is opened in a with block that closes
+#     it right after the header is written, so the later row writes and flush operate on a
+#     closed file and raise a ValueError.
 import csv
 import itertools
 import sys
@@ -36,12 +46,25 @@ inductor_config_options = {
 
 
 def maybe_record_function(name):
+    # [FUNCTION DOC] Return a profiler record_function context with the given name if the global
+    # profile flag is on, otherwise a do-nothing context.
     return torch.profiler.record_function(name) if profile_enabled else nullcontext()
 
 
 def compute_speedups(
     operator, models, example_inputs, repeats, accuracy_checking=False, device="cuda"
 ):
+    # [FUNCTION DOC] Time a list of models on the same inputs and return per-model median times.
+    # The first model is the reference. If accuracy checking is on, each other model is run and
+    # compared to the reference with a cosine similarity check; mismatches that raise
+    # AssertionError are printed with the operator and the largest absolute difference of the
+    # first output (nothing is raised). Then for the repeat count, models are timed interleaved:
+    # on cuda by a warm-up call and the GPU benchmarker (milliseconds, flushing L2), otherwise
+    # by the Inductor timed helper (seconds). Records profiler ranges when enabled. Returns a
+    # numpy array of medians.
+    # KNOWN ISSUE: the comparison helper normally reports a mismatch by returning False rather
+    #     than raising, and its return value is ignored, so most accuracy failures go
+    #     unreported.
     expected = models[0](*example_inputs)
     if accuracy_checking:
         for model in models[1:]:
@@ -76,6 +99,9 @@ def compute_speedups(
 
 
 def strip_overloads(gm):
+    # [FUNCTION DOC] Rewrite, in place, every graph node whose target is an OpOverload to use
+    # the corresponding overload packet, then recompile the module. Takes an FX GraphModule;
+    # returns nothing.
     """
     Modifies the target of graph nodes in :attr:`gm` to strip overloads.
     Args:
@@ -88,6 +114,9 @@ def strip_overloads(gm):
 
 
 def convert_to_jit(gm, gm_args):
+    # [FUNCTION DOC] Convert an FX graph module into TorchScript: strips overloads, tries
+    # scripting, and if that raises any exception falls back to tracing with the example inputs.
+    # Returns the scripted or traced module.
     strip_overloads(gm)
     try:
         return torch.jit.script(gm)
@@ -97,6 +126,8 @@ def convert_to_jit(gm, gm_args):
 
 
 def to_channels_last(ten):
+    # [FUNCTION DOC] Return the tensor unchanged unless it has four dimensions, in which case
+    # return it converted to channels-last memory format.
     return ten if ten.ndim != 4 else ten.to(memory_format=torch.channels_last)
 
 
@@ -110,6 +141,13 @@ def microbenchmark(
     measure_nvfuser,
     device,
 ):
+    # [FUNCTION DOC] Benchmark one operator on one set of arguments. Builds a one-node graph
+    # module with its tensor inputs, registers the convolution backward builtin for TorchScript,
+    # compiles the graph with Inductor once per config patch dict (printing a message if any
+    # compile takes over ten seconds), and optionally adds a CUDA-graphed TorchScript version.
+    # The eager graph module is always the first entry. Forces a single repeat when accuracy
+    # checking. Returns the median times array from the comparison helper, one value per
+    # variant.
     gm, gm_args = gen_gm_and_inputs(operator, args, kwargs)
     torch.jit._builtins._register_builtin(
         torch.ops.aten.convolution_backward.default, "aten::convolution_backward"
@@ -141,10 +179,16 @@ quantiles_thresholds = (0.2, 0.5, 0.8)
 
 
 def quantiles(timings):
+    # [FUNCTION DOC] Return the 20th, 50th and 80th percentiles of the timings as a plain list.
     return np.quantile(timings, quantiles_thresholds).tolist()
 
 
 def skip_operator(operator):
+    # [FUNCTION DOC] Decide whether an operator should be skipped. Returns True, printing a
+    # reason, for operators with unsupported input generation (gather, nll loss, index, scatter_
+    # in place, masked fill scalar), the unsafe view op, and ops with neither a decomposition
+    # nor a lowering in Inductor (checking both the overload and its packet). Also returns True
+    # silently for any operator whose name contains convolution. Otherwise False.
     nyi_strings = (
         "aten.gather.default",
         "nll_loss",
@@ -227,6 +271,17 @@ def benchmark(
     channels_last,
     profile,
 ):
+    # [FUNCTION DOC] Main click command. Options choose suite or custom input file, operator
+    # (default all), dtype (float16 or float32; others raise AssertionError), maximum samples,
+    # start index, repeats, accuracy checking, device, extra Inductor config presets (named;
+    # unknown names raise KeyError), nvfuser measuring, channels-last inputs and profiling. Sets
+    # matmul precision to high and ignores TorchScript check warnings. For each non-skipped
+    # operator it loads up to the sample limit of recorded inputs, benchmarks each (errors are
+    # printed and the input skipped), computes quantiles of eager time divided by each backend
+    # time (plus a ratio between the first two backends when only two are compared), prints one
+    # summary line and writes a CSV row when a file is open. With the all option it opens a CSV
+    # named for the suite and dtype. Modifies the global profile flag; the profiler writes
+    # traces under a log directory per operator.
     warnings.filterwarnings("ignore", module="torch.jit._check")
     torch.set_float32_matmul_precision("high")
     global profile_enabled

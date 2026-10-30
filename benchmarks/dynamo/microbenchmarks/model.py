@@ -1,3 +1,7 @@
+# [MODULE DOC] Data-only module listing convolution layer shapes: a tuple of resnet50 layer
+# configurations and a tuple holding the alexnet first layer. Each entry is input height, width,
+# channels, kernel height, width, number of kernels, stride pair and padding pair. No functions;
+# the only effect of importing is creating the two constants.
 # resnet50 layer shape
 resnet50_layers = (
     # IN_H, IN_W, IN_C, KERNEL_H, KERNEL_W, KERNEL_N, stride, padding

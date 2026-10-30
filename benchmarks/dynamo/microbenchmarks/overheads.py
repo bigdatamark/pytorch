@@ -1,3 +1,7 @@
+# [MODULE DOC] Script measuring steady-state per-call overhead of torch.compile on a trivial
+# add-one function compared to eager, for inputs without grad, with grad and under inference
+# mode, plus the overhead of the Dynamo disable wrapper. Prints microsecond medians. No import-
+# time side effects beyond imports.
 import time
 import timeit
 
@@ -7,10 +11,15 @@ import torch
 
 
 def add1(x):
+    # [FUNCTION DOC] Return x plus one; the trivial workload.
     return x + 1
 
 
 def bench(name, fn, requires_grad):
+    # [FUNCTION DOC] Benchmark a callable on a one-element random tensor (with the given
+    # requires-grad setting). Resets Dynamo, warms up with three calls, then takes the median of
+    # one thousand repeats of one thousand calls and prints name, microseconds per call and
+    # warmup time. Returns the median microseconds.
     torch._dynamo.reset()
     x = torch.randn(1, requires_grad=requires_grad)
     start = time.perf_counter()
@@ -25,6 +34,9 @@ def bench(name, fn, requires_grad):
 
 
 def bench_overhead(label, requires_grad):
+    # [FUNCTION DOC] Print the label, benchmark the eager workload and its torch.compile version
+    # with the given requires-grad setting, print their difference in microseconds as the
+    # overhead, and a blank line.
     print(label)
     eager_us = bench("eager   ", add1, requires_grad)
     compiled_us = bench("compiled", torch.compile(add1), requires_grad)
@@ -36,6 +48,8 @@ def bench_overhead(label, requires_grad):
 
 
 def main():
+    # [FUNCTION DOC] Run the overhead comparison for inputs without grad, with grad, and under
+    # inference mode, then compare eager to the Dynamo-disabled wrapper and print that overhead.
     bench_overhead("requires_grad=False", False)
     bench_overhead("requires_grad=True", True)
     with torch.inference_mode():

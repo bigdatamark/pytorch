@@ -1,3 +1,9 @@
+# [MODULE DOC] Utilities to record the inputs of ATen operators during a model run and to replay
+# them later for operator microbenchmarks. Defines abbreviation tables for dtypes, a call-
+# description serializer, a dispatch mode that tallies unique operator inputs, a text-file
+# writer, and a loader that parses those files back into actual tensors. Import-time side
+# effects: creates a module logger, computes the directories for the timm, huggingface and
+# torchbench log folders next to this file, and looks up the aten namespace and the tensor type.
 import functools
 import logging
 import math
@@ -45,6 +51,9 @@ dtype_abbrs_parsing = {value: key for key, value in dtype_abbrs.items()}
 
 
 def truncate_inp(arg):
+    # [FUNCTION DOC] HELPER: Shorten one value for serialization: a dtype in the abbreviation
+    # table becomes its short string, a device becomes its type string, anything else is
+    # returned unchanged.
     if arg in dtype_abbrs:
         return dtype_abbrs[arg]
     elif isinstance(arg, torch.device):
@@ -55,12 +64,22 @@ def truncate_inp(arg):
 
 # Serialize Function Call
 class FuncCallWrapper:
+    # [CLASS DOC] HELPER: Description of a call to a named constructor such as a
+    # tensor or sparse tensor builder. Holds the call name, the positional arguments and the
+    # keyword arguments, each with dtype and device values shortened. Its textual form is a call
+    # expression whose dtype arguments appear unquoted, so the text can be evaluated later with
+    # the deserializer helpers in scope.
     def __init__(self, call, *args, **kwargs):
+        # [FUNCTION DOC] Store the call name and shorten dtypes and devices inside the
+        # positional and keyword arguments with a tree traversal.
         self.call = call
         self.args = tree_map(truncate_inp, args)
         self.kwargs = tree_map(truncate_inp, kwargs) if kwargs is not None else {}
 
     def __repr__(self):
+        # [FUNCTION DOC] Build the textual call description: positional args joined by commas,
+        # keyword args appended as name equals value text, wrapped in the call name, with outer
+        # double quotes stripped and quoted dtype abbreviations unquoted. Returns the string.
         args = ", ".join([repr(arg) for arg in self.args])
         kwargs = "".join(
             [f", {str(key)}={value}" for key, value in self.kwargs.items()]
@@ -73,6 +92,8 @@ class FuncCallWrapper:
 
 
 def serialize_sparse_tensor(e):
+    # [FUNCTION DOC] Describe a sparse tensor as a call wrapper holding shape list, dtype,
+    # layout and coalesced flag, with the number of nonzeros appended unless the tensor is fake.
     if isinstance(e, torch._subclasses.FakeTensor):
         return FuncCallWrapper("ST", list(e.shape), e.dtype, e.layout, e.is_coalesced())
     else:
@@ -82,10 +103,16 @@ def serialize_sparse_tensor(e):
 
 
 def deserialize_sparse_tensor(size, dtype, layout, is_coalesced, nnz=None):
+    # [FUNCTION DOC] Placeholder for rebuilding a sparse tensor from its description; always
+    # raises NotImplementedError.
     raise NotImplementedError
 
 
 def deserialize_tensor(size, dtype, stride=None):
+    # [FUNCTION DOC] Rebuild a CPU tensor from a recorded size, dtype and optional stride.
+    # Allocates an empty (strided if a stride is given) tensor and tries to fill it with random
+    # values of that dtype; if filling fails the error is printed and the unfilled tensor is
+    # returned. Returns the tensor.
     if stride is not None:
         out = torch.empty_strided(size, stride, dtype=dtype)
     else:
@@ -99,6 +126,8 @@ def deserialize_tensor(size, dtype, stride=None):
 
 
 def serialize_tensor(e):
+    # [FUNCTION DOC] Describe a dense tensor as a call wrapper holding shape list and dtype,
+    # adding strides only if it is not contiguous.
     if not e.is_contiguous():
         return FuncCallWrapper("T", list(e.shape), e.dtype, stride=e.stride())
     else:
@@ -106,6 +135,8 @@ def serialize_tensor(e):
 
 
 def serialize_torch_args(e):
+    # [FUNCTION DOC] Serialize one dispatch argument: sparse tensors and dense tensors become
+    # call wrappers, any other value is shortened by the truncation helper.
     if isinstance(e, torch.Tensor):
         if e.is_sparse:
             return serialize_sparse_tensor(e)
@@ -115,6 +146,7 @@ def serialize_torch_args(e):
 
 
 def contains_tensor(elems):
+    # [FUNCTION DOC] Return True if any leaf of the nested structure is a tensor, else False.
     for elem in pytree.tree_leaves(elems):
         if isinstance(elem, torch.Tensor):
             return True
@@ -122,6 +154,8 @@ def contains_tensor(elems):
 
 
 def skip_args(elems):
+    # [FUNCTION DOC] Return True if any leaf of the nested structure is a memory format or an
+    # untyped storage (values seen only in constructors and similar ops), else False.
     for i in pytree.tree_leaves(elems):
         # only shows up in constructors and ops like that
         if isinstance(i, (torch.memory_format, torch.storage.UntypedStorage)):
@@ -130,6 +164,9 @@ def skip_args(elems):
 
 
 def contains_tensor_types(type):
+    # [FUNCTION DOC] Recursively test whether a TorchScript type is a subtype of tensor or
+    # contains such a type among its contained types (for example a list of tensors). Returns a
+    # bool.
     return type.isSubtypeOf(tensor_type) or any(
         contains_tensor_types(e) for e in type.containedTypes()
     )
@@ -137,6 +174,11 @@ def contains_tensor_types(type):
 
 @functools.cache
 def non_compute_operator(op):
+    # [FUNCTION DOC] Cached predicate deciding whether an operator should be excluded from
+    # benchmarks. True for ops with no tensor-typed argument (constructors), ops whose name
+    # contains the like suffix, and ops where the single tensor output aliases a tensor input.
+    # False for mutating ops and for ops without exactly one tensor output. Takes an OpOverload;
+    # the result is memoized per op.
     schema = op._schema
 
     # skip constructors
@@ -167,10 +209,19 @@ def non_compute_operator(op):
 
 
 class OperatorInputsMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode that records, for every intercepted operator call, its
+    # serialized inputs. State is a mapping from operator name text to a counter of serialized
+    # input strings (pass an existing mapping to accumulate across runs). Only calls with
+    # tensors in both inputs and outputs and without memory format or storage arguments are
+    # recorded. The call itself is always executed unchanged.
     def __init__(self, func_db=None):
+        # [FUNCTION DOC] Use the given operator database or start a fresh mapping of counters.
         self.func_db = defaultdict(Counter) if func_db is None else func_db
 
     def __torch_dispatch__(self, func_overload, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Serialize the arguments, execute the real operator, and when inputs and
+        # outputs contain tensors and there is no memory format or storage argument, increment
+        # the count for this operator and serialized input text. Returns the operator output.
         kwargs = kwargs if kwargs else {}
         arg_meta, kwarg_meta = tree_map(serialize_torch_args, (args, kwargs))
 
@@ -184,6 +235,11 @@ class OperatorInputsMode(TorchDispatchMode):
         return out
 
     def log_to_file(self, output_filename, *, skip_non_compute_operators=True):
+        # [FUNCTION DOC] Write the recorded database to a text file, overwriting it. Operators
+        # are sorted by name; unless disabled, non-compute operators are skipped (the name text
+        # is evaluated into an operator object, relying on the aten name in scope). Each
+        # operator gets a header line followed by one line per unique input with its count, with
+        # quoted dtype abbreviations unquoted.
         sorted_operators = sorted(self.func_db.keys())
         with open(output_filename, "w") as f:
             for operator in sorted_operators:
@@ -201,6 +257,11 @@ class OperatorInputsMode(TorchDispatchMode):
 
 
 def map_to_device(e, device):
+    # [FUNCTION DOC] Map a value onto a target device: tensors are moved, device objects are
+    # replaced by the target, the strings cuda and cpu become the target device type, other
+    # values are returned unchanged.
+    # KNOWN ISSUE: any other string value reaches the string branch and falls off the end, so
+    #     None is returned instead of the string.
     if isinstance(e, torch.Tensor):
         return e.to(device)
     elif isinstance(e, torch.device):
@@ -213,6 +274,8 @@ def map_to_device(e, device):
 
 
 def map_to_dtype(e, dtype):
+    # [FUNCTION DOC] Cast floating point tensors to the given dtype, replace dtype objects by
+    # it, and leave everything else unchanged.
     if isinstance(e, torch.Tensor) and e.is_floating_point():
         return e.to(dtype)
     elif isinstance(e, torch.dtype):
@@ -222,6 +285,11 @@ def map_to_dtype(e, dtype):
 
 
 def deserialize_args(inps):
+    # [FUNCTION DOC] Turn a serialized input line back into Python objects by evaluating it with
+    # a namespace providing the tensor builder, the sparse builder, torch, infinity and the
+    # dtype abbreviations (after unquoting those abbreviations). Returns the evaluated pair of
+    # positional args and keyword args. Evaluates arbitrary text, so only trusted files should
+    # be used.
     inps = inps.strip().strip("'")
     global_vals = {
         "T": deserialize_tensor,
@@ -238,7 +306,16 @@ def deserialize_args(inps):
 
 
 class OperatorInputsLoader:
+    # [CLASS DOC] Loader that reads an operator input log file into a mapping from operator name
+    # text to a counter of serialized input strings with counts, and replays or summarizes them.
+    # Several loaders can be merged. Factory static methods load the timm, huggingface and
+    # torchbench log folders.
     def __init__(self, json_file_path):
+        # [FUNCTION DOC] Parse the text file made by the log writer: each operator header line
+        # is followed by lines with a count and the serialized inputs, which are summed per
+        # input. The sum operator overload with a symbolic int is renamed to the dimension list
+        # overload. Raises an AssertionError if a block does not begin with an operator header
+        # line.
         self.operator_db = defaultdict(Counter)
 
         with open(json_file_path) as f:
@@ -268,6 +345,12 @@ class OperatorInputsLoader:
     def get_inputs_for_operator(
         self, operator, dtype=None, device="cuda"
     ) -> Generator[tuple[Iterable[Any], dict[str, Any]], None, None]:
+        # [FUNCTION DOC] Generator over recorded inputs of one operator overload (given as an
+        # object or its name). For each unique recorded input it rebuilds tensors, casts
+        # floating tensors to the requested dtype unless it is absent or float16, moves
+        # everything to the device (default cuda; skipped when empty) and yields the args and
+        # kwargs pair. Embedding operators log a warning and yield a single None. Raises an
+        # AssertionError, on first iteration, if the operator is unknown. Counts are ignored.
         if str(operator) not in self.operator_db:
             raise AssertionError(f"Could not find {operator}, must provide overload")
 
@@ -295,6 +378,9 @@ class OperatorInputsLoader:
             yield args, kwargs
 
     def get_all_ops(self):
+        # [FUNCTION DOC] Generator over all recorded operators converted to operator objects by
+        # evaluating their names; names that fail to evaluate with an attribute error are logged
+        # as warnings and skipped.
         for key in self.operator_db:
             try:
                 op = eval(key)
@@ -304,6 +390,8 @@ class OperatorInputsLoader:
             yield op
 
     def get_call_frequency(self, op):
+        # [FUNCTION DOC] Total number of recorded calls for an operator, summing its input
+        # counts. Raises an AssertionError if the operator is unknown.
         if str(op) not in self.operator_db:
             raise AssertionError(f"Could not find {op}, must provide overload")
 
@@ -313,24 +401,34 @@ class OperatorInputsLoader:
         return count
 
     def merge(self, other):
+        # [FUNCTION DOC] Add all counts from another loader into this one in place.
         for operator, counter_dict in other.operator_db.items():
             for inps, cnt in counter_dict.items():
                 self.operator_db[operator][inps] += cnt
 
     @staticmethod
     def get_timm_loader():
+        # [FUNCTION DOC] Return a loader merged from every log file of the timm training log
+        # folder.
         return OperatorInputsLoader._load_directory(TIMM_DIR)
 
     @staticmethod
     def get_huggingface_loader():
+        # [FUNCTION DOC] Return a loader merged from every log file of the huggingface training
+        # log folder.
         return OperatorInputsLoader._load_directory(HF_DIR)
 
     @staticmethod
     def get_torchbench_loader():
+        # [FUNCTION DOC] Return a loader merged from every log file of the torchbench training
+        # log folder.
         return OperatorInputsLoader._load_directory(TORCHBENCH_DIR)
 
     @staticmethod
     def _load_directory(inp_dir):
+        # [FUNCTION DOC] HELPER: Load and merge every text file in a directory into one loader.
+        # Raises an AssertionError if the directory is missing. Returns None if the directory
+        # has no text files.
         if not os.path.isdir(inp_dir):
             raise AssertionError(f"Directory does not exist: {inp_dir}")
         union = None
