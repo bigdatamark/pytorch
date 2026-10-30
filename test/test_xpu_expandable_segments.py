@@ -1,4 +1,10 @@
 # Owner(s): ["module: intel"]
+# [MODULE DOC] XPU variant of the test_xpu suite run with the expandable-segments allocator. Re-
+# exports the TestXpu and TestXpuOpsXPU test classes from test_xpu and, when run as a script on
+# a machine with an available XPU and not on Windows, loads the disabled-tests list, turns on
+# the allocator setting expandable_segments and sets the TestXpu class flag expandable_segments
+# before running all tests. Import has the side effect of temporarily adding the repo root to
+# the module search path to import tools.stats helpers.
 import pathlib
 import sys
 

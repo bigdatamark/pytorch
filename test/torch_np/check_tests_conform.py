@@ -1,9 +1,22 @@
+# [MODULE DOC] Command line script that scans converted torch_np test files for leftovers of the
+# pytest to PyTorch test conversion. It reports module-level test functions, test classes not
+# deriving from TestCase, stray pytest marks and xfail/skip/param usage, and parametrize
+# decorators that are outside a class or whose class lacks the instantiate_parametrized_tests
+# decorator. Prints findings to stdout; takes one path argument (file or directory).
 import sys
 import textwrap
 from pathlib import Path
 
 
 def check(path):
+    # [FUNCTION DOC] Scan one test file and print a report of conversion problems. Prints
+    # the file name as a header, then walks every line (skipping comment lines) and calls
+    # report_violation for each issue found. For parametrize decorators it walks backwards
+    # to find the nearest class line with indent below 8 and checks that the line above that
+    # class is the instantiate_parametrized_tests decorator. Returns nothing; only reads the
+    # file.
+    # KNOWN ISSUE: the backward search for the class may not find one, and the check of the
+    # line before the class is then done on stale loop variables; behavior is heuristic.
     """Check a test file for common issues with pytest->pytorch conversion."""
     print(path.name)
     print("=" * len(path.name), "\n")
@@ -49,10 +62,14 @@ def check(path):
 
 
 def is_comment(line):
+    # [FUNCTION DOC] Return True if the line, ignoring leading whitespace, starts with a
+    # hash.
     return textwrap.dedent(line).startswith("#")
 
 
 def report_violation(line, lineno, header):
+    # [FUNCTION DOC] Print one violation: the zero-based line number, the header text and
+    # the line.
     print(f">>>> line {lineno} : {header}\n {line}\n")
 
 

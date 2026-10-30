@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] einsum tests ported to torch._numpy. Contains the main test case for the subscript
+# string and the list-of-indices forms, with and without the optimize option: argument errors,
+# view semantics, per-dtype sum/product/contraction checks, regressions from NumPy issues, and
+# comparisons of optimized against plain evaluation on many subscript patterns. A path-planning
+# test case is skipped (no torch analog) and a small overlap case follows. At import time it
+# defines the sizes mapping for the letters a to j used by helpers.
 
 import functools
 import itertools
@@ -34,7 +40,15 @@ global_size_dict = dict(zip(chars, sizes))
 
 @instantiate_parametrized_tests
 class TestEinsum(TestCase):
+    # [CLASS DOC] Main einsum tests: errors, views, per-dtype sums, regressions and
+    # optimized-versus-plain comparisons. Parametrized tests are instantiated.
     def test_einsum_errors(self):
+        # [FUNCTION DOC] For both optimize settings, check that invalid calls raise
+        # errors: too few arguments, non-string subscripts, bad out, order, casting or
+        # dtype values, unknown keyword, mismatched operand counts, too many subscripts,
+        # bad ellipsis or characters, output labels missing from input or repeated,
+        # collapsed dimensions of unequal size, implicit broadcasting to new dimensions
+        # and an unsupported order value.
         for do_opt in [True, False]:
             # Need enough arguments
             assert_raises(
@@ -198,6 +212,11 @@ class TestEinsum(TestCase):
 
     @xfail  # (reason="a view into smth else")
     def test_einsum_views(self):
+        # [FUNCTION DOC] Check that einsum returns views (result base is the input) for
+        # pass-through, transpose, single and triple diagonals with ellipsis variants,
+        # and axis swaps, in both the string and list forms, and that the result is
+        # writeable only if the input is. Expected failure because torch._numpy arrays do
+        # not expose the same base attribute.
         # pass-through
         for do_opt in [True, False]:
             a = np.arange(6)
@@ -334,6 +353,12 @@ class TestEinsum(TestCase):
 
     #  @np._no_nep50_warning()
     def check_einsum_sums(self, dtype, do_opt=False):
+        # [FUNCTION DOC] HELPER: Run many einsum sums on arrays of the given dtype name,
+        # optionally with optimization, and compare with plain NumPy-style functions: sum
+        # over last or first axis, trace, multiply, inner and outer products, ellipsis
+        # forms, bool-like logic products, stride and contiguity variants, and several
+        # regression cases. Lengths from 1 to 16 are used to hit unrolled loops. Raises
+        # on any mismatch.
         dtype = np.dtype(dtype)
         # Check various sums.  Does many sizes to exercise unrolled loops.
 
@@ -746,42 +771,62 @@ class TestEinsum(TestCase):
 
     @xfail  # (reason="int overflow differs in numpy and pytorch")
     def test_einsum_sums_int8(self):
+        # [FUNCTION DOC] Run the sums helper for int8; expected failure as overflow
+        # differs.
         self.check_einsum_sums("i1")
 
     @xfail  # (reason="int overflow differs in numpy and pytorch")
     def test_einsum_sums_uint8(self):
+        # [FUNCTION DOC] Run the sums helper for uint8; expected failure as overflow
+        # differs.
         self.check_einsum_sums("u1")
 
     @xfail  # (reason="int overflow differs in numpy and pytorch")
     def test_einsum_sums_int16(self):
+        # [FUNCTION DOC] Run the sums helper for int16; expected failure as overflow
+        # differs.
         self.check_einsum_sums("i2")
 
     def test_einsum_sums_int32(self):
+        # [FUNCTION DOC] Run the sums helper for int32, without and with optimization.
         self.check_einsum_sums("i4")
         self.check_einsum_sums("i4", True)
 
     def test_einsum_sums_int64(self):
+        # [FUNCTION DOC] Run the sums helper for int64 without optimization.
         self.check_einsum_sums("i8")
 
     @xfail  # (reason="np.float16(4641) == 4640.0")
     def test_einsum_sums_float16(self):
+        # [FUNCTION DOC] Run the sums helper for float16; expected failure for rounding
+        # differences.
         self.check_einsum_sums("f2")
 
     def test_einsum_sums_float32(self):
+        # [FUNCTION DOC] Run the sums helper for float32 without optimization.
         self.check_einsum_sums("f4")
 
     def test_einsum_sums_float64(self):
+        # [FUNCTION DOC] Run the sums helper for float64, without and with optimization.
         self.check_einsum_sums("f8")
         self.check_einsum_sums("f8", True)
 
     def test_einsum_sums_cfloat64(self):
+        # [FUNCTION DOC] Run the sums helper for complex64 (code c8), without and with
+        # optimization.
         self.check_einsum_sums("c8")
         self.check_einsum_sums("c8", True)
 
     def test_einsum_sums_cfloat128(self):
+        # [FUNCTION DOC] Run the sums helper for complex128 (code c16) without
+        # optimization.
         self.check_einsum_sums("c16")
 
     def test_einsum_misc(self):
+        # [FUNCTION DOC] Regression checks for ellipsis contractions, the three-operand
+        # form, a reduction with repeated operands, an explicit out of None, and a multi-
+        # operand contraction with known results, each with and without optimization
+        # where relevant.
         # This call used to crash because of a bug in
         # PyArray_AssignZero
         a = np.ones((1, 2))
@@ -832,6 +877,9 @@ class TestEinsum(TestCase):
         assert_equal(np.einsum("i,j", [1], [2], out=None), [[2]])
 
     def test_subscript_range(self):
+        # [FUNCTION DOC] Check the list-of-indices form accepts index values up to 51
+        # (all letters of both cases) and raises ValueError for 52 and for negative
+        # values.
         # Issue #7741, make sure that all letters of Latin alphabet (both uppercase & lowercase) can be used
         # when creating a subscript from arrays
         a = np.ones((2, 3))
@@ -849,6 +897,8 @@ class TestEinsum(TestCase):
         )
 
     def test_einsum_broadcast(self):
+        # [FUNCTION DOC] Check ellipsis broadcasting in several operand shapes, with
+        # optimize on and off, gives the same result as the explicit subscript reference.
         # Issue #2455 change in handling ellipsis
         # remove the 'middle broadcast' error
         # only use the 'RIGHT' iteration in prepare_op_axes
@@ -900,6 +950,9 @@ class TestEinsum(TestCase):
             )  # used to raise error
 
     def test_einsum_fixedstridebug(self):
+        # [FUNCTION DOC] Regression check for a stride bug: einsum of a small matrix with
+        # a larger array (item counts above the default buffer size) must equal the
+        # result of tensordot, for two shape configurations.
         # Issue #4485 obscure einsum bug
         # This case revealed a bug in nditer where it reported a stride
         # as 'fixed' (0) when it was in fact not fixed during processing
@@ -930,6 +983,8 @@ class TestEinsum(TestCase):
         assert_equal(es, tp)
 
     def test_einsum_fixed_collapsingbug(self):
+        # [FUNCTION DOC] Regression check for use of the out argument with a repeated-
+        # label contraction on a random 4D array, compared with explicit fancy indexing.
         # Issue #5147.
         # The bug only occurred when output argument of einssum was used.
         x = np.random.normal(0, 1, (5, 5, 5, 5))
@@ -940,6 +995,8 @@ class TestEinsum(TestCase):
         assert_equal(y1, y2)
 
     def test_einsum_failed_on_p9_and_s390x(self):
+        # [FUNCTION DOC] Regression check: contraction of a 4D random array over repeated
+        # labels must be close to the double trace of the same array.
         # Issues gh-14692 and gh-12689
         # Bug with signed vs unsigned char errored on power9 and s390x Linux
         tensor = np.random.random_sample((10, 10, 10, 10))
@@ -949,6 +1006,9 @@ class TestEinsum(TestCase):
 
     @xfail  # (reason="no base")
     def test_einsum_all_contig_non_contig_output(self):
+        # [FUNCTION DOC] Check einsum with a non-contiguous output (a strided slice)
+        # writes into the memory of the base array. Expected failure because arrays here
+        # have no base attribute.
         # Issue gh-5907, tests that the all contiguous special case
         # actually checks the contiguity of the output
         x = np.ones((5, 5))
@@ -973,6 +1033,13 @@ class TestEinsum(TestCase):
 
     @parametrize("dtype", np.typecodes["AllFloat"] + np.typecodes["AllInteger"])
     def test_different_paths(self, dtype):
+        # [FUNCTION DOC] For each float and integer type code, exercise einsum code paths
+        # with contiguous, strided and scalar operands (reductions, products, with and
+        # without out) and compare against the direct arithmetic. Three and four operand
+        # products are then checked unless the dtype is among e, B, b, in which case the
+        # test raises SkipTest.
+        # KNOWN ISSUE: the skip check compares a dtype object with single-letter strings,
+        # which may not match on every dtype.
         # Test originally added to cover broken float16 path: gh-20305
         # Likely most are covered elsewhere, at least partially.
         dtype = np.dtype(dtype)
@@ -1032,6 +1099,8 @@ class TestEinsum(TestCase):
         assert_array_equal(res, (arr * arr * arr * arr).sum())
 
     def test_small_boolean_arrays(self):
+        # [FUNCTION DOC] Regression check: a batch matrix product of boolean arrays
+        # stored inside larger arrays, with an out slice, gives all True.
         # See gh-5946.
         # Use array of True embedded in False.
         a = np.zeros((16, 1, 1), dtype=np.bool_)[:2]
@@ -1042,12 +1111,18 @@ class TestEinsum(TestCase):
         assert_equal(res, tgt)
 
     def test_out_is_res(self):
+        # [FUNCTION DOC] Check that passing the input as out returns that same array
+        # object.
         a = np.arange(9).reshape(3, 3)
         res = np.einsum("...ij,...jk->...ik", a, a, out=a)
         if res is not a:
             raise AssertionError("Expected res is a")
 
     def optimize_compare(self, subscripts, operands=None):
+        # [FUNCTION DOC] HELPER: Compare plain, greedy and optimal einsum on the same
+        # operands. If no operands are given, random arrays are built for each input term
+        # using the letter sizes mapping. Assert the optimized results are almost equal
+        # to the plain result.
         # Tests all paths of the optimization function against
         # conventional einsum
         if operands is None:
@@ -1066,17 +1141,23 @@ class TestEinsum(TestCase):
         assert_almost_equal(opt, noopt)
 
     def test_hadamard_like_products(self):
+        # [FUNCTION DOC] Compare optimized and plain einsum for Hadamard-like product
+        # subscripts.
         # Hadamard outer products
         self.optimize_compare("a,ab,abc->abc")
         self.optimize_compare("a,b,ab->ab")
 
     def test_index_transformations(self):
+        # [FUNCTION DOC] Compare optimized and plain einsum for index transformation
+        # subscripts.
         # Simple index transformation cases
         self.optimize_compare("ea,fb,gc,hd,abcd->efgh")
         self.optimize_compare("ea,fb,abcd,gc,hd->efgh")
         self.optimize_compare("abcd,ea,fb,gc,hd->efgh")
 
     def test_complex(self):
+        # [FUNCTION DOC] Compare optimized and plain einsum for long multi-operand
+        # subscripts.
         # Long test cases
         self.optimize_compare("acdf,jbje,gihb,hfac,gfac,gifabc,hfac")
         self.optimize_compare("acdf,jbje,gihb,hfac,gfac,gifabc,hfac")
@@ -1088,6 +1169,8 @@ class TestEinsum(TestCase):
         self.optimize_compare("bdhe,acad,hiab,agac,hibd")
 
     def test_collapse(self):
+        # [FUNCTION DOC] Compare optimized and plain einsum for inner product (collapse)
+        # subscripts.
         # Inner products
         self.optimize_compare("ab,ab,c->")
         self.optimize_compare("ab,ab,c->c")
@@ -1097,6 +1180,8 @@ class TestEinsum(TestCase):
         self.optimize_compare("ab,ab,cd,cd,ef,ef->")
 
     def test_expand(self):
+        # [FUNCTION DOC] Compare optimized and plain einsum for outer product (expand)
+        # subscripts.
         # Outer products
         self.optimize_compare("ab,cd,ef->abcdef")
         self.optimize_compare("ab,cd,ef->acdf")
@@ -1106,6 +1191,8 @@ class TestEinsum(TestCase):
         self.optimize_compare("ab,bcd,cd->abd")  # codespell:ignore
 
     def test_edge_cases(self):
+        # [FUNCTION DOC] Compare optimized and plain einsum for difficult optimization
+        # edge cases.
         # Difficult edge cases for optimization
         self.optimize_compare("eb,cb,fb->cef")
         self.optimize_compare("dd,fb,be,cdb->cef")
@@ -1121,6 +1208,8 @@ class TestEinsum(TestCase):
         self.optimize_compare("ba,ac,da->bcd")
 
     def test_inner_product(self):
+        # [FUNCTION DOC] Compare optimized and plain einsum for two-operand inner
+        # products.
         # Inner products
         self.optimize_compare("ab,ab")
         self.optimize_compare("ab,ba")
@@ -1129,6 +1218,8 @@ class TestEinsum(TestCase):
         self.optimize_compare("abc,cba")
 
     def test_random_cases(self):
+        # [FUNCTION DOC] Compare optimized and plain einsum for randomly generated
+        # subscripts.
         # Randomly built test cases
         self.optimize_compare("aab,fa,df,ecc->bde")
         self.optimize_compare("ecb,fef,bad,ed->ac")
@@ -1143,12 +1234,17 @@ class TestEinsum(TestCase):
         self.optimize_compare("aef,fbc,dca->bde")
 
     def test_combined_views_mapping(self):
+        # [FUNCTION DOC] Check a diagonal-like contraction over repeated labels in a 5D
+        # array gives the expected single value.
         # gh-10792
         a = np.arange(9).reshape(1, 1, 3, 1, 3)
         b = np.einsum("bbcdc->d", a)
         assert_equal(b, [12])
 
     def test_broadcasting_dot_cases(self):
+        # [FUNCTION DOC] Compare optimized and plain einsum on explicit operands with
+        # broadcasting dimensions, so such cases are not treated as matrix
+        # multiplications.
         # Ensures broadcasting cases are not mistaken for GEMM
 
         a = np.random.rand(1, 5, 4)
@@ -1170,6 +1266,9 @@ class TestEinsum(TestCase):
 
     @xfail  # (reason="order='F' not supported")
     def test_output_order(self):
+        # [FUNCTION DOC] Check the memory order flags of results for each order option,
+        # optimize setting and input layout. Expected failure because Fortran order is
+        # not supported.
         # Ensure output order is respected for optimize cases, the below
         # contraction should yield a reshaped tensor view
         # gh-16415
@@ -1208,7 +1307,11 @@ class TestEinsum(TestCase):
 
 @skip(reason="no pytorch analog")
 class TestEinsumPath(TestCase):
+    # [CLASS DOC] Tests of the contraction path planner; skipped because torch has no analog.
     def build_operands(self, string, size_dict=global_size_dict):
+        # [FUNCTION DOC] HELPER: Return a list holding the subscripts string followed by
+        # random arrays whose shapes come from the letters in each input term, using a
+        # sizes mapping (default the module-level one).
         # Builds views based off initial operands
         operands = [string]
         terms = string.split("->")[0].split(",")
@@ -1219,6 +1322,8 @@ class TestEinsumPath(TestCase):
         return operands
 
     def assert_path_equal(self, comp, benchmark):
+        # [FUNCTION DOC] HELPER: Assert two paths have equal length and that all entries
+        # after the first are tuples equal to the benchmark's.
         # Checks if list of tuples are equivalent
         ret = len(comp) == len(benchmark)
         assert_(ret)
@@ -1228,6 +1333,8 @@ class TestEinsumPath(TestCase):
         assert_(ret)
 
     def test_memory_contraints(self):
+        # [FUNCTION DOC] Check paths computed with a zero memory limit for greedy and
+        # optimal modes are single full contractions.
         # Ensure memory constraints are satisfied
 
         outer_test = self.build_operands("a,b,c->abc")
@@ -1246,6 +1353,8 @@ class TestEinsumPath(TestCase):
         self.assert_path_equal(path, ["einsum_path", (0, 1, 2, 3)])
 
     def test_long_paths(self):
+        # [FUNCTION DOC] Check greedy and optimal paths for two long subscript cases
+        # equal the stored expected paths.
         # Long complex cases
 
         # Long test 1
@@ -1273,6 +1382,8 @@ class TestEinsumPath(TestCase):
         )
 
     def test_edge_paths(self):
+        # [FUNCTION DOC] Check greedy and optimal paths for several difficult subscripts
+        # equal the stored expected paths.
         # Difficult edge cases
 
         # Edge test1
@@ -1318,6 +1429,8 @@ class TestEinsumPath(TestCase):
         self.assert_path_equal(path, ["einsum_path", (0, 1), (0, 1, 2, 3, 4, 5)])
 
     def test_path_type_input(self):
+        # [FUNCTION DOC] Check path planning for False, True and an explicit path input,
+        # and that einsum with the explicit path matches the unoptimized result.
         # Test explicit path handling
         path_test = self.build_operands("dcc,fce,ea,dbf->ab")
 
@@ -1337,6 +1450,8 @@ class TestEinsumPath(TestCase):
         assert_almost_equal(noopt, opt)
 
     def test_path_type_input_internal_trace(self):
+        # [FUNCTION DOC] Regression check: an explicit path with a single-operand step is
+        # accepted and gives results matching the unoptimized einsum.
         # gh-20962
         path_test = self.build_operands("cab,cdd->ab")
         exp_path = ["einsum_path", (1,), (0, 1)]
@@ -1350,6 +1465,8 @@ class TestEinsumPath(TestCase):
         assert_almost_equal(noopt, opt)
 
     def test_path_type_input_invalid(self):
+        # [FUNCTION DOC] Check that invalid explicit paths make both einsum and the path
+        # planner raise RuntimeError.
         path_test = self.build_operands("ab,bc,cd,de->ae")
         exp_path = ["einsum_path", (2, 3), (0, 1)]
         assert_raises(RuntimeError, np.einsum, *path_test, optimize=exp_path)
@@ -1361,6 +1478,8 @@ class TestEinsumPath(TestCase):
         assert_raises(RuntimeError, np.einsum_path, *path_test, optimize=exp_path)
 
     def test_spaces(self):
+        # [FUNCTION DOC] Check all combinations of optional spaces around the ellipsis in
+        # a subscript string are accepted without error.
         # gh-10794
         arr = np.array([[1]])
         for sp in itertools.product(["", " "], repeat=4):
@@ -1369,7 +1488,10 @@ class TestEinsumPath(TestCase):
 
 
 class TestMisc(TestCase):
+    # [CLASS DOC] Miscellaneous einsum tests.
     def test_overlap(self):
+        # [FUNCTION DOC] Check einsum matches dot for a matrix product, also when the
+        # output array is the same memory as one of the inputs.
         a = np.arange(9, dtype=int).reshape(3, 3)
         b = np.arange(9, dtype=int).reshape(3, 3)
         d = np.dot(a, b)

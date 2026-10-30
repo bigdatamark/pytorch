@@ -1,4 +1,8 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] pytest configuration for the torch_np tests. Adds the slow marker and the
+# --runslow and --nonp command line options, parametrizes tests that take an np fixture over
+# torch._numpy and (when importable and not disabled) real NumPy, skips slow tests unless
+# requested, and skips the whole suite under dynamo-wrapped CI.
 
 import os
 import sys
@@ -9,20 +13,32 @@ import torch._numpy as tnp
 
 
 def pytest_configure(config):
+    # [FUNCTION DOC] pytest hook: register the slow marker description in the pytest
+    # configuration.
     config.addinivalue_line("markers", "slow: very slow tests")
 
 
 def pytest_addoption(parser):
+    # [FUNCTION DOC] pytest hook: add the boolean options --runslow (run slow tests) and
+    # --nonp (make any access to NumPy raise an error).
     parser.addoption("--runslow", action="store_true", help="run slow tests")
     parser.addoption("--nonp", action="store_true", help="error when NumPy is accessed")
 
 
 class Inaccessible:
+    # [CLASS DOC] Stand-in object installed in place of the numpy module when --nonp is
+    # given. Any attribute access on it raises RuntimeError, so tests that touch NumPy fail
+    # loudly.
     def __getattribute__(self, attr):
+        # [FUNCTION DOC] Raise RuntimeError naming the attribute that was accessed; never
+        # returns.
         raise RuntimeError(f"Using --nonp but accessed np.{attr}")
 
 
 def pytest_sessionstart(session):
+    # [FUNCTION DOC] pytest hook run at session start. If --nonp was passed (default False
+    # when the option is not registered), replace the numpy entry in the module table with
+    # an Inaccessible instance. Side effect: modifies the global module table.
     # Use default=False to handle case when option isn't registered
     # (e.g., when pytest is run from the root directory)
     if session.config.getoption("--nonp", default=False):
@@ -30,6 +46,10 @@ def pytest_sessionstart(session):
 
 
 def pytest_generate_tests(metafunc):
+    # [FUNCTION DOC] pytest hook that parametrizes tests having a fixture argument named np.
+    # Builds a list of numpy-like modules: always torch._numpy, plus real NumPy if it
+    # imports and is not the Inaccessible stand-in. Parametrizes the np argument over that
+    # list. Tests without such an argument are left unchanged.
     """
     Hook to parametrize test cases
     See https://docs.pytest.org/en/6.2.x/parametrize.html#pytest-generate-tests
@@ -75,6 +95,10 @@ def pytest_generate_tests(metafunc):
 
 
 def pytest_collection_modifyitems(config, items):
+    # [FUNCTION DOC] pytest hook that marks tests as skipped after collection. Unless
+    # --runslow is given (default False if unregistered), adds a skip marker to items with
+    # the slow keyword. If the environment variable PYTORCH_TEST_WITH_DYNAMO equals 1, adds
+    # a skip marker to every collected item. Mutates the items only.
     # Use default=False to handle case when option isn't registered
     # (e.g., when pytest is run from the root directory)
     # See: https://github.com/pytorch/pytorch/issues/171563
