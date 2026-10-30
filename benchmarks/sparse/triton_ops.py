@@ -1,8 +1,27 @@
+# [MODULE DOC] Benchmark driver for block-sparse (bsr) matrix multiplication kernels, comparing
+# dense matmul, torch matmul, bsr dense mm, bsr scatter mm variants and linear against random
+# blocked-sparse operands. Provides a generator of random block-sparse test data and one timing
+# function per operation; the main block (requires triton) parses a large set of comma-separated
+# sweep options (sizes, block sizes, sparsity, kernel tuning parameters, dtype, device, repeats,
+# output file, and a star mode that sweeps around heuristic kernel parameters), loops over all
+# valid combinations, prints time and TFLOPS lines marking the best result and results close to
+# the dense baseline, and prints the ten best lines at exit.
+# KNOWN ISSUE: the shared timing worker reads the sizes m, k and n from module globals that
+#     exist only when the main block has run, so the timing functions cannot be used after
+#     a plain import.
 import torch
 from torch._inductor.runtime.benchmarking import benchmarker
 
 
 def create_blocked_tensor(B, M, N, blocksize, sparsity, dtype, device):
+    # [FUNCTION DOC] Builds a random tensor of 0 and 1 blocks with a requested fraction of zero
+    # blocks. Shape is batch by M by N (the batch dimension is dropped when the batch size is
+    # zero); M and N must be divisible by the block size. First draws each block as one with
+    # probability one minus the sparsity, then randomly flips entries so the number of nonzero
+    # blocks equals the expected count (integer part of the density times the number of blocks),
+    # and finally expands every block to the block size along the last two dimensions. Raises an
+    # assertion error if the sparsity is outside zero to one or M or N is not divisible by the
+    # block size.
     if not (sparsity <= 1.0 and sparsity >= 0.0):
         raise AssertionError(
             f"sparsity should be a value between 0 and 1, but got {sparsity}"
@@ -35,6 +54,10 @@ def create_blocked_tensor(B, M, N, blocksize, sparsity, dtype, device):
 
 
 def _test_worker(test_func):
+    # [FUNCTION DOC] HELPER: Times a callable on the gpu with the inductor benchmarker (500
+    # warmup and 100 timed units) and uses the time in milliseconds it returns. Computes the
+    # throughput in TFLOPS as two times m times k times n over that time, using the module
+    # global sizes. Returns the pair of time and TFLOPS.
     ms, ms_min, ms_max = benchmarker.benchmark_gpu(test_func, warmup=500, rep=100)
 
     tflops = 2 * m * k * n * 1e-12 / (ms * 1e-3)
@@ -42,23 +65,37 @@ def _test_worker(test_func):
 
 
 def test_dense_dense_mm(x, y, **meta):
+    # [FUNCTION DOC] Benchmark of dense matmul: converts the first operand to dense once, then
+    # times matmul with the second operand. Extra meta arguments are ignored. Returns time in
+    # milliseconds and TFLOPS.
     def test_func(x=x.to_dense(), y=y):
+        # [FUNCTION DOC] HELPER: Timed callable computing the dense matrix product of the
+        # bound operands.
         return torch.matmul(x, y)
 
     return _test_worker(test_func)
 
 
 def test_torch_matmul(x, y, **meta):
+    # [FUNCTION DOC] Benchmark of the generic matmul call with the operands as given (the first
+    # may be sparse). Extra meta arguments are ignored. Returns time in milliseconds and TFLOPS.
     def test_func(x=x, y=y):
+        # [FUNCTION DOC] HELPER: Timed callable computing the product of the bound operands with
+        # the generic matmul.
         return torch.matmul(x, y)
 
     return _test_worker(test_func)
 
 
 def test_bsr_dense_mm(x, y, **meta):
+    # [FUNCTION DOC] Benchmark of the triton bsr dense mm kernel with fixed tuning parameters
+    # (group size 4, one stage, four warps), ignoring extra meta arguments. Imports the kernel
+    # lazily. Returns time in milliseconds and TFLOPS.
     from torch.sparse._triton_ops import bsr_dense_mm
 
     def test_func(x=x, y=y):
+        # [FUNCTION DOC] HELPER: Timed callable running the bsr dense mm kernel with the fixed
+        # tuning parameters.
         return bsr_dense_mm(
             x, y, meta=dict(GROUP_SIZE_ROW=4, num_stages=1, num_warps=4)
         )
@@ -67,15 +104,23 @@ def test_bsr_dense_mm(x, y, **meta):
 
 
 def test_bsr_dense_mm_with_meta(x, y, **meta):
+    # [FUNCTION DOC] Benchmark of the triton bsr dense mm kernel using the tuning parameters
+    # passed in as extra keyword arguments. Imports the kernel lazily. Returns time in
+    # milliseconds and TFLOPS.
     from torch.sparse._triton_ops import bsr_dense_mm
 
     def test_func(x=x, y=y, meta=meta):
+        # [FUNCTION DOC] HELPER: Timed callable running the bsr dense mm kernel with the bound
+        # tuning parameters.
         return bsr_dense_mm(x, y, meta=meta)
 
     return _test_worker(test_func)
 
 
 def test_bsr_scatter_mm2(x, y, **meta):
+    # [FUNCTION DOC] Benchmark of the bsr scatter mm kernel with index data in the scatter
+    # format, computed once outside the timed region using the extra keyword arguments as
+    # parameters. Imports lazily. Returns time in milliseconds and TFLOPS.
     from torch.sparse._triton_ops import bsr_scatter_mm, bsr_scatter_mm_indices_data
 
     indices_data = bsr_scatter_mm_indices_data(
@@ -83,12 +128,17 @@ def test_bsr_scatter_mm2(x, y, **meta):
     )
 
     def test_func(x=x, y=y):
+        # [FUNCTION DOC] HELPER: Timed callable running the bsr scatter mm kernel with
+        # precomputed index data.
         return bsr_scatter_mm(x, y, indices_data=indices_data)
 
     return _test_worker(test_func)
 
 
 def test_bsr_scatter_mm6(x, y, **meta):
+    # [FUNCTION DOC] Benchmark of the bsr scatter mm kernel with index data in the compressed
+    # strided format, computed once outside the timed region using the extra keyword arguments
+    # as parameters. Imports lazily. Returns time in milliseconds and TFLOPS.
     from torch.sparse._triton_ops import bsr_scatter_mm, bsr_scatter_mm_indices_data
 
     indices_data = bsr_scatter_mm_indices_data(
@@ -96,15 +146,22 @@ def test_bsr_scatter_mm6(x, y, **meta):
     )
 
     def test_func(x=x, y=y):
+        # [FUNCTION DOC] HELPER: Timed callable running the bsr scatter mm kernel with
+        # precomputed index data.
         return bsr_scatter_mm(x, y, indices_data=indices_data)
 
     return _test_worker(test_func)
 
 
 def test_bsr_scatter_mm(x, y, **meta):
+    # [FUNCTION DOC] Benchmark of the bsr scatter mm kernel including index data construction
+    # (compressed strided format, extra keyword arguments as parameters) inside the timed
+    # region. Imports lazily. Returns time in milliseconds and TFLOPS.
     from torch.sparse._triton_ops import bsr_scatter_mm, bsr_scatter_mm_indices_data
 
     def test_func(x=x, y=y):
+        # [FUNCTION DOC] HELPER: Timed callable that builds the index data and then runs the bsr
+        # scatter mm kernel.
         indices_data = bsr_scatter_mm_indices_data(
             x, y, indices_format="bsr_strided_mm_compressed", **meta
         )
@@ -114,9 +171,13 @@ def test_bsr_scatter_mm(x, y, **meta):
 
 
 def test_linear(x, y, **meta):
+    # [FUNCTION DOC] Benchmark of the functional linear op with the transposed second operand as
+    # input and the first operand as weight. Extra meta arguments are ignored. Returns time in
+    # milliseconds and TFLOPS.
     import torch.nn.functional as F
 
     def test_func(x=x, y=y.transpose(-2, -1)):
+        # [FUNCTION DOC] HELPER: Timed callable applying linear to the bound operands.
         return F.linear(y, x)
 
     return _test_worker(test_func)
@@ -135,12 +196,19 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     def integer_list(a):
+        # [FUNCTION DOC] HELPER: Parses a comma-separated string into a list of integers.
         return list(map(int, a.split(",")))
 
     def float_list(a):
+        # [FUNCTION DOC] HELPER: Parses a comma-separated string into a list of floats. Not used
+        # elsewhere in this script.
         return list(map(float, a.split(",")))
 
     def integer_or_float_list(a):
+        # [FUNCTION DOC] HELPER: Parses a comma-separated list where each item is an integer, a
+        # float (item contains a decimal point), a half-open range written as start colon end,
+        # or a stepped range written as start colon end colon step. Ranges expand to the
+        # integers they cover. Returns the flat list.
         lst = []
         for n in a.split(","):
             if n.count(":") == 1:
@@ -294,6 +362,9 @@ if __name__ == "__main__":
 
     @atexit.register
     def show_best_messages(best_messages=best_messages):
+        # [FUNCTION DOC] HELPER: Exit handler registered with the atexit module. Prints a header
+        # and the last ten collected best-result lines (the list bound at definition time), then
+        # flushes standard output.
         print("TOP 10:")
         for m in best_messages[-10:]:
             print(m)

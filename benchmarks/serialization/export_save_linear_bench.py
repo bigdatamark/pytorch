@@ -1,3 +1,9 @@
+# [MODULE DOC] Command-line benchmark of torch.export.save on exported programs of a five-layer
+# linear model, over a range of target parameter counts. For each target it derives a hidden
+# size, exports the model, times the save repeatedly into a temporary directory, and prints a
+# table of median save time and status (ok, out of memory, or error), plus a list of failures.
+# Defines default parameter counts, the layer count and the default repeat count. Nothing runs
+# at import time.
 import argparse
 import gc
 import statistics
@@ -23,7 +29,11 @@ DEFAULT_REPEATS = 5
 
 
 class LinearModel(torch.nn.Module):
+    # [CLASS DOC] Stack of five square linear layers (equal input and output width, with bias)
+    # in the requested dtype, used as the exported model. The layers are kept in a module list.
     def __init__(self, hidden_size: int, *, dtype: torch.dtype) -> None:
+        # [FUNCTION DOC] Builds the five linear layers of the given hidden size in the given
+        # (keyword-only) dtype and registers them as a module list.
         super().__init__()
         self.layers = torch.nn.ModuleList(
             [
@@ -38,6 +48,8 @@ class LinearModel(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Applies each linear layer in order to the input and returns the final
+        # activation. No nonlinearity is applied between layers.
         for layer in self.layers:
             x = layer(x)
         return x
@@ -45,6 +57,9 @@ class LinearModel(torch.nn.Module):
 
 @dataclass
 class BenchmarkResult:
+    # [CLASS DOC] Result record for one benchmark case: the actual parameter count, the median
+    # save time in milliseconds (none on failure), a status string (ok, oom or error) and an
+    # optional error message that defaults to none.
     num_params: int
     median_save_ms: float | None
     status: str
@@ -52,6 +67,10 @@ class BenchmarkResult:
 
 
 def _parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC] HELPER: Defines and parses the command-line options: a list of target
+    # parameter counts (default the module defaults), the repeat count, the example batch size
+    # (default zero) and the dtype name (float32, float16 or bfloat16). Returns the parsed
+    # namespace; the parser exits on invalid input.
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark torch.export.save for a five-layer LinearModel across "
@@ -93,6 +112,8 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _dtype_from_name(dtype_name: str) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Maps a dtype name (float32, float16 or bfloat16) to the matching
+    # torch dtype. Raises a key error for any other name.
     return {
         "float32": torch.float32,
         "float16": torch.float16,
@@ -101,10 +122,17 @@ def _dtype_from_name(dtype_name: str) -> torch.dtype:
 
 
 def _parameter_count(hidden_size: int) -> int:
+    # [FUNCTION DOC] HELPER: Total parameter count of the model for a hidden size: for each of
+    # the five layers, a square weight matrix plus a bias vector.
     return NUM_LAYERS * (hidden_size * hidden_size + hidden_size)
 
 
 def _hidden_size_from_num_params(num_params: int) -> int:
+    # [FUNCTION DOC] HELPER: Chooses the hidden size whose model parameter count is closest to
+    # the target. Solves the quadratic parameter formula for a real root, truncates it (at least
+    # one), then evaluates the candidates from one below to two above that base (those at least
+    # one) and returns the one with the smallest absolute difference. Raises a value error if
+    # the target is not positive.
     if num_params <= 0:
         raise ValueError("--num-params values must be positive")
 
@@ -127,6 +155,9 @@ def _hidden_size_from_num_params(num_params: int) -> int:
 
 
 def _format_num_params(num_params: int) -> str:
+    # [FUNCTION DOC] HELPER: Formats a parameter count for display using a B, M or K suffix for
+    # billions, millions or thousands (value with one decimal, trailing zeros and point
+    # removed), or the plain integer text below one thousand.
     for threshold, suffix in (
         (1_000_000_000, "B"),
         (1_000_000, "M"),
@@ -142,6 +173,10 @@ def _measure_save_times_ms(
     exported_program: torch.export.ExportedProgram,
     repeats: int,
 ) -> list[float]:
+    # [FUNCTION DOC] HELPER: Saves the given exported program repeats times to numbered files
+    # inside a fresh temporary directory, timing each save with the performance counter,
+    # deleting the file after each save. Returns the list of elapsed times in milliseconds. The
+    # directory is removed on exit.
     times_ms: list[float] = []
     with tempfile.TemporaryDirectory(prefix="export_save_bench_") as temp_dir:
         temp_path = Path(temp_dir)
@@ -156,6 +191,10 @@ def _measure_save_times_ms(
 
 
 def _status_for_exception(exc: BaseException) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Classifies an exception. Returns a pair of status and message,
+    # where the message is the first line of the exception text (or the exception type name if
+    # the text is empty). The status is oom for a memory error or a message mentioning running
+    # out of memory or being unable to allocate memory, otherwise error.
     message = (
         str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
     )
@@ -176,6 +215,15 @@ def _run_case(
     batch_size: int,
     dtype: torch.dtype,
 ) -> BenchmarkResult:
+    # [FUNCTION DOC] HELPER: Runs one benchmark case. Picks the hidden size nearest the target
+    # parameter count, builds the model in eval mode without gradients on a zero example input
+    # of the batch size, exports it in strict mode, then times saves. Returns a result with the
+    # median save time and status ok. Memory and runtime errors are caught and returned as a
+    # result with no timing, a classified status and the message; other exceptions propagate.
+    # Always releases the program, input and model and runs garbage collection afterwards.
+    # KNOWN ISSUE: the cleanup block deletes the model and example input, which are unbound if
+    #     the failure happens before they are created, so an early failure raises an
+    #     unbound-name error instead of being reported.
     exported_program = None
     hidden_size = _hidden_size_from_num_params(target_num_params)
     num_params = _parameter_count(hidden_size)
@@ -212,6 +260,10 @@ def _run_case(
 
 
 def _format_table(results: list[BenchmarkResult]) -> str:
+    # [FUNCTION DOC] HELPER: Renders results as an aligned text table with the columns
+    # parameter count (abbreviated), median save time (three decimals or n/a when missing) and
+    # status, with a header row and a separator row. Column widths fit the widest entry.
+    # Returns the text.
     headers = ("num_params", "median_save_ms", "status")
     rows = [
         (
@@ -231,6 +283,9 @@ def _format_table(results: list[BenchmarkResult]) -> str:
     ]
 
     def _format_row(row: tuple[str, ...]) -> str:
+        # [FUNCTION DOC] HELPER: Joins one row of three strings with a column separator,
+        # right-justifying the first two cells and left-justifying the status, using the
+        # enclosing column widths.
         return " | ".join(
             [
                 row[0].rjust(widths[0]),
@@ -248,6 +303,10 @@ def _format_table(results: list[BenchmarkResult]) -> str:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Script entry point. Parses options, prints a banner with dtype, batch size
+    # and repeats, runs one case per requested parameter count, prints a noise caveat, the
+    # results table, and, if any case has an error detail, a list of the failed cases. Returns
+    # nothing; writes only to standard output (plus temporary files during saving).
     args = _parse_args()
     dtype = _dtype_from_name(args.dtype)
 

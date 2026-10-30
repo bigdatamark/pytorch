@@ -1,3 +1,8 @@
+# [MODULE DOC] Script that profiles memory use of one forward pass of a freshly built ResNet-18
+# on a random batch of five images, first on cpu and then, if cuda is available, on gpu (without
+# cuda, the second pass repeats the cpu run). Prints a table of averaged profiler events grouped
+# by input shape, sorted by self memory usage, with no row limit. Everything runs at import
+# time; there are no functions or classes.
 from torchvision import models
 
 import torch

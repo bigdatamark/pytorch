@@ -1,3 +1,7 @@
+# [MODULE DOC] Command-line benchmark comparing the dispatch overhead of torch.add on a plain
+# tensor and on the subclass or protocol-implementing classes from the common module. Module
+# globals hold the repeat counts, which main may overwrite from command-line options. Nothing
+# runs at import time; main runs when executed as a script.
 import argparse
 import time
 
@@ -11,6 +15,11 @@ NUM_REPEAT_OF_REPEATS = 1000
 
 
 def bench(t1, t2):
+    # [FUNCTION DOC] Times repeated calls of the add op on the two given operands. Runs the
+    # inner loop for the module-wide number of repeats, once per outer repetition, recording
+    # wall-clock seconds for each outer repetition. Returns a pair: the minimum and the standard
+    # deviation of those times, each divided by 1000 (a per-call figure only when the inner
+    # repeat count is 1000). Reads module globals only.
     bench_times = []
     for _ in range(NUM_REPEAT_OF_REPEATS):
         time_start = time.time()
@@ -25,6 +34,12 @@ def bench(t1, t2):
 
 
 def main():
+    # [FUNCTION DOC] Script entry point. Parses command-line options for the inner repeat count
+    # (nreps) and the outer repetition count (nrepreps), stores them into the module globals,
+    # then benchmarks the add op for a plain tensor constructor, the tensor subclass, the
+    # torch-function class and the subclass overriding torch-function, each on one-element float
+    # inputs. Prints one line per type with the minimum time and standard deviation in
+    # microseconds. Exits via the parser on bad arguments.
     global NUM_REPEATS
     global NUM_REPEAT_OF_REPEATS
 

@@ -1,3 +1,10 @@
+# [MODULE DOC] Command-line benchmark of sparse-by-dense matrix multiplication time for coo
+# and csr layouts on cpu, using random sparse matrices and the cpu event shim from the utils
+# module. The main block parses options, runs the chosen format, and prints one result line to
+# standard output, standard error or an appended file. Timings are in seconds, averaged over
+# the repeat count.
+# KNOWN ISSUE: the main block calls the combined coo-and-csr benchmark with three arguments
+# while it requires five, so the both format fails with a type error.
 import argparse
 import sys
 
@@ -7,6 +14,9 @@ import torch
 
 
 def test_sparse_csr(m, n, k, nnz, test_count):
+    # [FUNCTION DOC] Times matrix multiplication of a random csr matrix (rows m, columns k, with
+    # the given nonzero count) by a random dense double matrix (k by n). Runs it test_count
+    # times, timing each run with the event shim, and returns the mean time in seconds.
     start_timer = Event(enable_timing=True)
     stop_timer = Event(enable_timing=True)
 
@@ -24,6 +34,8 @@ def test_sparse_csr(m, n, k, nnz, test_count):
 
 
 def test_sparse_coo(m, n, k, nnz, test_count):
+    # [FUNCTION DOC] Same as the csr variant but for a random coo matrix: times test_count
+    # multiplications by a random dense matrix and returns the mean time in seconds.
     start_timer = Event(enable_timing=True)
     stop_timer = Event(enable_timing=True)
 
@@ -41,6 +53,9 @@ def test_sparse_coo(m, n, k, nnz, test_count):
 
 
 def test_sparse_coo_and_csr(m, n, k, nnz, test_count):
+    # [FUNCTION DOC] Generates one sparse matrix in both coo and csr form, then times test_count
+    # multiplications by the same dense matrix for each layout. Returns a pair of the mean coo
+    # time and the mean csr time, in seconds.
     start = Event(enable_timing=True)
     stop = Event(enable_timing=True)
 

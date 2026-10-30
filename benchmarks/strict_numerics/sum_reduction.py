@@ -1,4 +1,10 @@
 from __future__ import annotations
+# [MODULE DOC] Command-line benchmark of row-sum reduction bandwidth on cuda for three
+# providers: plain eager, eager with the inner-tree summation environment switch enabled, and
+# inductor-compiled. For a grid of row counts and column counts it measures GB/s (optionally
+# with cuda graph replay over a rotating set of input buffers), prints one summary line per row
+# count, and saves a plot of bandwidth against column count. Requires triton and a cuda device.
+# Importing only defines constants and functions; the data type is float32.
 
 import argparse
 import os
@@ -31,10 +37,14 @@ DTYPE = torch.float32
 
 
 def _gbps(m: int, n: int, milliseconds: float) -> float:
+    # [FUNCTION DOC] HELPER: Converts a time in milliseconds for reading an m by n float32
+    # matrix once into effective bandwidth in decimal GB/s.
     return m * n * DTYPE.itemsize / (milliseconds * 1e-3) / 1e9
 
 
 def _sum_rows(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: The benchmarked operation: sums the input over its second dimension
+    # and returns the row sums.
     return tensor.sum(1)
 
 
@@ -42,11 +52,24 @@ def _circular_runner(
     function: Callable[[torch.Tensor], torch.Tensor],
     tensors: tuple[torch.Tensor, ...],
 ) -> Callable[[], torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Returns a zero-argument callable that, on each call, applies the
+    # function to the next tensor of the given tuple, cycling through the tuple endlessly. Used
+    # to rotate inputs so successive launches do not reuse cached data.
     tensor_iterator = cycle(tensors)
     return lambda: function(next(tensor_iterator))
 
 
 def measure(m: int, n: int, provider: str, cudagraph: bool) -> float:
+    # [FUNCTION DOC] Measures the achieved bandwidth in GB/s of the row sum for an m by n
+    # float32 cuda tensor with the named provider. Returns NaN without running if the tensor
+    # exceeds the memory budget constant. Seeds the random generator, creates the input (in
+    # cuda graph mode, enough copies to cover the working-set byte constant, otherwise one),
+    # and picks the cuda graph or the plain timing function. The summation environment variable
+    # is patched to enable the inner-tree path only for the inner-tree provider (and to disable
+    # it otherwise) for the duration of the measurement. Eager providers run once as warmup
+    # then are timed; any other provider resets dynamo, uses a fresh inductor cache, compiles
+    # the row sum, warms up and times it. Always frees the buffers and empties the cuda cache
+    # before returning.
     tensor_bytes = m * n * DTYPE.itemsize
     if tensor_bytes > MEMORY_BUDGET:
         return float("nan")
@@ -89,6 +112,10 @@ def measure(m: int, n: int, provider: str, cudagraph: bool) -> float:
 
 
 def _assert_inner_tree_route() -> None:
+    # [FUNCTION DOC] HELPER: Sanity check that the inner-tree switch changes the numerical
+    # result: sums a random 1024 by 300 cuda tensor with the switch on and off, and fails with
+    # an assertion error if the two results are exactly equal (meaning the inner-tree path was
+    # not taken). Frees the tensor and empties the cuda cache afterwards.
     tensor = torch.randn(1024, 300, device="cuda", dtype=DTYPE)
     try:
         with patch.dict(os.environ, {"PYTORCH_SUM_INNER_TREE": "1"}):
@@ -105,6 +132,12 @@ def _assert_inner_tree_route() -> None:
 
 
 def _plot(data: dict[str, dict[int, list[float]]], cudagraph: bool) -> str:
+    # [FUNCTION DOC] HELPER: Draws a grid of line plots, one panel for each row count in the
+    # module list, showing bandwidth per provider against column count on a base-2 log axis,
+    # with legend, grid and a title that mentions whether cuda graph mode was used. Selects the
+    # non-interactive plotting backend, saves a png file in the working directory whose name
+    # depends on the cuda graph flag, and returns that file name. The data argument is a mapping
+    # from provider to a mapping from row count to the list of bandwidths in column-count order.
     import matplotlib
 
     matplotlib.use("Agg")
@@ -138,6 +171,11 @@ def _plot(data: dict[str, dict[int, list[float]]], cudagraph: bool) -> str:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Script entry point. Parses the optional cuda graph flag, requires cuda
+    # (assertion error otherwise), runs the inner-tree sanity check, prints the providers and
+    # the measurement mode, then measures every provider for every row and column count with
+    # inductor caches disabled, printing a summary line per row count with the last column
+    # result for each provider. Finally saves the plot and prints its file name.
     parser = argparse.ArgumentParser()
     parser.add_argument("--cudagraph", action="store_true")
     args = parser.parse_args()

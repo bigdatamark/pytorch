@@ -1,3 +1,7 @@
+# [MODULE DOC] Operator microbenchmark for the where op with broadcasting condition, input and
+# other tensors. Defines short (cpu, three shape triples) and long (cpu and cuda, cross product
+# of shapes) configs and registers the benchmark at import time. Run as a script to start the
+# benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -29,8 +33,15 @@ configs_long = op_bench.cross_product_configs(
 
 
 class WhereBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for the where op: builds a boolean condition tensor plus input and
+    # other float tensors of independent (broadcastable) shapes on the given device.
     def init(self, cond_shape, input_shape, other_shape, dtype, device):
+        # [FUNCTION DOC] Creates the condition (random normal values compared against zero),
+        # input and other tensors in the inputs mapping, and sets the reported module name to
+        # where.
         def _create_tensor(shape):
+            # [FUNCTION DOC] HELPER: Returns a random normal tensor of the given shape using the
+            # enclosing dtype and device.
             return torch.randn(*shape, dtype=dtype, device=device)
 
         self.inputs = {
@@ -41,6 +52,8 @@ class WhereBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("where")
 
     def forward(self, condition, input, other):
+        # [FUNCTION DOC] Timed body: selects elementwise between input and other according to
+        # condition.
         return torch.where(condition, input, other)
 
 

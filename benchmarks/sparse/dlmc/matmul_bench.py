@@ -4,6 +4,13 @@
 # They exist for comparing the performance of sparse matrix routines
 # `sparse @ vector`, `sparse @ sparse` and `sparse @ dense` with different backends (CPU/CUDA)
 # and with other frameworks such as scipy.
+# [MODULE DOC] Command-line benchmark of sparse matrix multiplication on the DLMC dataset,
+# comparing the sparse torch path, the dense torch path and (on cpu only) scipy, for
+# sparse-by-sparse, sparse-by-dense and sparse-by-vector products, forward or backward. The main
+# block loads matrices for six sparsity levels, builds one timer per case and sparsity, runs
+# each timer three times with the autorange method, tags each measurement with its device,
+# prints a progress counter and a final comparison table. Needs scipy and the sibling utils
+# module (relative import). Nothing runs at import time except the main block.
 
 import argparse
 import os
@@ -18,17 +25,26 @@ from .utils import load_dlmc_dataset
 
 
 def scipy_matmul(mat1, mat2):
+    # [FUNCTION DOC] Reference product for scipy operands: if both are scipy sparse matrices,
+    # returns their product converted to coo format; otherwise returns the plain product of the
+    # first with the second.
     if isspmatrix(mat1) and isspmatrix(mat2):
         return mat1.dot(mat2).tocoo()
     return mat1.dot(mat2)
 
 
 def matmul_backward(a_dense, b_dense, grad_output):
+    # [FUNCTION DOC] Backward benchmark body for the dense path: multiplies two dense tensors
+    # and runs backpropagation of the result with the supplied gradient. Returns nothing;
+    # accumulates gradients on inputs requiring them.
     r1 = a_dense.matmul(b_dense)
     r1.backward(grad_output)
 
 
 def sparse_matmul_backward(a, b, grad_output):
+    # [FUNCTION DOC] Backward benchmark body for the sparse path: multiplies with the sparse
+    # matrix product op, then backpropagates the given gradient through the result. Returns
+    # nothing; accumulates gradients on inputs requiring them.
     c = torch.sparse.mm(a, b)
     c.backward(grad_output)
 
@@ -42,6 +58,11 @@ OPS_MAP = {
 
 # also get the arguments as input from the user using `argparse`
 def parse_args():
+    # [FUNCTION DOC] Builds and returns the argument parser (not the parsed result, despite the
+    # name). Options: dataset root path, dataset name (default magnitude pruning), hidden size
+    # (default 2048), a backward-test flag, the operation name (one of the keys of the
+    # operations map; first key by default), a cuda flag, and the minimum timer run time in
+    # seconds (default 1).
     parser = argparse.ArgumentParser(description="matmul benchmark")
     parser.add_argument("--path", type=str, help="DLMC dataset path")
     parser.add_argument("--dataset", type=str, default="magnitude_pruning")
@@ -61,7 +82,18 @@ def parse_args():
 
 
 def get_tasks(op, backward_test, device):
+    # [FUNCTION DOC] Returns the benchmark task list for the requested operation. Each task
+    # is a tuple of test name (device plus forward or backward label), device, a sub-label
+    # naming the backend and operation, and the statement string to time. Backward mode gives
+    # a dense and a sparse task; forward mode gives dense and sparse tasks using the call
+    # named in the operations map, plus a scipy task on cpu only. Raises a key error for an
+    # unknown operation.
     def filter_ops(operation):
+        # [FUNCTION DOC] HELPER: Builds the task tuples for one operation name using the
+        # enclosing backward flag and device, as described for the outer function. In backward
+        # mode the statements call the module backward helpers; in forward mode they call the
+        # function from the operations map, and the scipy entry is dropped when the device is
+        # not cpu.
         if backward_test:
             test_name = device + ":matmul-backward"
             return [

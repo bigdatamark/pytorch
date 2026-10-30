@@ -1,3 +1,9 @@
+# [MODULE DOC] Command-line benchmark measuring the overhead of the autograd record-function
+# machinery on jit-compiled ResNet-50 and LSTM models, for several thread counts, with the
+# callbacks enabled (using an empty test observer) and disabled. Results are gathered with the
+# benchmark timer and printed as a comparison table. Defines a registry of model preparers and
+# the thread-count list; the main block parses options and runs the selected models. Depends on
+# the fastrnns benchmark factory and torchvision.
 import argparse
 import sys
 
@@ -10,6 +16,9 @@ import torch.utils.benchmark as benchmark_utils
 
 
 def prepare_lstm_jit(bench_args):
+    # [FUNCTION DOC] HELPER: Builds a scripted LSTM through the fastrnns creator on cpu using
+    # the sequence length, layer count, input size, hidden size and mini-batch size options from
+    # the argument namespace. Returns a pair of the model inputs and its forward function.
     model_def = lstm_creator(
         script=True,
         seqLength=bench_args.lstmSeqLength,
@@ -23,6 +32,9 @@ def prepare_lstm_jit(bench_args):
 
 
 def prepare_resnet50_jit(bench_args):
+    # [FUNCTION DOC] HELPER: Builds a ResNet-50, traces it with one random batch of 32
+    # images and returns a pair of the inputs tuple and the traced model. The argument
+    # namespace is unused.
     model = resnet50()
     inputs = (torch.randn(32, 3, 224, 224),)
     model = torch.jit.trace(model, inputs)
@@ -38,6 +50,14 @@ NUM_THREADS = [1, 2, 4, 8, 16, 32]
 
 
 def run_bench(model_names, bench_args):
+    # [FUNCTION DOC] Runs the overhead benchmark for each named model. For each model it builds
+    # the model and inputs, runs the warmup iterations, then for every thread count measures
+    # with record function enabled (clearing callbacks and installing an empty test observer
+    # with a small sampling rate) and with it disabled, using a timer with automatic run counts
+    # and the minimum run time option, printing progress and each result. Finally prints a
+    # comparison table of all results. Side effects: toggles global autograd record-function
+    # state and callbacks, writes to stdout. Raises a key error for a model name not in the
+    # registry. The loops option is accepted by the parser but not used here.
     results = []
     for model_name in model_names:
         model_creator = MODELS[model_name]

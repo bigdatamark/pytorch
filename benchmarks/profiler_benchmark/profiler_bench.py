@@ -1,3 +1,9 @@
+# [MODULE DOC] Command-line benchmark measuring the overhead of the autograd profiler. It times
+# a matrix-multiplication workload (sequential loop, or split across forked jit tasks) with the
+# profiler disabled and then enabled, optionally on cuda, traced to script, with stacks or
+# kineto, and prints the timer result for each. Module globals hold the parallel task count and
+# the iteration count, which the main block sets from options. All work happens under the main
+# guard; options are described there.
 import argparse
 import sys
 import timeit
@@ -11,13 +17,22 @@ INTERNAL_ITER = None
 
 
 def loop_workload(x):
+    # [FUNCTION DOC] HELPER: Sequential workload. Repeatedly squares the input matrix by matrix
+    # multiplication for the number of iterations held in the module global, and returns the
+    # final matrix. Fails with a type error if the global was never set (it starts as none).
     for i in range(INTERNAL_ITER):
         x = torch.mm(x, x)
     return x
 
 
 def parallel_workload(x):
+    # [FUNCTION DOC] HELPER: Parallel workload. Forks several tasks (the module-wide task count)
+    # through the jit fork mechanism, each squaring the input by matrix multiplication for the
+    # total iteration count divided by the task count (integer part), then waits for all of
+    # them. Returns the original input, not any task result; results of the tasks are discarded.
     def parallel_task(x):
+        # [FUNCTION DOC] HELPER: One forked unit of work: repeatedly squares its argument by
+        # matrix multiplication for the per-task iteration count and returns the result.
         for i in range(int(INTERNAL_ITER / PARALLEL_TASKS_NUM)):
             x = torch.mm(x, x)
         return x
@@ -94,6 +109,10 @@ if __name__ == "__main__":
         if profiling_enabled:
 
             def payload():
+                # [FUNCTION DOC] HELPER: Timed callable used when profiling is on. Runs the
+                # selected workload on the captured input inside an autograd profiler context
+                # configured from the command-line flags (device, stack recording, kineto, cpu
+                # usage) and returns the workload output. Profiler results are discarded.
                 x = None
                 with torch.autograd.profiler.profile(
                     use_device="cuda" if args.with_cuda else None,
@@ -107,6 +126,8 @@ if __name__ == "__main__":
         else:
 
             def payload():
+                # [FUNCTION DOC] HELPER: Timed callable used when profiling is off: runs the
+                # selected workload on the captured input and returns its output.
                 return workload(input_x)
 
         t = Timer(

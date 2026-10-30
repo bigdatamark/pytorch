@@ -1,3 +1,9 @@
+# [MODULE DOC] Script measuring how long it takes to compute the annotation string of deeply
+# nested jit dictionary types. It builds dictionary types nested 1, 3, 5 and 10 levels deep
+# (each level maps strings to a pair of the previous level), times the annotation string
+# property with the benchmark timer, and prints the nesting level, the first 70 characters of
+# the string, and the timing for each. Everything runs at import time; a module-level cache
+# avoids rebuilding types.
 import torch
 import torch.utils.benchmark as benchmark
 
@@ -6,6 +12,10 @@ MEMO = {}
 
 
 def create_nested_dict_type(layers):
+    # [FUNCTION DOC] HELPER: Returns a jit type for the given nesting depth: the string type at
+    # depth zero, otherwise a dictionary from string to a two-element tuple whose elements are
+    # both the type one level shallower. Results for depths above zero are cached in the
+    # module-level mapping so shared subtypes are built once.
     if layers == 0:
         return torch._C.StringType.get()
     if layers not in MEMO:

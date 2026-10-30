@@ -1,3 +1,10 @@
+# [MODULE DOC] Command-line benchmark of sparse-matrix by dense-vector multiplication time for
+# coo and csr layouts, using random square sparse matrices and the cpu event shim from the utils
+# module. The main block parses options, runs the chosen format, and prints one result line (two
+# for both formats) to standard output, standard error or an appended file. Timings are in
+# seconds, averaged over the repeat count.
+# KNOWN ISSUE: the helper import is relative, so running this file directly as a script fails;
+#     it works only when imported as part of the package.
 import argparse
 import sys
 
@@ -7,6 +14,9 @@ from .utils import Event, gen_sparse_coo, gen_sparse_coo_and_csr, gen_sparse_csr
 
 
 def test_sparse_csr(m, nnz, test_count):
+    # [FUNCTION DOC] Times matrix-vector multiplication of a random square csr matrix (the given
+    # size and nonzero count) by a random double vector. Repeats test_count times, timing each
+    # run with the event shim, and returns the mean time in seconds.
     start_timer = Event(enable_timing=True)
     stop_timer = Event(enable_timing=True)
 
@@ -24,6 +34,8 @@ def test_sparse_csr(m, nnz, test_count):
 
 
 def test_sparse_coo(m, nnz, test_count):
+    # [FUNCTION DOC] Same as the csr variant but for a random square coo matrix: returns the
+    # mean time in seconds over test_count multiplications by a random double vector.
     start_timer = Event(enable_timing=True)
     stop_timer = Event(enable_timing=True)
 
@@ -41,6 +53,9 @@ def test_sparse_coo(m, nnz, test_count):
 
 
 def test_sparse_coo_and_csr(m, nnz, test_count):
+    # [FUNCTION DOC] Generates one random square sparse matrix in both coo and csr form and
+    # times test_count matrix-vector products for each layout with the same vector. Returns a
+    # pair of the mean coo time and the mean csr time, in seconds.
     start = Event(enable_timing=True)
     stop = Event(enable_timing=True)
 

@@ -1,3 +1,9 @@
+# [MODULE DOC] Script for profiling torch.add dispatch with an external sampling profiler. Run
+# with a class name (a name defined in the common module, or Tensor for the plain constructor)
+# and optional repeat count (default one million); it builds two one-element inputs of that
+# class and calls the add op in a loop. The class is looked up by name in the module globals, so
+# an unknown name raises a lookup error. All work happens under the main guard; nothing runs on
+# import. The common-module imports are kept only so the names resolve.
 import argparse
 
 from common import SubTensor, SubWithTorchFunction, WithTorchFunction  # noqa: F401

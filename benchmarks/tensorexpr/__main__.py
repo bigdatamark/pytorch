@@ -1,3 +1,9 @@
+# [MODULE DOC] Command-line driver for the tensor expression micro-benchmarks. Importing the
+# benchmark modules (attention, broadcast, concat, elementwise, matmul, reduction, rnn_eltwise,
+# softmax, swish and the engine module) registers their benchmark classes in the global registry
+# as a side effect. The main function parses options (devices, modes, dtypes, jit mode, fuser
+# backend, output format and others), configures global jit fuser flags, selects the tensor
+# engine and runs the requested benchmarks. Run as a module to execute main.
 import argparse
 import itertools
 import os
@@ -21,6 +27,21 @@ from . import (  # noqa: F401
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Parses options: benchmark names (optional), device list
+    # (default cpu and cuda), mode list (fwd and both), dtype list, an optional input-dimension
+    # sweep, engine (default pt), jit mode (trace or none), cuda pointwise tuning values, cuda
+    # fuser (te, nvf or old; anything else raises a value error), output format, IR and kernel
+    # printing, dynamic-shape disabling, cpu fusion and cat-without-conditionals switches. Sets
+    # the corresponding global jit flags, expands device names (gpu means cuda; names such as
+    # cpu followed by a number set the thread-count environment variables and become cpu; more
+    # than one cpu entry is an error), resolves dtype names to torch dtypes, and selects the
+    # engine. With no names it runs the default configs of every registered class. For each name
+    # it first runs every class whose module name contains the name (using the dimension sweep
+    # when given and supported); otherwise it parses a full name of module, mode, device and
+    # integer config values and runs that single float32 benchmark, raising a value error for
+    # malformed names, bad modes or unknown classes (listing the available ones).
+    # KNOWN ISSUE: the class match uses a substring test although the help text and comments
+    #     describe a prefix match.
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""Benchmark operators in specific shapes.
@@ -183,6 +204,8 @@ Works only with Python3.\n A few examples:
         torch._C._jit_cat_wo_conditionals(False)
 
     def set_global_threads(num_threads):
+        # [FUNCTION DOC] HELPER: Sets the thread-count environment variables used by OpenMP,
+        # MKL, TVM and the tensor expression runtime to the given number.
         os.environ["OMP_NUM_THREADS"] = str(num_threads)
         os.environ["MKL_NUM_THREADS"] = str(num_threads)
         os.environ["TVM_NUM_THREADS"] = str(num_threads)
@@ -221,6 +244,10 @@ Works only with Python3.\n A few examples:
     tensor_engine.set_engine_mode(args.engine)
 
     def run_default_configs(bench_cls, allow_skip=True):
+        # [FUNCTION DOC] HELPER: Runs the default configs of a benchmark class for every
+        # combination of mode, device and dtype from the parsed options. Creates each benchmark,
+        # applies the output type and jit mode, skips it if unsupported when skipping is allowed
+        # (otherwise raises a value error), and runs it.
         for mode, device, dtype, config in itertools.product(
             modes, devices, datatypes, bench_cls.default_configs()
         ):
@@ -237,6 +264,12 @@ Works only with Python3.\n A few examples:
             bench.run(args)
 
     def run_with_input_iter(bench_cls, input_iter, allow_skip=True):
+        # [FUNCTION DOC] HELPER: Runs a benchmark class over a sweep of dimensions given as
+        # comma-separated triples of start, stop and increment, where the increment is a number,
+        # the word for powers of two, or the word for powers of two plus one (doubling then
+        # adding one). Builds the cross product of the per-dimension value lists, and for every
+        # mode, device, dtype and config creates, configures and runs the benchmark with the
+        # same skip-or-raise rule for unsupported cases.
         tensor_dim_specs = input_iter.split(",")
         tensor_dim_specs = [dim.split(":") for dim in tensor_dim_specs]
 
