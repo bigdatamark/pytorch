@@ -1,4 +1,11 @@
 # Owner(s): ["module: mkldnn"]
+# [MODULE DOC] Tests for the oneDNN Graph (LLGA) fuser in TorchScript on CPU. Traces small ops,
+# fusion-pattern modules and TorchVision models, runs them in float32 and bfloat16, and checks
+# both numerical equality with eager mode and the number and contents of fusion group nodes in the
+# optimized graph. Import-time side effects: probes the CPU flags file on Linux for AVX512,
+# detects TorchVision availability, builds one test per vision model and dtype on the model test
+# class, and instantiates device-type tests for the op and fusion-pattern classes. Runs the test
+# runner only on Python older than 3.14.
 import sys
 import torch
 import unittest
@@ -24,14 +31,24 @@ from torch.testing._internal.common_device_type import (
 # only have 16 GB RAM. Cumulatively, these UTs had been using more than 14 GB
 # memory (as per psutils). So now we run each TorchVision model UTs in separate processes.
 def separate_process(func):
+    # [FUNCTION DOC] HELPER: Decorator that runs the wrapped test function in a
+    # separate worker process via a process pool and waits for it to finish, to
+    # avoid cumulative memory growth from traced models. The wrapper discards the
+    # result and does not re-raise errors from the worker.
+    # KNOWN ISSUE: the future's result is never retrieved, so exceptions raised in the worker
+    # process are silently swallowed and the test passes.
     @wraps(func)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Submits the original function with the given arguments to a new
+        # process pool, waits for completion, and returns nothing.
         with futures.ProcessPoolExecutor() as executor:
             future = executor.submit(func, *args, **kwargs)
             futures.wait([future])
     return wrapper
 
 def is_avx512_supported():
+    # [FUNCTION DOC] HELPER: Returns true only on Linux when the processor information file lists
+    # avx512; returns false on other platforms. Reads that file as text.
     if sys.platform != 'linux':
         return False
     with open("/proc/cpuinfo", encoding="ascii") as f:
@@ -44,14 +61,23 @@ LLGA_FUSION_GROUP = 'prim::oneDNNFusionGroup'
 LLGA_NOT_ENABLED = not torch.backends.mkldnn.is_available() or IS_WINDOWS or IS_MACOS
 
 def warmup_forward(f, *args, profiling_count=3):
+    # [FUNCTION DOC] HELPER: Calls the function the given number of times (default three) with the
+    # given arguments to let the profiling executor specialize it, and returns the result of the
+    # last call.
     for _ in range(profiling_count):
         results = f(*args)
 
     return results
 
 class JitLlgaTestCase(JitTestCase):
+    # [CLASS DOC] Base test case for the oneDNN Graph fuser tests. Setup enables oneDNN fusion and
+    # disables the JIT autocast mode; teardown restores them. Provides helpers to trace and check
+    # a module, find fusion groups in a graph and assert on graph contents.
 
     def setUp(self):
+        # [FUNCTION DOC] Records torch function mode stack length and state baselines, saves the
+        # previous JIT autocast mode while turning it off, and enables oneDNN fusion. Deliberately
+        # does not call the parent setup because its emit hooks cause crashes at process exit.
         # Don't call super().setUp() — JitTestCase.setUp installs JIT emit
         # hooks that cause segfaults during process cleanup. Record state
         # baselines that tearDown checks for.
@@ -64,10 +90,16 @@ class JitLlgaTestCase(JitTestCase):
         torch.jit.enable_onednn_fusion(True)
 
     def tearDown(self):
+        # [FUNCTION DOC] Disables oneDNN fusion and restores the saved JIT autocast mode.
         torch.jit.enable_onednn_fusion(False)
         torch._C._jit_set_autocast_mode(self.original_autocast_mode)
 
     def checkTrace(self, m, x, dtype=torch.float32, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Puts a module in eval mode, traces it (freezing it if it is a
+        # module) with the example inputs, warms it up, runs the eager model for reference, and
+        # gets the optimized graph. For bfloat16 the tracing runs under CPU autocast with caching
+        # disabled. Asserts the traced output equals the eager output and returns the traced
+        # object and its graph. Runs with gradients and emit hooks disabled.
         if isinstance(m, torch.nn.Module):
             m.eval()
         with torch.no_grad(), torch._jit_internal._disable_emit_hooks():
@@ -94,10 +126,14 @@ class JitLlgaTestCase(JitTestCase):
 
 
     def assertFused(self, graph, fused_patterns):
+        # [FUNCTION DOC] HELPER: Asserts that none of the given operator kind strings remain in
+        # the graph (exact count zero), i.e. they were absorbed into fusion groups.
         for pat in fused_patterns:
             self.assertGraphContainsExactly(graph, pat, 0)
 
     def findFusionGroups(self, graph):
+        # [FUNCTION DOC] HELPER: Recursively walks the graph nodes and nested blocks and returns a
+        # list of the subgraphs of every oneDNN fusion group node found.
         result = []
         for n in graph.nodes():
             if n.kind() == LLGA_FUSION_GROUP:
@@ -108,6 +144,9 @@ class JitLlgaTestCase(JitTestCase):
         return result
 
     def checkPatterns(self, graph, patterns):
+        # [FUNCTION DOC] HELPER: Collects the fusion groups of the graph, raises an assertion
+        # error if their number differs from the number of pattern lists, then asserts each group
+        # subgraph contains every operator in its corresponding pattern list.
         fusion_groups = self.findFusionGroups(graph)
         if len(fusion_groups) != len(patterns):
             raise AssertionError("length of subgraphs not equal to length of given patterns")
@@ -126,6 +165,9 @@ except RuntimeError:
 skipIfNoTorchVision = unittest.skipIf(not HAS_TORCHVISION, 'no torchvision')
 
 def get_eltwise_fn(name):
+    # [FUNCTION DOC] HELPER: Returns an elementwise function by name, looking first in the torch
+    # namespace, then the functional namespace, and returning an in-place hardswish module for the
+    # name with trailing underscore. Raises a name error if none is found.
     if hasattr(torch, name):
         return getattr(torch, name)
     elif hasattr(F, name):
@@ -139,9 +181,14 @@ def get_eltwise_fn(name):
 @unittest.skipIf(IS_AVX512_UNSUPPORTED, "This test fails for BF16 on machines without AVX512.")
 @unittest.skipIf(LLGA_NOT_ENABLED, "MKL-DNN build is disabled")
 class TestOp(JitLlgaTestCase):
+    # [CLASS DOC] Tests of single operators under the oneDNN Graph fuser (convolution, pooling,
+    # softmax, linear, binary ops and others), skipped without AVX512 or without a MKL-DNN build.
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_conv2d(self, dtype):
+        # [FUNCTION DOC] Traces a 2D convolution over a grid of spatial size, channels, kernel,
+        # padding, stride, dilation, groups and bias options, and asserts exactly one fusion group
+        # each time.
         for [spatial, in_channels, out_channels, kernel, padding, stride, dilation, g, bias] in itertools.product(
                 [7, 8],
                 [8, 15],
@@ -169,6 +216,8 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_bn2d(self, dtype):
+        # [FUNCTION DOC] Traces an eval-mode 2D batch norm and asserts no fusion group is created
+        # (single-op partitions are not formed).
         m = nn.BatchNorm2d(32).eval()
         x = torch.rand(1, 32, 28, 28)
         _, graph = self.checkTrace(m, [x], dtype)
@@ -178,12 +227,17 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_eltwise(self, dtype):
+        # [FUNCTION DOC] Checks that relu and gelu applied alone (wrapped in a module) produce no
+        # fusion group.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module applying a given elementwise function to its input.
             def __init__(self, eltwise_fn):
+                # [FUNCTION DOC] HELPER: Stores the elementwise function as an attribute.
                 super().__init__()
                 self.eltwise = eltwise_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the elementwise function applied to the input.
                 return self.eltwise(x)
 
         for eltwise in ['relu', 'gelu']:
@@ -197,6 +251,8 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_max_pool2d(self, dtype):
+        # [FUNCTION DOC] Traces 2D max pooling over a grid of sizes, kernel, padding, stride (one
+        # or two), dilation of one and ceil mode, asserting one fusion group each time.
         for [spatial, kernel, padding, stride, dilation, ceil_mode] in itertools.product(
                 [15, 16, 17, 18, 19],
                 [4, 5],
@@ -218,6 +274,9 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_avg_pool2d(self, dtype):
+        # [FUNCTION DOC] Traces 2D average pooling over a grid of sizes, kernel,
+        # padding, stride and count-include-pad, with ceil mode fixed to false,
+        # asserting one fusion group each time.
         for [spatial, kernel, padding, stride, ceil_mode, count_include_pad] in itertools.product(
                 [15, 16, 17, 18, 19],
                 [4, 5],
@@ -239,8 +298,14 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_variable_kernel_avg_pool2d(self, dtype):
+        # [FUNCTION DOC] Traces average pooling whose kernel size comes from the input size and
+        # asserts no fusion group, since the kernel is not constant.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module that average-pools its input with a kernel equal to its
+            # full spatial size.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the average pool over the full spatial extent,
+                # without padding and excluding padding from the count.
                 x = F.avg_pool2d(x, kernel_size=(x.size(2), x.size(3)), padding=0, count_include_pad=False)
                 return x
 
@@ -254,6 +319,8 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_softmax(self, dtype):
+        # [FUNCTION DOC] Traces softmax over each dimension of a 4D input and asserts no fusion
+        # group is created.
         for dim in [-4, -3, -2, -1, 0, 1, 2, 3]:
             m = nn.Softmax(dim=dim)
             x = torch.rand(8, 12, 12, 12)
@@ -264,6 +331,8 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_linear(self, dtype):
+        # [FUNCTION DOC] Traces a linear layer with and without bias, asserting one fusion group
+        # and that the linear operator no longer appears outside it.
         for bias in [True, False]:
             x = torch.rand(32, 28)
             m = torch.nn.Linear(in_features=28, out_features=64, bias=bias)
@@ -273,6 +342,9 @@ class TestOp(JitLlgaTestCase):
 
 
     def _gen_binary_inputs(self, gen_permute=True):
+        # [FUNCTION DOC] HELPER: Generator yielding pairs of random tensors for binary op tests: a
+        # 4D tensor with itself shape, with a broadcast shape, with a vector and with a single
+        # element, and optionally the swapped order for differing shapes.
         for xshape, yshape in [
             [[1, 32, 28, 28], [1, 32, 28, 28]],
             [[1, 32, 28, 28], [1, 1, 28, 28]],
@@ -287,7 +359,11 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_add(self, dtype):
+        # [FUNCTION DOC] Traces an add with an alpha factor over the binary inputs and asserts one
+        # fusion group each time.
         def forward_add(x, y):
+            # [FUNCTION DOC] HELPER: Returns the sum of the two inputs with an
+            # alpha of two on the second.
             return torch.add(x, y, alpha=2)
 
         for x, y in self._gen_binary_inputs():
@@ -297,7 +373,9 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_add_scalar(self, dtype):
+        # [FUNCTION DOC] Traces adding two scalars to a tensor and asserts one fusion group.
         def add_scalar(x):
+            # [FUNCTION DOC] HELPER: Returns the input plus an integer plus a float constant.
             return 42 + x + 3.14
 
         x = torch.rand(32, 32)
@@ -307,10 +385,14 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_addmm(self, dtype):
+        # [FUNCTION DOC] Traces a matrix multiply with bias add and asserts one fusion group (a
+        # single-op partition is allowed for matmul with bias).
         # Just a sidenote - comparison of eager-mode & oneDNN Graph JIT outputs of
         # addmm (which entails matmul-bias-add fusion) might require higher tolerance
         # bounds for BF16. This is subject to change in the near future.
         def addmm(x, y, z):
+            # [FUNCTION DOC] HELPER: Returns the fused matrix multiply of two inputs added to a
+            # third input.
             # alpha and beta are 1, by default
             return torch.addmm(z, x, y)
 
@@ -324,7 +406,10 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_mul(self, dtype):
+        # [FUNCTION DOC] Traces multiplication followed by a scalar multiply over the binary
+        # inputs and asserts one fusion group each time.
         def forward_mul(x, y):
+            # [FUNCTION DOC] HELPER: Returns the product of two inputs times three.
             return torch.mul(x, y) * 3
 
         for x, y in self._gen_binary_inputs():
@@ -335,7 +420,10 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_identity_binary(self, dtype):
+        # [FUNCTION DOC] Traces an expression multiplying by one and adding zero and asserts no
+        # mul or add operator remains outside fusion groups.
         def forward(x):
+            # [FUNCTION DOC] HELPER: Returns the input times one plus zero.
             return x * 1 + 0.0
 
         x = torch.rand(32)
@@ -345,6 +433,8 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_layer_norm(self, dtype):
+        # [FUNCTION DOC] Traces a layer norm over the last dimension of ten and
+        # asserts one fusion group.
         # TODO: support more normalized_shape
         m = torch.nn.LayerNorm(10)
         x = torch.randn(2, 5, 10, 10)
@@ -354,8 +444,14 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_cat(self, dtype):
+        # [FUNCTION DOC] Traces concatenation of three copies of a tensor along each dimension,
+        # for several shapes, asserting one fusion group.
         def cat_along_dim(d):
+            # [FUNCTION DOC] HELPER: Returns a function that concatenates its arguments along the
+            # given dimension.
             def forward_cat(*inputs):
+                # [FUNCTION DOC] HELPER: Concatenates all positional inputs along
+                # the captured dimension.
                 return torch.cat(inputs, d)
             return forward_cat
 
@@ -372,6 +468,9 @@ class TestOp(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_typecheck(self, dtype):
+        # [FUNCTION DOC] Traces a linear layer created in the test dtype with one fusion group,
+        # then runs the traced module on a smaller batch and checks the result still equals eager,
+        # exercising the fallback path on shape change.
         x = torch.rand(32, 28, dtype=dtype)
         m = torch.nn.Linear(in_features=28, out_features=64, bias=True, dtype=dtype)
         traced, graph = self.checkTrace(m, [x], dtype)
@@ -385,17 +484,29 @@ class TestOp(JitLlgaTestCase):
 @unittest.skipIf(IS_AVX512_UNSUPPORTED, "This test fails for BF16 on machines without AVX512.")
 @unittest.skipIf(LLGA_NOT_ENABLED, "MKL-DNN build is disabled")
 class TestFusionPattern(JitLlgaTestCase):
+    # [CLASS DOC] Tests of fusion patterns (convolution with elementwise ops, batch norm, linear
+    # with elementwise ops, sums, wildcards) under the oneDNN Graph fuser, skipped without AVX512
+    # or MKL-DNN.
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_conv2d_eltwise(self, dtype):
+        # [FUNCTION DOC] For several elementwise functions in in-place and out-of-place form,
+        # traces two convolutions with the function between and after, asserts two fusion groups
+        # and that neither the in-place nor out-of-place op remains outside.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module with two convolutions applying a given elementwise
+            # function after each.
             def __init__(self, eltwise_fn):
+                # [FUNCTION DOC] HELPER: Creates two 3x3 convolutions with 32 channels (the first
+                # with bias, the second without) and stores the elementwise function.
                 super().__init__()
                 self.conv1 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
                 self.conv2 = nn.Conv2d(32, 32, 3, padding=1, bias=False)
                 self.eltwise = eltwise_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs convolution, elementwise, convolution, elementwise
+                # on the input.
                 x = self.conv1(x)
                 x = self.eltwise(x)
                 x = self.conv2(x)
@@ -420,14 +531,24 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_conv2d_silu(self, dtype):
+        # [FUNCTION DOC] For in-place and out-of-place silu and both contiguous and channels-last
+        # memory formats, traces two convolutions with silu between them, asserts two fusion
+        # groups, that convolution and silu are fused, and that the first group contains
+        # convolution, sigmoid and multiply while the second contains only convolution.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module with two convolutions and a silu between them, in-place
+            # if requested.
             def __init__(self, inplace):
+                # [FUNCTION DOC] HELPER: Creates two biased 32 channel convolutions and the silu
+                # module with the in-place option.
                 super().__init__()
                 self.conv1 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
                 self.conv2 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
                 self.eltwise = nn.SiLU(inplace=inplace)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the first convolution, silu and
+                # the second convolution.
                 x = self.conv1(x)
                 x = self.eltwise(x)
                 x = self.conv2(x)
@@ -452,8 +573,16 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_ensure_tensor_is_rewrapped(self, dtype):
+        # [FUNCTION DOC] Traces a two-branch model of convolutions and relus, adds the branches
+        # and average-pools adaptively (an op the backend does not support), in channels-last
+        # format, and asserts the result matches eager and that there are four fusion groups.
+        # Guards against an accuracy bug when an output tensor is consumed by an unsupported op.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module with two parallel conv-elementwise-conv-elementwise
+            # branches summed and followed by adaptive average pooling.
             def __init__(self, eltwise_fn):
+                # [FUNCTION DOC] HELPER: Creates four biased 32 channel convolutions, stores the
+                # elementwise function and an adaptive average pooling to a 5 by 7 output.
                 super().__init__()
                 self.conv1 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
                 self.conv2 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
@@ -463,6 +592,9 @@ class TestFusionPattern(JitLlgaTestCase):
                 self.adaptive_avg_pool_2d = nn.AdaptiveAvgPool2d((5, 7))
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Runs each of two inputs through its own
+                # convolution pair with the elementwise function, adds the results
+                # and applies the adaptive pooling.
                 x = self.conv1(x)
                 x = self.eltwise(x)
                 x = self.conv2(x)
@@ -491,8 +623,14 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_conv2d_clamp(self, dtype):
+        # [FUNCTION DOC] Traces five stacked convolutions each followed by a clamp with different
+        # bound combinations (infinite, one-sided, two-sided), in contiguous and channels-last
+        # formats, asserting five fusion groups with convolution and clamp both fused.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module of five convolutions each followed by a clamp with
+            # different bounds.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates five biased 32 channel convolutions.
                 super().__init__()
                 self.conv1 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
                 self.conv2 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
@@ -501,6 +639,9 @@ class TestFusionPattern(JitLlgaTestCase):
                 self.conv5 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies each convolution then a clamp with min only
+                # (negative infinity), min only (minus five), min zero and infinite max, min one
+                # and max five, and max two only.
                 x = self.conv1(x)
                 x = torch.clamp(x, min=float('-inf'))
                 x = self.conv2(x)
@@ -523,13 +664,20 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_conv2d_bn(self, dtype):
+        # [FUNCTION DOC] Traces a convolution followed by batch norm in eval mode (pre-fused with
+        # the FX optimization for bfloat16) and asserts one fusion group containing convolution
+        # and batch norm.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module with a convolution followed by batch norm.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates one biased convolution and a batch norm layer of
+                # 32 channels.
                 super().__init__()
                 self.conv1 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
                 self.bn1 = nn.BatchNorm2d(32)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies convolution then batch norm.
                 x = self.conv1(x)
                 x = self.bn1(x)
                 return x
@@ -545,13 +693,19 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_conv2d_bn_relu(self, dtype):
+        # [FUNCTION DOC] Same as the convolution batch norm test with a relu after, asserting one
+        # fusion group with convolution, batch norm and relu fused.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module with a convolution, batch norm and relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates one biased convolution and a batch norm layer of
+                # 32 channels.
                 super().__init__()
                 self.conv1 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
                 self.bn1 = nn.BatchNorm2d(32)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies convolution, batch norm and relu.
                 x = self.conv1(x)
                 x = self.bn1(x)
                 x = F.relu(x)
@@ -569,13 +723,19 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_bn2d_eltwise(self, dtype):
+        # [FUNCTION DOC] Traces batch norm followed by relu in eval mode and asserts one fusion
+        # group with relu fused.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module applying batch norm then a given elementwise function.
             def __init__(self, eltwise_fn):
+                # [FUNCTION DOC] HELPER: Stores the elementwise function and creates a 32 channel
+                # batch norm.
                 super().__init__()
                 self.eltwise = eltwise_fn
                 self.bn = nn.BatchNorm2d(32)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies batch norm and then the elementwise function.
                 x = self.bn(x)
                 x = self.eltwise(x)
                 return x
@@ -591,13 +751,20 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_linear_eltwise(self, dtype):
+        # [FUNCTION DOC] Traces a linear layer with and without bias followed by each of several
+        # elementwise functions, asserting one fusion group with the function fused.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer from 28 to 64 features followed by an
+            # elementwise function.
             def __init__(self, eltwise_fn, bias):
+                # [FUNCTION DOC] HELPER: Creates the linear layer with the given bias flag and
+                # stores the elementwise function.
                 super().__init__()
                 self.linear = nn.Linear(28, 64, bias)
                 self.eltwise = eltwise_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and the elementwise function.
                 x = self.linear(x)
                 x = self.eltwise(x)
                 return x
@@ -616,8 +783,15 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_conv2d_sum(self, dtype):
+        # [FUNCTION DOC] Traces a residual-like model where two convolution plus batch norm
+        # branches are added, passed through relu and then another convolution plus batch norm,
+        # with and without convolution bias, asserting three fusion groups.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module with two convolution plus batch norm branches whose sum
+            # goes through relu and a third convolution plus batch norm.
             def __init__(self, bias=False):
+                # [FUNCTION DOC] HELPER: Creates three 32 channel convolutions with the given bias
+                # flag, each paired with a batch norm, and a relu.
                 super().__init__()
                 self.conv1 = nn.Conv2d(32, 32, 3, padding=1, bias=bias)
                 self.bn1 = nn.BatchNorm2d(32)
@@ -628,6 +802,8 @@ class TestFusionPattern(JitLlgaTestCase):
                 self.bn3 = nn.BatchNorm2d(32)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies the first two branches, adds and relus them, then
+                # applies the third convolution and batch norm.
                 x = self.conv1(x)
                 x = self.bn1(x)
                 y = self.conv2(y)
@@ -649,13 +825,21 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_wildcard(self, dtype):
+        # [FUNCTION DOC] Traces a convolution whose output is used both by relu and by a list
+        # construction (a wildcard op) and asserts one fusion group containing only the
+        # convolution, since relu cannot be fused with it.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module returning both a convolution output and
+            # its relu in a list.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a biased convolution and a relu.
                 super().__init__()
                 self.conv1 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
                 self.eltwise = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a list with the convolution output and the relu
+                # of it.
                 x = self.conv1(x)
                 y = self.eltwise(x)
                 return [x, y]
@@ -679,8 +863,13 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.int32)
     def test_wildcard_unsupported_dtype(self, dtype):
+        # [FUNCTION DOC] Traces floor division of an integer tensor by two, which involves an
+        # integer type the backend does not support, to check the bridge handles unsupported input
+        # dtypes, and asserts no fusion group.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module returning the floor division of its input by two.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input floor divided by two.
                 y = x // 2
                 return y
 
@@ -700,8 +889,16 @@ class TestFusionPattern(JitLlgaTestCase):
     @onlyCPU
     @dtypes(torch.float32, torch.bfloat16)
     def test_rewrap_tensor_input_to_pytorch(self, dtype):
+        # [FUNCTION DOC] Traces a model of two convolution and relu stages, adds a second input
+        # and applies adaptive average pooling (unsupported by the backend), in channels-last
+        # format, only checking that the result equals eager, so strides are passed correctly back
+        # to PyTorch.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module of two convolution plus elementwise stages, an addition
+            # with a second input and adaptive average pooling.
             def __init__(self, eltwise_fn):
+                # [FUNCTION DOC] HELPER: Creates two biased 32 channel convolutions, stores the
+                # elementwise function and an adaptive pooling to a 5 by 7 output.
                 super().__init__()
                 self.conv1 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
                 self.conv2 = nn.Conv2d(32, 32, 3, padding=1, bias=True)
@@ -709,6 +906,8 @@ class TestFusionPattern(JitLlgaTestCase):
                 self.adaptive_avg_pool_2d = nn.AdaptiveAvgPool2d((5, 7))
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies the two stages, adds the second input and applies
+                # the adaptive pooling.
                 x = self.conv1(x)
                 x = self.eltwise(x)
                 x = self.conv2(x)
@@ -731,21 +930,31 @@ class TestFusionPattern(JitLlgaTestCase):
 
 @unittest.skipIf(LLGA_NOT_ENABLED, "MKL-DNN build is disabled")
 class TestEnableDisableLlgaFuser(JitTestCase):
+    # [CLASS DOC] Tests turning the oneDNN Graph fuser on and off through the fuser context
+    # manager. Setup disables the fuser and remembers the prior state; teardown restores it.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the parent setup and then disables the LLGA fuser, saving
+        # its previous enabled flag.
         super().setUp()
         self.is_enabled = torch._C._jit_set_llga_enabled(False)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Restores the saved enabled flag of the LLGA fuser and then calls
+        # the parent teardown.
         torch._C._jit_set_llga_enabled(self.is_enabled)
         super().tearDown()
 
     def test_context_manager(self):
+        # [FUNCTION DOC] Scripts three small add functions: two under nested uses of the third
+        # fuser option, which must yield fusion group nodes after two calls, and one after leaving
+        # the context, which must have no fusion group.
         x = torch.randn(4, 8)
         y = torch.randn(4, 8)
         with torch.jit.fuser('fuser3'):
             with torch.jit.fuser('fuser3'):
 
                 def t1(x, y):
+                    # [FUNCTION DOC] HELPER: Returns the sum of the inputs plus two.
                     o = x + y
                     o = o + 2.0
                     return o
@@ -755,6 +964,7 @@ class TestEnableDisableLlgaFuser(JitTestCase):
                 self.assertGraphContains(t_jit.graph_for(x, y), LLGA_FUSION_GROUP)
 
             def t2(x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the inputs plus three.
                 o = x + y
                 o = o + 3.0
                 return o
@@ -764,6 +974,7 @@ class TestEnableDisableLlgaFuser(JitTestCase):
             self.assertGraphContains(t_jit_2.graph_for(x, y), LLGA_FUSION_GROUP)
 
         def t3(x, y):
+            # [FUNCTION DOC] HELPER: Returns the sum of the inputs plus four.
             o = x + y
             o = o + 4.0
             return o
@@ -776,9 +987,17 @@ class TestEnableDisableLlgaFuser(JitTestCase):
 @unittest.skipIf(LLGA_NOT_ENABLED, "MKL-DNN build is disabled")
 @unittest.skip("Enable when integration with dynamo aot_autograd is more stable")
 class TestDynamoAOT(JitTestCase):
+    # [CLASS DOC] Test case for ahead-of-time autograd compilation with a TorchScript backend and
+    # oneDNN fusion; the class is unconditionally skipped.
     def test_dynamo_aot_ts_onednn(self):
+        # [FUNCTION DOC] Compiles a small two layer network with the AOT TorchScript backend
+        # requiring a full graph, runs forward and backward ten times under the third fuser
+        # option, then resets dynamo state. Currently skipped.
         class Seq(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping a sequence of two linear layers with relus.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds a sequential container of linear, relu, linear and
+                # relu layers of width ten.
                 super().__init__()
                 self.layers = nn.Sequential(
                     nn.Linear(10, 10),
@@ -788,6 +1007,7 @@ class TestDynamoAOT(JitTestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the sequential layers on the input.
                 return self.layers(x)
 
         mod = Seq()
@@ -806,8 +1026,16 @@ class TestDynamoAOT(JitTestCase):
 @unittest.skipIf(IS_AVX512_UNSUPPORTED, "This test fails for BF16 on machines without AVX512.")
 @unittest.skipIf(LLGA_NOT_ENABLED, "MKL-DNN build is disabled")
 class TestModel(JitLlgaTestCase):
+    # [CLASS DOC] Whole-model tests on TorchVision networks. Test methods are
+    # attached dynamically after the class definition, one per model name and
+    # dtype, each running in a separate process.
     @skipIfNoTorchVision
     def _test_vision(self, model_name, dtype):
+        # [FUNCTION DOC] HELPER: Builds the named TorchVision model in eval mode (batch-norm-fused
+        # for bfloat16), traces it with a small random image batch, and asserts the listed
+        # operator kinds (convolution, batch norm, relu, linear, pooling) are no longer present
+        # outside fusion groups. Skipped without TorchVision; it is a helper, not a test itself,
+        # since its name has no test prefix.
         m = getattr(torchvision.models, model_name)().eval()
         if dtype == torch.bfloat16:
             m = optimization.fuse(m)
@@ -845,9 +1073,14 @@ for model_name, enabled in [
     ['wide_resnet50_2', True],
 ]:
     def _wrapper(mname, dtype):
+        # [FUNCTION DOC] HELPER: Factory building a test method for a model name and dtype,
+        # closing over the enabled flag of the loop variable.
         @unittest.skipIf(not enabled, 'Disabled')
         @separate_process
         def test(self, dtype=dtype):
+            # [FUNCTION DOC] HELPER: Test method that runs the vision check for the captured model
+            # in a separate process; skipped when the model is disabled. Accepts the dtype as a
+            # default argument.
             return self._test_vision(mname, dtype)
         return test
 

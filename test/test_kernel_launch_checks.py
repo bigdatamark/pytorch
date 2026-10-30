@@ -1,4 +1,7 @@
 # Owner(s): ["module: cuda"]
+# [MODULE DOC] Tests the helper that scans source code for CUDA kernel launches lacking an
+# error-check statement. One test class verifies the detection logic on sample code strings and
+# that the real repository has no unchecked launches.
 
 from torch.testing._internal.common_utils import TestCase, run_tests
 from torch.testing._internal.check_kernel_launches import (
@@ -7,7 +10,12 @@ from torch.testing._internal.check_kernel_launches import (
 
 
 class AlwaysCheckCudaLaunchTest(TestCase):
+    # [CLASS DOC] Test case for the kernel launch checker; has no state of its own.
     def test_check_code(self):
+        # [FUNCTION DOC] Feeds sample source strings to the code checker and asserts the number of
+        # unchecked launches reported. Cases: varied spacing and blank lines (two unchecked
+        # launches expected), macros including a multi-line one (none), and lambda arguments where
+        # one launch has the check and one has an unrelated statement before it (one).
         """Verifies that the regex works for a few different situations"""
 
         # Try some different spacings
@@ -73,6 +81,8 @@ some_function_call<TemplateArg><<<1,2,0,stream>>> ( arg1 , arg2 , arg3 ) ;
         """))
 
     def test_check_cuda_launches(self):
+        # [FUNCTION DOC] Runs the checker over the whole source tree and asserts it finds zero
+        # unchecked kernel launches.
         unsafeLaunchesCount = check_cuda_kernel_launches()
         self.assertTrue(unsafeLaunchesCount == 0)
 
