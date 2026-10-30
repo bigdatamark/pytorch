@@ -1,4 +1,10 @@
 # Owner(s): ["module: cpp-extensions"]
+# [MODULE DOC] Tests for torch.utils.cpp_extension: JIT compilation of C++, CUDA, SYCL and MPS
+# extensions through the load and load_inline entry points, the C++ frontend module bridge,
+# warning and error propagation, precompiled headers, and a few stable-API shims. Importing
+# computes TEST_ROCM, narrows TEST_CUDA to also require CUDA_HOME, and defines TEST_MPS,
+# IS_WINDOWS and IS_LINUX flags used by skip decorators. Two test classes are defined; the main
+# one builds extensions from sources under cpp_extensions and from inline strings.
 
 import glob
 import locale
@@ -40,7 +46,15 @@ IS_LINUX = sys.platform.startswith("linux")
 
 
 class TestCppExtensionImport(common.TestCase):
+    # [CLASS DOC] Checks that importing the cpp_extension module does not pull in a Cython package
+    # that happens to be on the path. Has no state.
     def test_cython_not_loaded_with_import_cpp_extension(self):
+        # [FUNCTION DOC] Runs a child Python process that builds a fake Cython package in a
+        # temporary directory, puts it first on the import path, imports
+        # torch.utils.cpp_extension, and asserts inside the child that no Cython modules were
+        # loaded and that the BuildExtension class is still importable with its source containing
+        # a build_extensions method. The test requires the child exit status to be zero and
+        # reports its output otherwise.
         script = """
 import importlib.util
 import inspect
@@ -86,11 +100,17 @@ with tempfile.TemporaryDirectory() as tmpdir:
 # There's only one test that runs gradcheck, run slow mode manually
 @torch.testing._internal.common_utils.markDynamoStrictTest
 class TestCppExtensionJIT(common.TestCase):
+    # [CLASS DOC] Test case for just-in-time C++ extensions (not TorchScript). Each test runs with
+    # the working directory set to this file's folder because sources are given as relative paths.
+    # Class setup and teardown remove the shared extension build root. Many tests are gated on
+    # CUDA, ROCm, XPU or MPS availability.
     """Tests just-in-time cpp extensions.
     Don't confuse this with the PyTorch JIT (aka TorchScript).
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Saves the current working directory in an instance attribute and changes
+        # into the directory containing this test file.
         super().setUp()
         # cpp extensions use relative paths. Those paths are relative to
         # this file, so we'll change the working directory temporarily
@@ -98,19 +118,28 @@ class TestCppExtensionJIT(common.TestCase):
         os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs the base teardown, then restores the working directory
+        # saved by setUp.
         super().tearDown()
         # return the working directory (see setUp)
         os.chdir(self.old_working_dir)
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class-level setup: removes any stale cpp extensions build root directory.
         torch.testing._internal.common_utils.remove_cpp_extensions_build_root()
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class-level cleanup: removes the cpp extensions build root directory.
         torch.testing._internal.common_utils.remove_cpp_extensions_build_root()
 
     def test_jit_compile_extension(self):
+        # [FUNCTION DOC] Loads a two-source C++ extension with extra include paths (including
+        # awkward ones with spaces and a quote) and debug flags, then checks the functions defined
+        # in each source file against the equivalent tensor math, and checks that an exported
+        # class can be built and used (its tensor has no gradient, its sum and forward results
+        # match expectations).
         module = torch.utils.cpp_extension.load(
             name="jit_extension",
             sources=[
@@ -142,6 +171,11 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(doubler.forward().sum(), 8)
 
     def test_jit_stale_lock_file_does_not_deadlock(self):
+        # [FUNCTION DOC] Regression test for a hang caused by a leftover lock file in the build
+        # directory. Creates an empty lock file in a temporary build directory, then loads an
+        # inline extension from a child process with a 300 second timeout so a hang shows up as a
+        # test failure instead of blocking. Passes if the child prints its success marker. The
+        # temp directory is removed at cleanup.
         # Regression test for https://github.com/pytorch/pytorch/issues/189245:
         # a leftover 'lock' file (e.g. from a builder killed by SIGKILL/OOM)
         # must not deadlock later loads. Run in a subprocess so a regression
@@ -176,6 +210,9 @@ class TestCppExtensionJIT(common.TestCase):
 
     @unittest.skipIf(not (TEST_CUDA or TEST_ROCM), "CUDA not found")
     def test_jit_cuda_extension(self):
+        # [FUNCTION DOC] Skipped unless CUDA or ROCm is usable. Loads a CUDA extension made from a
+        # C++ and a CUDA source with optimization flags, applies its sigmoid-add function to two
+        # zero tensors on the GPU, and checks the result is all ones.
         # NOTE: The name of the extension must equal the name of the module.
         module = torch.utils.cpp_extension.load(
             name="torch_test_cuda_extension",
@@ -197,6 +234,12 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(z, torch.ones_like(z))
 
     def _test_jit_xpu_extension(self, extra_sycl_cflags):
+        # [FUNCTION DOC] HELPER: Builds and checks one XPU extension with the given extra SYCL
+        # compiler flags. Copies the SYCL source into a temp directory with function names
+        # suffixed by a random string (so several builds in one process do not clash), loads it,
+        # runs the sigmoid-add function on zero tensors on the xpu device and checks all ones.
+        # Always deletes the temp directory, using a shell command on Windows to work around
+        # permission errors.
         # randomizing extension name and names of extension methods
         # for the case when we test building few extensions in a row
         # using this function
@@ -240,11 +283,17 @@ class TestCppExtensionJIT(common.TestCase):
 
     @unittest.skipIf(not (TEST_XPU), "XPU not found")
     def test_jit_xpu_extension(self):
+        # [FUNCTION DOC] Skipped without XPU. Runs the shared XPU extension check with no extra
+        # SYCL flags; the outcome can depend on the TORCH_XPU_ARCH_LIST environment variable.
         # NOTE: this test can be affected by setting TORCH_XPU_ARCH_LIST
         self._test_jit_xpu_extension(extra_sycl_cflags=[])
 
     @unittest.skipIf(not (TEST_XPU), "XPU not found")
     def test_jit_xpu_archlists(self):
+        # [FUNCTION DOC] Skipped without XPU. Runs the shared XPU extension check for three
+        # architecture-list settings (JIT only, JIT plus full AOT list, AOT only with the spir64
+        # target excluded) by setting the TORCH_XPU_ARCH_LIST environment variable for each case.
+        # The original value is restored (or removed if it was unset) afterwards.
         # NOTE: in this test we explicitly test few different options
         # for TORCH_XPU_ARCH_LIST. Setting TORCH_XPU_ARCH_LIST in the
         # environment before the test won't affect it.
@@ -283,6 +332,10 @@ class TestCppExtensionJIT(common.TestCase):
 
     @unittest.skipIf(not TEST_MPS, "MPS not found")
     def test_mps_extension(self):
+        # [FUNCTION DOC] Skipped without MPS. Loads an Objective-C++ extension, compares an add
+        # computed on CPU with the one computed on MPS, then as a regression check compiles a
+        # Metal shader, runs it and calls an extension function that adds one using a new context,
+        # verifying the MPS tensor was incremented correctly.
         module = torch.utils.cpp_extension.load(
             name="torch_test_mps_extension",
             sources=[
@@ -308,8 +361,22 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(cpu_output + 1.0, mps_output.to("cpu"))
 
     def _run_jit_cuda_archflags(self, flags, expected):
+        # [FUNCTION DOC] HELPER: Compiles the CUDA arch-flag test extension with the
+        # TORCH_CUDA_ARCH_LIST environment variable set to the given flags string, and
+        # verifies the embedded device code. The expected argument is a pair: a list of
+        # compute capability strings expected as ELF (cubin) entries and a list expected
+        # as PTX entries or None to skip the PTX check. On Windows the build happens in
+        # a child process; elsewhere in-process. Always removes the temp build dir and
+        # restores the environment variable. Raises an assertion error if the inspection
+        # tool fails or prints to stderr, or if the found architectures differ from
+        # expectations.
         # Compile an extension with given `flags`
         def _check_cuobjdump_output(expected_values, is_ptx=False):
+            # [FUNCTION DOC] HELPER: Runs the cuobjdump tool on the built extension library (found
+            # by wildcard in the temp directory, since the name may carry a version suffix)
+            # listing either ELF or PTX entries, and compares the sorted architecture names found
+            # against the expected values (mapping 121 to 120 first). Raises an assertion error if
+            # the tool exits nonzero or writes to stderr.
             elf_or_ptx = "--list-ptx" if is_ptx else "--list-elf"
             lib_ext = ".pyd" if IS_WINDOWS else ".so"
             # Note, .extension name may include _v1, _v2, so first find exact name
@@ -394,6 +461,13 @@ class TestCppExtensionJIT(common.TestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA not found")
     @unittest.skipIf(TEST_ROCM, "disabled on rocm")
     def test_jit_cuda_archflags(self):
+        # [FUNCTION DOC] Skipped without CUDA or on ROCm. Builds the arch-flag extension
+        # for several TORCH_CUDA_ARCH_LIST values (device default, plus-PTX forms, and,
+        # only for CUDA 12.9 or older, named architectures and mixed lists) and checks
+        # the resulting ELF and PTX contents. A runtime error from the default case
+        # whose message mentions a build error is ignored (the device may be newer than
+        # the compiler); any other error is re-raised. After each case, device
+        # synchronization errors are swallowed so they do not leak into later tests.
         # Test a number of combinations:
         #   - the default for the machine we're testing on
         #   - Separators, can be ';' (most common) or ' '
@@ -437,6 +511,9 @@ class TestCppExtensionJIT(common.TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not found")
     def test_cuda_arch_flags_non_default_gencode(self):
+        # [FUNCTION DOC] Skipped without CUDA. Checks that when the user's flags already
+        # contain an explicit gencode option, the helper that computes default arch
+        # flags returns an empty list.
         user_arch_flags = ["-gencode=arch=compute_86,code=sm_86"]
         result = _get_cuda_arch_flags(user_arch_flags)
 
@@ -449,6 +526,8 @@ class TestCppExtensionJIT(common.TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA not found")
     def test_cuda_arch_flags_default_gencode(self):
+        # [FUNCTION DOC] Skipped without CUDA. Checks that the arch flag helper returns a nonempty
+        # list when given no arguments, only unrelated flags, or an empty list.
         default_flags = _get_cuda_arch_flags()
         self.assertGreater(
             len(default_flags), 0, "No args should generate default flags"
@@ -467,6 +546,10 @@ class TestCppExtensionJIT(common.TestCase):
     @unittest.skipIf(not TEST_CUDNN, "CuDNN not found")
     @unittest.skipIf(TEST_ROCM, "Not supported on ROCm")
     def test_jit_cudnn_extension(self):
+        # [FUNCTION DOC] Skipped without cuDNN or on ROCm. Loads an extension implementing relu
+        # with cuDNN, linking against the cudnn library (library name differs on Windows). Checks
+        # the output matches the standard relu on a CUDA tensor and that passing an output of the
+        # wrong size raises a RuntimeError mentioning same size.
         # implementation of CuDNN ReLU
         if IS_WINDOWS:
             extra_ldflags = ["cudnn.lib"]
@@ -489,6 +572,9 @@ class TestCppExtensionJIT(common.TestCase):
             module.cudnn_relu(x, y_incorrect)
 
     def test_inline_jit_compile_extension_with_functions_as_list(self):
+        # [FUNCTION DOC] Loads an inline extension from a C++ string with the functions argument
+        # given as a plain function name, checks the generated binding's docstring has that name
+        # on its third line, and checks the result against the equivalent tensor math.
         cpp_source = """
         torch::Tensor tanh_add(torch::Tensor x, torch::Tensor y) {
           return x.tanh() + y.tanh();
@@ -511,6 +597,9 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(z, x.tanh() + y.tanh())
 
     def test_inline_jit_compile_extension_with_functions_as_dict(self):
+        # [FUNCTION DOC] Loads an inline extension with the functions argument given as a mapping
+        # from function name to doc text, and checks the third line of the binding's docstring is
+        # that custom text.
         cpp_source = """
         torch::Tensor tanh_add(torch::Tensor x, torch::Tensor y) {
           return x.tanh() + y.tanh();
@@ -527,6 +616,9 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(module.tanh_add.__doc__.split("\n")[2], "Tanh and then sum :D")
 
     def test_inline_jit_compile_extension_multiple_sources_and_no_functions(self):
+        # [FUNCTION DOC] Loads an inline extension from two C++ strings, one defining a function
+        # and one declaring it and writing the pybind module definition itself, with no functions
+        # argument. Checks the exported function matches the equivalent tensor math.
         cpp_source1 = """
         torch::Tensor sin_add(torch::Tensor x, torch::Tensor y) {
           return x.sin() + y.sin();
@@ -556,6 +648,9 @@ class TestCppExtensionJIT(common.TestCase):
     @unittest.skip("Temporarily disabled")
     @unittest.skipIf(not (TEST_CUDA or TEST_ROCM), "CUDA not found")
     def test_inline_jit_compile_extension_cuda(self):
+        # [FUNCTION DOC] Disabled by an unconditional skip (and also needs CUDA or ROCm). Compiles
+        # an inline extension with a CUDA kernel source and a C++ declaration, checks the binding
+        # docstring name, and checks the cosine-sum result on GPU tensors.
         cuda_source = """
         __global__ void cos_add_kernel(
             const float* __restrict__ x,
@@ -599,6 +694,10 @@ class TestCppExtensionJIT(common.TestCase):
     @unittest.skip("Temporarily disabled")
     @unittest.skipIf(not (TEST_CUDA or TEST_ROCM), "CUDA not found")
     def test_inline_jit_compile_custom_op_cuda(self):
+        # [FUNCTION DOC] Disabled by an unconditional skip (and also needs CUDA or ROCm). Compiles
+        # an inline CUDA kernel registered as a custom operator through a library registration
+        # block, loaded without a Python module, and checks the operator output against the
+        # cosine-sum on GPU tensors.
         cuda_source = """
         __global__ void cos_add_kernel(
             const float* __restrict__ x,
@@ -646,6 +745,9 @@ class TestCppExtensionJIT(common.TestCase):
 
     @unittest.skipIf(not TEST_XPU, "XPU not found")
     def test_inline_jit_compile_extension_xpu(self):
+        # [FUNCTION DOC] Skipped without XPU. Compiles an inline extension containing a SYCL
+        # kernel class that computes cosine sums and a C++ declaration, checks the binding
+        # docstring name, and checks the result on xpu tensors against the tensor math.
         sycl_source = """
         #include <c10/xpu/XPUStream.h>
 
@@ -719,12 +821,17 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(z, x.cos() + y.cos())
 
     def test_inline_jit_compile_extension_throws_when_functions_is_bad(self):
+        # [FUNCTION DOC] Checks that load_inline raises ValueError when the functions argument has
+        # an invalid type (an integer).
         with self.assertRaises(ValueError):
             torch.utils.cpp_extension.load_inline(
                 name="invalid_jit_extension", cpp_sources="", functions=5
             )
 
     def test_lenient_flag_handling_in_jit_extensions(self):
+        # [FUNCTION DOC] Builds an inline extension with sloppy flags (strings with trailing
+        # newlines, multiple options in one string, and an include path with leading spaces and a
+        # newline) to verify the loader tolerates them, then checks the function result.
         cpp_source = """
         torch::Tensor tanh_add(torch::Tensor x, torch::Tensor y) {
           return x.tanh() + y.tanh();
@@ -748,6 +855,10 @@ class TestCppExtensionJIT(common.TestCase):
     @unittest.skip("Temporarily disabled")
     @unittest.skipIf(not (TEST_CUDA or TEST_ROCM), "CUDA not found")
     def test_half_support(self):
+        # [FUNCTION DOC] Disabled by an unconditional skip (and needs CUDA or ROCm). Regression
+        # check for an ambiguous less-than operator on half precision values when certain headers
+        # are included: compiles a kernel comparing two half inputs, runs it and expects the
+        # sentinel value 123.
         """
         Checks for an issue with operator< ambiguity for half when certain
         THC headers are included.
@@ -787,7 +898,13 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(result[0], 123)
 
     def test_reload_jit_extension(self):
+        # [FUNCTION DOC] Checks that an extension with the same name can be rebuilt after its
+        # source changes. Compiles and loads an inline function returning one constant, then
+        # recompiles with different constants (including a repeated one) and checks each load
+        # returns the latest value.
         def compile(code):
+            # [FUNCTION DOC] HELPER: Loads an inline extension under a fixed name from the given
+            # C++ source, exporting a function named f; returns the loaded module.
             return torch.utils.cpp_extension.load_inline(
                 name="reloaded_jit_extension",
                 cpp_sources=code,
@@ -810,6 +927,9 @@ class TestCppExtensionJIT(common.TestCase):
         "utf" not in locale.getlocale()[1].lower(), "Only test in UTF-8 locale"
     )
     def test_load_with_non_platform_default_encoding(self):
+        # [FUNCTION DOC] Only runs in a UTF-8 locale. Writes a C++ source containing non-Latin-1
+        # characters encoded in GBK, loads it, and checks the exported function returns 123, to
+        # guard against decoding errors in the extension version tracking.
         # Assume the code is saved in UTF-8, but the locale is set to a different encoding.
         # You might encounter decoding errors in ExtensionVersioner.
         # But this case is quite hard to cover because CI environments may not in non-latin locale.
@@ -841,6 +961,10 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(module.f(), 123)
 
     def test_cpp_frontend_module_has_same_output_as_python(self, dtype=torch.double):
+        # [FUNCTION DOC] Loads a C++ frontend extension and compares its linear Net module with an
+        # equivalent Python linear layer for the given dtype (default double). Copies the
+        # parameters across, checks forward outputs match, runs backward on both, and checks all
+        # parameters have gradients and that weight and bias gradients are equal.
         extension = torch.utils.cpp_extension.load(
             name="cpp_frontend_extension",
             sources="cpp_extensions/cpp_frontend_extension.cpp",
@@ -872,6 +996,12 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(cpp_parameters["fc.bias"].grad, python_linear.bias.grad)
 
     def test_cpp_frontend_module_python_inter_op(self):
+        # [FUNCTION DOC] Loads a C++ frontend extension and mixes its Net module into Python
+        # module hierarchies. Wraps it in a custom Python module and a Sequential, checks forward
+        # and call give the same result and shape, dtype changes, recursive parameter, buffer and
+        # module counts, clone, autograd through the whole model, gradient zeroing to none, train
+        # and eval switching, custom getter and setter methods for the bias, and the named
+        # parameters and buffers registered by the module.
         extension = torch.utils.cpp_extension.load(
             name="cpp_frontend_extension",
             sources="cpp_extensions/cpp_frontend_extension.cpp",
@@ -880,12 +1010,17 @@ class TestCppExtensionJIT(common.TestCase):
 
         # Create a torch.nn.Module which uses the C++ module as a submodule.
         class M(torch.nn.Module):
+            # [CLASS DOC] Python module used by the test: holds a scalar parameter and an
+            # extension Net submodule, and adds the parameter to the Net output.
             def __init__(self) -> None:
+            # [FUNCTION DOC] Initializes the base module, creates the scalar parameter with value
+            # one and a Net of input size three and output size five.
                 super().__init__()
                 self.x = torch.nn.Parameter(torch.tensor(1.0))
                 self.net = extension.Net(3, 5)
 
             def forward(self, input):
+            # [FUNCTION DOC] Returns the Net output for the input plus the scalar parameter.
                 return self.net.forward(input) + self.x
 
         net = extension.Net(5, 2)
@@ -975,6 +1110,10 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(nb[0][1], torch.eye(5))
 
     def test_cpp_frontend_module_has_up_to_date_attributes(self):
+        # [FUNCTION DOC] Loads a C++ frontend extension and checks that the Python-
+        # visible parameter, buffer and submodule dictionaries reflect later additions
+        # made from C++: initial sizes are 0, 1 and 1, and each of the add-new methods
+        # grows its dictionary by one.
         extension = torch.utils.cpp_extension.load(
             name="cpp_frontend_extension",
             sources="cpp_extensions/cpp_frontend_extension.cpp",
@@ -997,6 +1136,10 @@ class TestCppExtensionJIT(common.TestCase):
 
     @unittest.skipIf(not (TEST_CUDA or TEST_ROCM), "CUDA not found")
     def test_cpp_frontend_module_python_inter_op_with_cuda(self):
+        # [FUNCTION DOC] Skipped without CUDA or ROCm. Checks a C++ frontend module moves between
+        # CPU and CUDA: parameters start on CPU, moving to device 0 keeps values equal, and after
+        # adding extra parameters, buffers and submodules on CPU, moving to CUDA puts all
+        # parameters on CUDA.
         extension = torch.utils.cpp_extension.load(
             name="cpp_frontend_extension",
             sources="cpp_extensions/cpp_frontend_extension.cpp",
@@ -1033,6 +1176,9 @@ class TestCppExtensionJIT(common.TestCase):
             self.assertTrue(p.device.type == "cuda")
 
     def test_returns_shared_library_path_when_is_python_module_is_true(self):
+        # [FUNCTION DOC] Loads an inline extension without a Python module (flag off) that
+        # registers an identity operator in the torch ops namespace, and checks calling it through
+        # the ops namespace returns its input.
         source = """
         #include <torch/script.h>
         torch::Tensor func(torch::Tensor x) { return x; }
@@ -1048,6 +1194,10 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(torch.ops.test.func(torch.eye(5)), torch.eye(5))
 
     def test_set_default_type_also_changes_aten_default_type(self):
+        # [FUNCTION DOC] Checks the default dtype visible to C++ follows the Python default dtype:
+        # an inline function creating an empty scalar tensor returns the initial default, then
+        # float64, float32 and float16 after each change. The original default dtype is restored
+        # in a finally block.
         module = torch.utils.cpp_extension.load_inline(
             name="test_set_default_type",
             cpp_sources="torch::Tensor get() { return torch::empty({}); }",
@@ -1068,6 +1218,10 @@ class TestCppExtensionJIT(common.TestCase):
             torch.set_default_dtype(initial_default)
 
     def test_compilation_error_formatting(self):
+        # [FUNCTION DOC] Checks that a C++ compilation error (missing semicolon) raises
+        # RuntimeError whose text does not have escaped newline sequences, meaning line breaks are
+        # preserved. Note the assertion is applied to the string of the context manager object,
+        # not the exception itself.
         # Test that the missing-semicolon error message has linebreaks in it.
         # This'll fail if the message has been munged into a single line.
         # It's hard to write anything more specific as every compiler has it's own
@@ -1081,6 +1235,13 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertNotRegex(str(e), pattern)
 
     def test_warning(self):
+        # [FUNCTION DOC] Checks warning and error propagation from C++ through the
+        # loaded function, which warns and optionally throws one of three error kinds
+        # chosen by an integer argument. Without the error handling wrapper no Python
+        # warnings are recorded and errors map to TypeError, SystemError and KeyError.
+        # With the wrapper, one warning is recorded per call in all cases. With warnings
+        # turned into errors, the no-error call raises UserWarning, while a call that
+        # throws still raises its own error and records nothing.
         # Note: the module created from this source will include the py::key_error
         # symbol. But because of visibility and the fact that it lives in a
         # different compilation unit than pybind, this trips up ubsan even though
@@ -1190,6 +1351,10 @@ class TestCppExtensionJIT(common.TestCase):
             self.assertEqual(len(w), 0)
 
     def test_autograd_from_cpp(self):
+        # [FUNCTION DOC] Checks calling autograd backward from C++. Compiles two inline functions,
+        # one that calls backward while holding the Python global lock and one that releases it
+        # first. The first must raise RuntimeError saying the engine was called while holding the
+        # lock, instead of deadlocking, and the second must run to completion.
         source = """
         void run_back(at::Tensor x) {
             x.backward({});
@@ -1202,12 +1367,16 @@ class TestCppExtensionJIT(common.TestCase):
         """
 
         class MyFn(torch.autograd.Function):
+        # [CLASS DOC] Custom autograd function used by the test: identity-like, returns a clone in
+        # forward and passes the incoming gradient through in backward.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] Returns a clone of the input; the context argument is unused.
                 return x.clone()
 
             @staticmethod
             def backward(ctx, gx):
+                # [FUNCTION DOC] Returns the incoming gradient unchanged.
                 return gx
 
         test_backward_deadlock = torch.utils.cpp_extension.load_inline(
@@ -1229,6 +1398,9 @@ class TestCppExtensionJIT(common.TestCase):
         test_backward_deadlock.run_back_no_gil(loss)
 
     def test_custom_compound_op_autograd(self):
+        # [FUNCTION DOC] Registers a custom operator in C++ that just adds two tensors (a compound
+        # op), loads it without a Python module, and runs gradient checking on it through the ops
+        # namespace in both fast and slow modes with a loose epsilon.
         # Test that a custom compound op (i.e. a custom op that just calls other aten ops)
         # correctly returns gradients of those other ops
 
@@ -1256,6 +1428,9 @@ class TestCppExtensionJIT(common.TestCase):
             gradcheck(torch.ops.my.add, [a, b], eps=1e-2, fast_mode=fast_mode)
 
     def test_custom_functorch_error(self):
+        # [FUNCTION DOC] Loads an extension with a custom C++ autograd function and checks that
+        # applying the vmap and grad function transforms to it raises RuntimeError saying C++
+        # autograd functions cannot be used with functorch.
         # Test that a custom C++ Function raises an error under functorch transforms
         identity_m = torch.utils.cpp_extension.load(
             name="identity",
@@ -1272,6 +1447,10 @@ class TestCppExtensionJIT(common.TestCase):
             torch.func.grad(identity_m.identity)(t)
 
     def test_gen_extension_h_pch(self):
+        # [FUNCTION DOC] Linux only (returns immediately elsewhere). Removes any existing
+        # precompiled header and its signature file for the extension header and checks both are
+        # absent, then builds an inline extension with precompiled headers enabled. If the C++
+        # compiler is GCC, checks that both files now exist.
         if not IS_LINUX:
             return
 
@@ -1308,6 +1487,9 @@ class TestCppExtensionJIT(common.TestCase):
             self.assertEqual(signature_exist, True)
 
     def test_aoti_torch_call_dispatcher(self):
+        # [FUNCTION DOC] Compiles an inline extension that calls the AOTI shim dispatcher for
+        # absolute value and floor on a tensor via stable value conversion, and checks the results
+        # match the torch absolute value and floor of a random tensor.
         source = """
         #include <torch/csrc/inductor/aoti_runtime/utils.h>
         #include <torch/csrc/inductor/aoti_torch/utils.h>
@@ -1347,6 +1529,9 @@ class TestCppExtensionJIT(common.TestCase):
         self.assertEqual(floor_t, torch.floor(t))
 
     def test_from_blob_stable_api(self):
+        # [FUNCTION DOC] Compiles an inline extension comparing the stable from_blob API with the
+        # standard from_blob over a static buffer, for contiguous, non-contiguous stride and
+        # storage offset cases, and checks each stable result equals its reference tensor.
         source = """
         #include <torch/csrc/stable/ops.h>
         #include <torch/extension.h>
@@ -1486,6 +1671,10 @@ class TestCppExtensionJIT(common.TestCase):
 
     @unittest.skipIf(not (TEST_CUDA or TEST_ROCM), "CUDA not found")
     def test_cuda_pluggable_allocator_include(self):
+        # [FUNCTION DOC] Skipped without CUDA or ROCm. Writes a C++ file including the CUDA
+        # pluggable allocator header into a temp directory and checks that loading it with CUDA
+        # enabled succeeds, mimicking how apex builds an NCCL allocator extension. Load failures
+        # are printed and cause the assertion on the success flag to fail.
         """
         This method creates a minimal example to replicate the apex setup.py to build nccl_allocator extension
         """
@@ -1531,6 +1720,10 @@ class TestCppExtensionJIT(common.TestCase):
         "PCH is only available on Linux with GCC",
     )
     def test_pch_command_injection(self):
+        # [FUNCTION DOC] Skipped unless on Linux with GCC. Security check: builds an inline
+        # extension with precompiled headers and a malicious extra compiler flag containing a
+        # shell command that would create a file. A RuntimeError from compilation is tolerated;
+        # the test fails if the marker file exists, which would mean the flag was run by a shell.
         """Tests that PCH compilation is not vulnerable to command injection."""
         with tempfile.TemporaryDirectory() as tmpdir:
             exploit_file = os.path.join(tmpdir, "pch_exploit")
@@ -1561,6 +1754,11 @@ class TestCppExtensionJIT(common.TestCase):
             )
 
     def test_torch_check_eq_stacktrace(self):
+        # [FUNCTION DOC] Runs a child process that compiles an inline extension whose C++ function
+        # fails an equality check, once with the C++ stack trace environment variable off and once
+        # on, via subtests. Both outputs must contain the failed check text. With the variable on,
+        # the traceback marker is required (except on aarch64) and the message must point at line
+        # 8 of main.cpp; with it off, the marker must be absent.
         """Test that TORCH_CHECK_EQ includes C++ stack trace when TORCH_SHOW_CPP_STACKTRACES=1.
 
         When TORCH_SHOW_CPP_STACKTRACES=1, errors from TORCH_CHECK_EQ should include

@@ -1,4 +1,9 @@
 # Owner(s): ["module: mtia"]
+# [MODULE DOC] Tests for a fake MTIA device backend supplied through a JIT-compiled C++ extension
+# (cpp_extensions/mtia_extension.cpp). Checks the mtia device module, streams, stream and device
+# context managers, and default generators. Importing computes TEST_ROCM and narrows TEST_CUDA to
+# also require CUDA_HOME; the test class is skipped on non-Linux, ARM64, or whenever another
+# accelerator backend is present, because the fake MTIA backend is mutually exclusive with them.
 
 import os
 import tempfile
@@ -29,11 +34,18 @@ TEST_CUDA = TEST_CUDA and CUDA_HOME is not None
 )
 @torch.testing._internal.common_utils.markDynamoStrictTest
 class TestCppExtensionMTIABackend(common.TestCase):
+    # [CLASS DOC] Test case that builds the fake MTIA extension once per class and exercises the
+    # mtia Python API against it. The class attribute module holds the loaded extension handle
+    # (loaded as a plain shared library, not a Python module). Each test changes the working
+    # directory to the test file's folder so relative source paths resolve.
     """Tests MTIA backend with C++ extensions."""
 
     module = None
 
     def setUp(self):
+        # [FUNCTION DOC] Saves the current working directory in an instance attribute and changes
+        # into the directory containing this test file, since extension sources are given as
+        # relative paths.
         super().setUp()
         # cpp extensions use relative paths. Those paths are relative to
         # this file, so we'll change the working directory temporarily
@@ -41,16 +53,26 @@ class TestCppExtensionMTIABackend(common.TestCase):
         os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs the base teardown, then restores the working directory
+        # saved by setUp.
         super().tearDown()
         # return the working directory (see setUp)
         os.chdir(self.old_working_dir)
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class-level cleanup: removes the shared cpp extensions build
+        # root directory.
         torch.testing._internal.common_utils.remove_cpp_extensions_build_root()
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class-level setup: removes any stale extension build root, creates a
+        # fresh temporary build directory, and JIT-compiles and loads mtia_extension.cpp with
+        # extra include paths (including two deliberately awkward paths with spaces and a quote).
+        # It is loaded with the Python-module flag off, so only its registration side effects (the
+        # fake MTIA device guard and hooks) matter. Stores the result in the class attribute
+        # module. Verbose build output.
         torch.testing._internal.common_utils.remove_cpp_extensions_build_root()
         build_dir = tempfile.mkdtemp()
         # Load the fake device guard impl.
@@ -69,6 +91,10 @@ class TestCppExtensionMTIABackend(common.TestCase):
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_get_device_module(self):
+        # [FUNCTION DOC] Gets the device module for the first mtia device and checks that its
+        # current stream reports the MTIA device type id. Also prints the method resolution order
+        # of the core Stream class and of the CUDA Stream class for debugging; no assertion is
+        # made on those.
         device = torch.device("mtia:0")
         default_stream = torch.get_device_module(device).current_stream()
         self.assertEqual(
@@ -79,6 +105,11 @@ class TestCppExtensionMTIABackend(common.TestCase):
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_stream_basic(self):
+        # [FUNCTION DOC] Checks basic stream behavior: the current stream is stable across calls,
+        # a newly created stream differs from the default one, the default stream id is 0 (as
+        # defined in the extension source) while a user stream id is nonzero, the stream context
+        # manager makes the user stream current, and query returns true for both streams (after
+        # synchronizing the default one).
         default_stream = torch.mtia.current_stream()
         user_stream = torch.mtia.Stream()
         self.assertEqual(torch.mtia.current_stream(), default_stream)
@@ -94,6 +125,9 @@ class TestCppExtensionMTIABackend(common.TestCase):
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_stream_context(self):
+        # [FUNCTION DOC] Creates two streams on the first mtia device, prints them, and
+        # checks that entering the stream context manager for each one in turn makes it
+        # the current stream.
         mtia_stream_0 = torch.mtia.Stream(device="mtia:0")
         mtia_stream_1 = torch.mtia.Stream(device="mtia:0")
         print(mtia_stream_0)
@@ -110,6 +144,10 @@ class TestCppExtensionMTIABackend(common.TestCase):
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_stream_context_different_device(self):
+        # [FUNCTION DOC] Creates one stream on each of two mtia devices and checks that entering a
+        # stream context switches the current device to that stream's device index and makes the
+        # stream current, and that on exit the original current device is restored. Requires the
+        # fake backend to report at least two devices.
         device_0 = torch.device("mtia:0")
         device_1 = torch.device("mtia:1")
         mtia_stream_0 = torch.mtia.Stream(device=device_0)
@@ -132,6 +170,8 @@ class TestCppExtensionMTIABackend(common.TestCase):
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_device_context(self):
+        # [FUNCTION DOC] Checks that the mtia device context manager sets the current device index
+        # to the requested device inside the block, for device 0 and then device 1.
         device_0 = torch.device("mtia:0")
         device_1 = torch.device("mtia:1")
         with torch.mtia.device(device_0):
@@ -142,6 +182,10 @@ class TestCppExtensionMTIABackend(common.TestCase):
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_default_generators(self):
+        # [FUNCTION DOC] Forces lazy initialization by asking for the current stream, then checks
+        # that the default_generators attribute exists, is a tuple whose length equals the device
+        # count, holds generator objects for devices 0 and 1, and that those two are distinct
+        # objects. Assumes at least two devices.
         # Trigger lazy initialization first by calling current_stream()
         torch.mtia.current_stream()
         device_count = torch.mtia.device_count()
@@ -161,6 +205,8 @@ class TestCppExtensionMTIABackend(common.TestCase):
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_new_generator(self):
+        # [FUNCTION DOC] Checks that a generator can be constructed for the first mtia device
+        # through the backend hooks and is a generator instance.
         # Verify we can create a generator via the hooks interface
         gen = torch.Generator(device="mtia:0")
         self.assertIsInstance(gen, torch.Generator)
