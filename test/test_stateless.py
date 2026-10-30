@@ -1,4 +1,11 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for functional_call, which runs a module with some or all of its parameters
+# and buffers temporarily replaced by supplied tensors. Covers both torch.func.functional_call and
+# the older torch.nn.utils.stateless wrappers: substitution, restoration of module state,
+# gradients, batch norm buffers, circular references, parametrizations, strict and tie_weights
+# options, in-place buffer updates, keyword arguments, multiple dictionaries, and deprecation
+# warnings. At import time it picks the current accelerator type (or cpu) as device_type and
+# registers the parametrized tests.
 
 import contextlib
 import os
@@ -26,18 +33,29 @@ device_type = (
 
 
 class MockModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Small fixture module with a one-in one-out linear layer named l1, a
+    # buffer named buffer holding ones, and a plain float attribute foo of zero. Its forward
+    # applies the linear layer and adds the buffer.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the linear layer, the buffer of ones and the float
+        # attribute.
         super().__init__()
         self.l1 = torch.nn.Linear(1, 1)
         self.buffer = torch.nn.Buffer(torch.ones(1))
         self.foo = 0.0
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the linear layer applied to the input plus the buffer.
         return self.l1(x) + self.buffer
 
 
 class MockTiedModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Fixture module like MockModule but with tied tensors: tied_bias is the
+    # same object as the linear layer's bias and tied_buffer is the same object as buffer. Forward
+    # sums linear output, both biases and both buffers.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the linear layer, aliases its bias as tied_bias, and
+        # creates buffer plus an alias tied_buffer.
         super().__init__()
         self.l1 = torch.nn.Linear(1, 1)
         self.tied_bias = self.l1.bias
@@ -45,11 +63,21 @@ class MockTiedModule(torch.nn.Module):
         self.tied_buffer = self.buffer
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the linear output plus tied_bias, buffer and tied_buffer.
         return self.l1(x) + self.tied_bias + self.buffer + self.tied_buffer
 
 
 class TestStatelessFunctionalAPI(TestCase):
+    # [CLASS DOC] Test case for functional_call (both the torch.func version and the stateless
+    # wrapper, selected by parametrization). Provides two helpers, one that runs a call with
+    # identity-producing parameters, and one that asserts a module's parameters and buffers are
+    # unchanged afterwards.
     def _run_call_with_mock_module(self, module, functional_call, device='cpu', prefix=''):
+        # [FUNCTION DOC] HELPER: Calls the given functional_call on the module with a weight of
+        # one, bias of zero and buffer of zero, optionally with names prefixed by a submodule
+        # name, so the module acts as the identity. Asserts the output equals the random input and
+        # that the module's own weight and buffer are unchanged afterwards. Arguments are the
+        # module, the callable, the device and an optional prefix.
 
         x = torch.rand((1, 1)).to(device)
         weight = torch.tensor([[1.0]], device=device)
@@ -81,6 +109,11 @@ class TestStatelessFunctionalAPI(TestCase):
 
     @contextlib.contextmanager
     def _ensure_module_unchanged(self, module, message):
+        # [FUNCTION DOC] HELPER: Context manager that records the module's parameter and buffer
+        # tensors and clones of their values, yields the module, and in a finally clause asserts
+        # that the same number of parameters and buffers exist, that each is the identical object
+        # as before, and that values are unchanged. Fails the test with the given message
+        # otherwise.
         orig_parameters, orig_buffers = tuple(module.parameters()), tuple(module.buffers())
         orig_tensors = orig_parameters + orig_buffers
         orig_tensors_values = tuple(t.clone() for t in orig_tensors)
@@ -107,6 +140,8 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_functional_call(self, functional_call):
+        # [FUNCTION DOC] Checks that functional_call with replacement weights, bias and buffer
+        # produces the identity output and leaves the module unmodified.
         module = MockModule()
         self._run_call_with_mock_module(module, functional_call)
 
@@ -115,6 +150,8 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_functional_call_with_jit(self, functional_call):
+        # [FUNCTION DOC] Checks that using functional_call on a scripted or traced module raises a
+        # RuntimeError saying it cannot be used with Jitted modules.
         module = MockModule()
         jit_module = torch.jit.script(module)
         with self.assertRaisesRegex(
@@ -137,6 +174,8 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_functional_call_with_data_parallel(self, functional_call):
+        # [FUNCTION DOC] Skipped (marked as not working) and also requires multiple accelerators.
+        # Would run the identity check on a DataParallel-wrapped module with a module prefix.
         module = MockModule()
         module.to(device_type)
         dp_module = torch.nn.DataParallel(module, [0, 1])
@@ -148,6 +187,9 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_functional_call_with_data_parallel_error(self, functional_call):
+        # [FUNCTION DOC] Requires multiple accelerators. Checks that calling functional_call on a
+        # DataParallel module raises a RuntimeError saying it cannot be used with nn.DataParallel
+        # modules.
         module = MockModule()
         module.to(device_type)
         dp_module = torch.nn.DataParallel(module, [0, 1])
@@ -162,6 +204,9 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_functional_call_with_gradient(self, functional_call):
+        # [FUNCTION DOC] Checks that backward through functional_call fills gradients of supplied
+        # tensors that require grad (weight and bias), leaves the grad of the non-requiring buffer
+        # empty, and leaves the module's own parameters without gradients.
         module = MockModule()
         x = torch.rand((1, 1))
         weight = torch.tensor([[1.0]], requires_grad=True)
@@ -186,6 +231,10 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_functional_batch_norm(self, functional_call):
+        # [FUNCTION DOC] Checks that passing a replacement running_mean buffer to a batch norm
+        # module in training mode updates the supplied tensor in place (to 12.8) while the
+        # module's own running mean is untouched, and that a call with empty replacements updates
+        # the module's own running mean.
         module = torch.nn.BatchNorm1d(10)
         module.train()  # Allow stats update
         # lets replace the running_mean buffer and check if its correctly updated
@@ -207,6 +256,9 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_circular_references(self, functional_call):
+        # [FUNCTION DOC] Adds a circular reference from a submodule back to the root module and
+        # calls with weight tie disabled using paths that go through the cycle. Checks the
+        # identity output and that the module's own weight and buffer are unchanged.
         module = MockModule()
         # Add a circular reference
         module.l1.m = module
@@ -232,6 +284,10 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_reparametrized_module_change_parametrization_original(self, functional_call):
+        # [FUNCTION DOC] Applies spectral normalization to the linear layer, then replaces the
+        # original tensor inside the parametrization. Checks that the output is the identity, that
+        # the parametrization is still present afterwards and that the normalized weight is back
+        # to its prior value.
         module = MockModule()
         torch.nn.utils.parametrizations.spectral_norm(module.l1)
         self.assertTrue('l1.parametrizations.weight.original' in dict(module.named_parameters()))
@@ -254,6 +310,9 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_reparametrize_module_fail_reset_to_original(self, functional_call):
+        # [FUNCTION DOC] Same spectral norm setup, but the call is made with an input of the wrong
+        # size so the module raises a RuntimeError about shapes that cannot be multiplied. Checks
+        # the parametrization and weight are restored after the failure.
         module = MockModule()
         torch.nn.utils.parametrizations.spectral_norm(module.l1)
         self.assertTrue('l1.parametrizations.weight.original' in dict(module.named_parameters()))
@@ -268,6 +327,8 @@ class TestStatelessFunctionalAPI(TestCase):
         with self.assertRaisesRegex(RuntimeError, "shapes cannot be multiplied"):
             @torch._dynamo.disable
             def _error_case():
+                # [FUNCTION DOC] HELPER: Dynamo-disabled function that builds a random input of
+                # the wrong size (4 by 5) and calls functional_call, expected to raise.
                 x = torch.rand((4, 5))  # to work, it should be of size (1, 1)
                 functional_call(module, parameters, x)  # this call will fail because x is the wrong size
             _error_case()
@@ -281,6 +342,8 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_reparametrize_some_weights(self, functional_call):
+        # [FUNCTION DOC] Checks that replacing only the weight leaves the module's own bias and
+        # buffer in use, and that an extra key naming no module member is ignored when not strict.
         module = MockModule()
         weight = torch.tensor([[2.0]])
         extra = torch.tensor([1.0])
@@ -301,6 +364,10 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_reparametrize_strict(self, functional_call):
+        # [FUNCTION DOC] Checks strict mode: a complete set of keys works and leaves the module
+        # unchanged; missing keys raise RuntimeError listing the missing names; unexpected keys
+        # raise RuntimeError listing them; both problems produce an error that lists unexpected
+        # then missing keys. The module is verified unchanged around each call.
         module = MockModule()
         weight = torch.tensor([[2.0]])
         bias = torch.tensor([5.0])
@@ -367,8 +434,16 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_reparametrize_special(self, functional_call):
+        # [FUNCTION DOC] Checks special replacement values: a None bias removes the bias from the
+        # computation; a non-tensor value raises TypeError saying it is not a tensor; replacing
+        # the float attribute with a tensor raises TypeError; and naming a nonexistent submodule
+        # raises AttributeError. The module is verified unchanged after each call.
         class NonTensor:
+            # [CLASS DOC] HELPER: Plain object used as an invalid replacement value, whose repr
+            # shows the class name in angle brackets.
             def __repr__(self):
+                # [FUNCTION DOC] HELPER: Returns the class name wrapped in angle brackets for use
+                # in error messages.
                 return f'<{self.__class__.__name__}>'
 
         module = MockModule()
@@ -434,6 +509,9 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_tied_weights_warns(self, functional_call):
+        # [FUNCTION DOC] Adds tied attributes to a module (a bias alias and a buffer alias) but
+        # then makes no call and no assertion.
+        # KNOWN ISSUE: despite the name, nothing is called or asserted, so the test checks nothing.
         module = MockModule()
         module.tied_bias = module.l1.bias
         module.tied_buffer = torch.nn.Buffer(module.buffer)
@@ -443,6 +521,9 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_reparametrize_tie_weights(self, functional_call):
+        # [FUNCTION DOC] Checks that with tying enabled on the tied module, replacing the main
+        # bias and buffer also replaces their tied aliases, so each contributes twice to the
+        # output; extra keys are ignored.
         module = MockTiedModule()
         weight = torch.tensor([[2.0]])
         bias = torch.tensor([5.0])
@@ -469,6 +550,9 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_reparametrize_tie_some_weights(self, functional_call):
+        # [FUNCTION DOC] Checks with tying enabled that when the bias is not supplied the module's
+        # own bias and its tied alias are both used, while the buffer and its alias use the
+        # supplied value. Calls the stateless wrapper directly regardless of parametrization.
         module = MockTiedModule()
         weight = torch.tensor([[2.0]])
         buffer = torch.tensor([3.0])
@@ -484,6 +568,10 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless._functional_call, "stateless")
     ])
     def test_tied_weights_errors(self, functional_call):
+        # [FUNCTION DOC] Checks tied weight conflicts with tying enabled: matching keys give no
+        # warning; tied keys that are the same tensor are accepted without warning; tied keys
+        # given different tensors raise ValueError saying multiple values were given for a bias or
+        # buffer key pair.
         module = MockTiedModule()
         weight = torch.tensor([[1.0]])
         bias = torch.tensor([0.0])
@@ -518,6 +606,8 @@ class TestStatelessFunctionalAPI(TestCase):
             functional_call(module, parameters, x, tie_weights=True)
 
     def test_tied_weights_no_error_without_flag(self):
+        # [FUNCTION DOC] Checks that with tying disabled the private stateless call emits no
+        # warning even when tied names are given conflicting values.
         module = MockTiedModule()
         weight = torch.tensor([[1.0]])
         bias = torch.tensor([0.0])
@@ -539,6 +629,10 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_reparametrize_tie_weights_strict(self, functional_call):
+        # [FUNCTION DOC] Checks the combination of strict and tie_weights across scenarios:
+        # complete and tied accepted; tying disabled reports missing tied names; partial tying
+        # reports missing bias and tied bias; extra keys are reported as unexpected; combined
+        # errors list unexpected then missing. The module is verified unchanged around each call.
         module = MockTiedModule()
         weight = torch.tensor([[2.0]])
         bias = torch.tensor([5.0])
@@ -638,12 +732,21 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_setattr(self, functional_call):
+        # [FUNCTION DOC] Uses a module that rebinds a buffer in its forward. Checks that the
+        # module's own buffer stays zero, that the supplied dictionary entry is replaced by the
+        # updated tensor (three) and is a different object, and that the original tensor keeps its
+        # value.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a buffer foo whose forward reassigns foo to foo plus
+            # one (a new tensor) and returns input plus foo.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the buffer foo holding zero.
                 super().__init__()
                 self.foo = torch.nn.Buffer(torch.tensor([0.0]))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Rebinds foo to a new tensor one larger and returns the
+                # input plus it.
                 self.foo = self.foo + 1
                 return x + self.foo
 
@@ -662,12 +765,19 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_in_place_operator(self, functional_call):
+        # [FUNCTION DOC] Uses a module that updates a buffer in place. Checks the module's own
+        # buffer stays zero, and the supplied tensor itself is mutated to three and remains the
+        # same object in the dictionary.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a buffer foo whose forward adds one to foo in place
+            # and returns input plus foo.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the buffer foo holding zero.
                 super().__init__()
                 self.foo = torch.nn.Buffer(torch.tensor([0.0]))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds one to foo in place and returns the input plus it.
                 self.foo.add_(1)
                 return x + self.foo
 
@@ -686,13 +796,22 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_setattr_strict(self, functional_call):
+        # [FUNCTION DOC] Uses a module that has no extra attribute but whose forward reads one.
+        # Checks that a supplied extra tensor makes the call work and the attribute is not left on
+        # the module; strict mode raises RuntimeError for the unexpected key; without the key the
+        # forward raises AttributeError, in both strict and non-strict modes.
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with no parameters whose forward adds an attribute named
+            # extra, which exists only if injected by functional_call.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Constructs the module and raises an assertion error if an
+                # extra attribute already exists.
                 super().__init__()
                 if hasattr(self, 'extra'):
                     raise AssertionError("self should not have 'extra' attribute")
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus the extra attribute.
                 return x + self.extra
 
         a = {'extra': torch.zeros(())}
@@ -731,12 +850,21 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_functional_call_with_kwargs(self, functional_call):
+        # [FUNCTION DOC] Checks passing keyword arguments: omitting the required keyword-only
+        # argument raises TypeError; a dictionary of kwargs, or all inputs in kwargs with an empty
+        # positional tuple, or only the kwargs keyword, give the same result equal to the keyword
+        # input since the injected x is zero.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a tensor attribute x whose forward multiplies the
+            # positional input by x and adds a keyword-only second input.
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: Stores the given tensor as attribute x.
                 super().__init__()
                 self.x = x
 
             def forward(self, inp, *, other_inp):
+                # [FUNCTION DOC] HELPER: Returns the first input times x plus the keyword-only
+                # other input.
                 return inp * self.x + other_inp
 
         a = {'x': torch.zeros(2, 3)}
@@ -752,6 +880,9 @@ class TestStatelessFunctionalAPI(TestCase):
         self.assertEqual(res, res_2)
 
     def test_functional_call_tuple_dicts(self):
+        # [FUNCTION DOC] Checks torch.func.functional_call accepting a tuple of dictionaries:
+        # parameters and buffers in two dictionaries (all ones and zeros), an empty tuple
+        # (module's own values), and three dictionaries each holding one replacement.
         mod = MockModule()
         x = torch.rand((1, 1))
         parameters = {k: torch.ones_like(v) for k, v in mod.named_parameters()}
@@ -771,6 +902,8 @@ class TestStatelessFunctionalAPI(TestCase):
         self.assertEqual(res, x + 1)
 
     def test_functional_call_multiple_dicts_error(self):
+        # [FUNCTION DOC] Checks that giving the same name in two dictionaries raises ValueError
+        # saying the name appeared in multiple dictionaries.
         mod = MockModule()
         x = torch.rand((1, 1))
         parameters = {'l1.weight': torch.zeros((1, 1)), 'l1.bias': torch.zeros((1, 1))}
@@ -786,13 +919,23 @@ class TestStatelessFunctionalAPI(TestCase):
         subtest(stateless.functional_call, "stateless")
     ])
     def test_functional_call_member_reference(self, functional_call):
+        # [FUNCTION DOC] Checks that the module's own parameters and buffers iterators, when
+        # called inside forward, return the substituted tensors (the same objects), across cases:
+        # all supplied, some supplied, extra keys including a parameter, and a None bias removing
+        # the parameter.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer and a buffer; forward returns the
+            # layer output plus buffer together with tuples of the module's parameters and buffers
+            # as seen during the call.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the linear layer and a buffer of ones.
                 super().__init__()
                 self.l1 = torch.nn.Linear(1, 1)
                 self.buffer = torch.nn.Buffer(torch.ones(1))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a tuple of the output, the tuple of parameters
+                # and the tuple of buffers.
                 parameters = tuple(self.parameters())
                 buffers = tuple(self.buffers())
                 return self.l1(x) + self.buffer, parameters, buffers
@@ -887,7 +1030,11 @@ class TestStatelessFunctionalAPI(TestCase):
 
 
 class TestStatelessDeprecation(TestCase):
+    # [CLASS DOC] Tests for deprecation warnings of the old stateless API.
     def test_private_stateless_warns(self):
+        # [FUNCTION DOC] Runs a subprocess with warnings always enabled that imports the private
+        # stateless module while recording warnings, exiting with the number of warnings; expects
+        # exactly one warning (exit code one) and fails if the subprocess succeeds.
         script = """
 import torch
 import warnings
@@ -910,6 +1057,8 @@ exit(len(w))
             self.assertTrue(False, "No warning was raised.")
 
     def test_stateless_functional_call_warns(self):
+        # [FUNCTION DOC] Checks that the stateless functional_call emits a FutureWarning
+        # recommending torch.func.functional_call.
         m = torch.nn.Linear(1, 1)
         params = dict(m.named_parameters())
         x = torch.randn(3, 1)
@@ -917,7 +1066,10 @@ exit(len(w))
             stateless.functional_call(m, params, x)
 
 class TestPythonOptimizeMode(TestCase):
+    # [CLASS DOC] Tests that torch can be imported in Python optimized mode.
     def test_runs_with_optimize_flag(self):
+        # [FUNCTION DOC] Runs a subprocess with the double optimize flag that imports torch and
+        # its deprecated functorch module, and fails if it exits with a non-zero code.
         script = "import torch; import torch._functorch.deprecated"
         try:
             subprocess.check_output(

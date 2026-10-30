@@ -1,5 +1,12 @@
 # Owner(s): ["module: fft"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for the torch.fft namespace and the short-time Fourier transforms (stft and
+# istft). TestFFT is instantiated per device type; it checks one-, two- and n-dimensional
+# transforms against NumPy or SciPy references, round trips, dtype promotion, half precision and
+# bfloat16 behavior, error messages, frequency helpers, shifts, the cuFFT plan cache, and many
+# stft/istft properties (vs librosa, round trips, linearity, window handling). Also builds one
+# doctest-running test per public torch.fft function at import time. Helper functions below
+# implement reference versions used by the tests.
 
 import torch
 import unittest
@@ -46,6 +53,10 @@ REFERENCE_NORM_MODES = (
 
 
 def _complex_stft(x, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Reference complex stft built from two real ones. Runs torch.stft on
+    # the real part and the imaginary part of the input separately (two-sided output, complex
+    # return) with the given extra arguments, and returns the first result plus the imaginary unit
+    # times the second.
     # Transform real and imaginary components separably
     stft_real = torch.stft(x.real, *args, **kwargs, return_complex=True, onesided=False)
     stft_imag = torch.stft(x.imag, *args, **kwargs, return_complex=True, onesided=False)
@@ -53,6 +64,11 @@ def _complex_stft(x, *args, **kwargs):
 
 
 def _hermitian_conj(x, dim):
+    # [FUNCTION DOC] HELPER: Returns the Hermitian conjugate of the input along one dimension,
+    # meaning entry i of the output is the conjugate of entry minus i (indices modulo size).
+    # Builds the output by copying, then swapping the positive and negative index ranges with a
+    # flip, handles the middle element for even sizes, and returns the conjugate of the result.
+    # The input is not modified.
     """Returns the hermitian conjugate along a single dimension
 
     H(x)[i] = conj(x[-i])
@@ -80,6 +96,11 @@ def _hermitian_conj(x, dim):
 
 
 def _complex_istft(x, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Reference complex istft built from real ones. Splits the input into
+    # Hermitian and anti-Hermitian parts along the frequency dimension (second to last), keeps the
+    # one-sided half of each, runs torch.istft on the Hermitian part and on the anti-Hermitian
+    # part times minus the imaginary unit, and combines the two real results into one complex
+    # tensor. Extra arguments are forwarded to istft.
     # Decompose into Hermitian (FFT of real) and anti-Hermitian (FFT of imaginary)
     n_fft = x.size(-2)
     slc = (Ellipsis, slice(None, n_fft // 2 + 1), slice(None))
@@ -93,6 +114,11 @@ def _complex_istft(x, *args, **kwargs):
 
 
 def _stft_reference(x, hop_length, window):
+    # [FUNCTION DOC] HELPER: Straightforward reference for the STFT definition. For a
+    # one-dimensional signal, a hop length and a window, returns a complex128 matrix with
+    # window-length rows and one column per frame; each column is the FFT of the windowed frame
+    # starting at the frame index times hop, with the last partial frame zero padded. Does not
+    # implement centering, padding or other options.
     r"""Reference stft implementation
 
     This doesn't implement all of torch.stft, only the STFT definition:
@@ -116,6 +142,8 @@ def _stft_reference(x, hop_length, window):
 
 
 def skip_helper_for_fft(device, dtype):
+    # [FUNCTION DOC] HELPER: Does nothing unless the dtype is half or complex32; for those dtypes
+    # on a CPU device it raises a unittest skip because they are unsupported there.
     device_type = torch.device(device).type
     if dtype not in (torch.half, torch.complex32):
         return
@@ -126,12 +154,19 @@ def skip_helper_for_fft(device, dtype):
 
 # Tests of functions related to Fourier analysis in the torch.fft namespace
 class TestFFT(TestCase):
+    # [CLASS DOC] Device-generic tests for the torch.fft functions and stft/istft. Sets
+    # exact_dtype so dtype mismatches fail comparisons by default.
     exact_dtype = True
 
     @onlyNativeDeviceTypes
     @ops([op for op in spectral_funcs if op.ndimensional == SpectralFuncType.OneD],
          allowed_dtypes=(torch.float, torch.cfloat))
     def test_reference_1d(self, device, dtype, op):
+        # [FUNCTION DOC] For each one-dimensional transform with a reference implementation
+        # (skipped if none), compares the result against the reference on float and complex float
+        # inputs of varied shapes, with sizes n of default, 50 and 6, dims, and every norm mode
+        # supported by the installed NumPy and SciPy. Exact dtype is checked only for double
+        # precision.
         if op.ref is None:
             raise unittest.SkipTest("No reference implementation")
 
@@ -177,6 +212,10 @@ class TestFFT(TestCase):
     })
     @dtypes(torch.half, torch.float, torch.double, torch.complex32, torch.complex64, torch.complex128)
     def test_fft_round_trip(self, device, dtype):
+        # [FUNCTION DOC] Checks that the inverse transform of the forward transform recovers the
+        # input for fft/ifft and, for real dtypes, rfft/irfft and ihfft/hfft, over several shapes,
+        # dims and norm modes. Half and complex32 use power-of-two sizes because cuFFT requires
+        # them and are promoted manually for comparison; skips on CPU for those dtypes.
         skip_helper_for_fft(device, dtype)
         # Test that round trip through ifft(fft(x)) is the identity
         if dtype not in (torch.half, torch.complex32):
@@ -237,6 +276,8 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @ops(spectral_funcs, allowed_dtypes=(torch.half, torch.float, torch.complex32, torch.cfloat))
     def test_empty_fft(self, device, dtype, op):
+        # [FUNCTION DOC] For each spectral op, an input with an empty transform dimension raises a
+        # RuntimeError saying the number of data points is invalid.
         t = torch.empty(1, 0, device=device, dtype=dtype)
         match = r"Invalid number of data points \([-\d]*\) specified"
 
@@ -245,6 +286,9 @@ class TestFFT(TestCase):
 
     @onlyNativeDeviceTypes
     def test_empty_ifft(self, device):
+        # [FUNCTION DOC] Checks that the inverse real transforms and Hermitian transforms in one,
+        # two and n dimensions raise a RuntimeError for invalid data point counts when given a
+        # complex input whose transform dimension has size one.
         t = torch.empty(2, 1, device=device, dtype=torch.complex64)
         match = r"Invalid number of data points \([-\d]*\) specified"
 
@@ -255,6 +299,8 @@ class TestFFT(TestCase):
 
     @onlyNativeDeviceTypes
     def test_fft_invalid_dtypes(self, device):
+        # [FUNCTION DOC] Checks that rfft, rfftn and ihfft applied to a complex input raise
+        # TypeError saying a real input is expected.
         t = torch.randn(64, device=device, dtype=torch.complex128)
 
         with self.assertRaisesRegex(TypeError, "rfft expects a real input tensor"):
@@ -271,6 +317,11 @@ class TestFFT(TestCase):
     @dtypes(torch.int8, torch.half, torch.float, torch.double,
             torch.complex32, torch.complex64, torch.complex128)
     def test_fft_type_promotion(self, device, dtype):
+        # [FUNCTION DOC] Checks output dtypes of fft, hfft and (for non-complex inputs) rfft for
+        # int8, half, float, double and complex inputs: integers and floats promote to the
+        # matching complex type, complex stays, hfft returns the matching real type. Half uses an
+        # odd length so the logical transform size is a power of two. bfloat16 is only checked for
+        # rfft on CUDA or XPU.
         skip_helper_for_fft(device, dtype)
 
         if dtype.is_complex or dtype.is_floating_point:
@@ -329,6 +380,11 @@ class TestFFT(TestCase):
     @ops(spectral_funcs, dtypes=OpDTypes.unsupported,
          allowed_dtypes=[torch.half, torch.bfloat16])
     def test_fft_half_and_bfloat16_errors(self, device, dtype, op):
+        # [FUNCTION DOC] For dtypes unsupported by the op (half, bfloat16), takes the first sample
+        # input and checks the op raises a RuntimeError with message about unsupported dtype.
+        # Returns early for bfloat16 on CUDA or XPU outside ROCm, where promotion is supported.
+        # KNOWN ISSUE: both branches of the message selection assign the same string, so the ROCm
+        # special case is redundant.
         # TODO: Remove torch.half error when complex32 is fully implemented
         # bfloat16 is supported on CUDA/XPU via promotion to float32, so
         # only expect an error on other device types (e.g. CPU, ROCm).
@@ -348,6 +404,9 @@ class TestFFT(TestCase):
     @ops(spectral_funcs, dtypes=OpDTypes.unsupported,
          allowed_dtypes=[torch.bfloat16])
     def test_fft_bfloat16_promoted_on_cuda(self, device, dtype, op):
+        # [FUNCTION DOC] Runs on CUDA or XPU only. Takes the first sample input for bfloat16 and
+        # checks the op runs without error and yields a complex64 or float32 result; skipped on
+        # ROCm because hipFFT lacks bfloat16.
         # bfloat16 inputs should be silently promoted to float32 on CUDA/XPU,
         # producing complex64 output without raising an error.
         # ROCm/hipFFT does not support bfloat16, so skip this test on ROCm.
@@ -365,6 +424,9 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @ops(spectral_funcs, allowed_dtypes=(torch.half, torch.chalf))
     def test_fft_half_and_chalf_not_power_of_two_error(self, device, dtype, op):
+        # [FUNCTION DOC] For half and complex half inputs, checks that an op on a tensor with side
+        # length 13, and with a requested size of 12 (as s or n depending on the op arity), raises
+        # a RuntimeError saying cuFFT supports only power-of-two sizes.
         t = make_tensor(13, 13, device=device, dtype=dtype)
         err_msg = "cuFFT only supports dimensions whose sizes are powers of two"
         with self.assertRaisesRegex(RuntimeError, err_msg):
@@ -387,6 +449,10 @@ class TestFFT(TestCase):
         torch.cfloat : tol(2e-4, 1.3e-6),
     })
     def test_reference_nd(self, device, dtype, op):
+        # [FUNCTION DOC] For n-dimensional transforms with a NumPy reference, checks the result
+        # against the reference over many combinations of input rank, sizes s, dims and norm
+        # modes, on complex float and complex double inputs, with relaxed tolerance for single
+        # precision. Exact dtype only for double precision.
         if op.ref is None:
             raise unittest.SkipTest("No reference implementation")
 
@@ -423,6 +489,9 @@ class TestFFT(TestCase):
     @dtypes(torch.half, torch.float, torch.double,
             torch.complex32, torch.complex64, torch.complex128)
     def test_fftn_round_trip(self, device, dtype):
+        # [FUNCTION DOC] Checks n-dimensional round trips (fftn/ifftn, and for real input
+        # rfftn/irfftn and ihfftn/hfftn) across ranks, dim selections and norm modes. Half types
+        # use power-of-two sizes and are compared after promotion to complex half.
         skip_helper_for_fft(device, dtype)
 
         norm_modes = (None, "forward", "backward", "ortho")
@@ -474,6 +543,10 @@ class TestFFT(TestCase):
     @ops([op for op in spectral_funcs if op.ndimensional == SpectralFuncType.ND],
          allowed_dtypes=[torch.float, torch.cfloat])
     def test_fftn_invalid(self, device, dtype, op):
+        # [FUNCTION DOC] Checks error handling of n-dimensional transforms: duplicate dims
+        # (including via negative index) raise RuntimeError about unique dims; mismatched lengths
+        # of s and dim raise RuntimeError; an out of range dim raises IndexError; an s longer than
+        # the rank raises RuntimeError.
         a = torch.rand(10, 10, 10, device=device, dtype=dtype)
         errMsg = "dims must be unique"
         with self.assertRaisesRegex(RuntimeError, errMsg):
@@ -495,6 +568,9 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.half, torch.float, torch.double, torch.cfloat, torch.cdouble)
     def test_fftn_noop_transform(self, device, dtype):
+        # [FUNCTION DOC] Checks that fftn, ifftn, fft2 and ifft2 with an empty dim list return the
+        # input unchanged except for conversion to the matching complex dtype (half becomes
+        # complex half, float becomes complex float, double becomes complex double).
         skip_helper_for_fft(device, dtype)
         RESULT_TYPE = {
             torch.half: torch.chalf,
@@ -523,6 +599,10 @@ class TestFFT(TestCase):
     })
     @dtypes(torch.half, torch.float, torch.double)
     def test_hfftn(self, device, dtype):
+        # [FUNCTION DOC] Checks hfftn against an inverse: builds a random target, applies ifftn
+        # with orthonormal norm, keeps the one-sided half of the last transformed dim, and checks
+        # hfftn with the original sizes recovers the target. Covers varied ranks and dims; half
+        # uses power-of-two sizes.
         skip_helper_for_fft(device, dtype)
 
         # input_ndim, dim
@@ -563,6 +643,9 @@ class TestFFT(TestCase):
     })
     @dtypes(torch.half, torch.float, torch.double)
     def test_ihfftn(self, device, dtype):
+        # [FUNCTION DOC] Checks ihfftn equals ifftn with orthonormal norm truncated to the
+        # one-sided half of the last transformed dim, over varied ranks and dims; half uses
+        # power-of-two sizes.
         skip_helper_for_fft(device, dtype)
 
         # input_ndim, dim
@@ -606,6 +689,10 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.double, torch.complex128)
     def test_fft2_numpy(self, device, dtype):
+        # [FUNCTION DOC] Compares the two-dimensional transforms (fft2, ifft2, irfft2, hfft2 and,
+        # for real input, rfft2 and ihfft2) with NumPy (or SciPy for the Hermitian ones, skipped
+        # when SciPy is missing) for varied ranks, sizes and norm modes, both with default dims
+        # and with explicit dims, and for the eager and scripted versions of the call.
         norm_modes = REFERENCE_NORM_MODES
 
         # input_ndim, s
@@ -630,6 +717,9 @@ class TestFFT(TestCase):
                     numpy_fn = getattr(np.fft, fname)
 
                 def fn(t: torch.Tensor, s: list[int] | None, dim: list[int] = (-2, -1), norm: str | None = None):
+                    # [FUNCTION DOC] HELPER: Wrapper with explicit type annotations that forwards
+                    # to the selected torch transform with input, sizes, dims and norm, so it can
+                    # be compiled with the script compiler.
                     return torch_fn(t, s, dim, norm)
 
                 torch_fns = (torch_fn, torch.jit.script(fn))
@@ -652,6 +742,9 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.float, torch.complex64)
     def test_fft2_fftn_equivalence(self, device, dtype):
+        # [FUNCTION DOC] Checks each two-dimensional transform equals the matching n-dimensional
+        # transform restricted to the last two dims (or the explicit dims), across ranks, sizes
+        # and norm modes.
         norm_modes = (None, "forward", "backward", "ortho")
 
         # input_ndim, s, dim
@@ -688,6 +781,10 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @onlyNativeDeviceTypes
     def test_fft2_invalid(self, device):
+        # [FUNCTION DOC] Checks error handling of two-dimensional transforms on a
+        # three-dimensional input: repeated dims raise RuntimeError, s and dim length mismatch
+        # raises RuntimeError, an out of range dim raises IndexError, and rfft2 on a complex input
+        # raises TypeError.
         a = torch.rand(10, 10, 10, device=device)
         fft_funcs = (torch.fft.fft2, torch.fft.ifft2,
                      torch.fft.rfft2, torch.fft.irfft2)
@@ -716,6 +813,8 @@ class TestFFT(TestCase):
     @unittest.skipIf(not TEST_NUMPY, 'NumPy not found')
     @dtypes(torch.float, torch.double)
     def test_fftfreq_numpy(self, device, dtype):
+        # [FUNCTION DOC] Compares fftfreq and rfftfreq for sizes one through nineteen with default
+        # or custom sample spacing against NumPy, ignoring exact dtype.
         test_args = [
             *product(
                 # n
@@ -741,6 +840,8 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.float, torch.double)
     def test_fftfreq_out(self, device, dtype):
+        # [FUNCTION DOC] Checks that fftfreq and rfftfreq with an out tensor that has the wrong
+        # size emit a UserWarning about resizing and fill the out tensor with the expected values.
         for func in (torch.fft.fftfreq, torch.fft.rfftfreq):
             expect = func(n=100, d=.5, device=device, dtype=dtype)
             actual = torch.empty((), device=device, dtype=dtype)
@@ -754,6 +855,8 @@ class TestFFT(TestCase):
     @unittest.skipIf(not TEST_NUMPY, 'NumPy not found')
     @dtypes(torch.float, torch.double, torch.complex64, torch.complex128)
     def test_fftshift_numpy(self, device, dtype):
+        # [FUNCTION DOC] Compares fftshift and ifftshift against NumPy for various shapes and axes
+        # (none, single, tuple) on float and complex inputs.
         test_args = [
             # shape, dim
             *product(((11,), (12,)), (None, 0, -1)),
@@ -780,6 +883,8 @@ class TestFFT(TestCase):
     @unittest.skipIf(not TEST_NUMPY, 'NumPy not found')
     @dtypes(torch.float, torch.double)
     def test_fftshift_frequencies(self, device, dtype):
+        # [FUNCTION DOC] Checks that fftshift sorts fftfreq output into ascending order equal to a
+        # consecutive range of integers, and ifftshift undoes it, for n from ten to fourteen.
         for n in range(10, 15):
             sorted_fft_freqs = torch.arange(-(n // 2), n - (n // 2),
                                             device=device, dtype=dtype)
@@ -795,9 +900,17 @@ class TestFFT(TestCase):
 
     # Legacy fft tests
     def _test_fft_ifft_rfft_irfft(self, device, dtype):
+        # [FUNCTION DOC] HELPER: Shared body of the legacy FFT round-trip tests. Defines checks
+        # for complex and real signals of various signal dimensionality (with an optional
+        # preprocessing function), then runs them on contiguous inputs and on many non-contiguous
+        # or expanded views, verifying fftn then ifftn, ifftn then fftn, and rfftn then irfftn
+        # recover the input with tight absolute tolerance, using ortho and default norms.
         complex_dtype = corresponding_complex_dtype(dtype)
 
         def _test_complex(sizes, signal_ndim, prepro_fn=lambda x: x):
+            # [FUNCTION DOC] HELPER: For a random complex tensor of the given shape (optionally
+            # preprocessed), checks forward then inverse and inverse then forward n-dimensional
+            # transforms over the last dims recover the input.
             x = prepro_fn(torch.randn(*sizes, dtype=complex_dtype, device=device))
             dim = tuple(range(-signal_ndim, 0))
             for norm in ('ortho', None):
@@ -809,6 +922,9 @@ class TestFFT(TestCase):
                 self.assertEqual(x, rec, atol=1e-8, rtol=0, msg='ifft and fft')
 
         def _test_real(sizes, signal_ndim, prepro_fn=lambda x: x):
+            # [FUNCTION DOC] HELPER: For a random real tensor of the given shape (optionally
+            # preprocessed), checks rfftn followed by irfftn recovers the input, and fftn followed
+            # by ifftn recovers it as a complex tensor with zero imaginary part.
             x = prepro_fn(torch.randn(*sizes, dtype=dtype, device=device))
             signal_numel = 1
             signal_sizes = x.size()[-signal_ndim:]
@@ -854,14 +970,24 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.double)
     def test_fft_ifft_rfft_irfft(self, device, dtype):
+        # [FUNCTION DOC] Runs the legacy FFT round-trip helper for double precision on the test
+        # device.
         self._test_fft_ifft_rfft_irfft(device, dtype)
 
     @deviceCountAtLeast(1)
     @onlyCUDA
     @dtypes(torch.double)
     def test_cufft_plan_cache(self, devices, dtype):
+        # [FUNCTION DOC] CUDA only. Exercises the cuFFT plan cache with varied maximum sizes
+        # (reduced, zero, cleared, ten) while rerunning the round-trip helper, checks the errors
+        # for a negative maximum size, setting the read-only size, and an invalid device index,
+        # and with multiple GPUs checks each device has its own cache and the unindexed cache
+        # refers to the current device.
         @contextmanager
         def plan_cache_max_size(device, n):
+            # [FUNCTION DOC] HELPER: Context manager that sets the maximum size of the cuFFT plan
+            # cache of the given device (or of the current device when the device is None) and
+            # restores the original value on exit.
             if device is None:
                 plan_cache = torch.backends.cuda.cufft_plan_cache
             else:
@@ -933,6 +1059,9 @@ class TestFFT(TestCase):
     @onlyCUDA
     @dtypes(torch.cfloat, torch.cdouble)
     def test_cufft_context(self, device, dtype):
+        # [FUNCTION DOC] CUDA only regression test for a cuFFT context problem. Backpropagates a
+        # zero gradient through the inverse transform of the transform of an input and checks the
+        # input gradient equals the expected value and differs from the input.
         # Regression test for https://github.com/pytorch/pytorch/issues/109448
         x = torch.randn(32, dtype=dtype, device=device, requires_grad=True)
         dout = torch.zeros(32, dtype=dtype, device=device)
@@ -949,6 +1078,9 @@ class TestFFT(TestCase):
     @onlyCUDA
     @largeTensorTest("18GB")
     def test_fft_conjugate_symmetry_fill_int64_indexing(self, device):
+        # [FUNCTION DOC] CUDA only, needs a large amount of memory. Writes an FFT result into an
+        # output view whose rows are two to the 31 elements apart so the conjugate-symmetry fill
+        # must use 64-bit indexing, and checks it equals the result written to a fresh tensor.
         # The CUDA conjugate-symmetry fill uses 32-bit index math when numel and
         # every element offset fit in int32, else a 64-bit fallback. Space the
         # output rows 2**31 elements apart so max_out_offset exceeds INT32_MAX and
@@ -966,10 +1098,18 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.double)
     def test_stft(self, device, dtype):
+        # [FUNCTION DOC] Compares stft with the librosa implementation (skipped if librosa is
+        # missing) for many sizes, hop lengths, window lengths, window tensors and centering,
+        # comparing both real-view and complex outputs, and checks invalid arguments raise
+        # RuntimeError.
         if not TEST_LIBROSA:
             raise unittest.SkipTest('librosa not found')
 
         def librosa_stft(x, n_fft, hop_length, win_length, window, center):
+            # [FUNCTION DOC] HELPER: Computes the stft of each signal with librosa using reflect
+            # padding, with an all-ones window if none is given, and returns a torch tensor
+            # stacking real and imaginary parts in a trailing dim; accepts a single signal or a
+            # batch.
             if window is None:
                 window = np.ones(n_fft if win_length is None else win_length)
             else:
@@ -995,6 +1135,10 @@ class TestFFT(TestCase):
 
         def _test(sizes, n_fft, hop_length=None, win_length=None, win_sizes=None,
                   center=True, expected_error=None):
+            # [FUNCTION DOC] HELPER: Generates random input and optional window of the
+            # given shapes. When no error is expected, compares x.stft against the
+            # librosa reference (real-view and complex return); otherwise asserts the
+            # stft call raises the expected error type.
             x = torch.randn(*sizes, dtype=dtype, device=device)
             if win_sizes is not None:
                 window = torch.randn(*win_sizes, dtype=dtype, device=device)
@@ -1040,10 +1184,15 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.double)
     def test_istft_against_librosa(self, device, dtype):
+        # [FUNCTION DOC] Checks istft of a stft against the librosa istft (skipped if librosa is
+        # missing) for varied lengths, hop lengths, windows, optional output length and centering.
         if not TEST_LIBROSA:
             raise unittest.SkipTest('librosa not found')
 
         def librosa_istft(x, n_fft, hop_length, win_length, window, length, center):
+            # [FUNCTION DOC] HELPER: Calls librosa istft with a numpy window (an all-ones window
+            # of the window length when none given) and the given hop, length and centering,
+            # returning a numpy result.
             if window is None:
                 window = np.ones(n_fft if win_length is None else win_length)
             else:
@@ -1054,6 +1203,9 @@ class TestFFT(TestCase):
 
         def _test(size, n_fft, hop_length=None, win_length=None, win_sizes=None,
                   length=None, center=True):
+            # [FUNCTION DOC] HELPER: Builds a random signal and optional window, takes
+            # its one-sided complex stft, and checks torch istft matches the librosa
+            # result.
             x = torch.randn(size, dtype=dtype, device=device)
             if win_sizes is not None:
                 window = torch.randn(*win_sizes, dtype=dtype, device=device)
@@ -1086,6 +1238,9 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.double, torch.cdouble)
     def test_complex_stft_roundtrip(self, device, dtype):
+        # [FUNCTION DOC] Checks that istft of stft recovers real or complex input of several
+        # shapes for many combinations of n_fft, hop, pad mode, normalization and onesidedness,
+        # through both the function and tensor method interfaces.
         test_args = list(product(
             # input
             (torch.randn(600, device=device, dtype=dtype),
@@ -1128,6 +1283,11 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.double, torch.cdouble)
     def test_stft_roundtrip_complex_window(self, device, dtype):
+        # [FUNCTION DOC] Checks that stft with a complex window gives a complex128 two-sided
+        # result and that istft with the same window recovers the input (real inputs have zero
+        # imaginary part) across shapes, hops, pad modes and normalization.
+        # KNOWN ISSUE: the second dtype assertion rechecks the stft output instead of the
+        # round-trip output.
         test_args = list(product(
             # input
             (torch.randn(600, device=device, dtype=dtype),
@@ -1168,6 +1328,8 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.cdouble)
     def test_complex_stft_definition(self, device, dtype):
+        # [FUNCTION DOC] Checks torch.stft on complex input with a window and no centering against
+        # the explicit reference definition.
         test_args = list(product(
             # input
             (torch.randn(600, device=device, dtype=dtype),
@@ -1188,6 +1350,8 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.cdouble)
     def test_complex_stft_real_equiv(self, device, dtype):
+        # [FUNCTION DOC] Checks torch.stft on complex input equals the sum of the stft of its real
+        # part and imaginary part times the imaginary unit, over many options.
         test_args = list(product(
             # input
             (torch.rand(600, device=device, dtype=dtype),
@@ -1221,6 +1385,9 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.cdouble)
     def test_complex_istft_real_equiv(self, device, dtype):
+        # [FUNCTION DOC] Checks torch.istft with complex output on complex input equals the
+        # reference built from Hermitian decomposition, for several shapes, hops, centering and
+        # normalization.
         test_args = list(product(
             # input
             (torch.rand(40, 20, device=device, dtype=dtype),
@@ -1246,6 +1413,9 @@ class TestFFT(TestCase):
 
     @skipCPUIfNoFFT
     def test_complex_stft_onesided(self, device):
+        # [FUNCTION DOC] Checks that onesided stft works for real signal and window (complex128
+        # result of shape six by fifty-one) and raises RuntimeError mentioning complex when the
+        # signal or window is complex.
         # stft of complex input cannot be onesided
         for x_dtype, window_dtype in product((torch.double, torch.cdouble), repeat=2):
             x = torch.rand(100, device=device, dtype=x_dtype)
@@ -1268,6 +1438,8 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @skipCPUIfNoFFT
     def test_stft_requires_complex(self, device):
+        # [FUNCTION DOC] Checks calling stft without specifying return_complex raises a
+        # RuntimeError saying the parameter is required.
         x = torch.rand(100)
         with self.assertRaisesRegex(RuntimeError, 'stft requires the return_complex parameter'):
             y = x.stft(10, pad_mode='constant')
@@ -1275,6 +1447,8 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @skipCPUIfNoFFT
     def test_stft_align_to_window_only_requires_non_center(self, device):
+        # [FUNCTION DOC] Checks that setting align_to_window together with centering raises a
+        # RuntimeError saying it should be set only without centering.
         x = torch.rand(100)
         for align_to_window in [True, False]:
             with self.assertRaisesRegex(RuntimeError, 'stft align_to_window should only be set when center = false'):
@@ -1284,6 +1458,8 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @skipCPUIfNoFFT
     def test_stft_requires_window(self, device):
+        # [FUNCTION DOC] Checks stft without a window emits a UserWarning that a window was not
+        # provided.
         x = torch.rand(100)
         with self.assertWarnsOnceRegex(UserWarning, "A window was not provided"):
             y = x.stft(10, pad_mode='constant', return_complex=True)
@@ -1291,6 +1467,8 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @skipCPUIfNoFFT
     def test_istft_requires_window(self, device):
+        # [FUNCTION DOC] Checks istft without a window emits a UserWarning that a window was not
+        # provided.
         stft = torch.rand((51, 5), dtype=torch.cdouble)
         # 51 = 2 * n_fft + 1, 5 = number of frames
         with self.assertWarnsOnceRegex(UserWarning, "A window was not provided"):
@@ -1298,6 +1476,8 @@ class TestFFT(TestCase):
 
     @skipCPUIfNoFFT
     def test_fft_input_modification(self, device):
+        # [FUNCTION DOC] Regression test that fftn, ifftn, rfftn and irfftn do not modify their
+        # input tensors.
         # FFT functions should not modify their input (gh-34551)
 
         signal = torch.ones((2, 2, 2), device=device)
@@ -1319,6 +1499,9 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @skipCPUIfNoFFT
     def test_fft_plan_repeatable(self, device):
+        # [FUNCTION DOC] Regression test that calling fftn on a complex input or rfft on a double
+        # input twice (second time on a clone) gives equal results for sizes where plans were once
+        # not repeatable.
         # Regression test for gh-58724 and gh-63152
         for n in [2048, 3199, 5999]:
             a = torch.randn(n, device=device, dtype=torch.complex64)
@@ -1335,8 +1518,12 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.double)
     def test_istft_round_trip_simple_cases(self, device, dtype):
+        # [FUNCTION DOC] Checks stft followed by istft recovers all ones and all zeros signals of
+        # length four.
         """stft -> istft should recover the original signale"""
         def _test(input, n_fft, length):
+            # [FUNCTION DOC] HELPER: Takes the stft of the input and the istft with the given
+            # length and asserts it equals the input with exact dtype.
             stft = torch.stft(input, n_fft=n_fft, return_complex=True)
             inverse = torch.istft(stft, n_fft=n_fft, length=length)
             self.assertEqual(input, inverse, exact_dtype=True)
@@ -1348,8 +1535,14 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.double)
     def test_istft_round_trip_various_params(self, device, dtype):
+        # [FUNCTION DOC] Checks stft/istft round trips for four parameter sets (Hann or Hamming
+        # windows, various hops, window lengths, padding, normalization and onesidedness) on
+        # random batches of signals, one hundred trials per shape.
         """stft -> istft should recover the original signale"""
         def _test_istft_is_inverse_of_stft(stft_kwargs):
+            # [FUNCTION DOC] HELPER: For each of several batch shapes and many trials, runs stft
+            # with the given arguments and istft (same arguments minus pad mode) and asserts the
+            # output equals the original within tolerance.
             # generates a random sound signal for each tril and then does the stft/istft
             # operation to check whether we can reconstruct signal
             data_sizes = [(2, 20), (3, 15), (4, 10)]
@@ -1419,8 +1612,15 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.double)
     def test_istft_round_trip_with_padding(self, device, dtype):
+        # [FUNCTION DOC] Checks round trips where the signal length is not perfectly reconstructed
+        # (non-centered or long hop): istft warns that the signal is shorter than the requested
+        # length, the covered part matches the original and the extra tail is zero.
         """long hop_length or not centered may cause length mismatch in the inversed signal"""
         def _test_istft_is_inverse_of_stft_with_padding(stft_kwargs):
+            # [FUNCTION DOC] HELPER: For repeated random signals, computes stft and istft with the
+            # given parameters (the size entry is consumed and removed from the mapping), expects
+            # a warning, computes the expected reconstructed length, and compares the covered
+            # prefix with the original and the remaining tail with zeros.
             # generates a random sound signal for each tril and then does the stft/istft
             # operation to check whether we can reconstruct signal
             num_trials = 100
@@ -1484,6 +1684,8 @@ class TestFFT(TestCase):
 
     @onlyNativeDeviceTypes
     def test_istft_throws(self, device):
+        # [FUNCTION DOC] Checks istft raises RuntimeError for a gap between windows, a window of
+        # zeros that fails overlap-add constraints, and empty inputs.
         """istft should throw exception for invalid parameters"""
         stft = torch.zeros((3, 5, 2), device=device, dtype=torch.cfloat)
         # the window is size 1 but it hops 20 so there is a gap which throw an error
@@ -1503,9 +1705,15 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.double)
     def test_istft_of_sine(self, device, dtype):
+        # [FUNCTION DOC] Checks istft of a hand-built spectrum of a pure sine reproduces the sine
+        # for several amplitudes, frame lengths and frequencies.
         complex_dtype = corresponding_complex_dtype(dtype)
 
         def _test(amplitude, L, n):
+            # [FUNCTION DOC] HELPER: Builds a sine of given amplitude and frame length L with
+            # frequency index n, constructs the matching one-frame spectrum by hand (imaginary
+            # entries at index n and L minus n), runs istft with rectangular window and compares
+            # with the sine within tolerance.
             # stft of amplitude*sin(2*pi/L*n*x) with the hop length and window size equaling L
             x = torch.arange(2 * L + 1, device=device, dtype=dtype)
             original = amplitude * torch.sin(2 * math.pi / L * x * n)
@@ -1539,10 +1747,16 @@ class TestFFT(TestCase):
     @skipCPUIfNoFFT
     @dtypes(torch.double)
     def test_istft_linearity(self, device, dtype):
+        # [FUNCTION DOC] Checks istft is linear: for four window and option sets, the istft of a
+        # weighted sum of two random spectra equals the weighted sum of their istfts, using both
+        # the tensor method and the function.
         num_trials = 100
         complex_dtype = corresponding_complex_dtype(dtype)
 
         def _test(data_size, kwargs):
+            # [FUNCTION DOC] HELPER: For one hundred trials, draws two random complex spectra of
+            # the given shape and random weights and compares the combined istft against the
+            # linear combination of the separate istfts.
             for _ in range(num_trials):
                 tensor1 = torch.randn(data_size, device=device, dtype=complex_dtype)
                 tensor2 = torch.randn(data_size, device=device, dtype=complex_dtype)
@@ -1605,6 +1819,8 @@ class TestFFT(TestCase):
     @onlyNativeDeviceTypes
     @skipCPUIfNoFFT
     def test_batch_istft(self, device):
+        # [FUNCTION DOC] Checks istft handles batches: a single, a one-element batch and a
+        # four-element batch of the same spectrum give consistent results.
         original = torch.tensor([
             [4., 4., 4., 4., 4.],
             [0., 0., 0., 0., 0.],
@@ -1624,6 +1840,9 @@ class TestFFT(TestCase):
     @onlyCUDA
     @requires_mkl
     def test_stft_window_device(self, device):
+        # [FUNCTION DOC] CUDA with MKL only. Checks stft and istft raise RuntimeError saying input
+        # and window must be on the same device when the window and the input are on different
+        # devices.
         # Test the (i)stft window must be on the same device as the input
         x = torch.randn(1000, dtype=torch.complex64)
         window = torch.randn(100, dtype=torch.complex64)
@@ -1644,13 +1863,20 @@ class TestFFT(TestCase):
 
 
 class FFTDocTestFinder:
+    # [CLASS DOC] HELPER: Minimal replacement for a doctest finder that collects a doctest from
+    # the docstring of each routine named in the all-list of a module, even though the functions
+    # report a different module name. Holds a doctest parser.
     '''The default doctest finder doesn't like that function.__module__ doesn't
     match torch.fft. It assumes the functions are leaked imports.
     '''
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the doctest parser used by find.
         self.parser = doctest.DocTestParser()
 
     def find(self, obj, name=None, module=None, globs=None, extraglobs=None):
+        # [FUNCTION DOC] HELPER: Returns a list with one parsed doctest per public routine of the
+        # given module that has a docstring; the module name defaults to the object name and
+        # globals default to empty. The module and extraglobs arguments are unused.
         doctests = []
 
         modname = name if name is not None else obj.__name__
@@ -1672,10 +1898,18 @@ class FFTDocTestFinder:
 
 
 class TestFFTDocExamples(TestCase):
+    # [CLASS DOC] Container of doctest-based tests, one per public torch.fft routine, added
+    # dynamically at import time. Runs on the CPU only.
     pass
 
 def generate_doc_test(doc_test):
+    # [FUNCTION DOC] HELPER: Defines a test method that runs the given doctest with a doctest
+    # runner and fails if any example fails, then attaches it to TestFFTDocExamples under a name
+    # made from the doctest name, wrapped to skip when CPU FFT is unavailable. Modifies the class
+    # as a side effect.
     def test(self, device):
+        # [FUNCTION DOC] HELPER: Test body asserting the device is cpu, running the captured
+        # doctest, and failing the test (after printing a summary) if any example failed.
         self.assertEqual(device, 'cpu')
         runner = doctest.DocTestRunner()
         runner.run(doc_test)
