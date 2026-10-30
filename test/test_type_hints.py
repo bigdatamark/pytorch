@@ -1,5 +1,9 @@
 # mypy: allow-untyped-defs
 # Owner(s): ["module: typing"]
+# [MODULE DOC] Smoke test that runs the code examples found in torch and Tensor docstrings
+# through mypy. Provides helpers that extract doctest examples and assemble them into one
+# generated module, plus a test that writes the module next to this file and type checks it.
+# Import-time side effect: tries to import mypy and records availability.
 
 import doctest
 import inspect
@@ -27,6 +31,8 @@ except ImportError:
 
 
 def get_examples_from_docstring(docstr):
+    # [FUNCTION DOC] Parses doctest examples from a docstring and returns a list of source
+    # lines, each prefixed with four spaces so they can sit inside a function body.
     """
     Extracts all runnable python code from the examples
     in docstrings; returns a list of lines.
@@ -36,6 +42,11 @@ def get_examples_from_docstring(docstr):
 
 
 def get_all_examples():
+    # [FUNCTION DOC] Builds the text of a Python module. It starts with a fixed header
+    # (imports, a type alias and a typed preprocess function) and then, for every public name
+    # of torch and of Tensor that has a docstring with doctest examples (excluding a small
+    # blocklist), appends a function containing those examples. Returns the whole module as
+    # one string joined by newlines. Reads docstrings only; no files are written.
     """get_all_examples() -> str
 
     This function grabs (hopefully all) examples from the torch documentation
@@ -97,10 +108,19 @@ def get_all_examples():
 
 
 class TestTypeHints(TestCase):
+    # [CLASS DOC] Test case with a single mypy based test of the documentation examples;
+    # stateless.
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/98259")
     @unittest.skipIf(IS_S390X, "flaky on s390x")
     @unittest.skipIf(not HAVE_MYPY, "need mypy")
     def test_doc_examples(self):
+        # [FUNCTION DOC] Skipped on Linux (known issue link), on s390x, or when mypy is
+        # missing. Writes the generated example module to a file in the test directory,
+        # creates a temporary directory with a symlink named torch pointing at the installed
+        # package (skips the test if symlinking fails), changes the working directory to the
+        # repo root, runs mypy with a private cache dir and relaxed optional checking, and
+        # fails with the stderr and stdout if mypy exits non-zero. Side effects: leaves the
+        # generated file on disk and the process cwd is changed temporarily.
         """
         Run documentation examples through mypy.
         """

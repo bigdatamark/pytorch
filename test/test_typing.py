@@ -1,4 +1,9 @@
 # Owner(s): ["module: typing"]
+# [MODULE DOC] Runs mypy over the pass, fail and reveal example directories under the typing
+# test data folder and checks the reported errors and revealed types match expectation
+# comments embedded in those files. Based on NumPy's typing tests. Defines directory
+# constants, parsing helpers and a parametrized test class. Import-time side effects: tries to
+# import mypy; builds the format dictionary.
 # based on NumPy numpy/typing/tests/test_typing.py
 
 import itertools
@@ -35,6 +40,8 @@ CACHE_DIR = os.path.join(DATA_DIR, ".mypy_cache")
 
 
 def _key_func(key: str) -> str:
+    # [FUNCTION DOC] HELPER: Grouping key for mypy output lines; returns the file path part
+    # before the first colon, ignoring a Windows drive letter.
     """Split at the first occurrence of the ``:`` character.
 
     Windows drive-letters (*e.g.* ``C:``) are ignored herein.
@@ -44,12 +51,19 @@ def _key_func(key: str) -> str:
 
 
 def _strip_filename(msg: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the part of a mypy message after the first colon
+    # following any drive letter, i.e. without the file name.
     """Strip the filename from a mypy message."""
     _, tail = os.path.splitdrive(msg)
     return tail.split(":", 1)[-1]
 
 
 def _run_mypy() -> dict[str, list[str]]:
+    # [FUNCTION DOC] HELPER: Deletes any previous mypy cache directory, then runs mypy once
+    # for each of the reveal, pass and fail directories with the repo mypy config. Raises an
+    # error if mypy writes to stderr. Strips asterisks from stdout, groups output lines by
+    # file path and returns a mapping from path to its message lines. Side effects: removes
+    # and recreates the cache directory.
     """Clears the cache and run mypy before running any of the typing tests."""
     if os.path.isdir(CACHE_DIR):
         shutil.rmtree(CACHE_DIR, ignore_errors=True)
@@ -78,6 +92,8 @@ def _run_mypy() -> dict[str, list[str]]:
 
 
 def get_test_cases(directory):
+    # [FUNCTION DOC] Generator walking a directory tree and yielding the full path of every
+    # python file whose name does not start with the disabled prefix.
     for root, _, files in os.walk(directory):
         for fname in files:
             if fname.startswith("disabled_"):
@@ -98,6 +114,9 @@ Observed error: {!r}
 
 
 def _test_fail(path: str, error: str, expected_error: str | None, lineno: int) -> None:
+    # [FUNCTION DOC] HELPER: Raises an AssertionError with the extra-error message when no
+    # mypy error was observed for the line, or the mismatch message when the marker text is
+    # not contained in the observed error text. The path argument is unused.
     if expected_error is None:
         raise AssertionError(_FAIL_MSG1.format(lineno, error))
     elif error not in expected_error:
@@ -105,6 +124,8 @@ def _test_fail(path: str, error: str, expected_error: str | None, lineno: int) -
 
 
 def _construct_format_dict():
+    # [FUNCTION DOC] HELPER: Returns a new mapping from short format keys (such as Tensor or
+    # Adam) to fully qualified torch type names used in reveal expectations.
     dct = {
         "ModuleList": "torch.nn.modules.container.ModuleList",
         "AdaptiveAvgPool2d": "torch.nn.modules.pooling.AdaptiveAvgPool2d",
@@ -122,6 +143,11 @@ FORMAT_DICT: dict[str, str] = _construct_format_dict()
 
 
 def _parse_reveals(file: IO[str]) -> list[str]:
+    # [FUNCTION DOC] HELPER: Reads a file, removes asterisks, takes the text after the
+    # expectation marker on every line (empty for lines without one) and joins them with a
+    # sentinel. Looks up each braced key in the format mapping (unknown keys become an
+    # unrecognized-key placeholder), substitutes them, and returns the list of expected reveal
+    # strings, one per source line so list index equals zero based line number.
     """Extract and parse all ``"  # E: "`` comments from the passed file-like object.
 
     All format keys will be substituted for their respective value from `FORMAT_DICT`,
@@ -152,17 +178,25 @@ Observed reveal: {!r}
 
 
 def _test_reveal(path: str, reveal: str, expected_reveal: str, lineno: int) -> None:
+    # [FUNCTION DOC] HELPER: Raises an AssertionError with both texts when the expected reveal
+    # string is not a substring of the observed mypy line. Note the parameter named reveal is
+    # the expectation and expected_reveal is the observed line. The path argument is unused.
     if reveal not in expected_reveal:
         raise AssertionError(_REVEAL_MSG.format(lineno, expected_reveal, reveal))
 
 
 @unittest.skipIf(NO_MYPY, reason="Mypy is not installed")
 class TestTyping(TestCase):
+    # [CLASS DOC] Parametrized test case, skipped when mypy is missing. Class state: a lock
+    # and a cached mapping of mypy output, filled lazily once per process. Tests are generated
+    # per example file by the parametrize decorator and instantiated at module level.
     _lock = Lock()
     _cached_output: dict[str, list[str]] | None = None
 
     @classmethod
     def get_mypy_output(cls) -> dict[str, list[str]]:
+        # [FUNCTION DOC] Class method returning the shared mypy output mapping, running mypy
+        # on first use under the class lock and caching the result on the class.
         with cls._lock:
             if cls._cached_output is None:
                 cls._cached_output = _run_mypy()
@@ -174,6 +208,8 @@ class TestTyping(TestCase):
         name_fn=lambda b: os.path.splitext(os.path.relpath(b, start=PASS_DIR))[0],
     )
     def test_success(self, path) -> None:
+        # [FUNCTION DOC] For each file in the pass directory, fails with the stripped mypy
+        # messages if mypy reported anything at all for that file.
         output_mypy = self.get_mypy_output()
         if path in output_mypy:
             msg = "Unexpected mypy output\n\n"
@@ -186,6 +222,11 @@ class TestTyping(TestCase):
         name_fn=lambda b: os.path.splitext(os.path.relpath(b, start=FAIL_DIR))[0],
     )
     def test_fail(self, path):
+        # [FUNCTION DOC] For each file in the fail directory: requires mypy to have output for
+        # it, parses each line into line number and error text (raises ValueError for an
+        # unrecognized format), then for each source line that either carries an expectation
+        # marker or has an observed error, checks the marker exists and that the observed
+        # error text matches it.
         __tracebackhide__ = True
 
         with open(path) as fin:
@@ -227,6 +268,10 @@ class TestTyping(TestCase):
         name_fn=lambda b: os.path.splitext(os.path.relpath(b, start=REVEAL_DIR))[0],
     )
     def test_reveal(self, path):
+        # [FUNCTION DOC] For each file in the reveal directory: parses the expected reveal
+        # strings, requires mypy output for the file, and for each note line (ValueError if
+        # the line format is unexpected, AssertionError if it is not a revealed type note)
+        # compares it with the expectation for that source line.
         __tracebackhide__ = True
 
         with open(path) as fin:
