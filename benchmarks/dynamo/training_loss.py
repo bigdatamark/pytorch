@@ -1,3 +1,9 @@
+# [MODULE DOC] End-to-end script that fine-tunes a BERT sequence classifier on a subset of the
+# yelp review dataset, once with native PyTorch and once through a chosen dynamo backend, then
+# compares the training loss history and reports the per-epoch time of each. Import-time side
+# effects: enables tf32 matmul on cuda, disables tokenizer parallelism through an environment
+# variable, and defines the module-level device (cuda when available, else cpu). Requires the
+# datasets and transformers packages and downloads data and model weights.
 import argparse
 import inspect
 import os
@@ -22,10 +28,17 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 
 def data_processing(num_samples, batch_size):
+    # [FUNCTION DOC] Loads the yelp review dataset and the cased BERT tokenizer, tokenizes the
+    # text field with padding to maximum length and truncation, drops the text column, renames
+    # the label column to labels, and sets the torch format. Selects the first num_samples
+    # examples of the train and test splits and wraps each in a data loader with the given batch
+    # size. Returns the train and evaluation loaders.
     dataset = load_dataset("yelp_review_full")
     tokenizer = AutoTokenizer.from_pretrained("bert-base-cased")
 
     def tokenize_function(examples):
+        # [FUNCTION DOC] HELPER: Tokenizes a batch of examples using the text field with padding
+        # and truncation, returning the tokenizer output.
         return tokenizer(examples["text"], padding="max_length", truncation=True)
 
     tokenized_datasets = dataset.map(tokenize_function, batched=True)
@@ -44,6 +57,9 @@ def data_processing(num_samples, batch_size):
 
 
 def training_iter_fn(batch, model, optimizer):
+    # [FUNCTION DOC] One training step: runs the model on the batch (keyword arguments), takes
+    # the loss from the output, backpropagates, steps the optimizer and clears gradients.
+    # Returns the loss tensor.
     outputs = model(**batch)
     loss = outputs.loss
     loss.backward()
@@ -55,6 +71,15 @@ def training_iter_fn(batch, model, optimizer):
 def model_training_evaluation(
     backend, train_dataloader, eval_dataloader, model, optimizer, num_epochs, evaluation
 ):
+    # [FUNCTION DOC] Trains the model on the module-level device for num_epochs epochs and
+    # optionally evaluates it. With no backend the step function runs natively, otherwise it is
+    # wrapped by dynamo optimization with that backend. A running loss is accumulated per batch
+    # and each 100th batch appends the mean over 100 batches to the loss history and resets the
+    # accumulator (it is not reset at epoch boundaries). If evaluation is requested, loads the
+    # accuracy metric, switches to eval mode, optionally wraps the model with the backend, and
+    # accumulates predictions (arg-max of logits) and references without gradients. Returns the
+    # loss history together with the computed metric, or None for the metric if not evaluating.
+    # Mutates the model and optimizer (weights are updated in place).
     model.to(device)
     model.train()
     loss_history = []
@@ -96,6 +121,11 @@ def model_training_evaluation(
 
 
 def check_loss(ref_loss, res_loss):
+    # [FUNCTION DOC] Compares two loss histories: raises AssertionError if their lengths differ.
+    # Returns true when the sum of the last up to ten values of the result history divided by
+    # ten is at most the same quantity of the reference history plus 0.1.
+    # KNOWN ISSUE: the sums are divided by ten even when fewer than ten values exist, so short
+    #     histories are scaled down inconsistently with the number of values summed.
     if len(ref_loss) != len(res_loss):
         raise AssertionError(
             f"Expected loss lists to have equal length, but got {len(ref_loss)} and {len(res_loss)}"
@@ -106,6 +136,9 @@ def check_loss(ref_loss, res_loss):
 
 
 def parse_args():
+    # [FUNCTION DOC] Parses command line options: epochs (default 10), num-samples (1000),
+    # batch-size (8), learning rate (5e-5), backend (any registered dynamo backend, default
+    # inductor), optimizer name (default Adam) and an evaluation flag. Returns the namespace.
     parser = argparse.ArgumentParser(
         description="TorchDynamo end to end training/evaluation benchmark"
     )
@@ -148,6 +181,15 @@ def parse_args():
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Parses arguments, builds the data loaders and the pretrained
+    # five-label BERT classifier, and creates the chosen torch optimizer by name (enabling its
+    # capturable option when supported). Runs training (and optional evaluation) natively and
+    # times it, then runs the same model and optimizer again through the chosen backend and
+    # times it. Prints a pass or fail line based on the loss comparison, the accuracy if
+    # evaluation was requested, and the per-epoch time of both runs.
+    # KNOWN ISSUE: both runs reuse the same model and optimizer without resetting weights, so
+    #     the second run starts from already-trained weights, and the reported accuracy is that
+    #     of the dynamo run only.
     args = parse_args()
     train_dataloader, eval_dataloader = data_processing(
         args.num_samples, args.batch_size

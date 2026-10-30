@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Dynamo benchmark suite driver for models from the TorchBench (torchbenchmark)
+# repository. Defines the runner class, a helper that moves into a TorchBench checkout, a helper
+# that fixes parameter types, and an entry function. Import-time side effects: enables tf32
+# matmul on cuda, enables the inductor FX graph cache and the autograd cache unless the
+# corresponding environment variables are set, and creates the module-level empty mapping used
+# for amp training output processing.
 
 import gc
 import importlib
@@ -37,10 +43,17 @@ if "TORCHINDUCTOR_AUTOGRAD_CACHE" not in os.environ:
 
 
 def _reassign_parameters(model):
+    # [FUNCTION DOC] HELPER: Registers a state dict hook on a model so that any tensor entries
+    # of its state dict that belong to named parameters are re-wrapped as parameters. Works
+    # around torch_geometric registering parameters as plain tensors.
     # torch_geometric models register parameter as tensors due to
     # https://github.com/pyg-team/pytorch_geometric/blob/master/torch_geometric/nn/dense/linear.py#L158-L168
     # Since it is unusual thing to do, we just reassign them to parameters
     def state_dict_hook(module, destination, prefix, local_metadata):
+        # [FUNCTION DOC] HELPER: The state dict hook. For each named parameter of the module,
+        # replaces a plain tensor entry of the destination state dict, found under the bare
+        # parameter name, with a parameter wrapping it. Mutates the destination in place;
+        # ignores the prefix and metadata.
         for name, param in module.named_parameters():
             if isinstance(destination[name], torch.Tensor) and not isinstance(
                 destination[name], torch.nn.Parameter
@@ -51,6 +64,11 @@ def _reassign_parameters(model):
 
 
 def setup_torchbench_cwd():
+    # [FUNCTION DOC] Records the current absolute directory, sets the KALDI_ROOT environment
+    # variable to the temp directory, and searches a fixed list of candidate relative paths for
+    # a TorchBench checkout. If one is found it changes into the first match (as an absolute
+    # path) and appends it to the module search path; otherwise the directory is left alone.
+    # Returns the original directory.
     original_dir = abspath(os.getcwd())
 
     os.environ["KALDI_ROOT"] = tempfile.gettempdir()  # avoids some spam
@@ -81,135 +99,185 @@ process_train_model_output = {}
 
 
 class TorchBenchmarkRunner(BenchmarkRunner):
+    # [CLASS DOC] Benchmark runner for TorchBench models. Sets suite_name to torchbench and no
+    # optimizer. Per-model policy (skip lists, batch sizes, tolerances, dtype handling, accuracy
+    # exceptions) is read from the torchbench yaml file through properties. Provides model
+    # loading via the torchbenchmark package, partition-aware model name iteration, tolerance
+    # selection and the forward and backward passes.
     def __init__(self):
+        # [FUNCTION DOC] Initializes the base runner, sets the suite name and clears the
+        # optimizer.
         super().__init__()
         self.suite_name = "torchbench"
         self.optimizer = None
 
     @property
     def _config(self):
+        # [FUNCTION DOC] HELPER: Loads and returns the parsed torchbench yaml configuration (re-
+        # read on every access).
         return load_yaml_file("torchbench.yaml")
 
     @property
     def _skip(self):
+        # [FUNCTION DOC] HELPER: Returns the skip section of the configuration.
         return self._config["skip"]
 
     @property
     def _batch_size(self):
+        # [FUNCTION DOC] HELPER: Returns the batch size section of the configuration (training
+        # and inference mappings).
         return self._config["batch_size"]
 
     @property
     def _tolerance(self):
+        # [FUNCTION DOC] HELPER: Returns the tolerance section of the configuration.
         return self._config["tolerance"]
 
     @property
     def _require_larger_multiplier_for_smaller_tensor(self):
+        # [FUNCTION DOC] HELPER: Returns the configured collection of models that need a larger
+        # multiplier for smaller tensors.
         return self._config["require_larger_multiplier_for_smaller_tensor"]
 
     @property
     def _accuracy(self):
+        # [FUNCTION DOC] HELPER: Returns the accuracy section of the configuration.
         return self._config["accuracy"]
 
     @property
     def skip_models(self):
+        # [FUNCTION DOC] Returns the configured model names skipped on all devices.
         return self._skip["all"]
 
     @property
     def skip_models_for_cpu(self):
+        # [FUNCTION DOC] Returns the configured model names skipped on cpu.
         return self._skip["device"]["cpu"]
 
     @property
     def skip_models_for_cpu_aarch64(self):
+        # [FUNCTION DOC] Returns the configured model names skipped on aarch64 cpu.
         return self._skip["device"]["cpu_aarch64"]
 
     @property
     def skip_models_for_cuda(self):
+        # [FUNCTION DOC] Returns the configured model names skipped on cuda.
         return self._skip["device"]["cuda"]
 
     @property
     def skip_models_for_xpu(self):
+        # [FUNCTION DOC] Returns the configured model names skipped on xpu.
         return self._skip["device"]["xpu"]
 
     @property
     def skip_models_for_freezing_cuda(self):
+        # [FUNCTION DOC] Returns the configured model names skipped when freezing on cuda.
         return self._skip["freezing"]["cuda"]
 
     @property
     def disable_cudagraph_models(self):
+        # [FUNCTION DOC] Returns the configured model names for which cuda graphs are disabled.
         return self._config["disable_cudagraph"]
 
     @property
     def skip_models_for_freezing_cpu(self):
+        # [FUNCTION DOC] Returns the configured model names skipped when freezing on cpu.
         return self._skip["freezing"]["cpu"]
 
     @property
     def slow_models(self):
+        # [FUNCTION DOC] Returns the configured list of slow models.
         return self._config["slow"]
 
     @property
     def very_slow_models(self):
+        # [FUNCTION DOC] Returns the configured list of very slow models.
         return self._config["very_slow"]
 
     @property
     def non_deterministic_models(self):
+        # [FUNCTION DOC] Returns the configured list of models with non-deterministic outputs.
         return self._config["non_deterministic"]
 
     @property
     def get_output_amp_train_process_func(self):
+        # [FUNCTION DOC] Returns the module-level mapping of amp training output processing
+        # functions, which is empty and shared.
         return process_train_model_output
 
     @property
     def skip_not_suitable_for_training_models(self):
+        # [FUNCTION DOC] Returns the configured model names not suitable for training.
         return self._skip["test"]["training"]
 
     @property
     def failing_fx2trt_models(self):
+        # [FUNCTION DOC] Returns the configured models that do not yet work with fx2trt.
         return self._config["trt_not_yet_working"]
 
     @property
     def force_amp_for_fp16_bf16_models(self):
+        # [FUNCTION DOC] Returns the configured models that must use amp when run in fp16 or
+        # bf16.
         return self._config["dtype"]["force_amp_for_fp16_bf16_models"]
 
     @property
     def force_fp16_for_bf16_models(self):
+        # [FUNCTION DOC] Returns the configured models that must use fp16 when bf16 is
+        # requested.
         return self._config["dtype"]["force_fp16_for_bf16_models"]
 
     @property
     def amp_dtype_bfloat16(self):
+        # [FUNCTION DOC] Returns the configured models whose amp dtype is bfloat16.
         return self._config["dtype"]["amp_dtype_bfloat16"]
 
     @property
     def skip_accuracy_checks_large_models_dashboard(self):
+        # [FUNCTION DOC] Returns the configured large-model skip set when either the dashboard
+        # or accuracy option is on; otherwise an empty set.
         if self.args.dashboard or self.args.accuracy:
             return self._accuracy["skip"]["large_models"]
         return set()
 
     @property
     def skip_accuracy_check_as_eager_non_deterministic(self):
+        # [FUNCTION DOC] Returns the configured models with non-deterministic eager output when
+        # checking accuracy in training mode; otherwise an empty set.
         if self.args.accuracy and self.args.training:
             return self._accuracy["skip"]["eager_not_deterministic"]
         return set()
 
     @property
     def skip_multiprocess_models(self):
+        # [FUNCTION DOC] Returns the configured model names that cannot run in the multiprocess
+        # mode.
         return self._skip["multiprocess"]
 
     @property
     def skip_models_due_to_control_flow(self):
+        # [FUNCTION DOC] Returns the configured model names skipped because of data-dependent
+        # control flow.
         return self._skip["control_flow"]
 
     @property
     def skip_models_due_to_export_not_supported(self):
+        # [FUNCTION DOC] Returns the configured model names for which export is not supported.
         return self._skip["export_not_supported"]
 
     @property
     def guard_on_nn_module_models(self):
+        # [FUNCTION DOC] Returns a fixed set containing only the vision_maskrcnn model, which
+        # needs guards on nn module state.
         return {
             "vision_maskrcnn",
         }
 
     @cached_property
     def _fb_models_available(self):
+        # [FUNCTION DOC] HELPER: Cached check for whether the internal torchbenchmark fb models
+        # package can be found, done lazily because importing the fbcode flag freezes some model
+        # config flags.
         """This property exists because importing IS_FBCODE causes some models to be
         frozen out of setting certain config flags."""
         return importlib.util.find_spec("torchbenchmark.models.fb") is not None
@@ -222,6 +290,24 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         part=None,
         extra_args=None,
     ):
+        # [FUNCTION DOC] Builds one benchmark case for a TorchBench model. Raises
+        # NotImplementedError if activation checkpointing is on or the model class is missing,
+        # and ImportError if no candidate module (models, canary models, or internal fb models
+        # if available) can be imported (other missing-module errors propagate). The batch size
+        # is dropped for models that disallow changes and otherwise defaults to the configured
+        # training or inference size; with accuracy checks it is capped by a per-model maximum.
+        # Sets a global backend flag for non-bracketed mutation, appends the part option to
+        # extra_args in place when given, and forces amp for sam_fast. Instantiates the
+        # benchmark in train or eval test mode (vision_maskrcnn training limits detections per
+        # image and uses eval mode), gets the module and inputs, re-types parameters for the
+        # basic_gnn models, sets train or eval mode, and collects garbage. Applies per-model
+        # fixes: namedtuple batches for torchrec_dlrm, random inputs for yolov3, fixed batch
+        # size five for maml_omniglot (raising AssertionError on mismatch) and one for
+        # vision_maskrcnn, imports torch_xla when tracing on xla, and disables the kv cache of
+        # hf models. Validates the model and returns the device, benchmark name, model, example
+        # inputs and batch size.
+        # KNOWN ISSUE: capping with the accuracy maximum fails with a type error if the batch
+        #     size is still unset at that point.
         if self.args.enable_activation_checkpointing:
             raise NotImplementedError(
                 "Activation checkpointing not implemented for Torchbench models"
@@ -385,6 +471,11 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         return device, benchmark.name, model, example_inputs, batch_size
 
     def iter_model_names(self, args):
+        # [FUNCTION DOC] Generator over model names found by the torchbenchmark package: all
+        # model paths plus canary model paths listed in the configuration, sorted and restricted
+        # to this partition's index range. Yields base names matching the filter patterns (case-
+        # insensitive) that do not match the exclude patterns, are not exact-excluded and are
+        # not in the skip list.
         from torchbenchmark import _list_canary_model_paths, _list_model_paths
 
         models = _list_model_paths()
@@ -412,27 +503,46 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             yield model_name
 
     def pick_grad(self, name, is_training):
+        # [FUNCTION DOC] Returns a gradient-enabled context when training or for the maml model,
+        # and a no-grad context otherwise.
         if is_training or name == "maml":
             return torch.enable_grad()
         else:
             return torch.no_grad()
 
     def use_larger_multiplier_for_smaller_tensor(self, name):
+        # [FUNCTION DOC] Returns whether the model name is in the configured set needing a
+        # larger multiplier for smaller tensors.
         return name in self._require_larger_multiplier_for_smaller_tensor
 
     def use_iou_for_bool_accuracy(self, name):
+        # [FUNCTION DOC] Returns whether the model is listed in the tolerance configuration as
+        # using an intersection-over-union comparison for boolean masks (empty if the section is
+        # absent).
         iou_models = self._tolerance.get("use_iou_for_bool_masks", [])
         return name in iou_models
 
     def get_iou_threshold(self, name):
+        # [FUNCTION DOC] Returns the per-model intersection-over-union threshold from the
+        # configuration, or 0.99 when the model has none.
         iou_thresholds = self._tolerance.get("iou_thresholds", {})
         return iou_thresholds.get(name, 0.99)
 
     def get_accuracy_check_runs(self, name):
+        # [FUNCTION DOC] Returns the configured number of accuracy check runs for the model, or
+        # one by default.
         accuracy_check_runs = self._tolerance.get("accuracy_check_runs", {})
         return accuracy_check_runs.get(name, 1)
 
     def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
+        # [FUNCTION DOC] Returns the tolerance and cosine flag. With fp16 or amp it returns
+        # early: freezing overrides if the model is in the freezing lists (0.01, or 0.08), else
+        # the fp16 lists, else a default of 0.001. With bfloat16, models in the bf16 list return
+        # 0.01 and xpu models in the xpu list 0.08. Otherwise the default is 0.0001, and for
+        # training on cuda or xpu it becomes 0.001, sets cosine for configured models, or 0.08
+        # for the even-higher list.
+        # KNOWN ISSUE: the branch for the higher list assigns the same value as the default set
+        # just before it, so it has no effect.
         tolerance = 1e-4
         cosine = self.args.cosine
         # Increase the tolerance for torch allclose
@@ -467,9 +577,13 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         return tolerance, cosine
 
     def compute_loss(self, pred):
+        # [FUNCTION DOC] Reduces a prediction to a scalar loss using the dynamo testing helper.
         return reduce_to_scalar_loss(pred)
 
     def forward_pass(self, mod, inputs, collect_outputs=True):
+        # [FUNCTION DOC] Runs the model under autocast; dictionary inputs are passed as keyword
+        # arguments, otherwise as positional arguments. Returns the output. The collect_outputs
+        # argument is unused.
         with self.autocast(**self.autocast_arg):
             if isinstance(inputs, dict):
                 return mod(**inputs)
@@ -477,6 +591,10 @@ class TorchBenchmarkRunner(BenchmarkRunner):
                 return mod(*inputs)
 
     def forward_and_backward_pass(self, mod, inputs, collect_outputs=True):
+        # [FUNCTION DOC] Clones inputs, clears gradients, then under autocast runs the model
+        # (keyword arguments for dictionary inputs) and computes the loss. Backpropagates the
+        # scaled loss and steps the optimizer if any. Returns collected results if
+        # collect_outputs is true, else None.
         cloned_inputs = clone_inputs(inputs)
         self.optimizer_zero_grad(mod)
         with self.autocast(**self.autocast_arg):
@@ -493,6 +611,9 @@ class TorchBenchmarkRunner(BenchmarkRunner):
 
 
 def torchbench_main():
+    # [FUNCTION DOC] Entry point: changes into the TorchBench checkout if found, sets the
+    # logging level to warning, silences warnings, and runs the shared benchmark main with a
+    # TorchBench runner and the original directory.
     original_dir = setup_torchbench_cwd()
     logging.basicConfig(level=logging.WARNING)
     warnings.filterwarnings("ignore")

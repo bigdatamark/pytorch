@@ -1,3 +1,7 @@
+# [MODULE DOC] Unit tests for the dynamo benchmark harness: timm auto-install behavior, the perf
+# command line repro preparation, argument parsing defaults, accuracy settings of the TorchBench
+# runner, and a CPU smoke test. Also defines a fallback sanitizer check used to skip tests.
+# Imports are relative to the dynamo benchmarks package.
 import importlib
 import importlib.util
 import io
@@ -18,11 +22,21 @@ try:
 except ImportError:
 
     def is_asan_or_tsan():
+        # [FUNCTION DOC] HELPER: Fallback used when the internal sanitizer status module is not
+        # available; always reports that no address or thread sanitizer is active.
         return False
 
 
 class TestDynamoBenchmark(unittest.TestCase):
+    # [CLASS DOC] Unit test case holding the dynamo benchmark harness tests. Tests do not share
+    # state; they patch modules and process-level functions locally.
     def test_timm_auto_install_uses_no_deps(self) -> None:
+        # [FUNCTION DOC] Loads the timm models benchmark file as a fresh module under a
+        # temporary name, with a fake timm package present in the module table, with module
+        # import patched to raise a missing-module error for timm, and with the subprocess call
+        # patched. Executes the module and asserts the install command was run exactly once with
+        # the interpreter running pip with no-deps on the timm git repository URL. The temporary
+        # module entry is always removed.
         module_name = "benchmarks.dynamo._timm_models_install_test"
         module_path = os.path.join(os.path.dirname(__file__), "timm_models.py")
         spec = importlib.util.spec_from_file_location(module_name, module_path)
@@ -45,6 +59,9 @@ class TestDynamoBenchmark(unittest.TestCase):
         original_import_module = importlib.import_module
 
         def import_module(name, package=None):
+            # [FUNCTION DOC] HELPER: Replacement for module import that raises
+            # ModuleNotFoundError when asked for timm and otherwise forwards to the original
+            # import function.
             if name == "timm":
                 raise ModuleNotFoundError("No module named 'timm'")
             return original_import_module(name, package)
@@ -79,9 +96,15 @@ class TestDynamoBenchmark(unittest.TestCase):
         )
 
     def test_prepare_repro_installs_timm_without_deps(self) -> None:
+        # [FUNCTION DOC] Runs the perf command line repro preparation for the timm suite with a
+        # patched pin reader that returns a fixed commit hash for the timm pin file, capturing
+        # stdout. Asserts the printed text contains a pip install command with no-deps pointing
+        # at the huggingface timm repository pinned at that commit.
         from . import perf_cli
 
         def read_pin(name):
+            # [FUNCTION DOC] HELPER: Fake pin reader returning a fixed hash for the timm pin
+            # file name and a placeholder string for any other name.
             return "abc123" if name == "timm.txt" else "unused"
 
         output = io.StringIO()
@@ -99,6 +122,9 @@ class TestDynamoBenchmark(unittest.TestCase):
         )
 
     def test_dashboard_performance_uses_warm_peak_memory(self) -> None:
+        # [FUNCTION DOC] Parses arguments for a cuda inductor inference performance run. With
+        # the dashboard flag the use_warm_peak_memory option must be true; without it must be
+        # false.
         args = parse_args(
             [
                 "-dcuda",
@@ -121,6 +147,9 @@ class TestDynamoBenchmark(unittest.TestCase):
         self.assertFalse(args.use_warm_peak_memory)
 
     def test_detectron2_maskrcnn_uses_iou_for_bool_masks(self) -> None:
+        # [FUNCTION DOC] For the two detectron2 maskrcnn model names, asserts the TorchBench
+        # runner says to use intersection-over-union for boolean accuracy checks and that the
+        # iou threshold is 0.99.
         runner = TorchBenchmarkRunner()
         for name in (
             "detectron2_maskrcnn_r_101_fpn",
@@ -131,6 +160,10 @@ class TestDynamoBenchmark(unittest.TestCase):
 
     @unittest.skipIf(is_asan_or_tsan(), "ASAN/TSAN not supported")
     def test_benchmark_infra_runs(self) -> None:
+        # [FUNCTION DOC] Smoke test, skipped under address or thread sanitizers. Switches to the
+        # TorchBench working directory, runs a one-iteration cpu inductor training performance
+        # run of the BERT_pytorch model with batch size 1 through the runner, and always
+        # restores the original working directory. Fails on any exception from the run.
         """
         Basic smoke test that TorchBench runs.
 

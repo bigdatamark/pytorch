@@ -1,3 +1,8 @@
+# [MODULE DOC] CI script that compares PR-time benchmark results against an expected-results CSV
+# and fails on regressions or unexpected improvements. Defines two small dataclasses for rows of
+# the expected and result files, a number-rounding helper, and main, which reads three file
+# paths from the command line. Reports outcomes to the open source signpost logger and prints
+# instructions for refreshing the expected file.
 import copy
 import csv
 import json
@@ -9,6 +14,8 @@ import torch._logging.scribe as scribe
 
 @dataclass
 class ExpectedFileEntry:
+    # [CLASS DOC] One row of the expected-results file: benchmark name, metric name, expected
+    # integer value and the allowed noise margin given as a fraction (not a percentage).
     benchmark_name: str
     metric_name: str
     expected_value: int
@@ -17,12 +24,19 @@ class ExpectedFileEntry:
 
 @dataclass
 class ResultFileEntry:
+    # [CLASS DOC] One row of a results file produced by a benchmark run: benchmark name, metric
+    # name and the measured integer value.
     benchmark_name: str
     metric_name: str
     actual_value: int
 
 
 def replace_with_zeros(num):
+    # [FUNCTION DOC] Rounds an integer down to four significant digits by zeroing the lower
+    # digits using floor division (so negative numbers round toward negative infinity); numbers
+    # with four or fewer digits are returned unchanged. Raises ValueError if the input is not an
+    # int.
+    # KNOWN ISSUE: the docstring says the first three digits are kept, but the code keeps four.
     """
     Keeps the first three digits of an integer and replaces the rest with zeros.
 
@@ -52,6 +66,23 @@ def replace_with_zeros(num):
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Command line arguments are the expected-results CSV path, the
+    # results CSV path and an output path for a regenerated expected-results CSV. Both inputs
+    # are loaded into mappings keyed by benchmark and metric names; blank rows are skipped only
+    # in the expected file, and a duplicate key in either file raises an AssertionError. For
+    # each expected entry, a missing result exits with status 1 immediately. Otherwise the
+    # percent change is computed and the result is classified as a regression (above the
+    # margin), a win (below it) or a pass, a message is printed and a signpost event is logged.
+    # The new expected value is replaced with the rounded result only when the change exceeds
+    # one fifth of the margin. Results without an expected entry are reported and logged as
+    # missing regression tests. The regenerated expected rows (each followed by three empty rows
+    # to ease merge conflicts) are written to the output path, and shell instructions to
+    # overwrite the expected file are printed. If any benchmark failed, reproduction
+    # instructions are printed and the process exits with status 1; otherwise it prints a
+    # success message.
+    # KNOWN ISSUE: the comment describing the result file format mentions an expected value and
+    #     noise margin, but result rows only carry three columns; a blank row in the results
+    #     file would raise an IndexError.
     # Expected file is the file that have the results that we are comparing against.
     # Expected has the following format:
     # benchmark_name, metric name, expected value, noise margin (as percentage)
@@ -118,6 +149,10 @@ def main():
         ratio = float(result - entry.expected_value) * 100 / entry.expected_value
 
         def log(event_name):
+            # [FUNCTION DOC] HELPER: Sends a signpost event with the given name under the
+            # pr_time_benchmarks subsystem, carrying the current benchmark's name, metric,
+            # actual and expected values, noise margin and change ratio as a JSON parameter.
+            # Uses the loop variables of the enclosing scope.
             scribe.open_source_signpost(
                 subsystem="pr_time_benchmarks",
                 name=event_name,

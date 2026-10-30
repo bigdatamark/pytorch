@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Driver around the dynamo benchmark scripts. Builds shell scripts of benchmark
+# commands from a table of compiler options per mode, runs them, parses the resulting per-
+# compiler CSV files into pandas frames, produces markdown summaries (executive summary,
+# warnings, per-suite tables), bar graphs, and optionally diffs against archived runs and posts
+# a comment to a GitHub dashboard issue. Import-time side effects: updates matplotlib rc
+# settings and defines the TABLE, DEFAULTS and DASHBOARD_DEFAULTS configuration mappings. The
+# command line entry block defines the globals args and output_dir that several functions rely
+# on.
 
 """
 A wrapper over the benchmark infrastructure to generate commonly used commands,
@@ -137,18 +145,25 @@ DASHBOARD_DEFAULTS = {
 
 
 def flag_speedup(x):
+    # [FUNCTION DOC] HELPER: Flag predicate for speedup values: true when the value is below
+    # 0.95.
     return x < 0.95
 
 
 def flag_compilation_latency(x):
+    # [FUNCTION DOC] HELPER: Flag predicate for compilation latency: true when above 120
+    # seconds.
     return x > 120
 
 
 def flag_compression_ratio(x):
+    # [FUNCTION DOC] HELPER: Flag predicate for compression ratio: true when below 0.9.
     return x < 0.9
 
 
 def flag_accuracy(x):
+    # [FUNCTION DOC] HELPER: Flag predicate for accuracy status strings: true when the text does
+    # not contain the substring pass.
     return "pass" not in x
 
 
@@ -161,12 +176,21 @@ FLAG_FNS = {
 
 
 def percentage(part, whole, decimals=2):
+    # [FUNCTION DOC] HELPER: Returns part as a percentage of whole rounded to the given number
+    # of decimals (default two); returns zero when whole is zero.
     if whole == 0:
         return 0
     return round(100 * float(part) / float(whole), decimals)
 
 
 def parse_args():
+    # [FUNCTION DOC] Defines and parses the command line options of this driver: lists of
+    # devices, dtypes, suites, compilers and flag compilers; quick, output and archive options;
+    # a mutually exclusive choice of printing run commands, visualizing logs, or running
+    # (running is the default); a required mutually exclusive choice of inference or training;
+    # dashboard update switches and paths; batch size, thread, partition and cpu launcher
+    # options; and the inductor compile mode. Returns the parsed namespace. Exits through
+    # argparse on invalid input.
     parser = argparse.ArgumentParser()
     parser.add_argument("--devices", action="append", help="cpu or cuda")
     parser.add_argument("--dtypes", action="append", help="float16/float32/amp")
@@ -362,12 +386,20 @@ def parse_args():
 
 
 def get_mode(args):
+    # [FUNCTION DOC] HELPER: Returns the mode string inference when the inference option is set,
+    # otherwise training.
     if args.inference:
         return "inference"
     return "training"
 
 
 def get_skip_tests(suite, device, is_training: bool):
+    # [FUNCTION DOC] Builds the string of option pairs that skip models for a suite and device.
+    # Imports the suite module by name and restores the working directory afterwards (the import
+    # may change it). Only the torchbench suite contributes: models skipped everywhere, models
+    # unsuitable for training when is_training is true, cpu models (plus aarch64 models on that
+    # architecture) or cuda models. Returns the pairs joined by single spaces in set order,
+    # which is unspecified; an empty string for other suites.
     """
     Generate -x separated string to skip the unusual setup training tests
     """
@@ -398,11 +430,25 @@ def get_skip_tests(suite, device, is_training: bool):
 
 
 def generate_csv_name(args, dtype, suite, device, compiler, testing):
+    # [FUNCTION DOC] HELPER: Returns the result CSV file name made from the compiler, suite,
+    # dtype, mode (from the arguments), device and testing kind. Used for both writing and
+    # reading logs.
     mode = get_mode(args)
     return f"{compiler}_{suite}_{dtype}_{mode}_{device}_{testing}.csv"
 
 
 def generate_commands(args, dtypes, suites, devices, compilers, output_dir):
+    # [FUNCTION DOC] Writes a bash script in the current directory whose name encodes the mode,
+    # devices, dtypes, suites and compilers, and returns that name. The script sets trace
+    # output, removes the output directory unless keep-output-dir is set, creates it, then for
+    # the performance and accuracy test kinds and each suite, device and dtype combination,
+    # emits a comment line and one command per compiler. Each command runs the suite script with
+    # the test kind, dtype, device, output file path, the compiler's option string from the
+    # table, extra arguments, the dashboard flag, and the skip list; optional additions are
+    # operator input logging, the quick model filter for the suite, cold start latency (for the
+    # two plain inductor compilers unless disabled), batch size, threads, partition options and
+    # the inductor compile mode. A compiler missing from the table for the mode raises a key
+    # error.
     mode = get_mode(args)
     suites_str = "_".join(suites)
     devices_str = "_".join(devices)
@@ -479,6 +525,8 @@ def generate_commands(args, dtypes, suites, devices, compilers, output_dir):
 
 
 def generate_dropdown_comment(title, body):
+    # [FUNCTION DOC] HELPER: Returns markdown text with the title followed by a collapsible
+    # details block that contains the body.
     str_io = io.StringIO()
     str_io.write(f"{title}\n")
     str_io.write("<details>\n")
@@ -490,9 +538,20 @@ def generate_dropdown_comment(title, body):
 
 
 def build_summary(args):
+    # [FUNCTION DOC] Writes the build summary comment file in the output directory (named
+    # gh_build_summary.txt). Sections list the run name, commit hashes of the pytorch and
+    # torchbenchmark checkouts, all boolean dynamo config flags, the torch version, selected
+    # environment variables and, if cuda is among the devices, cudnn version and the first GPU's
+    # name, count and memory. Wrapped as a collapsible comment.
+    # KNOWN ISSUE: the output directory is read from a module global that only exists when the
+    #     file runs as a script, so calling this from an importing module raises a name error.
     out_io = io.StringIO()
 
     def print_commit_hash(path, name):
+        # [FUNCTION DOC] HELPER: Writes commit information for a checkout. If a base sha was
+        # given on the command line only the pytorch entry is written, using that sha.
+        # Otherwise, if the path exists, reads the repository head with the git package and
+        # writes the sha and commit date; if the path is absent writes an absent marker.
         if args.base_sha is not None:
             if name == "pytorch":
                 out_io.write(f"{name} commit: {args.base_sha}\n")
@@ -508,6 +567,8 @@ def build_summary(args):
             out_io.write(f"{name} Absent\n")
 
     def env_var(name):
+        # [FUNCTION DOC] HELPER: Writes a line with an environment variable name and its value,
+        # or None when it is not set.
         if name in os.environ:
             out_io.write(f"{name} = {os.environ[name]}\n")
         else:
@@ -558,6 +619,11 @@ def build_summary(args):
 
 @functools.cache
 def archive_data(archive_name):
+    # [FUNCTION DOC] Memoized helper returning a pair of day number text and name prefix. With
+    # an archive name, the prefix is the word text before the performance marker (empty if
+    # absent) and the day is the number after the day marker (or 000). Without a name, uses the
+    # current time in a fixed UTC minus eight zone: the day of the year, and a prefix made of
+    # the day, date and two-digit year.
     if archive_name is not None:
         prefix_match = re.search(r"\w+(?=_performance)", archive_name)
         if prefix_match is not None:
@@ -578,17 +644,25 @@ def archive_data(archive_name):
 
 @functools.cache
 def default_archive_name(dtype):
+    # [FUNCTION DOC] Memoized per dtype default archive name: the generated prefix, the
+    # performance marker, the dtype and a random three digit number, so it stays the same within
+    # one process.
     _, prefix = archive_data(None)
     return f"{prefix}_performance_{dtype}_{randint(100, 999)}"
 
 
 def get_archive_name(args, dtype):
+    # [FUNCTION DOC] HELPER: Returns the archive name given in the arguments, or the generated
+    # default for the dtype when none was given.
     return (
         default_archive_name(dtype) if args.archive_name is None else args.archive_name
     )
 
 
 def archive(src_dir, dest_dir_prefix, archive_name, dtype):
+    # [FUNCTION DOC] Copies the source directory tree into a subdirectory of the destination
+    # prefix named by the archive name (default name for the dtype if none), merging into an
+    # existing directory, and prints a message. Raises the usual file errors on failure.
     if archive_name is None:
         archive_name = default_archive_name(dtype)
     # Copy the folder to archived location
@@ -598,6 +672,9 @@ def archive(src_dir, dest_dir_prefix, archive_name, dtype):
 
 
 def get_metric_title(metric):
+    # [FUNCTION DOC] HELPER: Maps a metric key to its human readable title (speedup, accuracy,
+    # compilation latency, memory compression ratio, absolute latency). Raises RuntimeError for
+    # any other key.
     if metric == "speedup":
         return "Performance speedup"
     elif metric == "accuracy":
@@ -612,9 +689,12 @@ def get_metric_title(metric):
 
 
 class Parser:
+    # [CLASS DOC] Base class for log parsers. Stores the suites, devices, dtypes, compilers,
+    # flag compilers, mode and the output directory where per-compiler CSV files live.
     def __init__(
         self, suites, devices, dtypes, compilers, flag_compilers, mode, output_dir
     ):
+        # [FUNCTION DOC] Stores all the constructor arguments as attributes.
         self.suites = suites
         self.devices = devices
         self.dtypes = dtypes
@@ -624,6 +704,9 @@ class Parser:
         self.mode = mode
 
     def has_header(self, output_filename):
+        # [FUNCTION DOC] HELPER: Returns true when the first line of the CSV file contains the
+        # text dev, which is taken to mean a header row exists. Opens the file for reading and
+        # raises if missing.
         header_present = False
         with open(output_filename) as f:
             line = f.readline()
@@ -633,6 +716,11 @@ class Parser:
 
 
 class ParsePerformanceLogs(Parser):
+    # [CLASS DOC] Parser for performance and accuracy CSVs that builds merged per-metric tables.
+    # After construction (which parses immediately) parsed_frames holds, per suite and metric,
+    # the merged and accuracy-filtered frame sorted by compilers, while untouched_parsed_frames
+    # holds the unfiltered sorted copy. Produces summary statistics (geomean, pass rate, mean
+    # compile time, memory ratio), markdown text, graphs and the github comment files.
     def __init__(
         self,
         suites,
@@ -644,6 +732,10 @@ class ParsePerformanceLogs(Parser):
         output_dir,
         include_slowdowns=False,
     ):
+        # [FUNCTION DOC] Initializes the base parser, creates the two nested mappings for
+        # frames, sets the metric list and a bottom-k constant of 50 (unused here), parses all
+        # CSV files right away, and then records whether slowdowns count in geomeans (set after
+        # the parse).
         super().__init__(
             suites,
             devices,
@@ -666,6 +758,10 @@ class ParsePerformanceLogs(Parser):
         self.include_slowdowns = include_slowdowns
 
     def plot_graph(self, df, title):
+        # [FUNCTION DOC] Draws a bar chart of all columns after the first three of the frame
+        # against the model name, titled and labeled as speedup over eager, and saves it as a
+        # PNG named by the title in the output directory. Draws on the current matplotlib
+        # figure.
         labels = df.columns.values.tolist()
         labels = labels[3:]
         df.plot(
@@ -684,6 +780,10 @@ class ParsePerformanceLogs(Parser):
         plt.savefig(f"{self.output_dir}/{title}.png")
 
     def read_csv(self, output_filename):
+        # [FUNCTION DOC] HELPER: Reads a result CSV into a frame. If the file has a header row
+        # it is read normally; otherwise it is read with fixed column names (device, name, batch
+        # size, speedup, absolute latency, compilation latency, compression ratio) using the
+        # python engine.
         if self.has_header(output_filename):
             return pd.read_csv(output_filename)
         else:
@@ -703,11 +803,18 @@ class ParsePerformanceLogs(Parser):
             )
 
     def parse(self):
+        # [FUNCTION DOC] HELPER: Builds all frames: the accuracy metric from the accuracy CSVs
+        # and every performance metric from the performance CSVs.
         self.extract_df("accuracy", "accuracy")
         for metric in self.metrics:
             self.extract_df(metric, "performance")
 
     def clean_batch_sizes(self, frames):
+        # [FUNCTION DOC] HELPER: Reconciles the batch size column across frames of different
+        # compilers. A single frame is returned untouched. Otherwise, element by element, sizes
+        # must agree or be zero in one of the frames (raises AssertionError on a real mismatch);
+        # the larger value is taken, and every frame's batch size column is replaced with the
+        # result (mutating the frames).
         # Clean up batch sizes when its 0
         if len(frames) == 1:
             return frames
@@ -727,6 +834,17 @@ class ParsePerformanceLogs(Parser):
         return frames
 
     def extract_df(self, metric, testing):
+        # [FUNCTION DOC] For each suite, device and dtype, reads each compiler's CSV for the
+        # testing kind, keeps device, name, batch size and the requested metric (inserting a NaN
+        # column when missing and renaming it to the compiler), merges the compiler frames on
+        # device, name and batch size, and for performance converts values to numbers with
+        # failures as zero. Stores a sorted copy (by compilers, then inductor if present) in the
+        # untouched mapping. For performance it then drops models whose accuracy row says the
+        # model failed to load or run in eager, zeroes compilers whose accuracy status is not a
+        # pass (and all compilers if no accuracy row exists), and stores the sorted frame in the
+        # parsed mapping. Accuracy must have been extracted first.
+        # KNOWN ISSUE: if every model is filtered out the concatenation of an empty list raises
+        #     an error.
         for iter in itertools.product(self.suites, self.devices, self.dtypes):
             suite, device, dtype = iter
             frames = []
@@ -794,9 +912,13 @@ class ParsePerformanceLogs(Parser):
             self.parsed_frames[suite][metric] = df
 
     def get_passing_entries(self, compiler, df):
+        # [FUNCTION DOC] HELPER: Returns the values of the compiler column that are greater than
+        # zero.
         return df[compiler][df[compiler] > 0]
 
     def comp_time(self, compiler, df):
+        # [FUNCTION DOC] Returns the mean of the passing values of the compiler column formatted
+        # with two decimals, or the text 0.0 if none pass.
         df = self.get_passing_entries(compiler, df)
         # df = df.sort_values(by=compiler, ascending=False)[compiler][: self.bottom_k]
         if df.empty:
@@ -805,6 +927,9 @@ class ParsePerformanceLogs(Parser):
         return f"{df.mean():.2f}"
 
     def geomean(self, compiler, df):
+        # [FUNCTION DOC] Returns the geometric mean of the passing values formatted with two
+        # decimals and an x suffix, or 0.0x when none pass. Unless slowdowns are included,
+        # values below one are first raised to one.
         cleaned_df = self.get_passing_entries(compiler, df)
         if not self.include_slowdowns:
             cleaned_df = cleaned_df.clip(1)
@@ -813,12 +938,16 @@ class ParsePerformanceLogs(Parser):
         return f"{gmean(cleaned_df):.2f}x"
 
     def passrate(self, compiler, df):
+        # [FUNCTION DOC] Returns the pass rate text: percentage (whole number) of rows with a
+        # positive value, followed by the passing and total counts.
         total = len(df.index)
         passing = df[df[compiler] > 0.0][compiler].count()
         perc = int(percentage(passing, total, decimals=0))
         return f"{perc}%, {passing}/{total}"
 
     def memory(self, compiler, df):
+        # [FUNCTION DOC] Returns the mean of the positive passing values (missing treated as
+        # zero) formatted with two decimals and an x suffix, or 0.0x if there are none.
         df = self.get_passing_entries(compiler, df)
         df = df.fillna(0)
         df = df[df > 0]
@@ -827,6 +956,10 @@ class ParsePerformanceLogs(Parser):
         return f"{df.mean():.2f}x"
 
     def exec_summary_df(self, fn, metric):
+        # [FUNCTION DOC] Builds a table whose rows are compilers and columns are suites, with
+        # each cell computed by applying the statistic function to the compiler column of the
+        # metric frame of the suite. Missing cells become zero. Writes the table to a CSV file
+        # named after the function in the output directory and returns the table.
         """
         Generate a table with passrate and geomean perf
         """
@@ -844,6 +977,9 @@ class ParsePerformanceLogs(Parser):
         return df
 
     def exec_summary_text(self, caption, fn, metric):
+        # [FUNCTION DOC] Builds the summary table for a statistic and returns text made of the
+        # caption followed by the table rendered in a fenced block. Side effect: writes the CSV
+        # through the table builder.
         df = self.exec_summary_df(fn, metric)
         tabform = tabulate(df, headers="keys", tablefmt="pretty", showindex="never")
 
@@ -855,6 +991,11 @@ class ParsePerformanceLogs(Parser):
         return str_io.getvalue()
 
     def generate_executive_summary(self):
+        # [FUNCTION DOC] Builds the executive summary markdown and stores it in the
+        # executive_summary attribute. The machine is a fixed GPU name, replaced by the cpu
+        # model reported by the system command when cpu is among the devices. The text has a
+        # collapsible description with caveats, then the pass rate, geomean speedup, mean
+        # compilation time and memory compression summary tables.
         machine = "A100 GPUs"
         if "cpu" in self.devices:
             get_machine_cmd = "lscpu| grep 'Model name' | awk -F':' '{print $2}'"
@@ -915,6 +1056,10 @@ class ParsePerformanceLogs(Parser):
         self.executive_summary = str_io.getvalue()
 
     def flag_bad_entries(self, suite, metric, flag_fn):
+        # [FUNCTION DOC] Takes the untouched frame for a suite and metric, drops the device
+        # column, renames batch size to bs, and keeps rows where the flag function is true for
+        # at least one of the flag compilers. Returns those rows with the suite name column,
+        # ordered with suite, name and the flag compiler columns.
         df = self.untouched_parsed_frames[suite][metric]
         df = df.drop("dev", axis=1)
         df = df.rename(columns={"batch_size": "bs"})
@@ -929,6 +1074,9 @@ class ParsePerformanceLogs(Parser):
         return df.reindex(columns=["suite", "name"] + self.flag_compilers)
 
     def generate_warnings(self):
+        # [FUNCTION DOC] Builds the collapsible warnings comment: a description of the flag
+        # rules and, for accuracy, speedup, compilation latency and compression ratio, a table
+        # of flagged models over all suites (skipped when none). Returns the markdown text.
         title = "## Warnings ##"
         body = (
             "We flag models where:\n\n"
@@ -963,6 +1111,10 @@ class ParsePerformanceLogs(Parser):
         return comment
 
     def prepare_message(self, suite):
+        # [FUNCTION DOC] Builds the collapsible comment for one suite, with a table per metric
+        # (speedup, accuracy, compilation latency, compression ratio, absolute latency) from the
+        # untouched frames, with the device column dropped and batch size renamed to bs. Returns
+        # the markdown text.
         title = f"## {suite} suite with {self.dtypes[0]} precision ##"
         body = ""
         for metric in [
@@ -988,6 +1140,10 @@ class ParsePerformanceLogs(Parser):
         return comment
 
     def gen_summary_files(self):
+        # [FUNCTION DOC] Writes the output files in the output directory: generates the
+        # executive summary, saves a speedup graph per suite, and writes the title, executive
+        # summary, warnings and a mode file (gh_training or gh_inference) containing the per-
+        # suite messages as text files.
         self.generate_executive_summary()
         for suite in self.suites:
             self.plot_graph(
@@ -1018,6 +1174,9 @@ class ParsePerformanceLogs(Parser):
 
 
 def parse_logs(args, dtypes, suites, devices, compilers, flag_compilers, output_dir):
+    # [FUNCTION DOC] Parses the finished logs: writes the build summary, creates the performance
+    # log parser with the slowdown setting from the arguments, and writes its summary files.
+    # Returns nothing.
     mode = get_mode(args)
     build_summary(args)
     include_slowdowns = args.include_slowdowns
@@ -1039,6 +1198,8 @@ def parse_logs(args, dtypes, suites, devices, compilers, flag_compilers, output_
 
 @dataclasses.dataclass
 class LogInfo:
+    # [CLASS DOC] Record of one archived run: the day of the year it was produced and the
+    # directory path of its logs. Created from rows of the lookup file.
     # Day of the year this log was generated
     day: str
 
@@ -1047,10 +1208,16 @@ class LogInfo:
 
 
 def get_date(log_info):
+    # [FUNCTION DOC] HELPER: Converts the day-of-year text of a log record to a month-day
+    # string.
     return datetime.strptime(f"{log_info.day}", "%j").strftime("%m-%d")
 
 
 def find_last_2_with_filenames(lookup_file, dashboard_archive_path, dtype, filenames):
+    # [FUNCTION DOC] Reads the lookup CSV (day, mode, precision, path), keeps performance rows
+    # for the dtype, and walks them from newest to oldest. Collects the archive directories in
+    # which every listed file name exists, stopping at two. Returns the list of two directories
+    # (current first), or None if fewer than two qualify.
     df = pd.read_csv(lookup_file, names=("day", "mode", "prec", "path"))
     df = df[df["mode"] == "performance"]
     df = df[df["prec"] == dtype]
@@ -1069,13 +1236,21 @@ def find_last_2_with_filenames(lookup_file, dashboard_archive_path, dtype, filen
 
 
 class SummaryStatDiffer:
+    # [CLASS DOC] Compares geomean and pass rate summary tables between the two most recent
+    # archived runs for the flag compilers and writes the result as a markdown comment file.
     def __init__(self, args):
+        # [FUNCTION DOC] Stores the arguments and the lookup file path inside the dashboard
+        # archive path. Raises AssertionError if that lookup file does not exist.
         self.args = args
         self.lookup_file = os.path.join(self.args.dashboard_archive_path, "lookup.csv")
         if not os.path.exists(self.lookup_file):
             raise AssertionError(f"lookup file not found: {self.lookup_file}")
 
     def generate_diff(self, last2, filename, caption):
+        # [FUNCTION DOC] HELPER: Reads the named summary CSV from the current and previous run
+        # directories, merges them on the compiler column with current and previous suffixes,
+        # and for each flag compiler and each suite present in both builds rows of previous and
+        # current values. Returns markdown text with the caption and a table.
         df_cur, df_prev = (pd.read_csv(os.path.join(path, filename)) for path in last2)
         df_merge = df_cur.merge(df_prev, on="Compiler", suffixes=("_cur", "_prev"))
         data = {col: [] for col in ("compiler", "suite", "prev_value", "cur_value")}
@@ -1100,6 +1275,10 @@ class SummaryStatDiffer:
         return str_io.getvalue()
 
     def generate_comment(self):
+        # [FUNCTION DOC] Finds the two most recent runs that have both summary files, and builds
+        # a comment naming the runs and showing the pass rate and geomean speedup diffs, or a
+        # notice when two runs cannot be found. Writes it to the summary diff file in the output
+        # directory.
         title = "## Summary Statistics Diff ##\n"
         body = (
             "For each relevant compiler, we compare the summary statistics "
@@ -1130,18 +1309,31 @@ class SummaryStatDiffer:
 
 
 class RegressionDetector:
+    # [CLASS DOC] Detects models that were fine in the previous archived run but are flagged
+    # now, per suite, flag compiler and metric. Writes the findings as a markdown comment file.
     """
     Compares the most recent 2 benchmarks to find previously unflagged models
     that are now flagged.
     """
 
     def __init__(self, args):
+        # [FUNCTION DOC] Stores the arguments and the lookup file path inside the dashboard
+        # archive path. Raises AssertionError if that lookup file does not exist.
         self.args = args
         self.lookup_file = os.path.join(self.args.dashboard_archive_path, "lookup.csv")
         if not os.path.exists(self.lookup_file):
             raise AssertionError(f"lookup file not found: {self.lookup_file}")
 
     def generate_comment(self):
+        # [FUNCTION DOC] For each suite, for each flag compiler finds the two latest archived
+        # runs that have its performance and accuracy CSVs and parses them. For each metric
+        # merges current and previous frames by model name and reports models that were not
+        # flagged before and are flagged now, as a table of compiler, name and statuses. Writes
+        # the combined comment (or a no regressions note per suite) to the metric regression
+        # file in the output directory.
+        # KNOWN ISSUE: the lookup of the parsed runs per compiler indexes a mapping that only
+        #     has keys for compilers where two runs were found, so a compiler without two runs
+        #     raises a key error instead of being skipped.
         title = "## Recent Regressions ##\n"
         body = (
             "For each relevant compiler, we compare the most recent 2 reports "
@@ -1251,11 +1443,15 @@ class RegressionDetector:
 
 
 class RegressionTracker:
+    # [CLASS DOC] Plots how metrics evolve over the last ten archived runs and writes the graph
+    # comment. Holds the arguments, suites, lookup file path and the number k of runs.
     """
     Plots progress of different metrics over time to detect regressions.
     """
 
     def __init__(self, args):
+        # [FUNCTION DOC] Stores the arguments, suites and lookup file path, sets k to ten, and
+        # raises AssertionError if the lookup file does not exist.
         self.args = args
         self.suites = self.args.suites
         self.lookup_file = os.path.join(self.args.dashboard_archive_path, "lookup.csv")
@@ -1264,6 +1460,8 @@ class RegressionTracker:
         self.k = 10
 
     def find_last_k(self):
+        # [FUNCTION DOC] Returns the log records for the last k performance rows of the lookup
+        # file for the dtype. Raises AssertionError if fewer than k rows exist.
         """
         Find the last k pairs of (day number, log_path)
         """
@@ -1283,6 +1481,10 @@ class RegressionTracker:
         return log_infos
 
     def generate_comment(self):
+        # [FUNCTION DOC] Uploads each over-time graph found in the output directory with the
+        # image uploader command (unless in dashboard test mode or graphs are disabled),
+        # collects markdown image links, and writes the comment to the regression file in the
+        # output directory. Runs an external process.
         title = "## Metrics over time ##\n"
         str_io = io.StringIO()
         if not self.args.update_dashboard_test and not self.args.no_graphs:
@@ -1299,6 +1501,14 @@ class RegressionTracker:
             gh_fh.write(comment)
 
     def diff(self):
+        # [FUNCTION DOC] For each of four statistics (geomean, pass rate, compile time, memory)
+        # creates a figure with three panels, one per suite, plotting each compiler's value over
+        # the last k runs read from the archived summary CSVs (strings converted to numbers,
+        # only requested compilers kept, missing values interpolated). Saves one over-time PNG
+        # per statistic into the output directory, then writes the comment. Raises
+        # AssertionError if an archive directory is missing.
+        # KNOWN ISSUE: the output directory is read from a module global that exists only when
+        #     run as a script, and it assumes exactly three suites.
         log_infos = self.find_last_k()
 
         for metric in ["geomean", "passrate", "comp_time", "memory"]:
@@ -1353,12 +1563,18 @@ class RegressionTracker:
 
 
 class DashboardUpdater:
+    # [CLASS DOC] Collects the generated comment files into one dashboard comment, posts it with
+    # the GitHub command line tool, updates the lookup file and archives the logs. Holds the
+    # arguments, output directory and lookup file path.
     """
     Aggregates the information and makes a comment to Performance Dashboard.
     https://github.com/pytorch/torchdynamo/issues/681
     """
 
     def __init__(self, args):
+        # [FUNCTION DOC] Stores the arguments and output directory and raises AssertionError if
+        # the lookup file is missing. Unless in dashboard test mode or archive updates are
+        # disabled, appends a lookup row, printing an error message if that command fails.
         self.args = args
         self.output_dir = args.output_dir
         self.lookup_file = os.path.join(self.args.dashboard_archive_path, "lookup.csv")
@@ -1371,6 +1587,11 @@ class DashboardUpdater:
             sys.stderr.write("failed to update lookup file\n")
 
     def update_lookup_file(self):
+        # [FUNCTION DOC] Appends a line with the day, the performance mode, the dtype and the
+        # archive name to the lookup file using a shell command. Raises CalledProcessError if it
+        # fails.
+        # KNOWN ISSUE: values are interpolated into a shell command string, so unusual archive
+        #     names could break or inject shell syntax.
         dtype = self.args.dtypes[0]
         day, _ = archive_data(self.args.archive_name)
         target_dir = get_archive_name(self.args, dtype)
@@ -1381,6 +1602,8 @@ class DashboardUpdater:
         )
 
     def archive(self):
+        # [FUNCTION DOC] Copies the output directory into the dashboard archive path under the
+        # archive name.
         dtype = self.args.dtypes[0]
         # Copy the folder to archived location
         archive(
@@ -1391,6 +1614,9 @@ class DashboardUpdater:
         )
 
     def upload_graphs(self):
+        # [FUNCTION DOC] Uploads each non-over-time PNG in the output directory with the image
+        # uploader command (skipped in dashboard test mode or with graphs disabled) and writes
+        # the collapsible graph comment file with image links.
         title = "## Performance graphs ##\n"
         str_io = io.StringIO()
         if not self.args.update_dashboard_test and not self.args.no_graphs:
@@ -1410,6 +1636,10 @@ class DashboardUpdater:
             gh_fh.write(comment)
 
     def gen_comment(self):
+        # [FUNCTION DOC] Reads the comment pieces (title, executive summary, summary diff,
+        # warnings, regression, metric regression, mode-specific table, graphs, build summary)
+        # from the output directory, skipping missing ones, and returns their lines with
+        # trailing whitespace stripped joined by newlines.
         files = [
             "gh_title.txt",
             "gh_executive_summary.txt",
@@ -1432,6 +1662,10 @@ class DashboardUpdater:
         return "\n".join([x.rstrip() for x in all_lines])
 
     def comment_on_gh(self, comment):
+        # [FUNCTION DOC] Writes the comment to a temporary file and posts it as an issue comment
+        # on the pytorch repository with the GitHub command line tool; the issue number depends
+        # on whether the dtype is float32 or not. Removes the temporary file afterwards (not if
+        # posting fails).
         """
         Send a comment to dashboard
         """
@@ -1458,6 +1692,11 @@ class DashboardUpdater:
         os.remove(filename)
 
     def update(self):
+        # [FUNCTION DOC] Full dashboard update: uploads graphs; unless regression detection is
+        # disabled, writes the summary diff and the metric regression comments and the over-time
+        # comment (a failure in the latter is logged and an empty file written). Builds and
+        # prints the combined comment. Unless in test mode, posts it to GitHub (unless disabled)
+        # and archives the logs (unless disabled).
         self.upload_graphs()
         if not self.args.no_detect_regressions:
             SummaryStatDiffer(self.args).generate_comment()
@@ -1483,6 +1722,8 @@ if __name__ == "__main__":
     args = parse_args()
 
     def extract(key):
+        # [FUNCTION DOC] HELPER: Returns the command line value for the named option if set,
+        # else the default from the DEFAULTS table.
         return DEFAULTS[key] if getattr(args, key, None) is None else getattr(args, key)
 
     dtypes = extract("dtypes")
