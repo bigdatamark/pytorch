@@ -1,3 +1,10 @@
+# [MODULE DOC] Operator benchmark for the weight norm sparsifier step from the ao
+# pruning package. Defines a short config list (explicit mask shape, sparsity level,
+# block shape and zeros per block rows) and a long cross product of those parameters,
+# plus the benchmark class. Import-time side effect: registers forward tests for both
+# lists. Runs the benchmark runner when executed as a script.
+# KNOWN ISSUE: the module name used here (weight_norm_sparsifier_step) is listed in the core
+# SKIP_OP_LISTS, so the runner filters these tests out and they never actually run.
 import operator_benchmark as op_bench
 
 import torch
@@ -27,7 +34,14 @@ sparse_configs_long = op_bench.cross_product_configs(
 
 
 class WeightNormSparsifierBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark that times one step of a weight norm sparsifier applied to a module
+    # with a single all-ones weight buffer. It has no tensor inputs (the inputs mapping is empty).
     def init(self, M, SL, SBS, ZPB):
+        # [FUNCTION DOC] Creates a bare module holding a buffer named weight filled with ones of
+        # the given mask shape, builds a weight norm sparsifier from the sparsity level, block
+        # shape and zeros per block, prepares it on the module for that buffer, sets an empty
+        # inputs mapping and the module name weight_norm_sparsifier_step. Mutates only local
+        # objects.
         weight = torch.ones(M)
         model = nn.Module()
         model.register_buffer("weight", weight)
@@ -43,6 +57,8 @@ class WeightNormSparsifierBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("weight_norm_sparsifier_step")
 
     def forward(self):
+        # [FUNCTION DOC] Runs one sparsifier step, which recomputes
+        # the mask of the prepared weight. Returns nothing.
         self.sparsifier.step()
 
 

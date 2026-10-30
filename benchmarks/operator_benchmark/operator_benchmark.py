@@ -1,3 +1,6 @@
+# [MODULE DOC] Facade module for benchmark writers: importing it as op_bench re-exports the
+# benchmark runner module, the PyTorch benchmark base class, the test registration helpers, and
+# all public utilities (config builders and similar). It defines nothing itself.
 # TODO (mingzhe09088): get rid of noqa
 import benchmark_runner  # noqa: F401
 from benchmark_pytorch import TorchBenchmarkBase  # noqa: F401

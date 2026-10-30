@@ -1,3 +1,8 @@
+# [MODULE DOC] PyTorch-specific part of the operator benchmark framework: the base
+# class for benchmark operators, a wrapper that runs one operator test in eager, JIT or
+# compile mode (forward or backward), and the factory producing test cases. Import-time
+# side effect: imports the C++ extension that registers the consume operator; raises
+# ImportError with build instructions if it is not built.
 import json
 import time
 
@@ -21,6 +26,11 @@ microbenchmarks.
 
 
 class TorchBenchmarkBase(torch.nn.Module):
+    # [CLASS DOC] Base class (a torch Module) for operator benchmarks. Subclasses implement
+    # init to create the inputs mapping and forward to run the operator. Holds an optional
+    # user-given module name, the pass counter and the count of inputs that require
+    # gradients used by auto_set, and the tuple form of the inputs. Provides naming, input
+    # access, consume loops and a default memory traffic estimate.
     """This is a base class used to create Pytorch operator benchmark.
     module_name is the name of the operator being benchmarked.
     test_name is the name (it's created by concatenating all the
@@ -28,15 +38,24 @@ class TorchBenchmarkBase(torch.nn.Module):
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Initializes the Module and sets no user given name, a pass
+        # counter of zero and a zero count of inputs requiring gradients.
         super().__init__()
         self.user_given_name = None
         self._pass_count = 0
         self._num_inputs_require_grads = 0
 
     def _set_backward_test(self, is_backward):
+        # [FUNCTION DOC] HELPER: Records whether this test measures the backward
+        # pass; used by auto_set. Stores the flag on the instance.
         self._is_backward = is_backward
 
     def auto_set(self):
+        # [FUNCTION DOC] Returns the requires_grad value for the next input during init.
+        # Always False when not a backward test. During the first init pass (pass counter
+        # zero) it counts the input and returns True. On later passes it increments an
+        # internal counter and returns True only for the input whose position equals the
+        # current pass number, so each pass differentiates exactly one input.
         """This is used to automatically set the require_grad for the backward patch.
         It is implemented based on two counters. One counter to save the number of
         times init has been called. The other counter to save the number of times
@@ -60,46 +79,66 @@ class TorchBenchmarkBase(torch.nn.Module):
             return self._pass_count == self._auto_set_counter
 
     def extract_inputs_tuple(self):
+        # [FUNCTION DOC] Stores the values of the inputs mapping as a tuple in the
+        # inputs_tuple attribute (done outside JIT so its size is known to the compiler).
         self.inputs_tuple = tuple(self.inputs.values())
 
     @torch.jit.export
     def get_inputs(self):
+        # [FUNCTION DOC] Exported to TorchScript. Returns the stored tuple of inputs.
         # Need to convert the inputs to tuple outside of JIT so that
         # JIT can infer the size of the inputs.
         return self.inputs_tuple
 
     @torch.jit.export
     def forward_impl(self):
+        # [FUNCTION DOC] Exported to TorchScript. Calls forward with
+        # the stored inputs unpacked and returns its result.
         # This is to supply the inputs to the forward function which
         # will be called in both the eager and JIT mode of local runs
         return self.forward(*self.get_inputs())
 
     @torch.jit.export
     def forward_consume(self, iters: int):
+        # [FUNCTION DOC] Exported to TorchScript. Runs the forward implementation the
+        # given number of times, passing each result to the registered consume
+        # operator so the work is not optimized away. Returns nothing.
         #  _consume is used to avoid the dead-code-elimination optimization
         for _ in range(iters):
             torch.ops.operator_benchmark._consume(self.forward_impl())
 
     def forward_impl_eager(self):
+        # [FUNCTION DOC] Same as the JIT-exported forward implementation but without export, used
+        # by eager and compile modes. Calls forward with the stored inputs and returns the result.
         # This is to supply the inputs to the forward function which
         # will be called in both the eager and compile mode of local runs
         return self.forward(*self.get_inputs())
 
     def forward_consume_eager(self, iters: int):
+        # [FUNCTION DOC] Eager counterpart of the consume loop: runs the eager forward
+        # implementation the given number of times, feeding each result to the consume
+        # operator. Returns nothing; this is the function that gets compiled in compile mode.
         # Eager version of forward_consume without decorators (compilation handled by torch.compile)
         for _ in range(iters):
             torch.ops.operator_benchmark._consume(self.forward_impl_eager())
 
     def module_name(self):
+        # [FUNCTION DOC] Returns the user-given module name if one was set,
+        # otherwise the class name. Used as the operator label.
         """this is used to label the operator being benchmarked"""
         if self.user_given_name:
             return self.user_given_name
         return self.__class__.__name__
 
     def set_module_name(self, name):
+        # [FUNCTION DOC] Sets the user-given module name returned by module_name.
         self.user_given_name = name
 
     def test_name(self, **kargs):
+        # [FUNCTION DOC] Builds the unique test name from the keyword attributes:
+        # the module name, then for each attribute its key followed by its value
+        # (booleans converted to 0 or 1; the key is omitted for device), joined by
+        # underscores, with spaces removed. Returns the string.
         """this is a globally unique name which can be used to
         label a specific test
         """
@@ -119,6 +158,11 @@ class TorchBenchmarkBase(torch.nn.Module):
         return name
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Default estimate of bytes moved by the operator, used for bandwidth
+        # reporting. Returns None when there is no inputs mapping or it holds no tensors.
+        # Otherwise returns the total size in bytes of all input tensors plus the size of the
+        # largest input as an estimate of the output. Subclasses override this for non-pointwise
+        # operators.
         """Return the number of bytes read/written by this operator.
 
         Override this method in subclasses for operations with non-standard memory patterns
@@ -158,6 +202,10 @@ class TorchBenchmarkBase(torch.nn.Module):
 
 
 class PyTorchOperatorTestCase:
+    # [CLASS DOC] Holds one benchmark case: the user-defined op object and its TestConfig,
+    # plus the framework label, the timeseries of per-iteration times, the cached JIT and
+    # compile forward callables (created lazily) and the last forward output and its mean.
+    # Provides run methods for eager, JIT and compile forward and for backward.
     """This class includes all the information needed to benchmark an operator.
     op_bench: it's a user-defined class (child of TorchBenchmarkBase)
     which includes input and operator, .etc
@@ -168,6 +216,9 @@ class PyTorchOperatorTestCase:
     """
 
     def __init__(self, op_bench, test_config):
+        # [FUNCTION DOC] Stores the op and test config, creates a one-element
+        # placeholder tensor, sets the framework label to PyTorch, an empty time
+        # series, and empty caches for the JIT and compile graphs.
         self.test_config = test_config
         self.op_bench = op_bench
         self.place_holder_tensor = torch.ones(1)
@@ -177,11 +228,15 @@ class PyTorchOperatorTestCase:
         self._compile_forward_graph = None
 
     def _generate_jit_forward_graph(self):
+        # [FUNCTION DOC] HELPER: Scripts the op module with
+        # TorchScript and returns its consume loop function.
         """generate a graph for the forward function via scripting"""
         scripted_op_bench = torch.jit.script(self.op_bench)
         return scripted_op_bench.forward_consume
 
     def _generate_compile_forward_graph(self):
+        # [FUNCTION DOC] HELPER: Compiles the eager consume loop of the op with
+        # torch.compile using the inductor backend and returns the compiled callable.
         """generate a compiled graph for the forward function via torch.compile"""
         compiled_forward_consume = torch.compile(
             self.op_bench.forward_consume_eager, backend="inductor"
@@ -189,12 +244,19 @@ class PyTorchOperatorTestCase:
         return compiled_forward_consume
 
     def run_jit_forward(self, num_runs, print_per_iter=False, gpu_sync=False):
+        # [FUNCTION DOC] Runs the forward path num_runs times in JIT mode. The
+        # scripted graph is created on first use and cached. The print and sync
+        # arguments are accepted but ignored. Returns nothing.
         """Run the forward path of an op with JIT mode"""
         if self._jit_forward_graph is None:
             self._jit_forward_graph = self._generate_jit_forward_graph()
         self._jit_forward_graph(num_runs)
 
     def run_compile_forward(self, num_runs, print_per_iter=False, gpu_sync=False):
+        # [FUNCTION DOC] Runs the forward path num_runs times in compile mode. The compiled
+        # function is created on first use and cached; the first call triggers compilation. If
+        # gpu_sync is true it synchronizes the accelerator afterwards. The print argument is
+        # ignored.
         """Run the forward path of an op with compile mode"""
         if self._compile_forward_graph is None:
             self._compile_forward_graph = self._generate_compile_forward_graph()
@@ -203,6 +265,9 @@ class PyTorchOperatorTestCase:
             torch.accelerator.synchronize()
 
     def _print_per_iter(self):
+        # [FUNCTION DOC] HELPER: Prints up to the last 50 recorded
+        # per-iteration times (milliseconds), most recent first, as observer
+        # JSON lines with the test name, latency metric and ms unit.
         # print last 50 values
         length = min(len(self.time_series), 50)
         for i in range(length):
@@ -219,6 +284,10 @@ class PyTorchOperatorTestCase:
             )
 
     def run_forward(self, num_runs, print_per_iter, gpu_sync):
+        # [FUNCTION DOC] Runs the eager forward num_runs times and keeps the last output in the
+        # output attribute. With print_per_iter each run is wall-clock timed (with an accelerator
+        # sync when gpu_sync is set) and appended in milliseconds to the time series; otherwise
+        # it runs the loop and synchronizes once at the end if requested.
         """Run the forward path of an op with eager mode"""
         if print_per_iter:
             for _ in range(num_runs):
@@ -235,6 +304,8 @@ class PyTorchOperatorTestCase:
                 torch.accelerator.synchronize()
 
     def _output_mean(self):
+        # [FUNCTION DOC] HELPER: Reduces the last forward output to its mean and
+        # stores it as the mean attribute, giving a scalar to call backward on.
         """TODO (mingzhe): it is not necessary to sum up everything by myself,
         torch.autograd.backward do take a gradient tensor. By default, it
         is the same shape as your output tensor, with all 1s.
@@ -245,6 +316,10 @@ class PyTorchOperatorTestCase:
         self.mean = self.output.mean()
 
     def run_backward(self, num_runs, print_per_iter=False, gpu_sync=False):
+        # [FUNCTION DOC] Runs backward on the stored mean num_runs times, retaining
+        # the graph so it can be repeated, and synchronizes the accelerator at the
+        # end if gpu_sync is set. Requires run_forward and the mean reduction to
+        # have been done first. The print argument is ignored.
         """Run the backward path of an op in many iterations"""
         # TODO: can we use JIT here to reduce python overhead?
         for _ in range(num_runs):
@@ -254,6 +329,9 @@ class PyTorchOperatorTestCase:
 
 
 def create_pytorch_op_test_case(op_bench, test_config):
+    # [FUNCTION DOC] Factory used by the framework: creates a PyTorchOperatorTestCase from
+    # the op and test config and returns a pair of a unique function name (module name,
+    # framework label and string form of the test config) and the test case.
     """This method is used to generate est. func_name is a global unique
     string. For PyTorch add operator with M=8, N=2, K=1, tag = long, here
     are the values for the members in test_case:

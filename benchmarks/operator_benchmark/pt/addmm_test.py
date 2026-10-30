@@ -1,3 +1,8 @@
+# [MODULE DOC] Operator benchmarks for the fused matrix multiply add (addmm) and batched
+# reduction add (addbmm) operators. Defines long and short config lists with cuda, xpu and
+# cpu devices and several dtypes, two benchmark classes that override the memory traffic
+# estimate, and registers forward tests for all configs and backward tests for the long
+# configs at import time. Runs the benchmark runner when executed as a script.
 import operator_benchmark as op_bench
 
 import torch
@@ -35,7 +40,12 @@ addmm_short_configs = op_bench.config_list(
 
 
 class AddmmBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for addmm: a matrix plus the product of two
+    # matrices. Inputs are an M by K matrix, an M by N matrix and an N by K
+    # matrix, each with requires_grad from auto_set. Module name is addmm.
     def init(self, M, N, K, device, dtype):
+        # [FUNCTION DOC] Fills the inputs mapping with the three random matrices of the stated
+        # sizes on the given device and dtype and sets the module name to addmm.
         self.inputs = {
             "input_one": torch.rand(
                 M, K, device=device, requires_grad=self.auto_set(), dtype=dtype
@@ -49,10 +59,16 @@ class AddmmBenchmark(op_bench.TorchBenchmarkBase):
         }
         self.set_module_name("addmm")
 
+        # [FUNCTION DOC] Returns the first input plus the product of the second and third inputs.
     def forward(self, input_one, mat1, mat2):
         return torch.addmm(input_one, mat1, mat2)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Memory traffic estimate in bytes for the bandwidth report:
+        # reads of the three matrices and the write of the result, counted as M*K plus
+        # M*N plus N*K plus M*K elements times the element size. Reads the dimensions
+        # from the stored inputs and raises AssertionError if they are inconsistent (a
+        # non two-dimensional input would fail on unpacking).
         """Override for addmm: input + (mat1 @ mat2) -> (M, K)
         addmm computes: input_one (M, K) + mat1 (M, N) @ mat2 (N, K)
         Memory traffic: read(M*K + M*N + N*K) + write(M*K)
@@ -81,7 +97,12 @@ op_bench.generate_pt_gradient_test(addmm_long_configs, AddmmBenchmark)
 
 
 class AddbmmBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark for addbmm: a matrix plus the sum over the batch of products of two
+    # batches of matrices. Inputs are an M by N matrix, a batch of B matrices of M by K and a
+    # batch of B matrices of K by N, each with requires_grad from auto_set. Module name is addbmm.
     def init(self, B, M, N, K, device, dtype):
+        # [FUNCTION DOC] Fills the inputs mapping with the three random tensors of the stated
+        # sizes on the given device and dtype and sets the module name to addbmm.
         self.inputs = {
             "input_one": torch.rand(
                 (M, N), device=device, requires_grad=self.auto_set(), dtype=dtype
@@ -102,10 +123,15 @@ class AddbmmBenchmark(op_bench.TorchBenchmarkBase):
         }
         self.set_module_name("addbmm")
 
+        # [FUNCTION DOC] Returns the matrix plus the sum over the
+        # batch of the products of the two batches.
     def forward(self, input_one, batch1, batch2):
         return torch.addbmm(input_one, batch1, batch2)
 
     def get_memory_traffic_bytes(self):
+        # [FUNCTION DOC] Memory traffic estimate in bytes: reads of the three inputs and the write
+        # of the result, counted as M*N plus B*M*K plus B*K*N plus M*N elements times the element
+        # size. Raises AssertionError if the dimensions of the stored inputs are inconsistent.
         """Override for addbmm: input + sum(batch1[i] @ batch2[i]) -> (M, N)
         addbmm computes: input_one (M, N) + sum over batch of batch1 (B, M, K) @ batch2 (B, K, N)
         Memory traffic: read(M*N + B*M*K + B*K*N) + write(M*N)

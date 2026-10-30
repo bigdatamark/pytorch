@@ -1,3 +1,6 @@
+# [MODULE DOC] Entry script that registers the quantized operator benchmarks by importing the
+# quantized test modules from the pt directory (imports are only for their registration side
+# effect). When run as a script it calls the operator_benchmark runner main function.
 from pt import (  # noqa: F401
     qactivation_test,
     qarithmetic_test,

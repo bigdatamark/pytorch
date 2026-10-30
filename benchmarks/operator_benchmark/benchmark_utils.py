@@ -1,3 +1,8 @@
+# [MODULE DOC] Utilities for writing operator micro-benchmarks: config generation helpers
+# (cross product, config lists, random sampling, op lists), argument parsing helpers
+# (boolean parsing, operator range, comma lists), thread environment setters and a numpy
+# random tensor helper. Module constants define the reserved config keywords (probs,
+# total_samples, tags) and the supported device names (cpu, cuda, mps, xpu).
 import argparse
 import bisect
 import itertools
@@ -18,10 +23,14 @@ _supported_devices = {"cpu", "cuda", "mps", "xpu"}
 
 
 def shape_to_string(shape):
+    # [FUNCTION DOC] Returns a comma plus space joined string of the elements of a shape.
     return ", ".join([str(x) for x in shape])
 
 
 def str2bool(v):
+    # [FUNCTION DOC] Converts a command line value to a boolean for argparse. Booleans pass
+    # through; the strings yes, true, t, y and 1 (any case) give True, and no, false, f, n
+    # and 0 give False. Anything else raises argparse.ArgumentTypeError.
     if isinstance(v, bool):
         return v
     if v.lower() in ("yes", "true", "t", "y", "1"):
@@ -33,6 +42,9 @@ def str2bool(v):
 
 
 def numpy_random(dtype, *shapes):
+    # [FUNCTION DOC] Returns a numpy array of uniform random values in the
+    # half-open range zero to one with the given shape dimensions, cast to the
+    # given numpy dtype. Uses the global numpy random state.
     """Return a random numpy tensor of the provided dtype.
     Args:
         shapes: int or a sequence of ints to defining the shapes of the tensor
@@ -47,6 +59,9 @@ def numpy_random(dtype, *shapes):
 
 
 def set_omp_threads(num_threads):
+    # [FUNCTION DOC] Sets the OMP_NUM_THREADS environment variable of this
+    # process to the given count, printing a notice if a different value
+    # was already set. Side effect: mutates os.environ.
     existing_value = os.environ.get("OMP_NUM_THREADS", "")
     if existing_value != "":
         print(
@@ -56,6 +71,8 @@ def set_omp_threads(num_threads):
 
 
 def set_mkl_threads(num_threads):
+    # [FUNCTION DOC] Sets the MKL_NUM_THREADS environment variable of this process to the given
+    # count, printing a notice if a value was already set. Side effect: mutates os.environ.
     existing_value = os.environ.get("MKL_NUM_THREADS", "")
     if existing_value != "":
         print(
@@ -65,6 +82,8 @@ def set_mkl_threads(num_threads):
 
 
 def cross_product(*inputs):
+    # [FUNCTION DOC] Returns the cartesian product of the given iterables as a list of
+    # tuples (the docstring's generator-style example is only illustrative).
     """
     Return a list of cartesian product of input iterables.
     For example, cross_product(A, B) returns ((x,y) for x in A for y in B).
@@ -73,11 +92,18 @@ def cross_product(*inputs):
 
 
 def get_n_rand_nums(min_val, max_val, n):
+    # [FUNCTION DOC] Returns a list of n distinct integers sampled from the range from min_val up
+    # to but excluding max_val. Side effect: reseeds the global random module with a fixed value
+    # first, so the result is deterministic but also resets the global random state.
     random.seed((1 << 32) - 1)
     return random.sample(range(min_val, max_val), n)
 
 
 def generate_configs(**configs):
+    # [FUNCTION DOC] Generates config combinations with a user supplied sampling function.
+    # Requires a sample_func keyword (AssertionError otherwise). For each other keyword it
+    # builds a list of single-entry mappings (name to one value) and then returns the result of
+    # calling the sampling function with those lists as positional arguments.
     """
     Given configs from users, we want to generate different combinations of
     those configs
@@ -103,6 +129,9 @@ def generate_configs(**configs):
 
 
 def cross_product_configs(**configs):
+    # [FUNCTION DOC] Returns the cartesian product of all keyword value lists as a list of
+    # tuples, where each tuple holds one single-entry mapping per keyword. First validates
+    # the configs (device names). Converts the lazy product into a list.
     """
     Given configs from users, we want to generate different combinations of
     those configs
@@ -126,6 +155,8 @@ def cross_product_configs(**configs):
 
 
 def _validate(configs):
+    # [FUNCTION DOC] HELPER: Checks the user configs. If a device entry is present, every listed
+    # device must be one of the supported devices, otherwise AssertionError is raised.
     """Validate inputs from users."""
     if "device" in configs:
         for v in configs["device"]:
@@ -136,6 +167,12 @@ def _validate(configs):
 
 
 def config_list(**configs):
+    # [FUNCTION DOC] Builds the config list from explicit attribute rows. Requires attrs,
+    # attr_names and tags keywords (ValueError if any is missing) and validates the device
+    # entry. Each row of attrs becomes a list of single-entry mappings keyed by attr_names,
+    # followed by a tags entry holding the tags joined by underscores. If
+    # cross_product_configs is given, every row is repeated once per combination of that
+    # cross product, with the combination appended. Returns the list of lists.
     """Generate configs based on the list of input shapes.
     This function will take input shapes specified in a list from user. Besides
     that, all other parameters will be cross produced first and each of the
@@ -193,16 +230,25 @@ def config_list(**configs):
 
 
 def attr_probs(**probs):
+    # [FUNCTION DOC] Returns the keyword arguments as a mapping; used to declare sampling weights.
     """return the inputs in a dictionary"""
     return probs
 
 
 class RandomSample:
+    # [CLASS DOC] Weighted random sampler over config value lists. Holds the configs mapping
+    # (value lists per name plus a probs mapping of weights) and a cache of cumulative
+    # distributions per name. get_one_set_of_inputs draws one value for every non-reserved name.
     def __init__(self, configs):
+        # [FUNCTION DOC] Stores the configs and creates an
+        # empty cache of cumulative distributions.
         self.saved_cum_distribution = {}
         self.configs = configs
 
     def _distribution_func(self, key, weights):
+        # [FUNCTION DOC] HELPER: Returns the normalized cumulative
+        # distribution for the weights of a name, computed on first use and
+        # cached under that name. The last value is one up to rounding.
         """this is a cumulative distribution function used for random sampling inputs"""
         if key in self.saved_cum_distribution:
             return self.saved_cum_distribution[key]
@@ -217,6 +263,11 @@ class RandomSample:
         return result
 
     def _random_sample(self, key, values, weights):
+        # [FUNCTION DOC] HELPER: Picks one value with probability proportional to its weight.
+        # Raises AssertionError if the numbers of values and weights differ or the found
+        # position is beyond the list. Draws a uniform number from the global random module,
+        # finds its position in the cumulative distribution, and clamps the position to the
+        # last value to absorb rounding error. Returns the chosen value.
         """given values and weights, this function randomly sample values based their weights"""
         # TODO(mingzhe09088): cache the results to avoid recalculation overhead
         if len(values) != len(weights):
@@ -238,6 +289,9 @@ class RandomSample:
         return values[idx]
 
     def get_one_set_of_inputs(self):
+        # [FUNCTION DOC] Draws one sample for each config name other than the reserved
+        # keywords, using the weights stored under probs for that name (a name without
+        # weights raises KeyError). Returns a list of single-entry mappings.
         tmp_attr_list = []
         for key, values in self.configs.items():
             if key in _reserved_keywords:
@@ -249,6 +303,12 @@ class RandomSample:
 
 
 def random_sample_configs(**configs):
+    # [FUNCTION DOC] Generates total_samples randomly sampled configs. Each is a
+    # list of single-entry mappings for every value list plus a tags entry (tags
+    # joined by underscores). Raises ValueError when probs is missing.
+    # KNOWN ISSUE: the docstring says probs is optional and defaults to
+    # equal weights, but the code raises ValueError if probs is absent and
+    # also fails with KeyError for any name lacking weights.
     """
     This function randomly sample <total_samples> values from the given inputs based on
     their weights.
@@ -297,6 +357,9 @@ def random_sample_configs(**configs):
 
 
 def op_list(**configs):
+    # [FUNCTION DOC] Turns the attrs rows and attr_names into a list of mappings from each name
+    # to the row's value, for example operator name and function. Raises ValueError if attrs is
+    # missing; a missing attr_names would fail with KeyError. Returns the list.
     """Generate a list of ops organized in a specific format.
     It takes two parameters which are "attr_names" and "attr".
     attrs stores the name and function of operators.
@@ -330,6 +393,10 @@ def op_list(**configs):
 
 
 def get_operator_range(chars_range):
+    # [FUNCTION DOC] Parses an operator range option into a set of lower-case characters. Returns
+    # None for None or the string None. Raises ValueError if the text contains neither a comma nor
+    # a dash. Items are comma separated: a single character is added as is, a dash pair adds every
+    # character from start to end inclusive. Used to filter operators by first letter.
     """Generates the characters from chars_range inclusive."""
     if chars_range == "None" or chars_range is None:
         return None
@@ -354,6 +421,8 @@ def get_operator_range(chars_range):
 
 
 def process_arg_list(arg_list):
+    # [FUNCTION DOC] Parses a comma separated option string. Returns None for
+    # the string None, otherwise a list of stripped non-empty items.
     if arg_list == "None":
         return None
 

@@ -1,3 +1,7 @@
+# [MODULE DOC] Example benchmark that uses weighted random sampling of configs: ten
+# configs are drawn from value lists for the three sizes using per-value probabilities,
+# under the short tag, and registered as forward tests for add. Registers at import time
+# and runs the benchmark runner main function when executed as a script.
 import operator_benchmark as op_bench
 
 import torch
@@ -20,12 +24,16 @@ configs = op_bench.random_sample_configs(
 
 
 class AddBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Add benchmark with module name add and two random inputs without gradients.
     def init(self, M, N, K):
+        # [FUNCTION DOC] Creates two random three dimensional tensors of
+        # the sampled sizes and sets the module name to add.
         self.input_one = torch.rand(M, N, K)
         self.input_two = torch.rand(M, N, K)
         self.set_module_name("add")
 
     def forward(self):
+        # [FUNCTION DOC] Returns the elementwise sum of the two stored inputs.
         return torch.add(self.input_one, self.input_two)
 
 

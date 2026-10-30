@@ -1,3 +1,7 @@
+# [MODULE DOC] Entry script that registers all operator benchmarks: it imports the
+# non-quantized suite, imports the quantized suite only on x86-64 machines (the
+# quantized backend supports only x86), and imports the unary test module. When run
+# as a script it calls the operator_benchmark runner main function.
 import platform
 
 import benchmark_all_other_test  # noqa: F401

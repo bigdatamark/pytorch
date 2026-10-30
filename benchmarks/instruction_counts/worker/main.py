@@ -1,3 +1,9 @@
+# [MODULE DOC] Standalone worker script launched in a child process by the instruction-count
+# benchmark runner. It reads a pickled WorkerTimerArgs from a communication file, times the
+# statement with a wall-clock autorange and collects Callgrind instruction counts, then overwrites
+# the same file with a pickled WorkerOutput or WorkerFailure. Imports only torch benchmark
+# utilities (nothing from the rest of the suite). Import-time side effect: defines WORKER_PATH as
+# this file's absolute path; the worker only runs when executed as a script.
 """File invoked through subprocess to actually carry out measurements.
 
 `worker/main.py` is deliberately isolated from the rest of the benchmark
@@ -62,6 +68,10 @@ CALLGRIND_REPEATS = 5
 
 @dataclasses.dataclass(frozen=True)
 class WorkerTimerArgs:
+    # [CLASS DOC] Frozen dataclass describing one measurement job: statement, per-iteration
+    # setup (default is a no-op), one-time global setup, thread count (default 1) and Timer
+    # language (default Python). Pickled by the parent process and sent to the worker
+    # because Timer itself cannot be pickled. Used as the worker's input.
     """Container for Timer constructor arguments.
 
     This dataclass serves two roles. First, it is a simple interface for
@@ -80,6 +90,9 @@ class WorkerTimerArgs:
 
 @dataclasses.dataclass(frozen=True)
 class WorkerOutput:
+    # [CLASS DOC] Frozen dataclass holding a successful worker result: a tuple of wall-clock
+    # times per run and a tuple of denoised Callgrind instruction counts, one per repeat.
+    # Only plain values are carried to keep parent/worker communication small.
     # Only return values to reduce communication between main process and workers.
     wall_times: tuple[float, ...]
     instructions: tuple[int, ...]
@@ -87,6 +100,9 @@ class WorkerOutput:
 
 @dataclasses.dataclass(frozen=True)
 class WorkerFailure:
+    # [CLASS DOC] Frozen dataclass holding a failed worker result: the formatted traceback text
+    # of the exception. A string is used instead of the exception because exceptions may not be
+    # picklable and re-raising in the parent would lose the real stack trace.
     # If a worker fails, we attach the string contents of the Exception
     # rather than the Exception object itself. This is done for two reasons:
     #   1) Depending on the type thrown, `e` may or may not be pickleable
@@ -95,7 +111,16 @@ class WorkerFailure:
 
 
 class WorkerUnpickler(pickle.Unpickler):
+    # [CLASS DOC] Pickle Unpickler subclass used to read the communication file. It remaps the
+    # three interface dataclasses so that objects pickled by the parent (where they live in a
+    # different module path) resolve to this script's own definitions, and offers typed load
+    # helpers.
     def find_class(self, module: str, name: str) -> Any:
+        # [FUNCTION DOC] Override of the unpickler class lookup. If the requested class name
+        # is WorkerTimerArgs, WorkerOutput or WorkerFailure, returns the local class
+        # regardless of the module recorded in the pickle (the parent sees them as worker.main
+        # while this script sees them as __main__). Any other name is delegated to the
+        # standard lookup, which may raise the usual import or attribute errors.
         """Resolve import for pickle.
 
         When the main runner uses a symbol `foo` from this file, it sees it as
@@ -116,12 +141,17 @@ class WorkerUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
     def load_input(self) -> WorkerTimerArgs:
+        # [FUNCTION DOC] Loads the next pickled object and requires it to be a WorkerTimerArgs.
+        # Returns it, or raises AssertionError naming the actual type if it is anything else.
         result = self.load()
         if not isinstance(result, WorkerTimerArgs):
             raise AssertionError(f"expected WorkerTimerArgs, got {type(result)}")
         return result
 
     def load_output(self) -> WorkerTimerArgs | WorkerOutput | WorkerFailure:
+        # [FUNCTION DOC] Loads the next pickled object and requires it to be one
+        # of WorkerTimerArgs, WorkerOutput or WorkerFailure. Returns it, or
+        # raises AssertionError naming the actual type otherwise.
         """Convenience method for type safe loading."""
         result = self.load()
         if not isinstance(result, (WorkerTimerArgs, WorkerOutput, WorkerFailure)):
@@ -137,6 +167,12 @@ class WorkerUnpickler(pickle.Unpickler):
 
 
 def _run(timer_args: WorkerTimerArgs) -> WorkerOutput:
+    # [FUNCTION DOC] HELPER: Runs one measurement job. Builds a Timer from the job (empty setup
+    # replaced by a no-op, standard timeit clock so GPU builds and C++ snippets work), runs a
+    # blocked autorange for MIN_RUN_TIME seconds to get wall times, then collects Callgrind stats
+    # for CALLGRIND_REPEATS repeats of CALLGRIND_NUMBER runs without a baseline and without
+    # keeping output files. Returns a WorkerOutput with the wall times and denoised instruction
+    # counts. Exceptions propagate to the caller; spawns Valgrind subprocesses as a side effect.
     timer = Timer(
         stmt=timer_args.stmt,
         setup=timer_args.setup or "pass",
@@ -163,6 +199,12 @@ def _run(timer_args: WorkerTimerArgs) -> WorkerOutput:
 
 
 def main(communication_file: str) -> None:
+    # [FUNCTION DOC] Worker entry point. Reads and unpickles the timer args from the
+    # communication file, runs the job, and captures any failure (except KeyboardInterrupt,
+    # which exits quietly) as a WorkerFailure holding the traceback text. If the directory
+    # containing the communication file no longer exists the worker is an orphan: it prints
+    # a message with its pid and returns without writing. Otherwise it overwrites the
+    # communication file with the pickled result. Returns nothing.
     result: WorkerOutput | WorkerFailure
     try:
         with open(communication_file, "rb") as f:

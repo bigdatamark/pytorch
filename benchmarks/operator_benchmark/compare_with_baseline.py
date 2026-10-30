@@ -1,3 +1,8 @@
+# [MODULE DOC] Command line tool that compares operator benchmark results of a branch against a
+# baseline. It reads dashboard-format JSON files from two directories, extracts latency per test
+# and compile mode, and prints a Markdown report with per-case differences and a geometric mean
+# speedup for eager and compile modes. Exits with status one if either directory yields no
+# records.
 """Compare operator microbenchmark results between a branch and a baseline.
 
 Reads two directories containing benchmark JSON files (dashboard format) and
@@ -15,6 +20,10 @@ import sys
 
 
 def load_benchmark_records(directory):
+    # [FUNCTION DOC] Reads every file ending in the json suffix in a directory (in sorted order)
+    # and returns the concatenated list of records from files whose top level value is a list.
+    # Files with invalid JSON are skipped with a warning on stderr; files holding other JSON
+    # values are ignored. Raises the usual OS error if the directory is missing.
     """Load all benchmark JSON records from a directory."""
     records = []
     for fname in sorted(os.listdir(directory)):
@@ -32,6 +41,10 @@ def load_benchmark_records(directory):
 
 
 def extract_latency_map(records):
+    # [FUNCTION DOC] Builds a mapping from the pair of test name and compile flag to latency
+    # in microseconds, using only records whose metric name is latency and taking the first
+    # benchmark value. A missing compile flag counts as false; records with no values are
+    # ignored; later records with the same key overwrite earlier ones.
     """Extract a mapping of (test_name, use_compile) -> latency_us from records."""
     result = {}
     for rec in records:
@@ -49,6 +62,8 @@ def extract_latency_map(records):
 
 
 def gmean(values):
+    # [FUNCTION DOC] Geometric mean of the positive values in the sequence. Returns 0.0 for an
+    # empty input or when no value is positive; non-positive values are ignored.
     if not values:
         return 0.0
     positive = [v for v in values if v > 0]
@@ -59,6 +74,13 @@ def gmean(values):
 
 
 def format_comparison(branch_map, baseline_map):
+    # [FUNCTION DOC] Builds the Markdown comparison. Takes the sorted union of keys from both
+    # maps and returns a note that nothing was found when there are none. Keys missing from
+    # either map are skipped. For each remaining key the percentage change is relative to the
+    # baseline (zero if baseline is not positive) and gets a status marker: faster than minus
+    # two percent, slower than plus two percent, otherwise neutral. Rows are split into eager
+    # and compile groups and rendered as tables followed by a summary. Returns the joined
+    # text, which is empty if no key was shared.
     """Format a Markdown comparison table. Returns the Markdown string."""
     all_keys = sorted(set(branch_map.keys()) | set(baseline_map.keys()))
     if not all_keys:
@@ -94,6 +116,12 @@ def format_comparison(branch_map, baseline_map):
     lines = []
 
     def render_table(rows, mode_label):
+        # [FUNCTION DOC] HELPER: Appends a section for one group of rows to the enclosing
+        # lines list: a heading, a table header and one row per case with branch and
+        # baseline latency, the signed percent delta and the status marker, followed by a
+        # summary line with the counts of faster, slower and neutral cases and the
+        # geometric mean of baseline-over-branch speedups. Does nothing for an empty group.
+        # A branch latency of zero would cause a division by zero.
         if not rows:
             return
         lines.append(f"### {mode_label}")
@@ -127,6 +155,9 @@ def format_comparison(branch_map, baseline_map):
 
 
 def main():
+    # [FUNCTION DOC] Command line entry. Requires branch and baseline directory options, loads
+    # records from both, exits with status one and an error message on stderr if either has no
+    # records, then extracts latency maps, formats the comparison and prints it to stdout.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--branch-dir", required=True, help="Directory with branch JSON results"

@@ -1,3 +1,7 @@
+# [MODULE DOC] Example benchmark of element-wise add over explicit size rows
+# (three rows) crossed with devices cpu and cuda and dtypes float32 and float64,
+# under the short tag. Registers a forward-only test at import time and runs the
+# benchmark runner main function when executed as a script.
 import operator_benchmark as op_bench
 
 import torch
@@ -21,7 +25,12 @@ add_short_configs = op_bench.config_list(
 
 
 class AddBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Add benchmark with module name add. The first input requires gradients
+    # and the second does not, with device and dtype taken from the config.
     def init(self, M, N, K, device, dtype):
+        # [FUNCTION DOC] Creates two random three dimensional tensors of the
+        # given sizes on the given device with the given dtype (the first with
+        # requires_grad enabled) and sets the module name to add.
         self.input_one = torch.rand(
             M, N, K, device=device, dtype=dtype, requires_grad=True
         )
@@ -29,6 +38,7 @@ class AddBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("add")
 
     def forward(self):
+        # [FUNCTION DOC] Returns the elementwise sum of the two stored inputs.
         return torch.add(self.input_one, self.input_two)
 
 

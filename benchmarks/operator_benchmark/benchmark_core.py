@@ -1,3 +1,9 @@
+# [MODULE DOC] Core of the operator micro-benchmark framework. Defines the TestConfig record, the
+# global registry of benchmark test definitions (BENCHMARK_TESTER) and the list of skipped
+# operator names, helpers that expand a registered config list into concrete test cases, and
+# BenchmarkRunner, which filters, times, prints and exports results (CSV, JSON, dashboard JSON).
+# Import-time side effects: imports torch and the C++ extension utilities and creates the empty
+# registry.
 import ast
 import copy
 import csv
@@ -41,6 +47,10 @@ SKIP_OP_LISTS = ["weight_norm_sparsifier_step"]
 
 
 def _register_test(*test_metainfo):
+    # [FUNCTION DOC] HELPER: Registers one benchmark definition by appending the
+    # given tuple of arguments (configs, benchmark op class, test case factory,
+    # backward flag, and optionally an op name and function mapping) to the global
+    # BENCHMARK_TESTER list. Mutates global state; returns nothing.
     """save the metainfo needed to create a test. Currently test_metainfo
     takes two different inputs:
     1) This input when adds single op to the benchmark
@@ -57,6 +67,14 @@ def _register_test(*test_metainfo):
 def _create_test(
     bench_op_obj, orig_test_attrs, tags, OperatorTestCase, run_backward, bwd_input
 ):
+    # [FUNCTION DOC] HELPER: Builds one test case from an initialized benchmark op. Deep-copies
+    # the attribute mapping, converts all values to strings, and derives the human readable
+    # input_config string (attributes joined without braces or quotes). If bwd_input is truthy it
+    # is added to the attributes under a backward key so the test name reflects which input is
+    # being differentiated. The name comes from the op's test_name method. Returns whatever the
+    # OperatorTestCase factory returns for the op and a TestConfig (name, input config, tags,
+    # run_backward); for the PyTorch factory that is a pair of a unique name string and a test
+    # case object. The caller's mapping is not modified.
     """Create tests with the benchmark backend.
     Args:
         bench_op_obj: an object which instantiated from a subclass of
@@ -82,6 +100,15 @@ def _create_test(
 def _build_test(
     configs, bench_op, OperatorTestCase, run_backward, op_name_function=None
 ):
+    # [FUNCTION DOC] HELPER: Generator that expands a list of configs into test cases. Each config
+    # is a list of single-entry mappings; a tags entry is extracted, entries naming cuda, mps or
+    # xpu devices cause the whole config to be skipped when that backend is unavailable, the rest
+    # are merged into the init attributes. Raises ValueError if tags are missing and
+    # AssertionError if the op factory returns None. For each kept config it creates the op,
+    # optionally sets the module name and op function from op_name_function, records the backward
+    # flag, calls init, extracts inputs, and disables requires_grad on module parameters when no
+    # backward is run. It yields one test case, and then, when auto_set tensors exist, yields one
+    # more per such input using a deep-copied op re-initialized with an incremented pass counter.
     """Generate PyTorch/Caffe2 tests of operators with different inputs.
     Args:
         configs: a dictionary that has the input shapes
@@ -184,6 +211,12 @@ def _build_test(
 
 
 class BenchmarkRunner:
+    # [CLASS DOC] Drives the benchmark run: stores command line arguments and timing
+    # parameters (starting iteration count 100 unless overridden, growth multiplier 2,
+    # minimum 1 second per measurement, iteration cap one million), filters registered
+    # tests, measures forward or backward execution, prints results and writes CSV/JSON
+    # outputs. Eager, JIT and compile modes are selected by the arguments and are mutually
+    # exclusive for JIT and compile. Main entry point is run.
     """BenchmarkRunner is responsible for benchmarking all the registered
     benchmark test groups.
 
@@ -197,6 +230,11 @@ class BenchmarkRunner:
     """
 
     def __init__(self, args):
+        # [FUNCTION DOC] Initializes the runner from the parsed arguments: copies the settings
+        # (jit, compile, number of runs, csv output, operator range via benchmark_utils), sets the
+        # default warmup to 100 when the argument is -1, and uses the explicit iteration count
+        # when it is set and not -1. When a specific test name is selected the tag filter is
+        # cleared. Raises ValueError if both JIT and compile are requested.
         # TODO: consider time-bound constraints as well.
         self.args = args
         self.iters = 100
@@ -226,6 +264,10 @@ class BenchmarkRunner:
             self.args.tag_filter = None
 
     def _print_header(self):
+        # [FUNCTION DOC] HELPER: Prints the banner for the run (separator lines, title
+        # and the tag filter). In list-tests mode it prints a list heading; in
+        # list-operators mode it prints a heading, creates the printed_ops_list set used
+        # for de-duplication, and prints the requested operators if given.
         DASH_LINE = "-" * 40
         print(
             f"# {DASH_LINE}\n"
@@ -242,6 +284,14 @@ class BenchmarkRunner:
                 print(f"# {self.args.operators}")
 
     def _print_perf_result(self, results, test_case):
+        # [FUNCTION DOC] HELPER: Prints the result of one test case to stdout. With the
+        # aibench report option it currently returns immediately and prints nothing.
+        # KNOWN ISSUE: the aibench branch has an early return, so the code after it
+        # is unreachable, and that dead code also indexes a string literal instead
+        # of the results list (a bug if it were ever reached).
+        # Otherwise prints the mode (JIT, Compile or Eager), test name and input config,
+        # then either one line per run (when multiple runs) or the single execution time,
+        # the peak memory and, when available, the memory bandwidth.
         if self.args.report_aibench:
             # Output for AIBench
             # Print out per iteration execution time instead of avg time
@@ -287,6 +337,12 @@ class BenchmarkRunner:
                 print()
 
     def _perf_result_to_dict(self, results, test_case):
+        # [FUNCTION DOC] HELPER: Counterpart of the print routine that returns a dictionary
+        # instead of printing: test name, input config, runtime mode, Forward or Backward,
+        # latency of the first run rounded to 3 digits and its unit, peak memory and unit,
+        # memory bandwidth and unit, plus one entry per input configuration key parsed out of
+        # the config string. Returns an empty mapping with the aibench option. Raises
+        # AssertionError if brackets in the config string are mismatched.
         """This function is the parallel of _print_perf_result, which instead of
         writing information to terminal, returns a dictionary.
         """
@@ -313,6 +369,9 @@ class BenchmarkRunner:
         # output: {'M':'1', 'N':'1', 'K':'1', 'device': 'cpu'}
         # splitting the string on unnested commas
         def split(s):
+            # [FUNCTION DOC] HELPER: Splits a string on commas that are not nested inside
+            # brackets, braces or parentheses. Returns the list of pieces; raises
+            # AssertionError on a closing bracket that does not match the innermost open one.
             open_to_close = {"{": "}", "(": ")", "[": "]"}
             break_idxs = [-1]
             curr_brackets = []
@@ -346,11 +405,17 @@ class BenchmarkRunner:
         return out
 
     def _predict_num_iter_needed(self, i):
+        # [FUNCTION DOC] HELPER: Returns the next iteration count to try, the
+        # given count multiplied by the runner's growth multiplier.
         return i * self.multiplier
 
     def _iteration_result_is_significant(
         self, iters, run_time_sec, curr_test_total_time, has_explicit_iteration_count
     ):
+        # [FUNCTION DOC] HELPER: Decides whether a measurement can be reported. True when
+        # the iteration count exceeds the cap, or the last run took longer than the
+        # predefined minimum, or an explicit iteration count was given, and in addition the
+        # accumulated test time exceeds the user's minimum time per test.
         """This function decides whether the measured time can be reported based on the
         following conditions: 1) the number of iterations is larger than the max_iters.
         2) the execution time is larger than the predefined minimum_time
@@ -363,6 +428,11 @@ class BenchmarkRunner:
         ) and curr_test_total_time > self.args.min_time_per_test
 
     def _launch_forward(self, test_case, iters, print_per_iter):
+        # [FUNCTION DOC] HELPER: Measures the forward pass in seconds for the given iteration
+        # count. Selects the eager, JIT or compile forward function of the test case. GPU
+        # synchronization is enabled when the test name mentions cuda or xpu. Without GPU sync it
+        # times one call with timeit; with GPU sync it uses an adaptive autorange Timer and
+        # returns the median per-call time multiplied by the iteration count.
         """Use Python's timeit module to measure execution time (unit: second)."""
         test_name = test_case.test_config.test_name
         gpu_sync = ("cuda" in test_name) or ("xpu" in test_name)
@@ -390,6 +460,10 @@ class BenchmarkRunner:
         return result.median * iters
 
     def _launch_backward(self, test_case, iters, print_per_iter=False):
+        # [FUNCTION DOC] HELPER: Measures the backward pass in seconds. First runs the forward
+        # once and has the test case reduce its output to a mean, then times the test case
+        # backward run with an adaptive autorange Timer and returns the median multiplied by the
+        # iteration count. GPU sync is used when the test name mentions cuda or xpu.
         """This function runs forward path of an op to get an output. Then the backward path is executed
         and the execution time is reported
         """
@@ -411,6 +485,13 @@ class BenchmarkRunner:
         return result.median * iters
 
     def _measure_metrics(self, launch_test, test_case, iters, print_per_iter):
+        # [FUNCTION DOC] HELPER: Repeatedly calls the given launch function, growing the iteration
+        # count until the result is significant. Each pass resets peak memory stats and
+        # synchronizes on the input tensor's device module when the first input is a tensor
+        # (memory is not tracked for CPU or non-tensor inputs), records peak allocated memory and
+        # appends the per-iteration time in microseconds. With the aibench option prints an
+        # observer JSON line per pass. Returns the median per-iteration time in microseconds and
+        # the peak memory in KB.
         """
         This function execute the operator for <iters> iterations then look at the time.
         If it's not significant, the number of iterations will be increased before rerun.
@@ -483,20 +564,34 @@ class BenchmarkRunner:
         return reported_run_time_us, peak_memory / 1024
 
     def _check_keep(self, test_flag, cmd_flag):
+        # [FUNCTION DOC] HELPER: Filter predicate that is true when no
+        # command line value is given or the test value equals it.
         return cmd_flag is None or test_flag == cmd_flag
 
     def _check_operator_first_char(self, test_flag, cmd_flag):
+        # [FUNCTION DOC] HELPER: Filter predicate that is true when no command
+        # line value is given or the lower-cased first character of the operator
+        # name is contained in the given range of characters.
         return cmd_flag is None or test_flag[:1].lower() in cmd_flag
 
     def _check_keep_list(self, test_flag, cmd_flag_list):
+        # [FUNCTION DOC] HELPER: Filter predicate that is true when no list
+        # is given or the test value equals any entry of the list.
         return cmd_flag_list is None or any(
             test_flag == cmd_flag for cmd_flag in cmd_flag_list
         )
 
     def _check_skip(self, test_module, cmd_flag):
+        # [FUNCTION DOC] HELPER: Filter predicate that is true when no
+        # skip list is given or the module name is not in it.
         return cmd_flag is None or (test_module not in cmd_flag)
 
     def _keep_test(self, test_case):
+        # [FUNCTION DOC] HELPER: Returns whether a test case passes all command line filters:
+        # exact test name, operator list (parsed with benchmark_utils), not in the skip list,
+        # first letter within the operator range, tag (unless the tag filter is all), forward-only
+        # handling, and device (only when the input config mentions a device). The code comment
+        # mentions substring matching although most filters here are exact comparisons.
         # TODO: consider regex matching for test filtering.
         # Currently, this is a sub-string matching.
         op_test_config = test_case.test_config
@@ -531,6 +626,10 @@ class BenchmarkRunner:
         )
 
     def _print_test_case_info(self, test_case):
+        # [FUNCTION DOC] HELPER: Handles the list modes. With list-tests prints the test
+        # name and returns True. With list-operators prints each operator module name once
+        # (only when no operators filter is set) using the printed_ops_list set, and returns
+        # True. Otherwise returns False so the test is actually run.
         # Print out the test name and skip the real execution
         if self.args.list_tests:
             print(f"# {test_case.test_config.test_name}")
@@ -547,6 +646,12 @@ class BenchmarkRunner:
         return False
 
     def _output_csv(self, filename, headers, row):
+        # [FUNCTION DOC] HELPER: Appends a row to a CSV file, creating it if needed. If the file
+        # exists its rows are read, and the header row is replaced by the new headers when those
+        # are longer (an earlier failed run may have left it incomplete), otherwise the existing
+        # header is kept. Floats are formatted with six decimals, every row is padded with the
+        # string zero up to the header width, and the whole file is rewritten with newline line
+        # endings.
         if os.path.exists(filename):
             with open(filename) as fd:
                 lines = list(csv.reader(fd)) or [[]]
@@ -569,6 +674,13 @@ class BenchmarkRunner:
         output_file,
         benchmark_name="PyTorch operator benchmark",
     ):
+        # [FUNCTION DOC] HELPER: Writes results in the benchmark-database JSON format. Does
+        # nothing for an empty list. For every result entry it builds three records (latency, peak
+        # memory and memory bandwidth), each with benchmark info (name, mode inference or training
+        # from Forward or Backward, dtype taken from the part after the dot, device, device
+        # architecture, compile flag, operator name taken from the test name prefix), model info
+        # and metric info, using local dataclasses. The list of records is written to the output
+        # file with indentation. Raises an error if the dtype string has no dot.
         """
         Write the result into JSON format, so that it can be uploaded to the benchmark database
         to be displayed on OSS dashboard. The JSON format is defined at
@@ -620,6 +732,8 @@ class BenchmarkRunner:
             # Create the record
             @dataclass
             class BenchmarkInfo:
+                # [CLASS DOC] HELPER: Local record for the benchmark part of a database entry:
+                # name, mode (may be absent), dtype and a free-form extra info mapping.
                 name: str
                 mode: str | None
                 dtype: str
@@ -627,6 +741,8 @@ class BenchmarkRunner:
 
             @dataclass
             class ModelInfo:
+                # [CLASS DOC] HELPER: Local record for the model part of a database
+                # entry: name, type, list of origins and an extra info mapping.
                 name: str
                 type: str
                 origins: list[str]
@@ -634,6 +750,8 @@ class BenchmarkRunner:
 
             @dataclass
             class MetricInfo:
+                # [CLASS DOC] HELPER: Local record for a metric: name, unit,
+                # list of measured values and an optional target value.
                 name: str
                 unit: str
                 benchmark_values: list[float]
@@ -641,6 +759,8 @@ class BenchmarkRunner:
 
             @dataclass
             class BenchmarkRecord:
+                # [CLASS DOC] HELPER: Local record combining the benchmark, model and metric parts
+                # of one database entry; converted to a plain mapping when written out.
                 benchmark: BenchmarkInfo
                 model: ModelInfo
                 metric: MetricInfo
@@ -699,6 +819,17 @@ class BenchmarkRunner:
             json.dump(records, f, indent=2)
 
     def run(self):
+        # [FUNCTION DOC] Main loop of the runner. Prints the header, then for every registered
+        # definition builds test cases and, for each one that is not just being listed and
+        # passes the filters, seeds numpy from the test id hash (32-bit), prints the benchmark
+        # name, runs a warmup with the forward or backward launcher, then measures the
+        # configured number of runs. It computes memory bandwidth from the op's reported memory
+        # traffic when available, prints the result, appends a row to the CSV output, and
+        # collects dictionaries when JSON output is requested. At the end writes the dashboard
+        # JSON and/or plain JSON files. Returns nothing.
+        # KNOWN ISSUE: the seed comes from the hash of a string test id, and string hashes
+        # are randomized per process unless the hash seed environment variable is fixed, so
+        # the input data is not reproducible across runs despite the comment.
         self._print_header()
         output_csv_filename = self.args.output_csv
         headers = [

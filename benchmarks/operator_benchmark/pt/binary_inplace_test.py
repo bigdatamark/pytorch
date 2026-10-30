@@ -1,3 +1,9 @@
+# [MODULE DOC] Operator benchmarks for in-place binary operators (add, subtract, multiply,
+# copy, and divide). Defines small wrapper functions around the in-place tensor methods,
+# and builds op lists and config lists twice: once for integer dtypes for add, sub, mul
+# and copy, and once for float dtypes for div (division needs float data). The benchmark
+# class is defined twice with identical code. Registers forward tests at import time and
+# runs the benchmark runner when executed as a script.
 import operator_benchmark as op_bench
 
 import torch
@@ -7,22 +13,32 @@ import torch
 
 
 def add_(in1, in2):
+    # [FUNCTION DOC] HELPER: Adds the second tensor into the
+    # first in place and returns the first tensor.
     return in1.add_(in2)
 
 
 def sub_(in1, in2):
+    # [FUNCTION DOC] HELPER: Subtracts the second tensor from
+    # the first in place and returns the first tensor.
     return in1.sub_(in2)
 
 
 def div_(in1, in2):
+    # [FUNCTION DOC] HELPER: Divides the first tensor by the
+    # second in place and returns the first tensor.
     return in1.div_(in2)
 
 
 def mul_(in1, in2):
+    # [FUNCTION DOC] HELPER: Multiplies the first tensor by the
+    # second in place and returns the first tensor.
     return in1.mul_(in2)
 
 
 def copy_(in1, in2):
+    # [FUNCTION DOC] HELPER: Copies the second tensor into the first in
+    # place (with dtype conversion) and returns the first tensor.
     return in1.copy_(in2)
 
 
@@ -67,7 +83,14 @@ binary_long_configs = op_bench.cross_product_configs(
 
 
 class InpBinaryOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark applying an in-place binary function, given by the op list entry, to
+    # two random tensors of possibly different dtypes. The first definition is used for the
+    # integer-typed configs. Because the op is in place, the first input is modified on every
+    # iteration.
     def init(self, M, N, K, device, dtype_one, dtype_two, op_func):
+        # [FUNCTION DOC] Creates two random normal tensors of the given sizes
+        # on the device, converts them to the two requested dtypes, stores
+        # them in the inputs mapping and keeps the op function.
         self.inputs = {
             "input_one": torch.randn(M, N, K, device=device).to(dtype=dtype_one),
             "input_two": torch.randn(M, N, K, device=device).to(dtype=dtype_two),
@@ -75,6 +98,8 @@ class InpBinaryOpBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, input_one, input_two):
+        # [FUNCTION DOC] Applies the stored in-place function
+        # to the two inputs and returns its result.
         return self.op_func(input_one, input_two)
 
 
@@ -121,7 +146,15 @@ binary_long_configs = op_bench.cross_product_configs(
 
 
 class InpBinaryOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Duplicate of the earlier in-place binary benchmark class with identical
+    # behavior, redefined for the division registration so the name now refers to this second
+    # definition.
+    # KNOWN ISSUE: the long config for the division case lists the float dtype twice per
+    # dtype argument, which produces duplicate configs and duplicate test names.
     def init(self, M, N, K, device, dtype_one, dtype_two, op_func):
+        # [FUNCTION DOC] Same as the earlier definition: creates two random normal
+        # tensors of the given sizes on the device, converts them to the requested
+        # dtypes, stores them in the inputs mapping and keeps the op function.
         self.inputs = {
             "input_one": torch.randn(M, N, K, device=device).to(dtype=dtype_one),
             "input_two": torch.randn(M, N, K, device=device).to(dtype=dtype_two),
@@ -129,6 +162,8 @@ class InpBinaryOpBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, input_one, input_two):
+        # [FUNCTION DOC] Applies the stored in-place function
+        # to the two inputs and returns its result.
         return self.op_func(input_one, input_two)
 
 

@@ -1,3 +1,8 @@
+# [MODULE DOC] Standalone script that benchmarks the tensor repeat operation on CPU. Defines a
+# fixed set of input shapes and matching repeat factors, warmup and timed iteration counts, and
+# the bytes per float. Import-time side effect: generates the random input tensors and the total
+# byte count at module load. When run as a script it does warmup, times the timed iterations with
+# wall-clock time and prints the time per iteration and achieved bandwidth in MB/s.
 import time
 
 import numpy as np
@@ -31,6 +36,10 @@ DTYPE_TO_BYTES = {"float": 4}
 
 
 def generate_data_for_repeat():
+    # [FUNCTION DOC] Creates one random normal tensor for each configured input shape and computes
+    # the total number of bytes touched: for every tensor, its element count plus the element
+    # count of its repeated output (input count times the product of the repeat factors),
+    # multiplied by four bytes per float. Returns the list of tensors and the byte total.
     input_tensors = [torch.randn(*input_shape) for input_shape in input_shapes]
     total_num_elements = 0
     for input_tensor, repeat in zip(input_tensors, repeats):
@@ -44,10 +53,14 @@ BYTES_TO_MB = 1.0 / 1000.0 / 1000.0
 
 
 def pt_repeat(input_tensor, repeat):
+    # [FUNCTION DOC] Applies the tensor repeat operation with the given repeat
+    # factors to the input tensor and returns the repeated tensor.
     return input_tensor.repeat(repeat)
 
 
 def pt_repeat_n_times(niters):
+    # [FUNCTION DOC] Runs the repeat operation for every module-level input tensor and its
+    # repeat factors, niters times in total. Results are discarded. Returns nothing.
     for _ in range(niters):
         for input_tensor, repeat in zip(input_tensors, repeats):
             pt_repeat(input_tensor, repeat)

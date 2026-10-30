@@ -1,3 +1,7 @@
+# [MODULE DOC] Script that compares a CSV of benchmark results against a baseline CSV and
+# fails (exit status one) when any case regressed, improved beyond the threshold, or has
+# no baseline. Contains a list of known-bad cases to skip, a per-case lookup helper, the
+# comparison routine and the command line main. Requires pandas.
 import argparse
 import sys
 import textwrap
@@ -17,6 +21,9 @@ SKIP_TEST_LISTS = [
 
 
 def get_field(csv, case: str, field: str):
+    # [FUNCTION DOC] HELPER: Returns the value of a column for the row
+    # whose case name matches. Returns None if the case is absent,
+    # duplicated or the column is missing (any error is swallowed).
     try:
         return csv.loc[csv["Case Name"] == case][field].item()
     except Exception:
@@ -24,6 +31,13 @@ def get_field(csv, case: str, field: str):
 
 
 def check_perf(actual_csv, expected_csv, expected_filename, threshold):
+    # [FUNCTION DOC] Compares actual against expected execution times. Cases in the skip list are
+    # dropped. For each remaining case the speed up is expected time divided by actual time. A
+    # case with no baseline is reported as Baseline Not Found; speed up within the threshold band
+    # (inclusive lower, exclusive upper) passes; at or above the upper edge is improved; below the
+    # lower edge fails. Prints one line per case. Builds a message describing regressed, improved
+    # and baseline-missing cases and a hint to update the expected file. Returns a pair: the first
+    # non-empty list among failed, improved and missing (or an empty list) and the message.
     failed = []
     improved = []
     baseline_not_found = []
@@ -91,6 +105,10 @@ def check_perf(actual_csv, expected_csv, expected_filename, threshold):
 
 
 def main():
+    # [FUNCTION DOC] Command line entry. Requires actual and expected CSV paths and takes a
+    # threshold (default 0.5). Reads both with pandas, drops duplicate case rows in the
+    # actual data keeping the first, runs the comparison, and if anything failed, improved
+    # or lacked a baseline prints the message and exits with status one.
     parser = argparse.ArgumentParser()
     parser.add_argument("--actual", type=str, required=True)
     parser.add_argument("--expected", type=str, required=True)
