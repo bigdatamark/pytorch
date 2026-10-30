@@ -1,4 +1,10 @@
 # flake8: noqa
+# [MODULE DOC] Static typing sample that calls a long list of pointwise math functions in
+# alphabetical-ish order (abs through xlogy, including arithmetic, trigonometric, hyperbolic,
+# exponential, logarithmic, bitwise, logical, rounding and special functions), with different
+# argument combinations (tensors, Python numbers, complex values, alpha/value keywords) so the
+# type checker verifies the overloads accept them. Only the first lines define shared random
+# tensors and an int8 tensor; there are no functions, and everything executes at import time.
 import math
 
 import torch

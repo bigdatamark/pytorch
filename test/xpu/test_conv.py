@@ -1,4 +1,13 @@
 # Owner(s): ["module: intel"]
+# [MODULE DOC] XPU (Intel GPU) convolution tests, adapted from the CUDA convolution tests. One
+# device-type test class checks forward and backward behavior of convolution and transposed
+# convolution modules and functional calls: depthwise and grouped equivalences, same and valid
+# padding versus explicit padding and scipy, double backward, empty and non-contiguous inputs,
+# very large inputs, channels-last layouts, misaligned memory, low-level aten backward ops and
+# the oneDNN tf32 flag. At import time it reads the scipy availability flag (importing scipy
+# submodules if present), computes a module constant for Ampere/ROCm support, and instantiates
+# the test class for the xpu device only (with xpu allowed). Runs the tests when executed as a
+# script.
 
 import copy
 import itertools
@@ -38,6 +47,10 @@ if TEST_SCIPY:
 
 
 class TestConvolutionNNDeviceType(NNTestCase):
+    # [CLASS DOC] Device-type test case (derived from the NN test base class) holding the
+    # convolution tests for xpu. Tests receive a device string and, where decorated, a dtype; a
+    # few helper methods build the reference computations. Some tests still use CUDA-flavored
+    # names and calls (cudnn flags, CUDA device-type checks) inherited from the originals.
     def run_conv_double_back_test(
         self,
         kern,
@@ -54,6 +67,14 @@ class TestConvolutionNNDeviceType(NNTestCase):
         use_bias=True,
         dtype=torch.double,
     ):
+        # [FUNCTION DOC] HELPER: Builds a 2D convolution problem and exercises its double
+        # backward. Creates a random input of batch by chan_in channels by a square inp_size, a
+        # random weight of shape chan_out by chan_in divided by groups by kern by kern
+        # (requiring grad unless no_weight is true) and an optional bias, all on xpu if use_xpu
+        # else cpu in the given dtype (default double). If dtype is float32, returns whether the
+        # first-order input gradient (built with create_graph) requires grad; otherwise returns
+        # the result of gradgradcheck on the functional convolution, which raises on mismatch
+        # and returns True on success.
         device = torch.device("xpu" if use_xpu else "cpu")
         x = torch.randn(
             batch_size,
@@ -79,6 +100,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
             bias = None
 
         def func(*inputs):
+            # [FUNCTION DOC] HELPER: Nested function under test for gradient checking: takes the
+            # inputs (input, weight and, when use_bias is set, bias), and returns the functional
+            # 2D convolution using the enclosing stride, padding, dilation and groups.
             if use_bias:
                 lx, lweight, lbias = inputs
             else:
@@ -105,6 +129,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(*floating_types_and(torch.half, torch.bfloat16))
     def test_Conv2d_large_workspace(self, device, dtype):
+        # [FUNCTION DOC] Runs forward and backward of a 256 to 256 channel 3x3 convolution
+        # (padding 1) for three large input sizes, for floating dtypes including half and
+        # bfloat16. Only checks that nothing crashes or runs out of workspace; there are no
+        # value assertions.
         sizes = [
             (1, 256, 109, 175),
             (1, 256, 80, 128),
@@ -112,6 +140,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
         ]
 
         def run_test(benchmark):
+            # [FUNCTION DOC] HELPER: Builds the convolution on the device, then for each size
+            # runs forward on a fresh requires-grad copy and backward with ones. Returns
+            # nothing.
+            # KNOWN ISSUE: the benchmark argument is never used, so the two calls (false and
+            # true) run the identical computation.
             conv = torch.nn.Conv2d(256, 256, kernel_size=3, padding=1).to(device, dtype)
             for size in sizes:
                 x = torch.randn(size, device=device, dtype=dtype)
@@ -123,6 +156,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.half, torch.float)
     def test_ConvTranspose2d_large_output_padding(self, device, dtype):
+        # [FUNCTION DOC] Chains three transposed 2D convolutions (128 to 64 to 32 to 3 channels,
+        # kernel 3, stride 2, padding 1, output padding 1) on a small random input in half or
+        # float, then runs backward with random gradient. A crash/shape smoke test with no value
+        # assertions.
         net1 = torch.nn.ConvTranspose2d(
             128, 64, kernel_size=3, stride=2, padding=1, output_padding=1
         ).to(device=device, dtype=dtype)
@@ -140,6 +177,12 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float, torch.double, torch.half)
     def test_Conv2d_depthwise_naive_groups(self, device, dtype):
+        # [FUNCTION DOC] Checks that a grouped (depthwise, groups equal to 2) 2D convolution
+        # equals two independent single-channel convolutions whose weights and biases are slices
+        # of the grouped layer, for depth multipliers 1 and 2. Skips half precision on xpu
+        # (known oneDNN accuracy issue). Compares concatenated outputs, input gradient, bias
+        # gradient and weight gradient, with tolerance from the per-dtype precision table and
+        # zero relative tolerance.
         if dtype == torch.half and "xpu" in device:
             self.skipTest(
                 "The accuracy issue of dtype fp16 would be fixed in oneDNN v3.4"
@@ -203,6 +246,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float, torch.double, torch.half)
     def test_Conv3d_depthwise_naive_groups(self, device, dtype):
+        # [FUNCTION DOC] 3D counterpart of the depthwise grouped-convolution equivalence test:
+        # grouped convolution with 2 groups versus two single-channel convolutions, depth
+        # multipliers 1 and 2, skipping half on xpu. Output and weight gradient use absolute
+        # tolerance 3e-4 and relative 3e-2; input and bias gradients use the per-dtype table
+        # with zero relative tolerance.
         if dtype == torch.half and "xpu" in device:
             self.skipTest(
                 "The accuracy issue of dtype fp16 would be fixed in oneDNN v3.4"
@@ -266,6 +314,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float, torch.double, torch.half)
     def test_noncontig_conv_grad(self, device, dtype):
+        # [FUNCTION DOC] Verifies that backward gives the same input gradient for a non-
+        # contiguous output gradient (a slice of a larger tensor) as for its contiguous copy.
+        # Raises an assertion error if the constructed gradient happens to be contiguous. Runs
+        # backward twice with retained graph, zeroing the stored input gradient between runs.
         module = nn.Conv2d(3, 5, kernel_size=3, padding=1).to(device, dtype)
         input = torch.randn(
             2, 3, 10, 10, dtype=dtype, device=device, requires_grad=True
@@ -287,6 +339,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.double)
     def test_conv_double_backward(self, device, dtype):
+        # [FUNCTION DOC] Double-precision double backward check run on xpu under cudnn flags
+        # (enabled, deterministic). Loops over kernel/input-size/dilation combinations (kernel 3
+        # with size 5 and dilations 1 and 2, kernel 4 with size 9 and dilation 1) with stride 1,
+        # padding 2, 2 input and 3 output channels, calls the double-backward helper and asserts
+        # it succeeded. The no-weight flag is always false because the stride is always 1.
         with torch.backends.cudnn.flags(enabled=True, deterministic=True):
             batch_size = 1
             for kern, inp_size, dilations in [(3, 5, [1, 2]), (4, 9, [1])]:
@@ -310,6 +367,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
                     self.assertTrue(result, "Conv double backward test failed")
 
     def test_conv_double_backward_no_bias(self):
+        # [FUNCTION DOC] Double backward check on the CPU with stride 2, kernel 3, padding 1, 2
+        # to 4 channels, batch 2, input size 5, using the default double dtype. Asserts the
+        # helper succeeded.
+        # KNOWN ISSUE: despite the name, the helper is called with the bias enabled, so the no-
+        # bias path is not exercised; also runs on CPU.
         kern, stride = 3, 2
         chan_in, chan_out = 2, 4
         batch_size, inp_size = 2, 5
@@ -330,6 +392,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
         self.assertTrue(result, "Conv double backward test failed")
 
     def test_conv_double_backward_groups(self):
+        # [FUNCTION DOC] Double backward check on the CPU with groups equal to 2 (channels
+        # scaled by the group count), kernel 3, stride 1, padding 2, batch 2, input size 6.
+        # Asserts the helper succeeded.
         kern, stride, padding = 3, 1, 2
         chan_in, chan_out = 2, 4
         batch_size, inp_size, dilation = 2, 6, 1
@@ -350,6 +415,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
         self.assertTrue(result, "Conv double backward test failed")
 
     def test_conv_double_backward_stride(self):
+        # [FUNCTION DOC] Runs the double-backward helper on the CPU for stride 2 over kernels of
+        # 3 with input sizes 5 (dilations 1 and 2) and 7 (dilation 1), paddings 0 and 1, 1 to 2
+        # channels, batch 2.
+        # KNOWN ISSUE: the result returned by the helper is discarded and never asserted, so
+        # only failures that raise inside the helper are detected.
         batch_size = 2
         for kern, inp_size, dilations in [(3, 5, [1, 2]), (3, 7, [1])]:
             for stride, padding, chan_in, chan_out, dilation in product(
@@ -370,6 +440,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv1d_large_input(self, device, dtype):
+        # [FUNCTION DOC] Compares a large 1D convolution (batch 4, 512 to 512 channels, length
+        # 441, kernel 3, padding 1, bias) computed on CPU in float32 with the same weights
+        # computed on the device in the test dtype. Seeds the generator with 42; asserts outputs
+        # match with tolerance 1e-5 ignoring device differences.
         N, C_in, L = 4, 512, 441
         C_out, K, P = 512, 3, 1
         torch.manual_seed(42)
@@ -395,6 +469,12 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv1d_same_padding(self, device, dtype):
+        # [FUNCTION DOC] Checks 1D same-padding convolution. First, for input sizes 50 to 54,
+        # kernel sizes 1, 2, 3 and 8, dilations 1 to 3 and stride 1, asserts the output length
+        # is the ceiling of input size over stride. Then compares same padding with explicit
+        # numeric padding for kernel 3 (padding 1), kernel 4 with dilation 2 (padding 3), and
+        # dilation 3 (padding 5 with the first output element dropped, since the total padding
+        # is asymmetric).
         test_args = [
             range(50, 55),
             [1, 2, 3, 8],
@@ -425,6 +505,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv3d_same_padding(self, device, dtype):
+        # [FUNCTION DOC] Checks 3D same-padding convolution against explicit padding: kernel
+        # 1x2x5 (padding 0,1,2, dropping the first row of the middle output dimension), the same
+        # with dilation 2 (padding 0,1,4), and kernel 4x4x4 with dilation 3 (padding 5, dropping
+        # the first element of each spatial dimension). Uses default comparison tolerances.
         rtol, atol = None, None
         x = torch.rand(1, 1, 10, 11, 12, device=device, dtype=dtype)
         y = torch.rand(1, 1, 1, 2, 5, device=device, dtype=dtype)
@@ -443,6 +527,8 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv1d_valid_padding(self, device, dtype):
+        # [FUNCTION DOC] Asserts that 1D convolution with the string valid padding gives the
+        # same result as default (no) padding.
         x = torch.rand(1, 1, 10, device=device, dtype=dtype)
         y = torch.rand(1, 1, 4, device=device, dtype=dtype)
         expect = F.conv1d(x, y)
@@ -451,6 +537,8 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv2d_valid_padding(self, device, dtype):
+        # [FUNCTION DOC] Asserts that 2D convolution with the string valid padding equals the
+        # default unpadded convolution for a 1x1x1x10 input and a 1x1x1x4 kernel.
         x = torch.rand(1, 1, 1, 10, device=device, dtype=dtype)
         y = torch.rand(1, 1, 1, 4, device=device, dtype=dtype)
         expect = F.conv2d(x, y)
@@ -459,6 +547,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv3d_valid_padding(self, device, dtype):
+        # [FUNCTION DOC] Asserts that 3D convolution with the string valid padding equals the
+        # default unpadded convolution on a small tensor with singleton leading spatial
+        # dimensions.
         x = torch.rand(1, 1, 1, 1, 10, dtype=dtype, device=device)
         y = torch.rand(1, 1, 1, 1, 4, dtype=dtype, device=device)
         expect = F.conv3d(x, y)
@@ -467,6 +558,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv1d_same_padding_backward(self, device, dtype):
+        # [FUNCTION DOC] Compares input and weight gradients of 1D convolution with same padding
+        # against those of an equivalent explicit-padding convolution (padding 3 with dilation
+        # 2; then padding 2 with the first output element dropped) using sum-abs of the output
+        # as the loss. Resets the stored gradients between runs.
         x = torch.rand(1, 1, 12, dtype=dtype, device=device, requires_grad=True)
         y = torch.rand(1, 1, 4, dtype=dtype, device=device, requires_grad=True)
 
@@ -493,6 +588,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv2d_same_padding_backward(self, device, dtype):
+        # [FUNCTION DOC] 2D version of the same-padding gradient comparison: kernel 4x5 with
+        # dilation 2 against explicit padding of 3 by 4, and kernel 4x4 against padding 2 with the
+        # first row and column of the output dropped. Compares input and weight gradients.
         x = torch.rand(1, 1, 10, 11, device=device, dtype=dtype, requires_grad=True)
         y = torch.rand(1, 1, 4, 5, device=device, dtype=dtype, requires_grad=True)
 
@@ -520,6 +618,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.double)
     def test_conv3d_same_padding_backward(self, device, dtype):
+        # [FUNCTION DOC] 3D same-padding backward test in double precision. Compares input and
+        # weight gradients with explicit padding for dilation 2 (kernel 1x2x5) and for kernel
+        # 1x4x4 (padding 2, output cropped), and additionally runs gradcheck (with forward-mode
+        # AD and nondeterminism tolerance 1e-5) and gradgradcheck (forward over reverse) on
+        # same-padding convolution for both kernels.
         x = torch.rand(1, 1, 1, 11, 12, dtype=dtype, device=device, requires_grad=True)
         y = torch.rand(1, 1, 1, 2, 5, dtype=dtype, device=device, requires_grad=True)
         z = F.conv3d(x, y, padding=(0, 1, 4), dilation=2)
@@ -568,6 +671,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv1d_valid_padding_backward(self, device, dtype):
+        # [FUNCTION DOC] Compares input and weight gradients of 1D convolution with valid
+        # padding against those with explicit zero padding, using sum-abs of the output as the
+        # loss.
         x = torch.rand(1, 1, 10, dtype=dtype, device=device, requires_grad=True)
         y = torch.rand(1, 1, 4, dtype=dtype, device=device, requires_grad=True)
         F.conv1d(x, y, padding=0).sum().abs().backward()
@@ -582,12 +688,21 @@ class TestConvolutionNNDeviceType(NNTestCase):
     @dtypes(torch.float)
     @parametrize_test("mode", ("valid", "same"))
     def test_conv1d_vs_scipy(self, device, dtype, mode):
+        # [FUNCTION DOC] Skipped without scipy. Parametrized over valid and same mode. Compares
+        # 1D torch convolution with scipy signal convolution for an even-length (size 4) and odd-
+        # length (size 5) kernel on a random 1x10 input, running under the float default dtype.
         t = make_tensor((1, 10), device=device, dtype=dtype)
         feat_dim = t.shape[1]
         weight_even = make_tensor((1, 1, 4), device=device, dtype=dtype)
         weight_odd = make_tensor((1, 1, 5), device=device, dtype=dtype)
 
         def _test(t, weight, mode):
+            # [FUNCTION DOC] HELPER: Computes the scipy convolution of the flattened input and
+            # kernel as the expected result, then the torch result using the flipped kernel
+            # (torch computes correlation). For same mode it pads the input manually by half the
+            # kernel size on both sides, uses no padding argument, and crops the result to the
+            # input length; for valid mode it passes the mode as the padding string. Asserts
+            # closeness with 2e-5 tolerances.
             t_a = t.view(-1).cpu().numpy()
             w_a = weight.view(-1).cpu().numpy()
             expected = scipy.signal.convolve(t_a, w_a, mode=mode)
@@ -613,11 +728,19 @@ class TestConvolutionNNDeviceType(NNTestCase):
     @dtypes(torch.float)
     @parametrize_test("mode", ("valid", "same"))
     def test_conv2d_vs_scipy(self, device, dtype, mode):
+        # [FUNCTION DOC] Skipped without scipy. Parametrized over valid and same mode. Compares
+        # 2D torch convolution to scipy 2D convolution for a 1x5x10 input with kernels 2x4
+        # (even) and 3x5 (odd), under float default dtype.
         t = make_tensor((1, 5, 10), device=device, dtype=dtype)
         weight_even = make_tensor((1, 1, 2, 4), device=device, dtype=dtype)
         weight_odd = make_tensor((1, 1, 3, 5), device=device, dtype=dtype)
 
         def _test(t, weight, mode):
+            # [FUNCTION DOC] HELPER: Computes the scipy 2D convolution of the squeezed input and
+            # kernel, then the torch result with the kernel flipped in both spatial dimensions.
+            # For same mode it pads by half the kernel size in each dimension manually and crops
+            # the result to 5 by 10; otherwise passes the mode as padding. Compares with rtol
+            # 2e-5 and atol 5e-6.
             t_a = t.squeeze(0).cpu().numpy()
             w_a = weight.squeeze(0).squeeze(0).cpu().numpy()
             expected = scipy.signal.convolve2d(t_a, w_a, mode=mode)
@@ -645,11 +768,19 @@ class TestConvolutionNNDeviceType(NNTestCase):
     @dtypes(torch.float)
     @parametrize_test("mode", ("valid", "same"))
     def test_conv3d_vs_scipy(self, device, dtype, mode):
+        # [FUNCTION DOC] Skipped without scipy. Parametrized over valid and same mode. Compares
+        # 3D torch convolution to scipy N-dimensional convolution for a 1x5x5x10 input and
+        # kernels 2x2x4 and 2x3x5, under float default dtype.
         t = make_tensor((1, 5, 5, 10), device=device, dtype=dtype)
         weight_even = make_tensor((1, 1, 2, 2, 4), device=device, dtype=dtype)
         weight_odd = make_tensor((1, 1, 2, 3, 5), device=device, dtype=dtype)
 
         def _test(t, weight, mode):
+            # [FUNCTION DOC] HELPER: Computes the scipy convolution of the squeezed input and
+            # kernel, then the torch result with the kernel flipped in all three spatial
+            # dimensions. For same mode it pads manually by half the kernel size in each
+            # dimension and crops the result to 5 by 5 by 10; otherwise passes the mode as
+            # padding. Compares with rtol 2e-5 and atol 5e-6.
             t_a = t.squeeze(0).cpu().numpy()
             w_a = weight.squeeze(0).squeeze(0).cpu().numpy()
             expected = scipy.signal.convolve(t_a, w_a, mode=mode)
@@ -680,6 +811,8 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv2d_valid_padding_backward(self, device, dtype):
+        # [FUNCTION DOC] Compares input and weight gradients of 2D convolution with valid
+        # padding against explicit zero padding, using sum-abs of the output as the loss.
         x = torch.rand(1, 1, 1, 10, device=device, dtype=dtype, requires_grad=True)
         y = torch.rand(1, 1, 1, 4, device=device, dtype=dtype, requires_grad=True)
         F.conv2d(x, y, padding=0).sum().abs().backward()
@@ -692,6 +825,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.double)
     def test_conv3d_valid_padding_backward(self, device, dtype):
+        # [FUNCTION DOC] Double-precision gradient comparison of 3D valid padding against
+        # explicit zero padding, followed by gradcheck (forward AD enabled) and gradgradcheck
+        # (forward over reverse) on valid-padding 3D convolution.
         x = torch.rand(1, 1, 1, 1, 10, dtype=dtype, device=device, requires_grad=True)
         y = torch.rand(1, 1, 1, 1, 4, dtype=dtype, device=device, requires_grad=True)
         F.conv3d(x, y, padding=0).sum().abs().backward()
@@ -715,6 +851,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @parametrize_test("N", range(2, 4), name_fn=lambda N: f"ConvTranspose{N}d")
     def test_conv_transpose_with_output_size_and_no_batch_dim(self, device, N):
+        # [FUNCTION DOC] Parametrized over 2 and 3 spatial dimensions (test names mention
+        # ConvTranspose2d/3d). Applies a transposed convolution (one channel, kernel 16, stride
+        # 16, padding 7, no bias) to an input without a batch dimension while passing an
+        # explicit output size of 240 by 200 (plus another 200 for 3D), and asserts the output
+        # shape equals that size.
         inp = torch.randn((1, 15, 13) if N == 2 else (1, 15, 13, 13), device=device)
         output_size = (1, 240, 200) if N == 2 else (1, 240, 200, 200)
         ConvTransposeNd = getattr(nn, f"ConvTranspose{N}d")
@@ -726,6 +867,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv_empty_channel(self, device, dtype):
+        # [FUNCTION DOC] Checks convolutions with zero input channels in 1D, 2D and 3D: a module
+        # with zero input channels run on an empty input must pass the shared empty-input check
+        # (forward, backward and zero gradients), while an input with a zero-sized spatial
+        # dimension but one channel must raise a RuntimeError whose message mentions the
+        # groups/weight mismatch.
         in_channels = 0
         mod = torch.nn.Conv1d(in_channels, 8, 2, stride=2, dtype=dtype).to(device)
         inp = torch.randn(2, 0, 15, device=device, dtype=dtype)
@@ -752,6 +898,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
             mod(inp)
 
     def test_group_conv_empty(self, device):
+        # [FUNCTION DOC] Runs a grouped (4 groups) strided 2D convolution on an input with batch
+        # size zero and checks it with the shared empty-input helper (forward, backward and zero
+        # gradients, without size check).
         mod = torch.nn.Conv2d(4, 4, stride=2, kernel_size=3, padding=1, groups=4).to(
             device
         )
@@ -759,6 +908,8 @@ class TestConvolutionNNDeviceType(NNTestCase):
         _test_module_empty_input(self, mod, inp, check_size=False)
 
     def test_group_convTranspose_empty(self, device):
+        # [FUNCTION DOC] Runs a grouped (4 groups) strided 2D transposed convolution on a zero-
+        # batch input through the shared empty-input check.
         mod = torch.nn.ConvTranspose2d(
             4, 4, stride=2, kernel_size=3, padding=1, groups=4
         ).to(device)
@@ -766,6 +917,8 @@ class TestConvolutionNNDeviceType(NNTestCase):
         _test_module_empty_input(self, mod, inp, check_size=False)
 
     def test_convTranspose_empty(self, device):
+        # [FUNCTION DOC] Runs a strided 2D transposed convolution on a zero-batch input through
+        # the shared empty-input check.
         mod = torch.nn.ConvTranspose2d(4, 4, stride=2, kernel_size=3, padding=1).to(
             device
         )
@@ -773,6 +926,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
         _test_module_empty_input(self, mod, inp, check_size=False)
 
     def test_conv_large_nosplit(self, device):
+        # [FUNCTION DOC] Smoke test in half precision: runs forward of a 2 to 2 channel
+        # convolution (kernel 8, stride 8) on a very large input (one by two by 1024 by about a
+        # million) and of a 1 to 1024 channel pointwise convolution on a 2048 by 1024 input. No
+        # assertions; checks that large launches do not fail.
         dtype = torch.half
         conv1 = nn.Conv2d(2, 2, 8, 8).to(device).to(dtype)
         input_large = torch.randn(1, 2, 1024, 1024 * 1024, dtype=dtype, device=device)
@@ -782,6 +939,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
         conv2(input_large)
 
     def test_conv_noncontig_weights(self, device):
+        # [FUNCTION DOC] For 1D, 2D and 3D, with and without grouping, builds an expanded (non-
+        # contiguous) weight and runs the functional convolution and transposed convolution
+        # forward and backward. Smoke test: only checks that non-contiguous weights are
+        # accepted, no value assertions.
         for dim in (1, 2, 3):
             for grouped in (False, True):
                 nc = 3
@@ -798,6 +959,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
                 y.sum().backward()
 
     def test_conv_noncontig_weights_and_bias(self, device):
+        # [FUNCTION DOC] With and without bias, runs a 3 to 64 channel 7x7 strided convolution
+        # with non-contiguous input, weight and bias (taken as slices of larger tensors) and
+        # again with their contiguous copies, and asserts the two outputs are equal.
         for bias in [True, False]:
             conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=bias).to(
                 device, torch.float
@@ -823,6 +987,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
             self.assertEqual(out1, out2)
 
     def test_conv_transposed_large(self, device):
+        # [FUNCTION DOC] Applies a 1 to 1 transposed convolution to a very large batch (4096)
+        # and compares each of four 1024-sample slices of the result with the convolution of the
+        # matching input slice, requiring maximum absolute difference zero. Uses half precision
+        # on CUDA device type and float otherwise.
         dtype = torch.half if self.device_type == "cuda" else torch.float
         conv = nn.ConvTranspose2d(1, 1, 1, 1, bias=False).to(device).to(dtype)
         input_large = torch.randn(4096, 1, 512, 1024, dtype=dtype, device=device)
@@ -857,6 +1025,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
         self.assertEqual(maxdiff3, 0)
 
     def test_conv_large(self, device):
+        # [FUNCTION DOC] Checks that a convolution (2 to 2 channels, kernel 8, stride 8) on a
+        # batch of 4097 gives the same output as when the batch is processed in three chunks,
+        # and that weight gradients accumulated from the whole batch match those from the chunks
+        # (after normalizing by mean magnitude) within tolerance 5e-2 absolute and 5e-3
+        # relative.
         dtype = torch.half if self.device_type == "cuda" else torch.float
         conv = nn.Conv2d(2, 2, 8, 8, bias=False).to(device).to(dtype)
         input_large = torch.randn(4097, 2, 512, 512, dtype=dtype, device=device)
@@ -880,6 +1053,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
         self.assertEqual(grad1, grad2, atol=5e-2, rtol=5e-3)
 
     def test_Conv2d_size_1_kernel(self, device):
+        # [FUNCTION DOC] Compares a 3-channel 1x1 convolution on CPU with the device version
+        # (cudnn disabled for the device part), copying weights and bias, using a shared random
+        # gradient. Asserts outputs and bias/weight gradients are close (atol 1e-5, devices
+        # ignored).
         x_cpu = torch.randn(2, 3, 5, 5)
         conv_cpu = torch.nn.Conv2d(3, 3, kernel_size=1)
         y_cpu = conv_cpu(x_cpu)
@@ -910,6 +1087,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
         )
 
     def test_ConvTranspose2d_size_1_kernel(self, device):
+        # [FUNCTION DOC] Compares a 3-channel 1x1 transposed 2D convolution on CPU with the
+        # device version using copied weights and bias and a shared random output gradient;
+        # asserts the output and bias and weight gradients are close (atol 1e-5, devices
+        # ignored).
         x_cpu = torch.randn(2, 3, 5, 5)
         conv_cpu = torch.nn.ConvTranspose2d(3, 3, kernel_size=1)
         y_cpu = conv_cpu(x_cpu)
@@ -938,6 +1119,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
         )
 
     def test_ConvTranspose3d_size_1_kernel(self, device):
+        # [FUNCTION DOC] Same CPU-versus-device comparison for a 1x1 transposed 3D convolution,
+        # executed with the default dtype temporarily set to double; asserts output, bias
+        # gradient and weight gradient match with atol 1e-5.
         with set_default_dtype(torch.double):
             x_cpu = torch.randn(2, 3, 3, 5, 5)
             conv_cpu = torch.nn.ConvTranspose3d(3, 3, kernel_size=1)
@@ -968,6 +1152,10 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_Conv2d_naive_groups(self, device, dtype):
+        # [FUNCTION DOC] Checks a 4 to 4 channel convolution with 2 groups against two 2 to 2
+        # channel convolutions on the halves of the channels (weights and biases copied from
+        # slices). Asserts concatenated outputs and the input, bias and weight gradients match,
+        # using the per-dtype precision table for gradients.
         m = nn.Conv2d(4, 4, kernel_size=3, groups=2).to(device, dtype)
         i = torch.randn(2, 4, 6, 6, device=device, dtype=dtype, requires_grad=True)
         output = m(i)
@@ -1010,10 +1198,14 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.double)
     def test_Conv2d_backward_depthwise(self, device, dtype):
+        # [FUNCTION DOC] Runs gradcheck in double precision on a depthwise (2 groups) 2D
+        # functional convolution with stride 1 by 10 and no bias.
         x = torch.randn(2, 2, 4, 20, device=device, dtype=dtype, requires_grad=True)
         weight = torch.randn(2, 1, 3, 5, device=device, dtype=dtype, requires_grad=True)
 
         def conv2d_depthwise(x, weight):
+            # [FUNCTION DOC] HELPER: Takes an input and weight and returns the grouped
+            # functional convolution with 2 groups, stride of 1 by 10 and no bias.
             return torch.nn.functional.conv2d(
                 x, weight, bias=None, stride=(1, 10), groups=2
             )
@@ -1022,7 +1214,16 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.half, torch.float)
     def test_conv_cudnn_nhwc(self, device, dtype):
+        # [FUNCTION DOC] Runs the nested channels-last 2D convolution comparison for four
+        # configurations (small and 56 by 56 inputs, each with 1 group and with groups equal to
+        # the channel count), for half and float dtypes.
         def helper(n, c, h, w, out_channels, kernel_size, groups):
+            # [FUNCTION DOC] HELPER: Builds a channels-last random-integer input and convolution
+            # of the given size, group count and dtype, and a double-precision contiguous
+            # reference with the same weights. Runs forward and backward with the same random-
+            # integer gradient, asserts the tested output and gradients are channels-last
+            # contiguous and the reference ones are contiguous, and asserts output, weight, bias
+            # and input gradients match the reference (dtype not required to match).
             input = torch.randint(-3, 3, (n, c, h, w), dtype=dtype, device=device).to(
                 memory_format=torch.channels_last
             )
@@ -1071,7 +1272,14 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.half, torch.float)
     def test_conv_cudnn_ndhwc(self, device, dtype):
+        # [FUNCTION DOC] 3D version: runs the nested channels-last-3d comparison for four
+        # configurations (small 4-cube and 18-cube inputs, each with 1 group and with groups
+        # equal to the channel count), for half and float dtypes.
         def helper(n, c, d, h, w, out_channels, kernel_size, groups):
+            # [FUNCTION DOC] HELPER: Same as the 2D helper but with a 3D convolution and
+            # channels-last-3d layout, with random integers in the range minus 2 to 2: compares
+            # against a double-precision contiguous reference and asserts layout of
+            # outputs/gradients and numerical match.
             input = torch.randint(
                 -2, 2, (n, c, d, h, w), dtype=dtype, device=device
             ).to(memory_format=torch.channels_last_3d)
@@ -1134,6 +1342,12 @@ class TestConvolutionNNDeviceType(NNTestCase):
         grad_format,
         output_format,
     ):
+        # [FUNCTION DOC] HELPER: Builds a float convolution of the given class on the device
+        # with channels from the input and gradient sizes and the reference kernel size, loads
+        # the reference state, forces the weight, input and gradient into the given memory
+        # formats, runs forward and backward, asserts the output is contiguous in the expected
+        # output format, and asserts output, weight gradient, bias gradient and input gradient
+        # equal the reference values.
         conv = (
             layer(inp.size(1), grad.size(1), ref_conv.weight.size(2)).float().to(device)
         )
@@ -1158,6 +1372,13 @@ class TestConvolutionNNDeviceType(NNTestCase):
         self.assertEqual(input.grad, ref_input.grad)
 
     def _test_conv_cudnn_nhwc_nchw(self, layer, n, c, h, w, k, filter_size, device):
+        # [FUNCTION DOC] HELPER: Builds random-integer float data, a reference convolution layer
+        # and its reference output and gradient in default layout, then for every combination of
+        # weight, gradient and input format (contiguous or channels-last) calls the run helper,
+        # expecting channels-last output if the input or weight is channels-last and contiguous
+        # otherwise.
+        # KNOWN ISSUE: not prefixed as a test and never called in this file, so it is dead code
+        # here.
         data = torch.randint(1, 10, (n, c, h, w), dtype=torch.float32, device=device)
         ref_input = data.clone().contiguous().requires_grad_(True)
         ref_conv = layer(c, k, filter_size).float().to(device)
@@ -1189,6 +1410,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float, torch.double)
     def test_conv_cudnn_nhwc_support(self, device, dtype):
+        # [FUNCTION DOC] Convolves a 1x16x1x1 input with a channels-last 8 to 16 weight with 3x3
+        # kernel, stride of 2 by 1, padding 1, and asserts the output is channels-last contiguous,
+        # then runs backward on the sum of the output. For float and double.
         input = torch.randn(
             (1, 16, 1, 1), dtype=dtype, device=device, requires_grad=True
         )
@@ -1202,6 +1426,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float)
     def test_conv2d_no_grad(self, device, dtype):
+        # [FUNCTION DOC] For batch sizes 1 to 3 and group counts 1, 2 and 4, builds a grouped
+        # 8-output-channel 3x3 convolution and asserts that the output with gradient tracking
+        # matches the output computed under no-grad (rtol 1e-2, atol 1e-5).
         for batch in [1, 2, 3]:
             for groups in [1, 2, 4]:
                 input = torch.rand(batch, groups, 8, 8, dtype=dtype, device=device)
@@ -1221,6 +1448,13 @@ class TestConvolutionNNDeviceType(NNTestCase):
     @unittest.skipIf(torch.xpu.device_count() < 2, "only one GPU detected")
     @dtypes(torch.double, torch.float, torch.half)
     def test_conv2d_on_multi_device(self, dtype):
+        # [FUNCTION DOC] Skipped if fewer than two xpu devices. Runs the same convolution on xpu
+        # 0 and xpu 1 with copied modules and the same CPU input, asserts the two outputs match,
+        # and runs backward on both with the same output gradient. Takes only a dtype and uses
+        # explicit device names.
+        # KNOWN ISSUE: the final assertion compares the two output-gradient copies with each
+        # other, which are identical by construction; the resulting input gradients are never
+        # compared.
         input = torch.randn(3, 256, 224, 224, dtype=dtype, requires_grad=True)
         conv = torch.nn.Conv2d(256, 256, kernel_size=3, padding=1, dtype=dtype)
         output_grad = torch.randn(3, 256, 224, 224, dtype=dtype)
@@ -1238,6 +1472,11 @@ class TestConvolutionNNDeviceType(NNTestCase):
         self.assertEqual(output_grad_0.cpu(), output_grad_1.cpu())
 
     def test_conv_double_backward_strided_with_3D_input_and_weight(self, device):
+        # [FUNCTION DOC] Computes a strided 1D convolution through the low-level aten
+        # convolution op on a 3D input and weight with bias, then calls the aten double-backward
+        # op with random second-order gradients, an output gradient and an all-true output mask,
+        # and asserts the returned gradients have the shapes of the output gradient, input and
+        # weight respectively.
         input = torch.randn(2, 3, 6, device=device)
         weight = torch.randn(3, 3, 3, device=device)
         bias = torch.randn(3, device=device)
@@ -1289,8 +1528,16 @@ class TestConvolutionNNDeviceType(NNTestCase):
         self.assertEqual(grad_weight.shape, weight.shape)
 
     def test_aten_conv_backward_op(self, device):
+        # [FUNCTION DOC] Compares the aten convolution backward op on the device against CPU for
+        # all eight combinations of the output mask (input, weight, bias gradients), by calling
+        # the nested helper for each mask.
         # test low-level aten.convolution_backward ops
         def test_aten_conv_backward_op_output_mask(output_mask):
+            # [FUNCTION DOC] HELPER: Takes a mask of three flags. Runs the aten convolution
+            # backward op on CPU with fixed random input (1x1x4x4), weight (1x1x3x3) and output
+            # gradient (1x1x2x2), stride 1, no padding, then repeats with copies on the device,
+            # and asserts each enabled output (input, weight or bias gradient) matches between
+            # CPU and device.
             input_cpu = torch.randn(1, 1, 4, 4, device="cpu")
             weight_cpu = torch.randn(1, 1, 3, 3, device="cpu")
             grad_output_cpu = torch.randn(1, 1, 2, 2, device="cpu")
@@ -1344,6 +1591,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
     @onlyXPU
     @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
     def test_channels_last_ouput_stride(self, device, dtype):
+        # [FUNCTION DOC] XPU only. For four floating dtypes, convolves a channels-last input
+        # (2x3x16x16) with a channels-last weight (512 output channels, 3x3, stride 2, no
+        # padding) and asserts the output has size 2x512x7x7 with channels-last strides.
         input = torch.randn(
             (2, 3, 16, 16), device=device, dtype=dtype, requires_grad=True
         )
@@ -1359,9 +1609,16 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @dtypes(torch.float16, torch.bfloat16, torch.float32, torch.float64)
     def test_conv_misaligned_input(self, device, dtype):
+        # [FUNCTION DOC] For four floating dtypes, compares 1D, 2D and 3D convolution (kernel 3,
+        # 3 to 4 channels, batch 2) on CPU with the device using input, weight and bias stored
+        # at an address deliberately not aligned to 64 bytes, and asserts the results are equal.
         N, C, OUT_CHANNELS = 2, 3, 4
 
         def make_misaligned_tensor(tensor, shape):
+            # [FUNCTION DOC] HELPER: Allocates a device buffer one element larger than needed,
+            # takes a view that starts one element in, reshapes it, copies the given tensor into
+            # it, asserts the data address is not a multiple of 64 and returns the misaligned
+            # tensor.
             numel = math.prod(shape)
             base = torch.empty(numel + 1, device=device, dtype=dtype)
             tensor_device = base[1:].reshape(shape)
@@ -1392,6 +1649,9 @@ class TestConvolutionNNDeviceType(NNTestCase):
 
     @onlyXPU
     def test_onednn_allow_tf32_get_set(self):
+        # [FUNCTION DOC] XPU only. Uses the mkldnn flags context manager to set the tf32 flag
+        # false and then true (leaving enabled and deterministic untouched) and asserts the
+        # backend attribute reports each value inside the context.
         with torch.backends.mkldnn.flags(
             enabled=None, deterministic=None, allow_tf32=False
         ):

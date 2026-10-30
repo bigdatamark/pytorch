@@ -1,5 +1,12 @@
 # mypy: ignore-errors
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Runtime tests that keep the operator typing sample (pass/arithmetic_ops.py)
+# honest. It defines tables of operator strings (comparison, float-or-int, int-only, matrix
+# multiply, unary, punctuation) and sample operands (Python and tensor floats and ints). Tests
+# verify the tables against the tokenizer's operator list, that the typing sample covers every
+# operator with the same operand shapes, and the runtime result types of every operator and
+# operand combination. Importing the module only builds the constants; the test class is
+# parametrized at import time and run_tests is invoked when run as a script.
 import token
 from itertools import product
 from pathlib import Path
@@ -43,8 +50,18 @@ TYPE_TEST_FILE = Path(__file__).parent / "pass/arithmetic_ops.py"
 
 
 class TestPythonOperators(TestCase):
+    # [CLASS DOC] TestCase holding four checks: operator tables versus the tokenizer, coverage
+    # of the typing sample file, and parametrized runtime result checks for binary and unary
+    # operators over the combinations of the module-level sample operands. Parametrization is
+    # expanded by instantiate_parametrized_tests below the class.
     # Prove that UNARY_OPS, BINARY_OPS, and OPERATORS are correct and complete
     def test_operators_are_correct_and_complete(self):
+        # [FUNCTION DOC] Checks that the module-level operator tables are correct and complete.
+        # Asserts every listed operator is a known exact token, then for each exact token that
+        # is not punctuation tries to compile a unary and a binary expression using it,
+        # collecting those that compile. The collected unary, binary and punctuation sets must
+        # equal the unary, binary and punctuation tables. Fails if Python gains an operator the
+        # tables lack.
         self.assertFalse(set(OPERATORS).difference(token.EXACT_TOKEN_TYPES))
 
         unary, binary, punctuation = {}, {}, {}
@@ -67,6 +84,14 @@ class TestPythonOperators(TestCase):
         self.assertEqual(sorted(punctuation), sorted(PUNCTUATION))
 
     def test_type_tests_are_complete(self):
+        # [FUNCTION DOC] Checks that the typing sample file has assertions for every operator.
+        # Reads the sample file line by line, keeps lines mentioning the tensor constant, and
+        # parses the first argument of the assert_type call: a leading letter means a binary
+        # expression, split into left operand, operator and right operand (the power operator is
+        # padded with spaces first), recorded per operator; otherwise the first character is a
+        # unary operator. Lines without an assert_type call are ignored. The unary list must
+        # equal the unary table, the binary operators must equal the binary table, and every
+        # binary operator must list exactly the same operand pairs as the others.
         binary, unary = {}, []
 
         with TYPE_TEST_FILE.open() as fp:
@@ -89,6 +114,17 @@ class TestPythonOperators(TestCase):
 
     @parametrize("a, op, b", product(ALL, BINARY_OPS, ALL))
     def test_binary(self, a, op, b):
+        # [FUNCTION DOC] Parametrized over every combination of binary operator and two operands
+        # from the sample operand list. Evaluates the expression and captures any raised
+        # exception as the result, then checks the outcome category. Matrix multiply: a
+        # TypeError unless both are tensors; a tensor result when both are the identical tensor;
+        # otherwise a RuntimeError. With a tensor operand: int-only operators with any float
+        # operand give a NotImplementedError (linked issue), else a tensor whose dtype is bool
+        # for comparisons, non-floating for int-only operators, and floating exactly when an
+        # operand is a float or the operation is true division. Without tensors: bool for
+        # comparisons, TypeError for int-only operators with a float, int for those without,
+        # float if any float or true division, else int. Reaching the default branch fails the
+        # test.
         try:
             r = eval(f"a {op} b")
         except Exception as e:
@@ -139,6 +175,10 @@ class TestPythonOperators(TestCase):
 
     @parametrize("op, a", product(UNARY_OPS, ALL))
     def test_unary(self, op, a):
+        # [FUNCTION DOC] Parametrized over every unary operator and sample operand. Evaluates
+        # the operator on the operand, capturing any exception as the result. Expected:
+        # TypeError for bitwise invert on a float or float tensor; a tensor for tensor operands;
+        # an int for invert on a Python int; a float for a Python float; an int otherwise.
         try:
             r = eval(f"{op} a")
         except Exception as e:
@@ -157,6 +197,9 @@ class TestPythonOperators(TestCase):
 
 
 def _any_float(*x):
+    # [FUNCTION DOC] HELPER: Takes any number of values and returns True if any is a Python
+    # float or a tensor with a floating-point dtype; returns False if none is (including no
+    # arguments).
     for i in x:
         if isinstance(i, float) or (
             isinstance(i, torch.Tensor) and i.dtype.is_floating_point

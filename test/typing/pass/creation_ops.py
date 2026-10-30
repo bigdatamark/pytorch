@@ -1,5 +1,12 @@
 # mypy: disable-error-code="possibly-undefined"
 # flake8: noqa
+# [MODULE DOC] Static typing sample covering the documented ways to create tensors: tensor,
+# sparse_coo_tensor, as_tensor, as_strided, from_numpy (only when numpy is available per the
+# TEST_NUMPY flag), zeros/ones and their like variants, arange, range, linspace, logspace, eye,
+# empty variants, full variants, quantize per tensor and per channel, dequantize, complex,
+# polar, heaviside, and a final check that Parameter keeps its own type. Calls are run at import
+# time and several name a CUDA device, so the file is meant for type checking, not for execution
+# on a machine without CUDA.
 from typing_extensions import assert_type
 
 import torch

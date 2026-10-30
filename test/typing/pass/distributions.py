@@ -1,3 +1,7 @@
+# [MODULE DOC] Static typing check that distribution attributes are typed as Tensor. It builds a
+# Normal distribution from two Python numbers and a MultivariateNormal from a zero vector and
+# identity matrix, and asserts the mean and covariance_matrix attributes are typed as Tensor.
+# Constructing the distributions runs at import time.
 from typing_extensions import assert_type
 
 import torch

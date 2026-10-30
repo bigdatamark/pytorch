@@ -1,3 +1,6 @@
+# [MODULE DOC] Reveal-type sample: builds a list holding three tensors of rank 1, 2 and 3, then
+# reveals the type of one shape entry of each element, expecting int in all three cases
+# (indexing the shape tuple of an element drawn from the list).
 import torch
 
 

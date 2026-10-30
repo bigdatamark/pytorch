@@ -1,7 +1,14 @@
+# [MODULE DOC] Reveal-type sample for optimizers: builds an Adagrad and an Adam optimizer over a
+# single scalar tensor, reveals their types as Adagrad and Adam, and passes each to a helper
+# typed to accept the Optimizer base class, checking the subclasses are accepted. Constructs the
+# optimizers at import time.
 import torch
 
 
 def foo(opt: torch.optim.Optimizer) -> None:
+    # [FUNCTION DOC] HELPER: Takes any Optimizer and calls its zero_grad method; returns
+    # nothing. It exists to check that concrete optimizer classes are accepted where the base
+    # class is annotated.
     opt.zero_grad()
 
 

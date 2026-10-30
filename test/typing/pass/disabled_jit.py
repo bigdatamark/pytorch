@@ -1,3 +1,9 @@
+# [MODULE DOC] Static typing check of the return types of the script entry point of the jit
+# package. It defines a ParamSpec and a covariant TypeVar (both unused later) and a small Enum,
+# then asserts the inferred type for scripting an Enum class, a dict, a list, a module and a
+# function. The final block expects scripting a module class (not an instance) to raise a
+# RuntimeError, via pytest raises, and the assert_never inside it marks the call as returning a
+# bottom type. All of these scripting calls execute at import time.
 from enum import Enum
 from typing import TypeVar
 from typing_extensions import assert_never, assert_type, ParamSpec
@@ -12,6 +18,8 @@ R = TypeVar("R", covariant=True)
 
 
 class Color(Enum):
+    # [CLASS DOC] HELPER: Plain Enum with three members (RED, GREEN, BLUE with values 1 to 3),
+    # used only as the argument whose scripted type is checked.
     RED = 1
     GREEN = 2
     BLUE = 3

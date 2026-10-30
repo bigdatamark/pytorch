@@ -1,4 +1,12 @@
 # mypy: enable-error-code=unused-ignore
+# [MODULE DOC] Static typing check for torch.Size, which is a tuple subclass. It builds tuples
+# of various lengths (including empty and a never-typed variadic one) and a Size, then asserts:
+# Size is assignable to a tuple of ints; indexing with an int or an object providing the index
+# protocol gives int; slicing gives Size; addition with Size or any tuple gives Size;
+# multiplication by an int or index-protocol object (either side) gives Size. The reflected-
+# addition (tuple plus Size) assertions carry type-ignore markers because the current mypy
+# infers a different type (linked mypy issue); the mypy flag in the first line makes unused
+# ignores an error so they must stay necessary. Executes the expressions at import time.
 
 from typing_extensions import assert_type, Never
 
@@ -6,7 +14,11 @@ from torch import Size
 
 
 class ZeroIndex:
+    # [CLASS DOC] HELPER: Minimal class whose only member provides the integer-index protocol
+    # and always yields zero. It is used to check that Size indexing and multiplication accept
+    # index-like objects, not only int.
     def __index__(self) -> int:
+        # [FUNCTION DOC] HELPER: Index-protocol method; always returns the integer 0.
         return 0
 
 

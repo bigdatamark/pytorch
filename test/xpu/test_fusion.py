@@ -1,4 +1,9 @@
 # Owner(s): ["module: intel"]
+# [MODULE DOC] XPU tests that the oneDNN fused pointwise operators (linear and convolution
+# followed by a unary or binary pointwise op) match eager computation. Defines a named tuple
+# describing a unary post-op, a lookup table of convolution module classes keyed by spatial
+# dimension (2 and 3), and one device-type test class instantiated for the xpu device only (with
+# xpu allowed) at import time. Runs the tests when executed as a script.
 
 import itertools
 from typing import NamedTuple
@@ -13,6 +18,10 @@ CONV_MODULES = {2: torch.nn.Conv2d, 3: torch.nn.Conv3d}
 
 
 class PointwisePostOp(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple describing one unary post-op: the attribute name passed to
+    # the fused kernel, the reference module applying the same op in eager mode, optional scalar
+    # arguments (default empty list, shared across instances), and an algorithm string (default
+    # empty) such as the gelu approximation.
     attr: str
     pointwise_module: nn.Module
     scalars: list = []
@@ -20,7 +29,15 @@ class PointwisePostOp(NamedTuple):
 
 
 class TestoneDNNFusion(TestCase):
+    # [CLASS DOC] Device-type test class comparing fused mkldnn linear and convolution pointwise
+    # kernels against the eager module followed by the equivalent pointwise op. Holds no state;
+    # helpers supply the tables of unary and binary post-ops. Instantiated only for xpu.
     def _unary_list(self):
+        # [FUNCTION DOC] HELPER: Returns a mapping from post-op name to a description with the
+        # fused-kernel attribute name and the reference module: relu, sigmoid, tanh, hardswish,
+        # swish (SiLU), leaky relu with slope 0.1, hardtanh with bounds minus 0.5 and 4, and
+        # gelu with the none and tanh approximations (carrying the algorithm string). Builds new
+        # modules on each call.
         unary_list = {
             "relu": PointwisePostOp("relu", nn.ReLU()),
             "sigmoid": PointwisePostOp("sigmoid", nn.Sigmoid()),
@@ -45,6 +62,9 @@ class TestoneDNNFusion(TestCase):
         return unary_list
 
     def _binary_list(self):
+        # [FUNCTION DOC] HELPER: Returns a mapping from binary post-op name (add, sub, mul) to
+        # the matching torch function, used both as the eager reference and, by name, as the
+        # fused-kernel attribute.
         binary_list = {
             "add": torch.add,
             "sub": torch.sub,
@@ -53,8 +73,18 @@ class TestoneDNNFusion(TestCase):
         return binary_list
 
     def test_linear_unary_fusion_ops(self, device):
+        # [FUNCTION DOC] For every unary post-op, input shape (a three-dimensional and a two-
+        # dimensional one with last dim 10) and bias on/off, builds a linear layer plus post-op
+        # in eval mode on the given device, runs it eagerly under no-grad, then calls the fused
+        # linear pointwise kernel with the layer weight, bias, post-op name, scalars and
+        # algorithm, and asserts the two outputs are equal.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module that applies a linear layer then a stored unary
+            # function. Constructor takes the unary callable, in and out feature counts, a bias
+            # flag and extra keyword arguments forwarded to the linear layer.
             def __init__(self, unary_fn, in_channels, out_channels, bias, **kwargs):
+                # [FUNCTION DOC] HELPER: Creates the linear layer from the sizes, bias flag and
+                # extra keyword arguments, and stores the unary callable.
                 super().__init__()
                 self.linear = torch.nn.Linear(
                     in_channels, out_channels, bias=bias, **kwargs
@@ -62,6 +92,8 @@ class TestoneDNNFusion(TestCase):
                 self.unary = unary_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer, then the stored unary
+                # callable, and returns the result.
                 x = self.linear(x)
                 x = self.unary(x)
                 return x
@@ -91,8 +123,19 @@ class TestoneDNNFusion(TestCase):
                     self.assertEqual(ref, fused)
 
     def test_linear_binary_fusion_ops(self, device):
+        # [FUNCTION DOC] For each binary post-op (add, sub, mul), builds a linear layer from 10
+        # to 20 features with bias plus the binary op in eval mode on the given device, draws a
+        # random input and a random second operand, computes the eager result under no-grad,
+        # then calls the fused linear pointwise kernel with the input, second operand, weight,
+        # bias and op name, and asserts both results are equal.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module that applies a linear layer and then combines the
+            # result with a second input using a stored binary function. Constructor takes the
+            # binary callable, in and out feature counts, a bias flag and extra keyword
+            # arguments forwarded to the linear layer.
             def __init__(self, binary_fn, in_channels, out_channels, bias, **kwargs):
+                # [FUNCTION DOC] HELPER: Creates the linear layer from the sizes, bias flag and
+                # extra keyword arguments, and stores the binary callable.
                 super().__init__()
                 self.linear = torch.nn.Linear(
                     in_channels, out_channels, bias=bias, **kwargs
@@ -100,6 +143,8 @@ class TestoneDNNFusion(TestCase):
                 self.binary = binary_fn
 
             def forward(self, x, other):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the first input, then the
+                # stored binary callable with the second input, and returns the result.
                 x = self.linear(x)
                 x = self.binary(x, other)
                 return x
@@ -123,7 +168,16 @@ class TestoneDNNFusion(TestCase):
                 self.assertEqual(ref, fused)
 
     def test_conv_unary_fusion_ops(self):
+        # [FUNCTION DOC] Convolution plus unary post-op test, hard-coded to the xpu device.
+        # Loops over each unary post-op, 2D and 3D, bias on/off, dilation 1 or 2, groups 1 or 4
+        # and contiguous or channels-last memory format, with input of 3 times groups channels
+        # and 32 times groups output channels, kernel size 3. Runs the module eagerly and the
+        # fused convolution pointwise kernel (weight, bias, padding, stride, dilation, groups,
+        # post-op name, scalars, algorithm) under no-grad on xpu, and asserts equal outputs.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module that applies a 2D or 3D convolution, chosen by the
+            # dimension argument through the module-level lookup table, followed by a stored
+            # unary callable. Extra keyword arguments such as kernel size go to the convolution.
             def __init__(
                 self,
                 unary_fn,
@@ -135,6 +189,9 @@ class TestoneDNNFusion(TestCase):
                 bias,
                 **kwargs,
             ):
+                # [FUNCTION DOC] HELPER: Builds the convolution of the requested dimensionality
+                # with the given channels, dilation, groups, bias and extra keyword arguments,
+                # and stores the unary callable.
                 super().__init__()
                 self.conv = CONV_MODULES[dim](
                     in_channels,
@@ -147,6 +204,8 @@ class TestoneDNNFusion(TestCase):
                 self.unary = unary_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the convolution, then the stored unary
+                # callable, and returns the result.
                 x = self.conv(x)
                 x = self.unary(x)
                 return x
@@ -203,7 +262,18 @@ class TestoneDNNFusion(TestCase):
                     self.assertEqual(ref, fused)
 
     def test_conv_binary_fusion_ops(self):
+        # [FUNCTION DOC] Convolution plus binary post-op test on xpu. For each binary op (add,
+        # sub, mul), builds a 2D 3-to-3 channel convolution module with kernel size 3 and a
+        # random input of shape 1x3x112x112, with a second operand shaped like the convolution
+        # output. Computes the eager reference and the fused kernel result. For add, also calls
+        # the in-place fused variant, which writes into the second operand, and asserts it
+        # equals the reference, as does the returned tensor. Finally compares the fused result
+        # with the reference using tolerances of 5e-4.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module that applies a 2D or 3D convolution, chosen by
+            # dimension through the module-level lookup table, then combines the result with a
+            # second input using a stored binary callable. Extra keyword arguments go to the
+            # convolution.
             def __init__(
                 self,
                 binary_fn,
@@ -215,6 +285,9 @@ class TestoneDNNFusion(TestCase):
                 bias,
                 **kwargs,
             ):
+                # [FUNCTION DOC] HELPER: Builds the convolution of the requested dimensionality
+                # with the given channels, dilation, groups, bias and extra keyword arguments,
+                # and stores the binary callable.
                 super().__init__()
                 self.conv = CONV_MODULES[dim](
                     in_channels,
@@ -227,6 +300,8 @@ class TestoneDNNFusion(TestCase):
                 self.binary = binary_fn
 
             def forward(self, x, other):
+                # [FUNCTION DOC] HELPER: Applies the convolution to the first input, then the
+                # stored binary callable with the second input, and returns the result.
                 x = self.conv(x)
                 x = self.binary(x, other)
                 return x

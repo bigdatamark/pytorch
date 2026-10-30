@@ -1,5 +1,11 @@
 # mypy: disable-error-code="possibly-undefined"
 # flake8: noqa
+# [MODULE DOC] Reveal-type counterpart of the creation sample: the same family of tensor
+# constructors (tensor, sparse_coo_tensor, as_tensor, as_strided, from_numpy under the numpy
+# flag, zeros, ones, arange, range, linspace, logspace, eye, empty, full, quantize, dequantize,
+# complex, polar, heaviside) are wrapped in reveal_type, each expected to report Tensor via the
+# marker comments, plus a last check that the contains method reveals bool. Runs constructors at
+# import time and refers to a CUDA device in some calls.
 import torch
 from torch.testing._internal.common_utils import TEST_NUMPY
 

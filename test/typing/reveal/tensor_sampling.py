@@ -1,4 +1,8 @@
 # flake8: noqa
+# [MODULE DOC] Reveal-type sample for random-number and sampling functions: seed, initial_seed
+# (int), manual_seed (a Generator), get_rng_state, bernoulli, multinomial, normal, poisson,
+# rand, randint, randn and their like variants, randperm (all Tensor), and the Sobol engine
+# class and its draw method. Expected types are in the marker comments.
 import torch
 
 

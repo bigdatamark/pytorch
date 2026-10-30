@@ -1,3 +1,9 @@
+# [MODULE DOC] Reveal-type sample for named-tuple return types of tensor ops. It sorts a small
+# 2x2 tensor and indexes the result both by position and by the indices and values field names,
+# expecting the revealed type torch.return_types.sort; then it runs the linalg QR decomposition,
+# uses position and the Q field, and reveals Any (a TODO in the file says the precise tuple type
+# is not yet inferred). The comparisons are bare expressions with noqa markers; the expected
+# types are in the marker comments.
 import torch
 
 

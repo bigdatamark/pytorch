@@ -1,3 +1,7 @@
+# [MODULE DOC] Reveal-type sample checking that the adaptive average and max pooling 2D modules
+# accept an output size containing None in either position (None in the second or first slot),
+# and that the resulting variable types are revealed as AdaptiveAvgPool2d and AdaptiveMaxPool2d
+# respectively, per the expected-output markers.
 import torch
 
 
