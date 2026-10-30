@@ -1,15 +1,22 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Unit tests for the APoT observer's qparams computation: invalid configuration, level
+# counts and gamma for several (b, k) settings, signed levels symmetric about zero, and alpha
+# derived from observed data via forward.
 
 from torch.ao.quantization.experimental.observer import APoTObserver
 import unittest
 import torch
 
 class TestNonUniformObserver(unittest.TestCase):
+    # [CLASS DOC] Test case for APoTObserver; each test builds its own observer and sets the min
+    # and max values by hand (except the forward test), no shared state.
     """
         Test case 1: calculate_qparams
         Test that error is thrown when k == 0
     """
     def test_calculate_qparams_invalid(self):
+        # [FUNCTION DOC] Creates an observer with zero bits and zero base bitwidth, sets zero min
+        # and max, and asserts that computing unsigned qparams raises AssertionError.
         obs = APoTObserver(b=0, k=0)
         obs.min_val = torch.tensor([0.0])
         obs.max_val = torch.tensor([0.0])
@@ -27,6 +34,10 @@ class TestNonUniformObserver(unittest.TestCase):
         * note: b = k * n
     """
     def test_calculate_qparams_2terms(self):
+        # [FUNCTION DOC] With 4 bits and base bitwidth 2 (two additive terms), range 0 to 1,
+        # computes unsigned qparams and asserts: alpha equals the larger of the negated min and the
+        # max; gamma equals the reciprocal of the sum of the terms 1 and one half; there are 16
+        # quantization levels and 16 level indices; level indices are all distinct.
         obs = APoTObserver(b=4, k=2)
 
         obs.min_val = torch.tensor([0.0])
@@ -69,6 +80,9 @@ class TestNonUniformObserver(unittest.TestCase):
         * n = 3 (number of additive terms)
     """
     def test_calculate_qparams_3terms(self):
+        # [FUNCTION DOC] Same checks as the two-term test for 6 bits and base bitwidth 2 (three
+        # additive terms): gamma is the reciprocal of 1 plus one half plus one quarter, with 64
+        # quantization levels and 64 distinct level indices.
         obs = APoTObserver(b=6, k=2)
 
         obs.min_val = torch.tensor([0.0])
@@ -113,6 +127,9 @@ class TestNonUniformObserver(unittest.TestCase):
         * signed = True
     """
     def test_calculate_qparams_signed(self):
+        # [FUNCTION DOC] With 4 bits and base bitwidth 2, computes qparams with the signed flag
+        # set. Asserts alpha and gamma as in the two-term test, 49 quantization levels, every level
+        # has its negation also present, and 49 level indices that are distinct.
         obs = APoTObserver(b=4, k=2)
 
         obs.min_val = torch.tensor([0.0])
@@ -162,6 +179,9 @@ class TestNonUniformObserver(unittest.TestCase):
         * n = 6 (number of additive terms)
     """
     def test_calculate_qparams_k1(self):
+        # [FUNCTION DOC] With 6 bits and base bitwidth 1 (six additive terms), computes unsigned
+        # qparams and asserts gamma is the reciprocal of the sum of the six terms, and that there
+        # are 64 quantization levels and 64 distinct level indices. Alpha is not checked.
         obs = APoTObserver(b=6, k=1)
 
         obs.min_val = torch.tensor([0.0])
@@ -198,6 +218,9 @@ class TestNonUniformObserver(unittest.TestCase):
         Checks that alpha is max of abs value of max and min values in tensor.
     """
     def test_forward(self):
+        # [FUNCTION DOC] Feeds a fixed tensor with negative and positive values through the
+        # observer forward, computes signed qparams and asserts alpha equals the larger of the
+        # negated minimum and the maximum of the returned tensor.
         obs = APoTObserver(b=4, k=2)
 
         X = torch.tensor([0.0, -100.23, -37.18, 3.42, 8.93, 9.21, 87.92])

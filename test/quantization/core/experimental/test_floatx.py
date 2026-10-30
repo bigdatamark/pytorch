@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Tests for the float8 dtypes (e5m2, e5m2fnuz, e4m3fn, e4m3fnuz, e8m0fnu) and the
+# packed float4 shell dtype. Holds per-dtype tables (mantissa bits, minimum exponent, special bit
+# patterns), a pure-tensor float32 to float8 rounding simulator, an e8m0 rounding-rule reference,
+# and round-trip input generators. Device-generic classes are instantiated at import time for all
+# devices, the multiplication and compile class for CPU only.
 
 import copy
 import struct
@@ -131,11 +136,19 @@ FLOAT8_DTYPES_SATURATE_ON_OVERFLOW = [torch.float8_e4m3fn]
 
 
 def _int_bits_to_float(x):
+    # [FUNCTION DOC] HELPER: Reinterprets a non-negative integer as the bit pattern of a 32-bit
+    # IEEE float (pack as big-endian unsigned int, unpack as float) and returns the float value.
     y = struct.unpack("!f", struct.pack("!I", x))[0]
     return y
 
 
 def simulate_fp8_precision(input, variant):
+    # [FUNCTION DOC] Reference simulation of casting to a float8 variant while staying in float32:
+    # converts the input to float32, splits it into sign, exponent and mantissa bit fields, shifts
+    # mantissas of values that are subnormal in the target format, rounds to the target mantissa
+    # width with ties to even, recomposes the value and handles overflow beyond the variant maximum
+    # (infinity for variants with infinity, saturation to maximum for the saturating variant, NaN
+    # for the rest). Returns a float32 tensor with the sign reapplied;
     """Round input (as float32) to the given float8 datatype variant."""
 
     # Constants
@@ -194,6 +207,10 @@ def simulate_fp8_precision(input, variant):
 
 
 def _round_e8m0_rne(biased_exponent, lsb, g, r, s):
+    # [FUNCTION DOC] HELPER: Round-to-nearest-even decision for the e8m0 exponent. Given a biased
+    # exponent, the lowest kept bit flag and the guard, round and sticky bits, increments the
+    # exponent when guard is set and either round or sticky is set, or when guard is set alone and
+    # the lowest kept bit flag is true. Returns the possibly incremented exponent.
     round_up = False
 
     # apply g,r,s rounding rules for RNE rounding
@@ -244,9 +261,16 @@ ROUND_TRIP_TEST_CASES = (
 
 
 class TestFloat8Dtype(TestCase):
+    # [CLASS DOC] Device-generic tests for the float8 dtypes, instantiated per device. Dtype lists
+    # come from the module tables, with a smaller list used on CUDA. Covers creation, round-trip
+    # casting against the simulator, e8m0 rounding, special bit patterns, promotion errors,
+    # printing, finfo, cat and save/load.
     @dtypes(*FLOAT8_DTYPES)
     @dtypesIfCUDA(*CUDA_FLOAT8_DTYPES)
     def test_creation_with_zeros(self, dtype, device):
+        # [FUNCTION DOC] Creates a zero tensor of the dtype and checks that converting to float32
+        # gives zeros exactly (zero tolerance). For e8m0, which cannot represent zero, the expected
+        # value is the smallest representable power of two (2 to the minus 127).
         """Sanity test, round-trip casting of zeros."""
         x8 = torch.zeros(8, dtype=dtype, device=device)
         if dtype is torch.float8_e8m0fnu:
@@ -262,6 +286,12 @@ class TestFloat8Dtype(TestCase):
     @dtypesIfCUDA(*CUDA_FLOAT8_DTYPES)
     @parametrize("get_input", ROUND_TRIP_TEST_CASES)
     def test_cast_round_trip(self, dtype, get_input, device):
+        # [FUNCTION DOC] For each dtype and input generator (soak, subnormals, round-to-even
+        # integers, values around the maximum): builds the input, concatenates it with its
+        # negation, casts to float8 and back to float32, and asserts equality with the float32
+        # simulation of the rounding.
+        # KNOWN ISSUE: for the e8m0 dtype it returns a skip decorator object instead of raising a
+        # skip, so the test just ends and counts as passed without checking anything.
         """Numerical test of float8 conversion, by performing a round-trip cast
         to the float8 dtype and back to float32, comparing against simulated
         lower precision."""
@@ -275,6 +305,12 @@ class TestFloat8Dtype(TestCase):
         self.assertEqual(x8_simulated, x8.float())
 
     def test_float8_e8m0fnu_rne_rounding(self, device):
+        # [FUNCTION DOC] Exhaustively checks float32 to e8m0 conversion: for all 256 biased
+        # exponents and all 8 guard/round/sticky patterns of the top mantissa bits, builds the
+        # float32, computes the expected result with the reference rounding helper (exponent 255
+        # stays, giving NaN), casts a one-element tensor on the device to e8m0 and back, and
+        # asserts it equals the expectation. Overflow from the largest finite exponent with guard
+        # set, and inf/NaN inputs, are expected to be NaN.
         """
         For every possible e8m0 exponent (256 options) and for every possible
         g, r, s bits of the float32 mantissa, verify that RNE rounding is
@@ -333,9 +369,16 @@ class TestFloat8Dtype(TestCase):
     @dtypes(*FLOAT8_DTYPES)
     @dtypesIfCUDA(*CUDA_FLOAT8_DTYPES)
     def test_special_numbers(self, dtype, device):
+        # [FUNCTION DOC] Iterates the table of special bit patterns for the dtype and, for each,
+        # checks via the nested helper that reinterpreting the byte as float8 gives the expected
+        # value (NaN, infinity, zeros, extreme normals and subnormals).
         """Test special numbers."""
 
         def compare_binary_with_decimal(binary, decimal, number_name, dtype, device):
+            # [FUNCTION DOC] HELPER: Parses the bit string as an integer, builds a uint8 tensor on
+            # the device and views it as the float8 dtype. If the name is nan, raises
+            # AssertionError unless the value is NaN; otherwise converts to float32 and asserts
+            # exact equality with the expected decimal value.
             bits_int = int(binary, 2)
             tensor_int = torch.tensor([bits_int], dtype=torch.uint8, device=device)
             tensor_fp8 = tensor_int.view(dtype)
@@ -357,6 +400,9 @@ class TestFloat8Dtype(TestCase):
     @dtypes(*FLOAT8_DTYPES)
     @dtypesIfCUDA(*CUDA_FLOAT8_DTYPES)
     def test_type_promotion_fails(self, dtype, device):
+        # [FUNCTION DOC] Adds a random float8 tensor to random tensors of float16, bfloat16,
+        # float32 and float64 and asserts each addition raises RuntimeError mentioning that
+        # promotion for float8 types is not supported.
         """Test that float8 is not promoted to higher precision Float Type."""
         for other_dtype in [
             torch.float16,
@@ -374,6 +420,9 @@ class TestFloat8Dtype(TestCase):
     @dtypes(*FLOAT8_DTYPES)
     @dtypesIfCUDA(*CUDA_FLOAT8_DTYPES)
     def test_empty(self, dtype, device):
+        # [FUNCTION DOC] Allocates an uninitialized float8 tensor with deterministic algorithms
+        # both enabled and disabled; a guard restores the previous setting afterward. Only checks
+        # that allocation succeeds.
         with DeterministicGuard(torch.are_deterministic_algorithms_enabled()):
             for use_deterministic in (True, False):
                 torch.use_deterministic_algorithms(use_deterministic)
@@ -382,16 +431,22 @@ class TestFloat8Dtype(TestCase):
     @dtypes(*FLOAT8_DTYPES)
     @dtypesIfCUDA(*CUDA_FLOAT8_DTYPES)
     def test_to_string(self, dtype, device):
+        # [FUNCTION DOC] Smoke test: allocates an empty float8 tensor and converts it to a string;
+        # passes if no error is raised.
         x = torch.empty(4, 4, device=device, dtype=dtype)
         str(x)
 
     @dtypes(*FLOAT8_DTYPES)
     def test_finfo(self, dtype, device):
+        # [FUNCTION DOC] Smoke test: queries the floating point info of the dtype; passes if no
+        # error is raised. Runs for all float8 dtypes on every device.
         torch.finfo(dtype)
 
     @dtypes(*FLOAT8_DTYPES)
     @dtypesIfCUDA(*CUDA_FLOAT8_DTYPES)
     def test_cat(self, dtype, device):
+        # [FUNCTION DOC] Smoke test: concatenates two empty float8 tensors; passes if no error is
+        # raised.
         x1 = torch.empty(4, 4, device=device, dtype=dtype)
         x2 = torch.empty(4, 4, device=device, dtype=dtype)
         torch.cat([x1, x2])
@@ -399,6 +454,8 @@ class TestFloat8Dtype(TestCase):
     @dtypes(*FLOAT8_DTYPES)
     @dtypesIfCUDA(*CUDA_FLOAT8_DTYPES)
     def test_save_load(self, dtype, device):
+        # [FUNCTION DOC] Views random bytes as float8, saves the tensor to a temporary file, loads
+        # it back and asserts exact equality (zero tolerances) with the original.
         x1 = torch.randint(0, 10, (4, 4), device=device, dtype=torch.uint8).view(dtype)
         with TemporaryFileName() as fname:
             torch.save(x1, fname)
@@ -407,8 +464,13 @@ class TestFloat8Dtype(TestCase):
 
 
 class TestFloat4Dtype(TestCase):
+    # [CLASS DOC] Device-generic tests for the packed float4 (e2m1, two values per byte) shell
+    # dtype, which supports only creation, printing, views, deepcopy, contiguous and save/load.
     # TODO(#146647): make the testing generic for shell dtypes
     def test_float4_e2m1fn_x2(self, device):
+        # [FUNCTION DOC] Creates a large empty float4 tensor, prints it, views it as uint8 and
+        # back, checks a deep copy compares equal, and calls contiguous on a column slice (which
+        # forces a copy). Each step must simply not raise.
         # can create a tensor of dtype float4
         x1 = torch.empty(4096, 4096, device=device, dtype=torch.float4_e2m1fn_x2)
 
@@ -429,6 +491,9 @@ class TestFloat4Dtype(TestCase):
         x1[:, 0:2048].contiguous()
 
     def test_f4_save_load(self, device):
+        # [FUNCTION DOC] Views random bytes as float4, saves and reloads through a temporary file,
+        # and asserts equality of the uint8 views, since the dtype does not support direct equality
+        # comparison.
         x1 = torch.randint(0, 10, (4, 4), device=device, dtype=torch.uint8).view(
             torch.float4_e2m1fn_x2
         )
@@ -447,6 +512,8 @@ instantiate_device_type_tests(TestFloat4Dtype, globals())
 
 
 class TestFloat8DtypeCPUOnly(TestCase):
+    # [CLASS DOC] CPU-only tests for float8 arithmetic and compilation; excluded from CUDA because
+    # there is no use case for unscaled float8 multiplication there.
     """
     Test of mul implementation
 
@@ -457,6 +524,10 @@ class TestFloat8DtypeCPUOnly(TestCase):
 
     @dtypes(*CUDA_FLOAT8_DTYPES)
     def test_mul(self, dtype):
+        # [FUNCTION DOC] Multiplies two random float8 tensors (cast from float32) and asserts the
+        # result equals the product of the float32 simulated roundings cast to float8.
+        # KNOWN ISSUE: for e8m0 it returns a skip decorator object rather than skipping, so the
+        # test passes vacuously.
         # TODO(#113663): remove arithmetic support from all float8 dtypes
         if dtype is torch.float8_e8m0fnu:
             return unittest.skip("arithmetic not supported for torch.float8_e8m0fnu")
@@ -474,6 +545,11 @@ class TestFloat8DtypeCPUOnly(TestCase):
     @unittest.skipIf(IS_WINDOWS, "torch.compile not supported on Windows yet")
     @dtypes(*CUDA_FLOAT8_DTYPES)
     def test_pt2_traceable_aot_eager(self, dtype):
+        # [FUNCTION DOC] Skipped on Windows. Compiles a function converting to float8 and back to
+        # float32 with the eager AOT backend and full graph, then runs it on a tensor requiring
+        # grad and backpropagates the sum, checking tracing and autograd do not fail.
+        # KNOWN ISSUE: for e8m0 it returns a skip decorator object rather than skipping, so the
+        # test passes vacuously.
         if dtype is torch.float8_e8m0fnu:
             return unittest.skip(
                 "PT2 support for torch.float8_e8m0fnu is not implemented yet"
@@ -481,6 +557,8 @@ class TestFloat8DtypeCPUOnly(TestCase):
 
         @torch.compile(backend="aot_eager", fullgraph=True)
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled function; casts the input to the captured float8
+            # dtype and back to float32 and returns the result.
             x = x.to(dtype)
             x = x.float()
             return x

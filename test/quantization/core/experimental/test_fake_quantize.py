@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Unit tests for the APoT fake quantization module and its autograd function:
+# qparams agreement with the observer, forward equal to quantize then dequantize, failure
+# when no qparams exist, and gradient checking of the backward pass.
 
 import torch
 import unittest
@@ -11,11 +14,16 @@ backward = fake_quantize_function.backward
 from torch.autograd import gradcheck
 
 class TestFakeQuantize(unittest.TestCase):
+    # [CLASS DOC] Test case for the APoT fake quantize module (b=4, k=2); each test builds its
+    # own observers and fake quantizers, no shared state.
     r""" Tests fake quantize calculate_qparams() method
          by comparing with result from observer calculate_qparams.
          Uses hard-coded values: alpha=1.0, b=4, k=2.
     """
     def test_fake_calc_qparams(self):
+        # [FUNCTION DOC] Sets min 0 and max 1 on the fake quantizer's observer and on a standalone
+        # observer, computes unsigned qparams from both, and asserts alpha, gamma, quantization
+        # levels and level indices match.
         apot_fake = APoTFakeQuantize(b=4, k=2)
         apot_fake.activation_post_process.min_val = torch.tensor([0.0])
         apot_fake.activation_post_process.max_val = torch.tensor([1.0])
@@ -40,6 +48,9 @@ class TestFakeQuantize(unittest.TestCase):
          and APoT observer with hard-coded values b=4, k=2
     """
     def test_forward(self):
+        # [FUNCTION DOC] Observes a random tensor (values up to 1000) to get unsigned qparams, runs
+        # an observing, fake-quant-enabled fake quantizer on a clone, and asserts the output is
+        # exactly equal to APoT quantization followed by dequantization of the input.
         # generate a tensor of size 20 with random values
         # between 0 -> 1000 to quantize -> dequantize
         X = 1000 * torch.rand(20)
@@ -64,6 +75,8 @@ class TestFakeQuantize(unittest.TestCase):
          throws error when qparams are None
     """
     def test_forward_exception(self):
+        # [FUNCTION DOC] With the observer disabled the qparams stay unset, so calling forward on a
+        # random tensor must raise; asserts some exception is raised.
         # generate a tensor of size 20 with random values
         # between 0 -> 1000 to quantize -> dequantize
         X = 1000 * torch.rand(20)
@@ -80,6 +93,8 @@ class TestFakeQuantize(unittest.TestCase):
          using torch.autograd.gradcheck function.
     """
     def test_backward(self):
+        # [FUNCTION DOC] Gets unsigned qparams from an observer fed double precision random input
+        # and runs gradient checking on the fake quantize function at absolute tolerance 1e-4.
         input = torch.randn(20, dtype=torch.double, requires_grad=True)
 
         observer = APoTObserver(b=4, k=2)

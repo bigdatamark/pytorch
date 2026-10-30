@@ -1,3 +1,10 @@
+# [MODULE DOC] Manual script (not a unit test) mirroring the PTQ script but for quantization
+# aware training: for each of six APoT/uniform qconfig variants (8 and 4 bit) it prepares a
+# copy of pretrained ResNet-18 with the config on Linear layers, trains it with the shared
+# training loop, then prints top-1/top-5 accuracy on the ImageNet validation loader.
+# Importing it executes everything and needs ImageNet at a fixed home-directory path.
+# KNOWN ISSUE: relies on names never imported here (nn, torch, prepare_fx, the qconfig
+# objects), so it raises NameError when run standalone.
 from torchvision.models.quantization.resnet import resnet18
 from torch.ao.quantization.experimental.quantization_helper import (
     evaluate,
@@ -26,6 +33,10 @@ model_to_quantize.eval()
 Prepare model QAT for specified qconfig for torch.nn.Linear
 """
 def prepare_qat_linear(qconfig):
+    # [FUNCTION DOC] Builds a qconfig mapping applying the given qconfig to Linear modules,
+    # prepares a deep copy of the global float_model with prepare_fx, trains it using the
+    # imported training loop on the global train loader, switches it to eval mode and returns
+    # it. Side effect: long-running training over several epochs.
     qconfig_dict = {"object_type": [(torch.nn.Linear, qconfig)]}  # noqa: F821
     prepared_model = prepare_fx(copy.deepcopy(float_model), qconfig_dict)  # fuse modules and insert observers  # noqa: F821
     training_loop(prepared_model, criterion, data_loader)

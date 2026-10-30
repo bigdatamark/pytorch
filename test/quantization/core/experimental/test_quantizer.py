@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Unit tests for the APoT quantize and dequantize functions: agreement with uniform
+# quantization when the base bitwidth is 1, hand-computed indices for 4 bits and base 2, quantize-
+# dequantize-quantize stability, output shape preservation, and the unimplemented alpha method of
+# the quantizer class.
 
 import torch
 from torch import quantize_per_tensor
@@ -9,6 +13,8 @@ import unittest
 import random
 
 class TestQuantizer(unittest.TestCase):
+    # [CLASS DOC] Test case for APoT quantization; the random tests draw tensor sizes and values
+    # from the standard random sources, with no shared state.
     r""" Tests quantize_APoT result on random 1-dim tensor
         and hardcoded values for b, k by comparing to uniform quantization
         (non-uniform quantization reduces to uniform for k = 1)
@@ -18,6 +24,10 @@ class TestQuantizer(unittest.TestCase):
         * k: 1
     """
     def test_quantize_APoT_rand_k1(self):
+        # [FUNCTION DOC] Quantizes a random float tensor (1 to 20 elements, up to 1000) with APoT
+        # at 8 bits and base bitwidth 1, using unsigned qparams from an observer, and with a
+        # uniform per-tensor quint8 quantization from a min-max observer. Asserts the integer
+        # values are exactly equal, since base 1 reduces to uniform quantization.
         # generate random size of tensor2quantize between 1 -> 20
         size = random.randint(1, 20)
 
@@ -59,6 +69,9 @@ class TestQuantizer(unittest.TestCase):
         * k: 2
     """
     def test_quantize_APoT_k2(self):
+        # [FUNCTION DOC] Quantizes a fixed six-element tensor with 4 bits and base bitwidth 2 and
+        # asserts the integers equal the hand-calculated level indices of the nearest quantization
+        # levels from the APoT paper example.
         r"""
         given b = 4, k = 2, alpha = 1.0, we know:
         (from APoT paper example: https://arxiv.org/pdf/1909.13144.pdf)
@@ -103,6 +116,9 @@ class TestQuantizer(unittest.TestCase):
         * k: 2
     """
     def test_dequantize_quantize_rand_b4(self):
+        # [FUNCTION DOC] With an observer for 4 bits and base 2, quantizes a random tensor with
+        # APoT, dequantizes the result, quantizes it again with the same qparams and asserts the
+        # integer values equal those of the first quantization.
         # make observer
         observer = APoTObserver(4, 2)
 
@@ -148,6 +164,9 @@ class TestQuantizer(unittest.TestCase):
         * k: 4
     """
     def test_dequantize_quantize_rand_b6(self):
+        # [FUNCTION DOC] Same round trip as the 4-bit test but with an observer for 12 bits and
+        # base bitwidth 4 (the method name says b6 but 12 bits are used). Asserts quantizing the
+        # dequantized values reproduces the first quantization.
         # make observer
         observer = APoTObserver(12, 4)
 
@@ -194,6 +213,9 @@ class TestQuantizer(unittest.TestCase):
          * k: 2
     """
     def test_dequantize_dim(self):
+        # [FUNCTION DOC] Quantizes a random 3-dimensional tensor with random sizes up to 20 per
+        # dimension (4 bits, base 2), dequantizes it and asserts the dequantized tensor has the
+        # same shape as the quantized tensor data.
         # make observer
         observer = APoTObserver(4, 2)
 
@@ -222,6 +244,8 @@ class TestQuantizer(unittest.TestCase):
         self.assertEqual(original_apot.data.size(), dequantize_result.size())
 
     def test_q_apot_alpha(self):
+        # [FUNCTION DOC] Asserts calling the quantizer class alpha method raises
+        # NotImplementedError; the test case itself is passed as the instance argument.
         with self.assertRaises(NotImplementedError):
             APoTQuantizer.q_apot_alpha(self)
 

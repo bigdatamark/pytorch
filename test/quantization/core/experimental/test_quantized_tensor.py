@@ -1,4 +1,6 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Unit test for the integer representation of an APoT quantized tensor, using the
+# observer to compute qparams and the APoT quantize function.
 
 import torch
 import unittest
@@ -6,10 +8,16 @@ from torch.ao.quantization.experimental.observer import APoTObserver
 from torch.ao.quantization.experimental.quantizer import quantize_APoT
 
 class TestQuantizedTensor(unittest.TestCase):
+    # [CLASS DOC] Test case holding one test of the integer representation method of an APoT
+    # quantized tensor; no state.
     r""" Tests int_repr on APoTQuantizer with random tensor2quantize
     and hard-coded values
     """
     def test_int_repr(self):
+        # [FUNCTION DOC] Observes a fixed six-element float tensor with 4 bits and base bitwidth 2,
+        # computes unsigned qparams, quantizes the tensor with APoT using those parameters, takes
+        # the integer representation as int32 and asserts it equals the hard-coded level indices of
+        # the nearest quantization levels.
         # generate tensor with random fp values
         tensor2quantize = torch.tensor([0, 0.0215, 0.1692, 0.385, 1, 0.0391])
 

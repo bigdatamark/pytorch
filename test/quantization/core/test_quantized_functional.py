@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Property-based (hypothesis) tests for the functional quantized API: relu on
+# quantized tensors, the quantized functional convolutions for 1d, 2d and 3d compared against
+# quantized outputs of the float convolutions, and grid sampling on quantized input. Running it
+# directly raises an error via the common helper that points to the main quantization test file.
 
 # Torch
 import torch
@@ -19,7 +23,14 @@ from torch.testing._internal.common_quantized import override_quantized_engine
 from torch.testing._internal.common_utils import raise_on_run_directly, IS_PPC
 
 class TestQuantizedFunctionalOps(QuantizationTestCase):
+    # [CLASS DOC] Quantization test case with functional operator tests. A shared helper runs a
+    # quantized convolution function and its float counterpart on generated inputs and compares
+    # integer outputs; the conv tests supply the hypothesis-generated parameters and per-dimension
+    # tuples.
     def test_relu_api(self):
+        # [FUNCTION DOC] Quantizes a range of values to unsigned 8-bit with a fixed scale and zero
+        # point, applies relu through the tensor function and through the functional module, and
+        # asserts the results are equal.
         X = torch.arange(-5, 5, dtype=torch.float)
         scale = 2.0
         zero_point = 1
@@ -34,6 +45,12 @@ class TestQuantizedFunctionalOps(QuantizationTestCase):
         stride, padding, dilation, X_scale, X_zero_point, W_scale, W_zero_point,
         Y_scale, Y_zero_point, use_bias, use_channelwise,
     ):
+        # [FUNCTION DOC] HELPER: Shared conv check. First calls the assume filter to discard
+        # generated cases where any spatial dimension would give a non-positive output size. Builds
+        # float and quantized inputs, weights and bias with the common test-input factory, computes
+        # the float convolution and quantizes it with the output scale and zero point, runs the
+        # quantized convolution with zeros padding mode, and asserts the integer outputs agree
+        # within one unit (decimal tolerance zero), which absorbs rounding-order differences.
         for i in range(len(kernel_size)):
             assume(input_feature_map_size[i] + 2 * padding[i]
                    >= dilation[i] * (kernel_size[i] - 1) + 1)
@@ -87,6 +104,11 @@ class TestQuantizedFunctionalOps(QuantizationTestCase):
         X_scale, X_zero_point, W_scale, W_zero_point, Y_scale, Y_zero_point,
         use_bias, use_channelwise, qengine,
     ):
+        # [FUNCTION DOC] Hypothesis-driven check of the quantized 1d convolution against the float
+        # one. Returns early (passes) if the chosen engine is unsupported, or for qnnpack on PPC;
+        # for qnnpack it forces channelwise quantization off. Wraps the scalar length, kernel,
+        # stride, padding and dilation into one-element tuples, and runs the shared helper under
+        # the selected quantized engine.
         # Tests the correctness of the conv1d function.
         if qengine not in torch.backends.quantized.supported_engines:
             return
@@ -139,6 +161,10 @@ class TestQuantizedFunctionalOps(QuantizationTestCase):
         X_scale, X_zero_point, W_scale, W_zero_point, Y_scale, Y_zero_point,
         use_bias, use_channelwise, qengine,
     ):
+        # [FUNCTION DOC] Hypothesis-driven check of the quantized 2d convolution. Returns early if
+        # the engine is unsupported or for qnnpack on PPC. Builds height-width tuples for size,
+        # kernel, stride and padding, repeats the dilation in both dimensions, and runs the shared
+        # helper under the engine. Channelwise quantization is left as generated, even for qnnpack.
         # Tests the correctness of the conv2d function.
 
         if qengine not in torch.backends.quantized.supported_engines:
@@ -196,6 +222,10 @@ class TestQuantizedFunctionalOps(QuantizationTestCase):
         X_zero_point, W_scale, W_zero_point, Y_scale, Y_zero_point, use_bias,
         use_channelwise, qengine,
     ):
+        # [FUNCTION DOC] Hypothesis-driven check of the quantized 3d convolution, restricted to the
+        # fbgemm engine (the only one supported). Returns early if that engine is unavailable.
+        # Builds depth-height-width tuples, repeats the dilation, and runs the shared helper under
+        # the engine.
         # Tests the correctness of the conv3d function.
         # Currently conv3d only supports FbGemm engine
 
@@ -227,6 +257,9 @@ class TestQuantizedFunctionalOps(QuantizationTestCase):
            scale=st.floats(.1, 2),
            zero_point=st.integers(0, 4))
     def test_grid_sample(self, N, C, H, H_out, W, W_out, scale, zero_point):
+        # [FUNCTION DOC] Hypothesis-driven check of grid sampling: quantizes a random input to
+        # unsigned 8-bit, samples it with a random grid, and compares the integer values to the
+        # quantized float grid sample of the unquantized input, allowing one unit difference.
         X = torch.rand(N, C, H, W)
         X_q = torch.quantize_per_tensor(X, scale=scale, zero_point=zero_point, dtype=torch.quint8)
         grid = torch.rand(N, H_out, W_out, 2)
