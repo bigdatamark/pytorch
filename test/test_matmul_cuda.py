@@ -1,4 +1,12 @@
 # Owner(s): ["module: linear algebra"]
+# [MODULE DOC] Tests for CUDA (and ROCm) matrix-multiply paths: cuBLAS/cuBLASLt addmm and
+# baddbmm accuracy against CPU, SM carveout handling, fp16 accumulation, grouped GEMM (eager,
+# compiled, cuBLASLt alignment and int64 stride cases, ROCm CK flag), the out_dtype overloads of
+# mm/bmm/addmm/baddbmm, and the CUTLASS mixed-dtype int8/int4 linear. Defines small context-
+# manager helpers, two test classes instantiated per device type with the CPU excluded, and a
+# main block that enables the default-dtype check and runs the tests. Import time: raises an
+# error if the default dtype is not float32, and records whether device 0 is an SM 8.x GPU when
+# CUDA is available.
 
 import contextlib
 import json
@@ -73,6 +81,10 @@ if torch.get_default_dtype() is not torch.float32:
     raise AssertionError("default dtype should be float32")
 
 def xfailIfSM100OrLaterNonRTXAndCondition(condition_fn):
+    # [FUNCTION DOC] HELPER: Builds a test decorator that marks a parametrized test as an
+    # expected failure only on SM100-or-later non-RTX (compute capability major not 12) GPUs and
+    # only when the supplied predicate, called with the test parameter mapping, returns true.
+    # Returns the decorator produced by decorateIf wrapping unittest.expectedFailure.
     """
     Conditionally xfail tests on SM100+ datacenter SKUs based on a condition function.
     The condition function receives the test parameters dict and returns True to xfail.
@@ -86,6 +98,9 @@ def xfailIfSM100OrLaterNonRTXAndCondition(condition_fn):
 
 @contextlib.contextmanager
 def rocm_group_gemm_ck_env(value):
+    # [FUNCTION DOC] HELPER: Context manager that sets the ROCM_ALLOW_GROUP_GEMM_CK environment
+    # variable to the given string for the body, or removes it when the value is None. The
+    # previous state (set or unset) is restored in a finally clause. Mutates os.environ.
     var = "ROCM_ALLOW_GROUP_GEMM_CK"
     old = os.environ.get(var, None)
     try:
@@ -103,6 +118,9 @@ def rocm_group_gemm_ck_env(value):
 
 @contextlib.contextmanager
 def prefer_cublaslt_grouped_gemm():
+    # [FUNCTION DOC] HELPER: Context manager that turns on the global
+    # prefer_cublaslt_grouped_gemm matmul backend flag for the body and restores the previous
+    # value in a finally clause.
     old = torch.backends.cuda.matmul.prefer_cublaslt_grouped_gemm
     try:
         torch.backends.cuda.matmul.prefer_cublaslt_grouped_gemm = True
@@ -113,6 +131,9 @@ def prefer_cublaslt_grouped_gemm():
 
 @contextlib.contextmanager
 def sm_carveout(value: int | None):
+    # [FUNCTION DOC] HELPER: Context manager that sets the experimental SM carveout (number of
+    # SMs withheld from matmul kernels) to the given integer or None through the private C
+    # binding. On exit it always resets the carveout to None, not to the previous value.
     torch._C._set_sm_carveout_experimental(value)
     try:
         yield
@@ -121,7 +142,14 @@ def sm_carveout(value: int | None):
 
 
 class TestMatmulCuda(InductorTestCase):
+    # [CLASS DOC] Inductor-based CUDA test case covering cuBLAS/cuBLASLt matmul behaviors,
+    # grouped GEMM and the out_dtype matmul overloads. setUp disables TF32 for matmul and
+    # tearDown restores the saved fp32 precision setting. Helper methods build grouped GEMM
+    # inputs and references; test methods are device-instantiated, and many are parametrized
+    # over backend, dtype and size.
     def setUp(self):
+        # [FUNCTION DOC] Saves the CUDA matmul fp32_precision setting in an attribute so it can
+        # be restored exactly, then turns off allow_tf32 so tests run with full fp32 matmul.
         super().setUp()
         # Snapshot fp32_precision (not allow_tf32) so the round-trip is exact:
         # writing allow_tf32 back can't always reproduce the original
@@ -130,11 +158,18 @@ class TestMatmulCuda(InductorTestCase):
         torch.backends.cuda.matmul.allow_tf32 = False
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the CUDA matmul fp32_precision setting saved by setUp, then
+        # calls the parent tearDown.
         torch.backends.cuda.matmul.fp32_precision = self._prev_cuda_matmul_fp32
         super().tearDown()
 
     @unittest.skipIf(not SM90OrLater, "sm89 kernel isn't opted into carveout yet")
     def test_legacy_cublas_honors_sm_carveout(self, device):
+        # [FUNCTION DOC] Checks that legacy cuBLAS matmul honors the SM carveout: skipped unless
+        # CUDA (not ROCm) on SM90. Profiles a large half precision mm under several carveout
+        # values and compares the summed kernel grid sizes from the exported chrome trace.
+        # Expects no carveout equals carveout zero, a half-SM carveout differs, and clearing
+        # returns the original size. Resets the carveout at start; uses a temporary trace file.
         if torch.version.cuda is None or not IS_SM90:
             raise unittest.SkipTest("cublasSetSmCountTarget requires CUDA and sm90")
 
@@ -146,6 +181,10 @@ class TestMatmulCuda(InductorTestCase):
         b = torch.empty(8192, 8192, device=device, dtype=dtype)
 
         def mm_grid_size(carveout_value: int | None) -> int:
+            # [FUNCTION DOC] HELPER: Runs one mm under the given carveout while profiling CUDA,
+            # exports the chrome trace to a temporary file, and returns the sum over kernel
+            # events of the product of grid dimensions. Asserts at least one kernel with a grid
+            # was seen.
             with sm_carveout(carveout_value), TemporaryFileName(mode="w+") as fname:
                 with profile(activities=[ProfilerActivity.CUDA]) as prof:
                     torch.mm(a, b)
@@ -177,6 +216,9 @@ class TestMatmulCuda(InductorTestCase):
 
     @unittest.skipIf(not SM90OrLater, "sm89 kernel isn't opted into carveout yet")
     def test_sm_carveout_invalid_value_throws(self, device):
+        # [FUNCTION DOC] Checks that an out-of-range SM carveout (equal to the SM count, above
+        # it, or negative) makes mm with the cuBLAS backend raise a RuntimeError whose message
+        # says the carveout must be between zero and a number. Skipped unless CUDA on SM90.
         if torch.version.cuda is None or not IS_SM90:
             raise unittest.SkipTest("cublasSetSmCountTarget requires CUDA and sm90")
         sm_count = torch.cuda.get_device_properties().multi_processor_count
@@ -219,6 +261,15 @@ class TestMatmulCuda(InductorTestCase):
         fp16_accumulate: bool = False,
         bias_shape_modifier: Callable | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Shared body for addmm accuracy tests. Uses sizes m=size+1,
+        # k=size, n=size+2, sets the bf16/fp16 reduced-precision-reduction flags to the given
+        # flag and fp16 accumulation to the given flag, builds random CPU inputs with a bias
+        # optionally reshaped by the modifier, divides inputs by 100 when accumulating in fp16,
+        # and computes a CPU reference (upcasting half types to float32 and casting back). Runs
+        # the same addmm on CUDA and asserts equality with the CPU result. The original flag
+        # values are restored only on success, not in a finally clause.
+        # KNOWN ISSUE: the three global matmul flags are restored only if the comparison passes;
+        # a failing assertion leaves them modified for later tests.
         #
         # Check for catastrophic cuBLAS inaccuracy by measuring the deviation between
         # results from the CUDA invocation of torch.addmm and the CPU invocation
@@ -286,6 +337,11 @@ class TestMatmulCuda(InductorTestCase):
     @dtypes(torch.cfloat, torch.cdouble)
     @parametrize("backend", ["cublas", "cublaslt"])
     def test_mm_with_mH_args(self, dtype, backend):
+        # [FUNCTION DOC] Regression test for matrix products with conjugate-transposed complex
+        # arguments (see the linked issue) on the cublas and cublaslt backends: checks that the
+        # product of a diagonal-filled matrix and its conjugate transpose sums to the expected
+        # value for both the matrix and its conjugate transpose, and that corrcoef matches the
+        # expected matrix.
         # Testing mm with mH-transformed arguments.
         # The root cause of:
         # https://github.com/pytorch/pytorch/issues/174382
@@ -313,6 +369,9 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("size", [100, 1000, 10000])
     @parametrize("backend", ["cublas", "cublaslt"])
     def test_cublas_addmm(self, size: int, dtype: torch.dtype, backend):
+        # [FUNCTION DOC] Runs the shared addmm accuracy check without reduced precision
+        # reductions for the selected backend, size and dtype. Skips on Navi with old ROCm
+        # hipblas for large fp16 sizes.
         with blas_library_context(backend):
             if (TEST_WITH_ROCM and backend == "cublas" and isRocmArchAnyOf(NAVI_ARCH) and
                     getRocmVersion() < (6, 4) and dtype == torch.float16 and size >= 10000):
@@ -327,6 +386,8 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("size", [100, 1000, 10000])
     @parametrize("backend", ["cublas", "cublaslt"])
     def test_cublas_addmm_reduced_precision(self, size: int, dtype: torch.dtype, backend):
+        # [FUNCTION DOC] Runs the shared addmm accuracy check with reduced precision reductions
+        # enabled for fp16 and bf16 on the selected backend, using looser tolerances.
         with blas_library_context(backend):
             self.cublas_addmm(size, dtype, True)
 
@@ -340,6 +401,9 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("size", [128])
     @parametrize("backend", ["cublas", "cublaslt"])
     def test_cublas_addmm_bias_shapes(self, size: int, dtype: torch.dtype, backend):
+        # [FUNCTION DOC] Runs the shared addmm accuracy check with three bias layouts: full 2D,
+        # a 2D single-row bias, and a 1D bias, to cover bias broadcasting on the selected
+        # backend.
         with blas_library_context(backend):
             # 2D bias
             self.cublas_addmm(size, dtype, bias_shape_modifier=lambda shape: shape)
@@ -359,6 +423,11 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("size", [32768])
     @parametrize("backend", ["cublaslt", "cublas"])
     def test_cublas_addmm_no_reduced_precision(self, small_size: int, size: int, dtype: torch.dtype, backend):
+        # [FUNCTION DOC] Checks that with fp16 reduced precision reduction disabled, addmm over
+        # a very long reduction dimension of values 65504 times plus and minus one does not
+        # overflow: the output sum must be exactly zero. Sets the backend, disables the flag,
+        # and restores the previous flag value afterward (not in a finally clause). Skipped on
+        # Navi ROCm.
         with blas_library_context(backend):
             torch.backends.cuda.preferred_blas_library(backend)
             orig_precision = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
@@ -377,6 +446,10 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("batched", [False, True])
     @parametrize("backend", ["cublas", "cublaslt"])
     def test_fp16_backward_preserves_subnormals_rocm(self, backend, batched):
+        # [FUNCTION DOC] ROCm MI200 regression test (issue 182952): backward of a matmul with
+        # fp16 weights and a gradient filled with a subnormal value must yield a weight gradient
+        # equal to M times that value rather than flushed to zero, for plain and batched cases
+        # on both backends.
         # Regression test for issue #182952. On ROCm, the hipBLASLt path for
         # at::Half had no equivalent of rocBLAS's fp16_alt_impl, so backward
         # fp16 GEMMs silently flushed subnormals to zero. The dispatcher now
@@ -413,11 +486,16 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("size", [100, 1000, 10000])
     @parametrize("backend", ["cublas", "cublaslt"])
     def test_cublas_addmm_reduced_precision_fp16_accumulate(self, size: int, dtype: torch.dtype, backend):
+        # [FUNCTION DOC] Runs the shared addmm accuracy check with fp16 accumulation enabled
+        # (reduced precision reductions off) for the selected backend, dtype and size.
         with blas_library_context(backend):
             self.cublas_addmm(size, dtype, False, True)
 
     @onlyCUDA
     def test_cublas_and_lt_reduced_precision_fp16_accumulate(self):
+        # [FUNCTION DOC] With fp16 accumulation enabled, compares CUDA linear (3D input with
+        # bias) and baddbmm results against CPU within loose tolerances, then restores the flag
+        # (not in a finally clause). Does not select a backend explicitly.
         orig_fp16_accumulate = torch.backends.cuda.matmul.allow_fp16_accumulation
         torch.backends.cuda.matmul.allow_fp16_accumulation = True
         x = torch.rand(32, 512, 512, device='cuda', dtype=torch.half)
@@ -439,6 +517,9 @@ class TestMatmulCuda(InductorTestCase):
     @toleranceOverride({torch.float16: xtol(atol=1e-3, rtol=3e-3)})
     @dtypes(torch.float16)
     def test_cublas_addmm_alignment(self, dtype):
+        # [FUNCTION DOC] Checks fp16 linear on CUDA with a 3D input and bias is correct when the
+        # input, weight or bias storage start at a misaligned offset, by comparing against
+        # matmul with the transposed weight plus bias.
         device = 'cuda'
         # perturb X, A, or B alignment
         for idx in range(3):
@@ -468,6 +549,10 @@ class TestMatmulCuda(InductorTestCase):
         name_fn=lambda batch_size, N, M, P: f"{batch_size}_{N}_{M}_{P}",
     )
     def test_cublas_baddbmm_large_input(self, device, batch_size, N, M, P, dtype):
+        # [FUNCTION DOC] Compares large CUDA linear and baddbmm results with CPU references
+        # (half types computed in float32 on CPU), including multiplication by an identity
+        # matrix when the dimensions are equal, and checks the linear result equals the first
+        # baddbmm batch. Uses looser tolerance on ROCm MI200 fp16. Skipped on Jetson.
         cpu_dtype = dtype
         if dtype == torch.float16 or dtype == torch.bfloat16:
             cpu_dtype = torch.float32
@@ -477,6 +562,8 @@ class TestMatmulCuda(InductorTestCase):
         A = torch.rand((N, P), device=device, dtype=dtype)
 
         def _convert_to_cpu(t):
+            # [FUNCTION DOC] HELPER: Moves a tensor to the CPU and to the CPU compute dtype
+            # chosen by the enclosing test (float32 for half types).
             return t.to(device='cpu', dtype=cpu_dtype)
         M1_cpu, M2_cpu, A_cpu = map(_convert_to_cpu, [M1, M2, A])
 
@@ -495,6 +582,8 @@ class TestMatmulCuda(InductorTestCase):
 
         # baddbmm
         def _expand_to_batch(t: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Returns a view of the tensor expanded with a new leading
+            # batch dimension of the enclosing test's batch size.
             return t.expand((batch_size, ) + t.size())
         alpha, beta = 1.0, 1.0
         M1, M2, A, M1_cpu, M2_cpu, A_cpu = map(_expand_to_batch, [M1, M2, A, M1_cpu, M2_cpu, A_cpu])
@@ -518,12 +607,19 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("shape", [2**i for i in range(5, 14)])
     @dtypes(torch.float, torch.half, torch.bfloat16)
     def test_cublas_deterministic(self, device, shape, dtype):
+        # [FUNCTION DOC] Checks matmul determinism: multiplies a square random matrix by itself
+        # repeatedly and requires bit-identical results (zero tolerance) across ten reruns, over
+        # sizes powers of two and three dtypes.
         inp = torch.randn(shape, shape, device=device, dtype=dtype)
         first = torch.matmul(inp, inp)
         for _ in range(10):
             self.assertEqual(first, torch.matmul(inp, inp), atol=0., rtol=0.)
 
     def grouped_mm_helper(self, alist, blist, gOlist, agradlist, bgradlist, outlist):
+        # [FUNCTION DOC] HELPER: For each group, recomputes the reference product of a and the
+        # transposed b with autograd, backpropagates the group's output gradient, asserts the
+        # grouped op's output equals it, and when a gradient is supplied asserts the grouped a
+        # and b gradients match the reference gradients.
         for a, b, gO, agrad, bgrad, out in zip(alist, blist, gOlist, agradlist, bgradlist, outlist):
             a = a.clone().detach().requires_grad_()
             b = b.clone().detach().requires_grad_()
@@ -541,6 +637,10 @@ class TestMatmulCuda(InductorTestCase):
     @unittest.skipIf(not SM100OrLater, "cuBLAS integration for batch invariance is only on Blackwell")
     @serialTest()
     def test_cublas_batch_invariance_blackwell(self, device, dtype, batched):
+        # [FUNCTION DOC] On Blackwell with the cublaslt backend and reduced precision reductions
+        # disabled, checks batch invariance: the first row (per batch) of a larger matmul equals
+        # the matmul of only that row, bit for bit. Covers plain and batched inputs, then
+        # restores the flags (not in a finally clause).
         orig_bf16 = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
         orig_fp16 = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (False, False)
@@ -573,6 +673,10 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("b_row_major", [False, True])
     @dtypes(torch.bfloat16, torch.float32, torch.float16)
     def test_grouped_gemm_2d_2d(self, strided, a_row_major, b_row_major, dtype):
+        # [FUNCTION DOC] Tests grouped_mm with a 2D left and 2D right operand split along the
+        # reduction dimension by an offsets tensor, over row/column major and strided layouts.
+        # Runs forward and backward, then checks each group's slice against the per-group
+        # reference via the helper.
         device = "cuda"
         m, n, k, n_groups = 16, 32, 64, 4
         if a_row_major:
@@ -610,6 +714,10 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("b_row_major", [False, True])
     @dtypes(torch.bfloat16, torch.float32, torch.float16)
     def test_grouped_gemm_2d_3d(self, strided, a_row_major, b_row_major, dtype):
+        # [FUNCTION DOC] Tests grouped_mm with a 2D left operand split by offsets and a 3D right
+        # operand, over layouts and strides, checking contiguity expectations. Runs once
+        # normally and once with an empty first group (forward only, no gradient checks),
+        # comparing per-group slices with the helper.
         device = "cuda"
         s_int = int(strided)
         m, n, k, n_groups = 16, 32, 64, 4
@@ -665,6 +773,9 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("b_row_major", [False, True])
     @dtypes(torch.bfloat16, torch.float32, torch.float16)
     def test_grouped_gemm_3d_3d(self, strided, a_row_major, b_row_major, dtype):
+        # [FUNCTION DOC] Tests grouped_mm with 3D operands and no offsets over row/column major
+        # and strided layouts, checking contiguity expectations, then forward and backward
+        # against per-group references via the helper.
         device = "cuda"
         s_int = int(strided)
         m, n, k, n_groups = 16, 32, 64, 4
@@ -698,6 +809,10 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("b_row_major", [False, True])
     @dtypes(torch.bfloat16, torch.float32, torch.float16)
     def test_grouped_gemm_3d_2d(self, strided, a_row_major, b_row_major, dtype):
+        # [FUNCTION DOC] Tests grouped_mm with a 3D left operand and a 2D right operand split by
+        # offsets along the output columns, over layouts and strides. Runs once normally and
+        # once with an empty first group (forward only), comparing per-group slices with the
+        # helper.
         device = "cuda"
         s_int = int(strided)
         m, n, k, n_groups = 16, 32, 64, 4
@@ -750,6 +865,11 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("b_row_major", [False, True])
     @parametrize("max_autotune", [False, True])
     def test_grouped_gemm_compiled(self, op, a_row_major, b_row_major, max_autotune):
+        # [FUNCTION DOC] Compares torch.compile of grouped_mm (optionally with max autotune
+        # restricted to the Triton backend) against eager for each of four operand-dimension
+        # combinations with unaligned sizes and strided inputs. On ROCm asserts the eager output
+        # is contiguous. On non-big GPUs with max autotune, expects an Inductor error about no
+        # valid choices instead.
         device = "cuda"
         dtype_AB = torch.bfloat16
         dtype_offset = torch.int32
@@ -869,6 +989,14 @@ class TestMatmulCuda(InductorTestCase):
             self.assertEqual(C, C_ref)
 
     def grouped_gemm_cublaslt_common(self, op, jagged_size, a_row_major, b_row_major, dtype):
+        # [FUNCTION DOC] HELPER: Builds grouped GEMM inputs for the given operand-dimension
+        # combination, with one jagged dimension of the given size (offsets multiples of eight
+        # except the last) or, for 3d/3d, the reduction dimension of that size, with padded
+        # strides per layout flags. Returns the left operand, the right operand transposed on
+        # its last two dims, the offsets tensor (None for 3d/3d), and a flag saying whether
+        # cuBLASLt alignment (16 bytes) is expected to be satisfied.
+        # KNOWN ISSUE: no else branch for an unknown op, so an invalid op value causes an
+        # unbound local variable error instead of a clear message.
         device = "cuda"
         element_size = dtype.itemsize
         align = 16 // element_size  # 8 for bf16
@@ -968,6 +1096,10 @@ class TestMatmulCuda(InductorTestCase):
         return A, B.transpose(-2, -1), offs, aligned
 
     def grouped_gemm_reference(self, A, B, offs):
+        # [FUNCTION DOC] HELPER: Computes the grouped matmul reference with per-group mm calls:
+        # for two 2D inputs stacks per-group products split along the reduction dim, for a 2D
+        # left concatenates rows, for a 2D right concatenates columns, otherwise stacks products
+        # of batched pairs. Offsets are the cumulative group ends.
         if A.dim() == 2 and B.dim() == 2:
             offs_cpu = offs.cpu()
             outputs = []
@@ -998,6 +1130,9 @@ class TestMatmulCuda(InductorTestCase):
         return torch.stack([torch.mm(a, b) for a, b in zip(A, B)])
 
     def grouped_gemm_cublaslt_alignment_error(self, op):
+        # [FUNCTION DOC] HELPER: Returns the expected cuBLASLt alignment error message text for
+        # the given operand-dimension combination (jagged K, M, N, or fixed K); raises an
+        # AssertionError for an unknown op.
         if op == "2d/2d":
             return "cublasLt grouped GEMM with jagged K not aligned to 16 bytes"
         if op == "2d/3d":
@@ -1017,6 +1152,10 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("b_row_major", [False, True])
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     def test_grouped_gemm_cublaslt_alignment(self, op, jagged_size, a_row_major, b_row_major, dtype):
+        # [FUNCTION DOC] Checks cuBLASLt grouped GEMM across layouts and jagged sizes 31 and 32:
+        # when the inputs are not expected to be aligned, expects a RuntimeError with the
+        # alignment message; otherwise compares the result against the per-group reference.
+        # Skipped on ROCm, old CUDA toolkits, and unsupported SM ranges.
         # Verify that cuBLASLt grouped GEMM succeeds with all expected combinations
         # Always succeeds if jagged_size * sizeof(dtype) is divisible by 16
         # Otherwise:
@@ -1046,7 +1185,12 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("dtype", [torch.float16, torch.bfloat16])
     @parametrize("mode", ["default", "reduce-overhead"])
     def test_grouped_gemm_cublaslt_compiled(self, op, jagged_size, a_row_major, b_row_major, dtype, mode):
+        # [FUNCTION DOC] Like the cuBLASLt alignment test but runs grouped GEMM through
+        # torch.compile with full graph and the default or reduce-overhead mode, comparing with
+        # the eager result; unaligned inputs only check for the alignment error in eager mode.
         def f_ref(A, B, offs):
+            # [FUNCTION DOC] HELPER: Eager wrapper that calls the private grouped matmul with
+            # the given operands and offsets and returns the result.
             return torch._grouped_mm(A, B, offs=offs)
 
         A, B, offs, aligned = self.grouped_gemm_cublaslt_common(op, jagged_size, a_row_major, b_row_major, dtype)
@@ -1063,6 +1207,9 @@ class TestMatmulCuda(InductorTestCase):
         self.assertEqual(C, C_ref)
 
     def test_grouped_gemm_doubly_non_contiguous(self):
+        # [FUNCTION DOC] Checks that a 2D left operand whose strides are both not one is
+        # rejected by the grouped matmul input validation with a RuntimeError mentioning invalid
+        # strides or sizes.
         # Verify that doubly-non-contiguous inputs (neither stride is 1)
         # are rejected by _grouped_mm_validate_inputs.
         device = "cuda"
@@ -1085,6 +1232,10 @@ class TestMatmulCuda(InductorTestCase):
     @unittest.skipIf(not SM90OrLater or SM120OrLater, "cublaslt grouped gemm requires SM 9.0-11.0")
     @parametrize("op", ["2d/2d", "2d/3d", "3d/3d"])
     def test_grouped_gemm_cublaslt_int64_indexing(self, op):
+        # [FUNCTION DOC] Checks the int64 indexing path of cuBLASLt grouped GEMM when a leading
+        # dimension exceeds the 32-bit limit, using as_strided views over a tiny storage with
+        # one row or column so little memory is touched. Compares against a contiguous mm
+        # reference for each op combination; raises an AssertionError for an unknown op.
         # Verify that the int64 indexing path works correctly when a
         # leading dimension (stride) exceeds INT32_MAX. Uses as_strided
         # with M=1 or N=1 so only a small amount of storage is needed
@@ -1147,17 +1298,30 @@ class TestMatmulCuda(InductorTestCase):
     @skipCUDAIfNotRocm
     # Fails with triton 3.7
     def test_grouped_gemm_rocm_ck_flag(self):
+        # [FUNCTION DOC] ROCm-only check of the ROCM_ALLOW_GROUP_GEMM_CK flag: with the variable
+        # unset the profiled grouped GEMM kernel names include the hipBLASLt kernel, and with it
+        # set to one the kernel names include the CK split-K kernel for both equal-K and
+        # unequal-K cases.
+        # KNOWN ISSUE: the two CK hint strings are identical, so the equal-K and unequal-K
+        # checks cannot distinguish the two kernels.
         CK_EQUAL_K_HINT = "kernel_grouped_gemm_xdl_splitk"
         CK_UNEQUAL_K_HINT = "kernel_grouped_gemm_xdl_splitk"
         HIPBLASLT_HINT = "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs"
 
         def has_ck_kernel(kernels: set[str], hint: str) -> bool:
+            # [FUNCTION DOC] HELPER: Returns true if any kernel name in the set contains the
+            # given hint substring.
             return any(hint in k for k in kernels)
 
         def uses_hipblaslt(kernels: set[str]) -> bool:
+            # [FUNCTION DOC] HELPER: Returns true if any kernel name in the set contains the
+            # hipBLASLt kernel hint constant.
             return any(HIPBLASLT_HINT in k for k in kernels)
 
         def run_grouped_mm(equal_k: bool):
+            # [FUNCTION DOC] HELPER: Runs a bf16 grouped GEMM on CUDA: with equal_k a 3D by 3D
+            # case with identical K per group, otherwise a 2D by 2D case with unequal group
+            # sizes given by offsets. Returns the output.
             device = "cuda"
             dtype = torch.bfloat16
             if equal_k:
@@ -1176,6 +1340,8 @@ class TestMatmulCuda(InductorTestCase):
             return F.grouped_mm(a, b.transpose(-2, -1), offs=offs, out_dtype=dtype)
 
         def collect_kernel_names(equal_k: bool):
+            # [FUNCTION DOC] HELPER: Profiles CPU and CUDA activity around one grouped GEMM run
+            # and returns the set of event keys (kernel and op names) from the averaged profile.
             kernels = set()
             with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -1204,6 +1370,11 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("batch_size", [None, 1, 16])
     @parametrize("backend", ["cublas", "cublaslt"])
     def test_mm_bmm_dtype_overload(self, input_dtype, M, N, K, batch_size, backend):
+        # [FUNCTION DOC] Checks the out_dtype overloads of mm and bmm (batched when batch_size
+        # is set) across input dtypes, shapes and backends: output dtype must match the request
+        # and values must match a float32 or native baseline within tolerance. On platforms
+        # without bf16 support, requesting float32 output for bf16 input must raise a
+        # RuntimeError. Skips certain ROCm shapes with a known accuracy regression.
         if torch.version.hip and (
             _get_torch_rocm_version() < (7, 2, 1) or isRocmArchAnyOf(MI200_ARCH)
         ):
@@ -1221,6 +1392,8 @@ class TestMatmulCuda(InductorTestCase):
         dtype = input_dtype
         with blas_library_context(backend):
             def create_inputs(B=None):
+            # [FUNCTION DOC] HELPER: Creates random CUDA operands a and b for the enclosing
+            # shapes, batched when the batch argument is not None, and returns them.
                 if B is None:
                     a = torch.randn(M, K, device=device, dtype=dtype)
                     b = torch.randn(K, N, device=device, dtype=dtype)
@@ -1273,6 +1446,11 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("high_precision_self", [False, True])
     @parametrize("backend", ["cublas", "cublaslt"])
     def test_addmm_baddmm_dtype_overload(self, input_dtype, M, N, K, batch_size, broadcast_self, high_precision_self, backend):
+        # [FUNCTION DOC] Checks the out_dtype overloads of addmm and baddbmm, including
+        # broadcast self and high precision self, plus the out= variant filled initially with
+        # NaN: output dtypes must match the request and values must match baselines and the out=
+        # result within tolerance. On platforms without bf16 support expects a RuntimeError for
+        # float32 output. Skips known bad ROCm shapes.
         if torch.version.hip and (
             _get_torch_rocm_version() < (7, 2, 1) or isRocmArchAnyOf(MI200_ARCH)
         ):
@@ -1290,6 +1468,9 @@ class TestMatmulCuda(InductorTestCase):
         dtype = input_dtype
         with blas_library_context(backend):
             def create_inputs(B, broadcast_self):
+            # [FUNCTION DOC] HELPER: Creates random CUDA operands a, b and a self tensor c (full
+            # shape or broadcast one-dimensional, depending on the flag), batched when B is not
+            # None, and returns all three.
                 if B is None:
                     a = torch.randn(M, K, device=device, dtype=dtype)
                     b = torch.randn(K, N, device=device, dtype=dtype)
@@ -1356,6 +1537,9 @@ class TestMatmulCuda(InductorTestCase):
     @parametrize("batch_size", [1, 32])
     @parametrize("backend", ["cublas", "cublaslt"])
     def test_fp16_accum_and_fp32_out_failure(self, batch_size, backend):
+        # [FUNCTION DOC] Checks that enabling fp16 accumulation together with a float32
+        # out_dtype makes baddbmm, addmm, bmm and mm each raise an exception, on the selected
+        # backend. Restores the accumulation flag afterward, but not in a finally clause.
         M, N, K = 32, 32, 32
         device = "cuda"
         dtype = torch.float16
@@ -1366,12 +1550,16 @@ class TestMatmulCuda(InductorTestCase):
             torch.backends.cuda.matmul.allow_fp16_accumulation = True
 
             def create_inputs():
+            # [FUNCTION DOC] HELPER: Creates random fp16 CUDA matrices a, b and c for the
+            # enclosing sizes and returns them.
                 a = torch.randn(M, K, device=device, dtype=dtype)
                 b = torch.randn(K, N, device=device, dtype=dtype)
                 c = torch.randn(M, N, device=device, dtype=dtype)
                 return a, b, c
 
             def expand(tensor):
+            # [FUNCTION DOC] HELPER: Returns the tensor with a new leading dimension expanded to
+            # the enclosing batch size.
                 return tensor.unsqueeze(0).expand(batch_size, *tensor.shape)
 
             a, b, c = create_inputs()
@@ -1393,14 +1581,23 @@ class TestMatmulCuda(InductorTestCase):
     @onlyCUDA
     @parametrize("ops", [("mm", torch.mm), ("bmm", torch.bmm), ("addmm", torch.addmm), ("baddbmm", torch.baddbmm)])
     def test_input_dimension_checking_out_dtype(self, ops):
+        # [FUNCTION DOC] Checks that mm, bmm, addmm and baddbmm with out_dtype float32 raise a
+        # RuntimeError with the expected messages for a mismatched inner dimension, an extra
+        # dimension on the second operand, and (for batched ops) a mismatched batch size.
+        # KNOWN ISSUE: for the non-addmm ops the extra-dimension case passes the bias tensor c
+        # as the first operand instead of the matrix a; this still triggers the expected error
+        # but looks unintended.
         op_name, op = ops
         B = 2
         M, N, K = 32, 32, 32
 
         def is_addmm():
+            # [FUNCTION DOC] HELPER: Returns true if the op name under test contains the add
+            # prefix, meaning a self argument is expected.
             return "add" in op_name
 
         def is_batched():
+            # [FUNCTION DOC] HELPER: Returns true if the op name under test is a batched op.
             return "bmm" in op_name
 
         if is_batched():
@@ -1448,8 +1645,14 @@ class TestMatmulCuda(InductorTestCase):
 @unittest.skipIf(IS_WINDOWS, "Windows doesn't support CUTLASS extensions")
 @unittest.skipIf(not _IS_SM8X, "mixed dtypes linear only supported on SM 8.x")
 class TestMixedDtypesLinearCuda(TestCase):
+    # [CLASS DOC] CUTLASS mixed-dtype linear tests for SM 8.x GPUs (skipped on ROCm, Windows and
+    # other architectures): int8 or packed int4 weights with half or bfloat16 activations. The
+    # class holds a single test that sweeps shapes, bias and activation options.
     @dtypes(torch.float16, torch.bfloat16)
     def test_mixed_dtypes_linear(self, dtype: torch.dtype, device: str = "cuda"):
+        # [FUNCTION DOC] Sweeps batch shapes, matrix sizes, weight dtypes (int8, packed int4),
+        # bias presence and activation (none, relu, silu) and runs the nested checker for each
+        # combination, with a looser relative tolerance for bfloat16.
         def run_test(
             batch_shape,
             m,
@@ -1463,6 +1666,11 @@ class TestMixedDtypesLinearCuda(TestCase):
             rtol,
             atol,
         ):
+            # [FUNCTION DOC] HELPER: For one configuration builds a random activation, int8
+            # weights, scale and optional bias, then compares the mixed-dtypes linear op against
+            # a float32 reference twice: first plain multiplication with the transposed
+            # unreordered weight, then the full linear with bias and optional activation.
+            # Returns immediately for the unsupported combination of no bias with an activation.
             if not add_bias and activation != "none":
                 return
 
