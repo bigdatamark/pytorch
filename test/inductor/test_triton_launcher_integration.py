@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests that the kernel-saving step of the Triton autotuner takes kernel name, warp
+# count and shared memory size from the launch metadata schema when present, and falls back to
+# plain metadata attributes otherwise. A mock-based unit test class always runs; an end-to-end
+# AOTInductor class runs only when a CUDA GPU is available. Import time work: probes for CUDA
+# and records the result in a module flag.
 """Tests for save_gpu_kernel() Level 0 schema integration (diff 3/N).
 
 Validates that save_gpu_kernel reads metadata from launch_metadata_schema
@@ -21,6 +26,10 @@ def _make_mock_launcher(
     shared=0,
     launch_metadata_schema=None,
 ):
+    # [FUNCTION DOC] HELPER: Builds a mock launcher whose compiled binary object carries the
+    # given kernel name, warp count, shared memory size and launch metadata schema (default
+    # none). The launcher also gets fixed argument name lists and no scratch buffers; the binary
+    # has dummy cubin and ptx assembly. Returns the mock; no side effects.
     """Create a mock launcher with bin (CompiledKernel)."""
     launcher = MagicMock()
     launcher.config = MagicMock()
@@ -43,6 +52,9 @@ def _make_mock_launcher(
 
 
 def _make_mock_autotuner(kernel_name="test_kernel"):
+    # [FUNCTION DOC] HELPER: Builds a mock autotuner object standing in for the caching
+    # autotuner, with inductor metadata holding the given kernel name, a small Triton signature
+    # mapping and a device properties mock of type cuda. Returns the mock.
     """Create a mock CachingAutotuner (self) for save_gpu_kernel."""
     autotuner = MagicMock()
     autotuner.inductor_meta = {"kernel_name": kernel_name}
@@ -53,9 +65,17 @@ def _make_mock_autotuner(kernel_name="test_kernel"):
 
 
 class SaveGpuKernelSchemaTest(TestCase):
+    # [CLASS DOC] Unit tests for the kernel-saving method of the caching autotuner, checking
+    # whether launcher parameters come from the schema (when the compiled binary exposes one) or
+    # from legacy metadata attributes. All collaborators are mocks, so no GPU is needed.
     """Unit tests for save_gpu_kernel() reading from Level 0 schema."""
 
     def _call_save_gpu_kernel(self, launcher, kernel_name="test_kernel"):
+        # [FUNCTION DOC] HELPER: Runs the kernel-saving method on a mock autotuner and the given
+        # launcher, with the kernel parameter cache setter and the config conversion function
+        # patched out (the latter returns a fixed block size mapping). Asserts the cache setter
+        # was called exactly once and returns the parameter mapping that was passed as its
+        # second positional argument.
         """Call save_gpu_kernel with mocks and return the params passed to cache."""
         from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
@@ -77,6 +97,9 @@ class SaveGpuKernelSchemaTest(TestCase):
         return params
 
     def test_schema_path_reads_entry_name(self):
+        # [FUNCTION DOC] With a schema holding entry name, warp count and shared memory that
+        # differ from the binary metadata name, checks the saved mangled name equals the schema
+        # entry name.
         """When schema exists, mangled_name should come from schema['entry_name']."""
         schema = {
             "abi_version": 1,
@@ -92,6 +115,8 @@ class SaveGpuKernelSchemaTest(TestCase):
         self.assertEqual(params["mangled_name"], "schema_kernel_name")
 
     def test_schema_path_reads_num_warps(self):
+        # [FUNCTION DOC] With a schema giving sixteen warps while the binary metadata says four,
+        # checks the saved warp count is the schema value.
         """When schema exists, num_warps should come from schema."""
         schema = {
             "abi_version": 1,
@@ -107,6 +132,8 @@ class SaveGpuKernelSchemaTest(TestCase):
         self.assertEqual(params["num_warps"], 16)
 
     def test_schema_path_reads_shared_mem(self):
+        # [FUNCTION DOC] With a schema giving a large shared memory size while the binary
+        # reports zero, checks the saved shared memory size is the schema value.
         """When schema exists, shared_mem should come from schema."""
         schema = {
             "abi_version": 1,
@@ -122,6 +149,8 @@ class SaveGpuKernelSchemaTest(TestCase):
         self.assertEqual(params["shared_mem"], 49152)
 
     def test_fallback_when_no_schema(self):
+        # [FUNCTION DOC] With no schema, checks the saved mangled name, warp count and shared
+        # memory size equal the values from the binary metadata, i.e. the fallback path is used.
         """Without schema, should use hasattr probing (metadata.name, etc.)."""
         launcher = _make_mock_launcher(
             metadata_name="fallback_name",
@@ -151,9 +180,17 @@ except (ImportError, AttributeError):
 
 @unittest.skipUnless(_HAS_GPU, "requires CUDA GPU")
 class SaveGpuKernelAOTIE2ETest(TestCase):
+    # [CLASS DOC] End-to-end tests, skipped without a CUDA GPU, that compile small models
+    # through the AOTInductor export, compile, package and load pipeline and check results and
+    # use of the schema path.
     """E2E tests for 3/N: verify AOTI pipeline uses save_gpu_kernel schema path."""
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the base setUp, then works around the CUDA home path being cached
+        # as unset at import time: if neither CUDA_HOME nor CUDA_PATH is in the environment,
+        # tries to take the SDK home from an fbcode-only Triton build module (ignoring import
+        # failure), and if the cpp_extension module-level CUDA home is still unset, sets it from
+        # the environment variable. Mutates os.environ and that module attribute.
         super().setUp()
         # Fix a known module-loading-order issue (see D74745573):
         # torch.utils.cpp_extension.CUDA_HOME is evaluated at import time.
@@ -177,6 +214,9 @@ class SaveGpuKernelAOTIE2ETest(TestCase):
             torch.utils.cpp_extension.CUDA_HOME = os.environ.get("CUDA_HOME")
 
     def test_aoti_pipeline_correctness(self):
+        # [FUNCTION DOC] Exports a simple two-input addition model on CUDA, compiles and
+        # packages it with AOTInductor, loads the package, runs it and asserts the result is
+        # close to the eager output. Resets dynamo state first.
         """Full AOTI pipeline (export → compile → load → run) should produce correct results."""
         import torch._dynamo
         import torch._inductor
@@ -185,7 +225,9 @@ class SaveGpuKernelAOTIE2ETest(TestCase):
         torch._dynamo.reset()
 
         class AddModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Tiny module computing the sum of its two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the elementwise sum of the two inputs.
                 return x + y
 
         model = AddModel().to("cuda")
@@ -200,6 +242,12 @@ class SaveGpuKernelAOTIE2ETest(TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_aoti_schema_populated(self):
+        # [FUNCTION DOC] Compiles a multiply-add model through AOTInductor while temporarily
+        # replacing the autotuner kernel-saving method with a wrapper that records that it was
+        # called and, if the launcher binary has a schema, its key names, then delegates to the
+        # original. Asserts the result matches eager, that the method was called, and, only if a
+        # schema was seen, that it has entry name, num warps and shared memory keys. The
+        # original method is restored in a finally block.
         """AOTI compilation should call save_gpu_kernel with a populated schema."""
         import torch._dynamo
         import torch._inductor
@@ -212,6 +260,10 @@ class SaveGpuKernelAOTIE2ETest(TestCase):
         schema_info = {"called": False, "schema_used": False, "schema_keys": None}
 
         def patched_save_gpu_kernel(self, stream, launcher):
+            # [FUNCTION DOC] HELPER: Replacement for the kernel-saving method: reads the
+            # optional schema from the launcher binary, records in the enclosing info mapping
+            # whether it was called and the schema keys, and returns the result of the original
+            # method called with the same arguments.
             schema = getattr(launcher.bin, "launch_metadata_schema", None)
             schema_info["called"] = True
             if schema is not None:
@@ -223,7 +275,11 @@ class SaveGpuKernelAOTIE2ETest(TestCase):
         try:
 
             class MulAddModel(torch.nn.Module):
+                # [CLASS DOC] HELPER: Tiny module computing the product of the first two inputs
+                # plus the third.
                 def forward(self, x, y, z):
+                    # [FUNCTION DOC] HELPER: Returns the elementwise product of the first two
+                    # inputs plus the third.
                     return x * y + z
 
             model = MulAddModel().to("cuda")
