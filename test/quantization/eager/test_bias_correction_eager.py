@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Eager-mode tests for bias correction of quantized models
+# (torch.ao.quantization._correct_bias). Artificial bias is injected into a quantized copy of a
+# float model, then corrected using calibration data and compared to the float bias. Not meant
+# to be run directly; the entry point raises and points to test_quantization.
 
 import copy
 
@@ -22,12 +26,27 @@ from torch.testing._internal.common_utils import raise_on_run_directly
 
 
 class TestBiasCorrectionEager(QuantizationTestCase):
+    # [CLASS DOC] Test case for eager-mode bias correction. The helper methods build and check
+    # models; the two FBGEMM-gated tests run it on a chain of linear layers and a chain of conv
+    # layers wrapped in QuantWrapper. Holds no state of its own.
     def compute_sqnr(self, x, y):
+        # [FUNCTION DOC] HELPER: Returns the signal-to-quantization-noise ratio in decibels as a
+        # tensor: twenty times the base-10 log of the norm of x over the norm of the difference
+        # x - y.
         Ps = torch.norm(x)
         Pn = torch.norm(x - y)
         return 20 * torch.log10(Ps / Pn)
 
     def correct_artificial_bias_quantize(self, float_model, img_data):
+        # [FUNCTION DOC] HELPER: Core check shared by the tests. Deep-copies float_model,
+        # prepares it with the default qconfig, feeds the first element of every item in
+        # img_data through it, and converts it to a quantized model. Then triples the bias of
+        # each quantized module whose type is in _supported_modules (via set_weight_bias,
+        # keeping the weight) when it has a bias, and runs bias_correction against float_model
+        # with the quantized target modules. Afterwards every ns.Shadow submodule is replaced in
+        # its parent by its orig_module, and for each quantized module the bias must have SQNR
+        # above 30 dB versus the float model bias, otherwise an assertion fails. Mutates only
+        # the copy.
         """Adding artificial bias and testing if bias persists after bias
         correction. This test case changes the bias of a quantized submodule
         """
@@ -73,14 +92,21 @@ class TestBiasCorrectionEager(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_linear_chain(self):
+        # [FUNCTION DOC] Runs the bias correction check on a QuantWrapper around three chained
+        # linear layers (3->4->5->6), with fifty batches of random float inputs of shape 10x3.
+        # Skipped when FBGEMM is unavailable.
         class LinearChain(nn.Module):
+            # [CLASS DOC] HELPER: Three sequential linear layers (3->4, 4->5, 5->6).
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the three linear layers linear1, linear2,
+                # linear3.
                 super().__init__()
                 self.linear1 = nn.Linear(3, 4)
                 self.linear2 = nn.Linear(4, 5)
                 self.linear3 = nn.Linear(5, 6)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the three linear layers in order; returns it.
                 x = self.linear1(x)
                 x = self.linear2(x)
                 x = self.linear3(x)
@@ -98,14 +124,22 @@ class TestBiasCorrectionEager(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_conv_chain(self):
+        # [FUNCTION DOC] Runs the bias correction check on a QuantWrapper around three chained
+        # 2D convolutions (kernel 5, stride 5), with fifty batches of random float inputs of
+        # shape 10x3x125x125. Skipped when FBGEMM is unavailable.
         class ConvChain(nn.Module):
+            # [CLASS DOC] HELPER: Small module of three sequential 2D convolutions with channels
+            # 3->4, 4->5, 5->6, each with kernel size 5 and stride 5.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the convolution layers conv2d1, conv2d2,
+                # conv2d3.
                 super().__init__()
                 self.conv2d1 = nn.Conv2d(3, 4, 5, 5)
                 self.conv2d2 = nn.Conv2d(4, 5, 5, 5)
                 self.conv2d3 = nn.Conv2d(5, 6, 5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the three convolutions in order and returns it.
                 x = self.conv2d1(x)
                 x = self.conv2d2(x)
                 x = self.conv2d3(x)

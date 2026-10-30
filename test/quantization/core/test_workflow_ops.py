@@ -1,5 +1,12 @@
 # Owner(s): ["oncall: quantization"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for the fake-quantize operators and modules: per-tensor and per-channel
+# forward and backward, learnable-qparam variants, half precision and overflow behavior,
+# cachemask dtype handling, FakeQuantize module state, numerical agreement with quantize and
+# dequantize, and the fused moving-average observer plus fake-quant operator. Also holds pure-
+# Python reference implementations (forward, gradients, running min and max, scale and zero
+# point) used as oracles. Calls the hypothesis deadline-disabling helper at import time. Running
+# the file directly raises a RuntimeError pointing at the test_quantization entry point.
 
 import torch
 import math
@@ -35,6 +42,9 @@ from torch.testing._internal.common_utils import TestCase, skipIfTorchDynamo
 # Reference method for fake quantize
 # Note: because scale/zero_point are left as float in the actual kernel, this mimics how fake_quant works for float16/64
 def _fake_quantize_per_tensor_affine_reference(X, scale, zero_point, quant_min, quant_max):
+    # [FUNCTION DOC] HELPER: Reference per-tensor fake quantize: scales to float32, adds zero
+    # point, rounds, clamps to the quant range, subtracts zero point, multiplies by scale, and
+    # casts back to the input dtype (mimics the kernel keeping scale and zero point as float).
     dtype = X.dtype
     res = ((torch.clamp(torch.round(X.to(torch.float32) * (1.0 / scale) + zero_point), quant_min, quant_max) - zero_point) * scale)
     return res.to(dtype)
@@ -42,6 +52,9 @@ def _fake_quantize_per_tensor_affine_reference(X, scale, zero_point, quant_min, 
 # Reference method for the gradient of the fake quantize operator
 # Note: because scale/zero_point are left as float in the actual kernel, this mimics how fake_quant works for float16/64
 def _fake_quantize_per_tensor_affine_grad_reference(dY, X, scale, zero_point, quant_min, quant_max):
+    # [FUNCTION DOC] HELPER: Reference gradient of per-tensor fake quantize: passes the incoming
+    # gradient through where the rounded quantized value lies within the quant range and zeros
+    # it elsewhere; result is cast to the input dtype.
     dtype = X.dtype
     Xq = torch.round(X.to(torch.float32) * (1.0 / scale) + zero_point)
     mask = (Xq >= quant_min) * (Xq <= quant_max)
@@ -51,6 +64,13 @@ def _fake_quantize_per_tensor_affine_grad_reference(dY, X, scale, zero_point, qu
 
 # Reference method for the gradients of the fake quantize operator
 def _fake_quantize_learnable_per_tensor_affine_grad_reference(dY, X, scale, zero_point, quant_min, quant_max, device, dtype):
+    # [FUNCTION DOC] HELPER: Reference gradients for the learnable per-tensor op. Rounds the
+    # zero point (add half, clamp, to int, single-element only), classifies each element as
+    # below, above or inside the range, and builds scale gradient (range offsets or normalized
+    # quantization error) and zero point gradient (negative scale where saturated, zero
+    # otherwise). Returns the input gradient (from the plain reference), and the scale and zero
+    # point gradients each summed against dY to shape one. For bfloat16 it computes in float32
+    # and downcasts the results.
     r"""This method references the following literatures for back propagation on scale and zero point.
     - https://arxiv.org/pdf/1902.08153.pdf
     - https://arxiv.org/pdf/1903.08066.pdf
@@ -104,11 +124,18 @@ def _fake_quantize_learnable_per_tensor_affine_grad_reference(dY, X, scale, zero
 
 # Reference method for quantization.
 def _quantize_per_tensor(x, scale, zero_point, quant_min, quant_max):
+    # [FUNCTION DOC] HELPER: Reference quantization: divides by scale, adds zero point, rounds
+    # and clamps to the quant range. Returns the integer-valued float tensor.
     return ((x / scale) + zero_point).round().clamp(quant_min, quant_max)
 
 # Reference method for the per channel gradients of the learnable fake quantize operator
 def _fake_quantize_learnable_per_channel_affine_grad_reference(
         dY, X, per_channel_scale, per_channel_zero_point, axis, quant_min, quant_max, device, dtype):
+    # [FUNCTION DOC] HELPER: Reference gradients for the learnable per-channel op. Returns the
+    # input gradient from the per-channel plain reference plus per-channel scale and zero point
+    # gradient tensors, computed by looping over slices along the channel axis with the same
+    # range classification as the per-tensor version. Zero points are rounded and clamped first;
+    # bfloat16 inputs are computed in float32 and the results downcast.
     r"""This method references the following literatures for back propagation on scale and zero point.
     - https://arxiv.org/pdf/1902.08153.pdf
     - https://arxiv.org/pdf/1903.08066.pdf
@@ -185,6 +212,10 @@ def _get_tensor_min_max(
         running_max: float | torch.Tensor = float("-inf"),
         averaging_const: float = 0.01,
         dtype: torch.dtype = torch.float32) -> tuple[float, float]:
+    # [FUNCTION DOC] HELPER: Computes the new running min and max after observing X: current
+    # tensor min and max in the given dtype, blended toward them with the averaging constant
+    # when the running value is not infinite, otherwise taken as is. Returns both as Python
+    # floats.
     min_val_tensor = X.min().to(dtype=dtype)
     max_val_tensor = X.max().to(dtype=dtype)
     averaging_const_tensor = torch.tensor(averaging_const, dtype=dtype).item()
@@ -207,6 +238,10 @@ def _get_per_row_min_max(
         max_vals: torch.Tensor,
         axis: int = 0,
         averaging_const: float = 0.01) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Per-row (per-channel) version of the running min and max update:
+    # moves the channel axis to the front, flattens the rest, takes the per-row min and max, and
+    # returns them directly when the given running values are infinite, else the moving average
+    # update with the averaging constant. Returns tensors.
     x_dim = x.size()
     new_axis_list = [i for i in range(len(x_dim))]  # noqa: C416
     new_axis_list[axis] = 0
@@ -229,6 +264,13 @@ def _get_scale_zp(
         dtype: torch.dtype,
         reduce_range: bool = False,
         preserve_sparsity: bool = False) -> tuple[float, int]:
+    # [FUNCTION DOC] HELPER: Reference scale and zero point computation from a min and max for
+    # qint8 or unsigned types, optionally reduced range and optionally making the range
+    # symmetric about zero when preserve_sparsity is set. Range is extended to include zero,
+    # scale is range over quant span (default 0.1 if zero or not invertible), and the zero point
+    # is nudged to the quant range and rounded. Returns the scale and the integer zero point.
+    # KNOWN ISSUE: the zero point assigned in the degenerate scale branch is never used, since
+    # the zero point is recomputed afterwards from the scale.
     """
     Calculate the quantization parameters (scale, zero_point)
     based on the min and max element of the tensor
@@ -286,10 +328,16 @@ NP_RANDOM_SEED = 19
 tolerance = 1e-6
 
 class TestFakeQuantizeOps(TestCase):
+    # [CLASS DOC] Tests for the fake-quantize operators and FakeQuantize modules. Stateless;
+    # helper methods named with an underscore prefix hold shared bodies that the cpu and cuda
+    # variants call.
     @given(device=st.sampled_from(['cpu', 'cuda'] if torch.cuda.is_available() else ['cpu']),
            X=hu.tensor(shapes=hu.array_shapes(1, 5,),
                        qparams=hu.qparams(dtypes=torch.quint8)))
     def test_forward_per_tensor(self, device, X):
+        # [FUNCTION DOC] Property test of the per-tensor forward: compares
+        # torch.fake_quantize_per_tensor_affine with the Python reference on random tensors and
+        # qparams, within tolerance.
         r"""Tests the forward path of the FakeQuantizePerTensorAffine op.
         """
         np.random.seed(NP_RANDOM_SEED)
@@ -308,6 +356,8 @@ class TestFakeQuantizeOps(TestCase):
                        qparams=hu.qparams(dtypes=torch.quint8)))
     @unittest.skip("temporarily disable the test")
     def test_backward_per_tensor(self, device, X):
+        # [FUNCTION DOC] Property test of the per-tensor backward comparing the autograd
+        # gradient with the reference gradient. Currently skipped with an unittest skip.
         r"""Tests the backward method.
         """
         np.random.seed(NP_RANDOM_SEED)
@@ -327,6 +377,8 @@ class TestFakeQuantizeOps(TestCase):
         np.testing.assert_allclose(dX.cpu(), X.grad.cpu().detach().numpy(), rtol=tolerance, atol=tolerance)
 
     def test_forward_backward_per_tensor_with_amp(self):
+        # [FUNCTION DOC] Prepares a conv model for QAT with the fbgemm qconfig and runs forward
+        # and backward inside autocast, checking the weight receives a gradient.
         net = nn.Sequential(nn.Conv2d(1, 1, 3))
         net.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm')
         net_prep = torch.ao.quantization.prepare_qat(net)
@@ -338,6 +390,9 @@ class TestFakeQuantizeOps(TestCase):
             self.assertTrue(net_prep[0].weight.grad is not None)
 
     def test_forward_per_tensor_half_precision_numerics(self):
+        # [FUNCTION DOC] Compares the float16 per-tensor fake quantize op with the reference for
+        # twenty random inputs, then for a value that overflows half range and a value that
+        # underflows with a large scale.
         scale = .1
         zero = 0
         maxi = 255
@@ -364,6 +419,10 @@ class TestFakeQuantizeOps(TestCase):
         self.assertEqual(Y3, Y3r, rtol=tolerance, atol=tolerance)
 
     def _test_forward_per_tensor_cachemask_impl(self, device):
+        # [FUNCTION DOC] HELPER: Shared body: for float dtypes, quantized dtypes, a contiguous
+        # and a strided input, and tensor or Python-number qparams, obtains qparams from a
+        # MinMaxObserver on a shrunken input so some values clip, then compares the op with the
+        # reference and checks the output keeps the input float dtype.
         float_types = (torch.float32, torch.float16, torch.float64, torch.bfloat16)
         torch_types = (torch.qint8, torch.quint8)
         Xs = (torch.randn(4, 8, device=device), torch.randn(4, 16, device=device)[:, ::2])
@@ -386,15 +445,22 @@ class TestFakeQuantizeOps(TestCase):
             self.assertTrue(Y_test.dtype == float_type)
 
     def test_forward_per_tensor_cachemask_cpu(self):
+        # [FUNCTION DOC] Runs the per-tensor cachemask forward check on cpu.
         device = torch.device('cpu')
         self._test_forward_per_tensor_cachemask_impl(device)
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is not available.")
     def test_forward_per_tensor_cachemask_cuda(self):
+        # [FUNCTION DOC] Runs the per-tensor cachemask forward check on cuda; skipped without
+        # CUDA.
         device = torch.device('cuda')
         self._test_forward_per_tensor_cachemask_impl(device)
 
     def _test_backward_per_tensor_cachemask_impl(self, device):
+        # [FUNCTION DOC] HELPER: Shared body: for float dtypes, quantized dtypes and tensor or
+        # Python qparams, checks forward output against the reference, backpropagates a random
+        # gradient, and checks the input gradient equals the reference gradient and has the
+        # input's float dtype.
         float_types = (torch.float32, torch.float16, torch.float64)
         torch_types = (torch.qint8, torch.quint8)
         tensor_qparams = (True, False)
@@ -426,15 +492,21 @@ class TestFakeQuantizeOps(TestCase):
             self.assertTrue(X.grad.dtype == float_type)
 
     def test_backward_per_tensor_cachemask_cpu(self):
+        # [FUNCTION DOC] Runs the per-tensor cachemask backward check on cpu.
         device = torch.device('cpu')
         self._test_backward_per_tensor_cachemask_impl(device)
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is not available.")
     def test_backward_per_tensor_cachemask_cuda(self):
+        # [FUNCTION DOC] Runs the per-tensor cachemask backward check on cuda; skipped without
+        # CUDA.
         device = torch.device('cuda')
         self._test_backward_per_tensor_cachemask_impl(device)
 
     def _test_learnable_forward_per_tensor(self, X, device, scale_base, zero_point_base):
+        # [FUNCTION DOC] HELPER: Shared body: for 4-bit and 8-bit ranges and three grad factors,
+        # checks the learnable per-tensor op forward output matches the plain reference with the
+        # zero point clamped to the range.
         X_base = torch.tensor(X).to(device)
 
         for n_bits in (4, 8):
@@ -462,6 +534,8 @@ class TestFakeQuantizeOps(TestCase):
         "this is broken without changes to any relevant code, "
         "we need to remove hypothesis testing in CI")
     def test_learnable_forward_per_tensor_cpu(self, X):
+        # [FUNCTION DOC] Property test of the learnable per-tensor forward on cpu with random
+        # scale and zero point. Currently skipped as broken.
         X, (_, _, _) = X
         scale_base = torch.normal(mean=0, std=1, size=(1,)).clamp(1e-4, 100)
         zero_point_base = torch.normal(mean=0, std=128, size=(1,))
@@ -473,6 +547,8 @@ class TestFakeQuantizeOps(TestCase):
                        qparams=hu.qparams(dtypes=torch.quint8)))
     @unittest.skipIf(not TEST_CUDA, "No gpu is not available.")
     def test_learnable_forward_per_tensor_cuda(self, X):
+        # [FUNCTION DOC] Property test of the learnable per-tensor forward on cuda; skipped
+        # without CUDA.
         X, (_, _, _) = X
         scale_base = torch.normal(mean=0, std=1, size=(1,)).clamp(1e-4, 100)
         zero_point_base = torch.normal(mean=0, std=128, size=(1,))
@@ -480,6 +556,10 @@ class TestFakeQuantizeOps(TestCase):
             X, 'cuda', scale_base, zero_point_base)
 
     def _test_learnable_backward_per_tensor(self, X, device, scale_base, zero_point_base, dtype=torch.float32):
+        # [FUNCTION DOC] HELPER: Shared body: for 4-bit and 8-bit ranges and three grad factors,
+        # runs the learnable per-tensor op with gradient-requiring input, scale and zero point,
+        # backpropagates a random gradient, and checks the three gradients against the reference
+        # (scale and zero point gradients scaled by the grad factor), then clears the gradients.
         r"""Tests the backward method with additional backprop support for scale and zero point.
         """
         X_base = torch.tensor(X).to(device)
@@ -530,6 +610,8 @@ class TestFakeQuantizeOps(TestCase):
                        elements=hu.floats(-1e3, 1e3, allow_nan=False, allow_infinity=False),
                        qparams=hu.qparams(dtypes=torch.quint8)))
     def test_learnable_backward_per_tensor_cpu(self, X):
+        # [FUNCTION DOC] Property test of the learnable per-tensor backward on cpu with a fixed
+        # seed and random scale and zero point.
         torch.random.manual_seed(NP_RANDOM_SEED)
         X, (_, _, _) = X
         scale_base = torch.normal(mean=0, std=1, size=(1,)).clamp(1e-4, 100)
@@ -539,6 +621,8 @@ class TestFakeQuantizeOps(TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is not available.")
     def test_learnable_backward_per_tensor_cuda(self):
+        # [FUNCTION DOC] CUDA only: with a fixed seed, runs the learnable per-tensor backward
+        # check for bfloat16 and float32 on a small tensor.
         # setting seed to avoid increasing tolerance due to cases where
         # difference in Python vs CPP downcasting causes tensor mismatches
         # e.g. 27.87704 vs  27.8408 before downcasting, 27.7500 vs 27.8750 after downcasting for Python vs CPP op
@@ -557,6 +641,9 @@ class TestFakeQuantizeOps(TestCase):
                        qparams=hu.qparams(dtypes=[torch.quint8])),
            )
     def test_fq_module_per_tensor(self, device, X):
+        # [FUNCTION DOC] Property test: runs the default FakeQuantize module forward and
+        # backward on random input and compares output and input gradient with the references
+        # using the module's scale and zero point.
         np.random.seed(NP_RANDOM_SEED)
         X, (scale, zero_point, torch_type) = X
         quant_min = torch.iinfo(torch_type).min
@@ -583,6 +670,9 @@ class TestFakeQuantizeOps(TestCase):
            X=hu.tensor(shapes=hu.array_shapes(1, 5,),
                        qparams=hu.qparams(dtypes=torch.quint8)))
     def test_fixed_qparams_fq_module(self, device, X):
+        # [FUNCTION DOC] Property test: a fixed-qparams fake quant module (range zero to one)
+        # keeps its scale and zero point unchanged even with the observer enabled and data
+        # passed through.
         X, (scale, zero_point, torch_type) = X
         X = to_tensor(X, device)
         fq_module = default_fixed_qparams_range_0to1_fake_quant()
@@ -596,6 +686,9 @@ class TestFakeQuantizeOps(TestCase):
         self.assertEqual(fixed_zero_point, fq_module.zero_point)
 
     def test_fq_serializable_per_tensor(self):
+        # [FUNCTION DOC] For FakeQuantize and the learnable variant, runs one input, checks the
+        # state dict scale and zero point against known values, saves and reloads it
+        # (weights_only on and off) into a new module, and checks state and qparams are equal.
         observer = default_observer
         quant_min = 0
         quant_max = 127
@@ -619,6 +712,10 @@ class TestFakeQuantizeOps(TestCase):
                 self.assertEqual(loaded_fq_module.calculate_qparams(), fq_module.calculate_qparams())
 
     def test_fake_quant_control(self):
+        # [FUNCTION DOC] For a default FakeQuantize and a learnable one, checks that disabling
+        # fake quant makes the output equal the input, that with the observer disabled scale and
+        # zero point stay fixed while the output differs, and that re-enabling the observer
+        # changes them.
         for fq_module in [torch.ao.quantization.default_fake_quant(),
                           _LearnableFakeQuantize.with_args(observer=MovingAverageMinMaxObserver, quant_min=0,
                                                            quant_max=255,
@@ -666,12 +763,17 @@ class TestFakeQuantizeOps(TestCase):
             self.assertNotEqual(fq_module.zero_point, zero_point)
 
     def test_fake_quant_preserves_qparam_shapes_for_activations(self):
+        # [FUNCTION DOC] Prepares a linear model for QAT and checks that scale and zero point
+        # shapes of the activation fake quant are the same before and after a forward pass.
         class Model(nn.Module):
+        # [CLASS DOC] HELPER: Model with a single linear layer.
             def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = nn.Linear(4, 4)
 
             def forward(self, x):
+            # [FUNCTION DOC] HELPER: Applies the linear layer.
                 x = self.linear(x)
                 return x
 
@@ -695,6 +797,11 @@ class TestFakeQuantizeOps(TestCase):
             msg="FakeQuant zero_point shape must stay consistent")
 
     def fake_quant_scriptable(self):
+        # [FUNCTION DOC] Intended to check that FakeQuantize and the learnable variant can be
+        # scripted with TorchScript, give the same qparams as eager after a forward, and survive
+        # save and load.
+        # KNOWN ISSUE: the name does not start with the test prefix, so the test runner never
+        # collects or runs this method.
         observer = default_observer
         quant_min = 0
         quant_max = 255
@@ -719,6 +826,8 @@ class TestFakeQuantizeOps(TestCase):
            X=hu.per_channel_tensor(shapes=hu.array_shapes(1, 5,),
            qparams=hu.qparams(dtypes=torch.quint8)))
     def test_forward_per_channel(self, device, X):
+        # [FUNCTION DOC] Property test of the per-channel forward: compares the per-channel op
+        # with the Python reference with random qparams and axis.
         r"""Tests the forward path of the FakeQuantizePerTensorAffine op.
         """
         np.random.seed(NP_RANDOM_SEED)
@@ -735,6 +844,11 @@ class TestFakeQuantizeOps(TestCase):
         np.testing.assert_allclose(Y, Y_prime.cpu(), rtol=tolerance, atol=tolerance)
 
     def _test_forward_per_channel_cachemask_impl(self, device):
+        # [FUNCTION DOC] HELPER: Shared body: for quantized dtypes, float dtypes and zero point
+        # dtypes, gets per-channel qparams from an observer on a shrunken input, compares the op
+        # with the reference, and checks the dtype.
+        # KNOWN ISSUE: the dtype assertion is applied to the reference output, not the op
+        # output.
         torch_types = (torch.qint8, torch.quint8)
         float_types = (torch.float32, torch.float16, torch.float64, torch.bfloat16)
         zero_point_types = (torch.int, torch.float32, torch.float16)
@@ -758,13 +872,18 @@ class TestFakeQuantizeOps(TestCase):
             self.assertTrue(Y.dtype == float_type)
 
     def test_forward_per_channel_cachemask_cpu(self):
+        # [FUNCTION DOC] Runs the per-channel cachemask forward check on cpu.
         self._test_forward_per_channel_cachemask_impl('cpu')
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is not available.")
     def test_forward_per_channel_cachemask_cuda(self):
+        # [FUNCTION DOC] Runs the per-channel cachemask forward check on cuda; skipped without
+        # CUDA.
         self._test_forward_per_channel_cachemask_impl('cuda')
 
     def test_forward_per_channel_half_precision_numerics(self):
+        # [FUNCTION DOC] Compares the float16 per-channel op with the reference over random
+        # inputs, a forced overflow value and a forced underflow value.
         scale = torch.randn(5).abs()
         zero = torch.randn(5).to(dtype=torch.int)
         axis = 1
@@ -796,6 +915,9 @@ class TestFakeQuantizeOps(TestCase):
     @given(X=hu.per_channel_tensor(shapes=hu.array_shapes(1, 5,),
            qparams=hu.qparams(dtypes=torch.quint8)))
     def test_fake_quant_per_channel_qparam_range(self, X):
+        # [FUNCTION DOC] Property test: with a zero point below the quant range, the per-channel
+        # op must raise RuntimeError for integer zero points, while float zero points (float32
+        # and float16) outside the range are accepted and match the reference.
         X, (scale, zero_point, axis, torch_type) = X
         quant_min = torch.iinfo(torch_type).min
         quant_max = torch.iinfo(torch_type).max
@@ -820,6 +942,9 @@ class TestFakeQuantizeOps(TestCase):
                 np.testing.assert_allclose(Y.cpu().numpy(), Y_ref.cpu().numpy(), rtol=tolerance, atol=tolerance)
 
     def _test_learnable_forward_per_channel(self, X_base, device, scale_base, zero_point_base, axis):
+        # [FUNCTION DOC] HELPER: Shared body: for 4-bit and 8-bit ranges and three grad factors,
+        # checks the learnable per-channel forward output equals the reference with rounded,
+        # clamped zero points.
         r"""Tests the forward path of the learnable FakeQuantizePerTensorAffine op.
         """
         for n_bits in (4, 8):
@@ -844,6 +969,8 @@ class TestFakeQuantizeOps(TestCase):
     @given(X=hu.per_channel_tensor(shapes=hu.array_shapes(1, 5,),
                                    qparams=hu.qparams(dtypes=torch.quint8)))
     def test_learnable_forward_per_channel_cpu(self, X):
+        # [FUNCTION DOC] Property test of the learnable per-channel forward on cpu with random
+        # scale and zero point per channel.
         torch.random.manual_seed(NP_RANDOM_SEED)
         X, (_, _, axis, _) = X
         X_base = torch.tensor(X).to('cpu')
@@ -855,6 +982,8 @@ class TestFakeQuantizeOps(TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is not available.")
     def test_learnable_forward_per_channel_cuda(self):
+        # [FUNCTION DOC] CUDA only: runs the learnable per-channel forward check for float32 and
+        # bfloat16.
         torch.random.manual_seed(NP_RANDOM_SEED)
         shape = (2, 1, 2, 10)
         axis = 1
@@ -875,6 +1004,8 @@ class TestFakeQuantizeOps(TestCase):
         "this is broken without changes to any relevant code, "
         "we need to remove hypothesis testing in CI")
     def test_backward_per_channel(self, device, X):
+        # [FUNCTION DOC] Property test of the per-channel backward over zero point dtypes
+        # comparing the gradient with the reference. Currently skipped as broken.
         r"""Tests the backward method.
         """
         np.random.seed(NP_RANDOM_SEED)
@@ -897,6 +1028,10 @@ class TestFakeQuantizeOps(TestCase):
             np.testing.assert_allclose(dX.cpu().detach().numpy(), X.grad.cpu().detach().numpy(), rtol=tolerance, atol=tolerance)
 
     def _test_backward_per_channel_cachemask_impl(self, device):
+        # [FUNCTION DOC] HELPER: Shared body: for quantized dtypes, float dtypes and zero point
+        # dtypes, backpropagates a random gradient through the per-channel op and checks the
+        # input gradient equals the reference and has the input's float dtype (raises
+        # AssertionError otherwise).
         torch_types = (torch.qint8, torch.quint8)
         float_types = (torch.float32, torch.float16, torch.float64)
         zero_point_types = (torch.int, torch.float32, torch.float16)
@@ -927,13 +1062,20 @@ class TestFakeQuantizeOps(TestCase):
 
 
     def test_backward_per_channel_cachemask_cpu(self):
+        # [FUNCTION DOC] Runs the per-channel cachemask backward check on cpu.
         self._test_backward_per_channel_cachemask_impl('cpu')
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is not available.")
     def test_backward_per_channel_cachemask_cuda(self):
+        # [FUNCTION DOC] Runs the per-channel cachemask backward check on cuda; skipped without
+        # CUDA.
         self._test_backward_per_channel_cachemask_impl('cuda')
 
     def _test_learnable_backward_per_channel(self, X_base, device, scale_base, zero_point_base, axis, dtype=torch.float32):
+        # [FUNCTION DOC] HELPER: Shared body: for 4-bit and 8-bit ranges and three grad factors,
+        # backpropagates through the learnable per-channel op and compares input, scale and zero
+        # point gradients to the reference with a looser tolerance for bfloat16, then clears the
+        # gradients.
         r"""Tests the backward path of the learnable FakeQuantizePerTensorAffine op.
         """
         for n_bits in (4, 8):
@@ -989,6 +1131,8 @@ class TestFakeQuantizeOps(TestCase):
         "this is broken without changes to any relevant code, "
         "we need to remove hypothesis testing in CI")
     def test_learnable_backward_per_channel_cpu(self, X):
+        # [FUNCTION DOC] Property test of the learnable per-channel backward on cpu. Currently
+        # skipped as broken.
         torch.random.manual_seed(NP_RANDOM_SEED)
         X, (_, _, axis, _) = X
         X_base = torch.tensor(X).to('cpu')
@@ -1000,6 +1144,8 @@ class TestFakeQuantizeOps(TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is not available.")
     def test_learnable_backward_per_channel_cuda(self):
+        # [FUNCTION DOC] CUDA only: runs the learnable per-channel backward check on a small
+        # tensor for bfloat16 and float32.
         torch.random.manual_seed(NP_RANDOM_SEED)
 
         x_shape = (2, 1)
@@ -1015,12 +1161,17 @@ class TestFakeQuantizeOps(TestCase):
             )
 
     def test_numerical_consistency_per_tensor(self):
+        # [FUNCTION DOC] Runs the numerical consistency check in per-tensor mode.
         self._test_numerical_consistency('per_tensor')
 
     def test_numerical_consistency_per_channel(self):
+        # [FUNCTION DOC] Runs the numerical consistency check in per-channel mode.
         self._test_numerical_consistency('per_channel')
 
     def _test_numerical_consistency(self, test_type):
+        # [FUNCTION DOC] HELPER: Shared body: twenty times, for quantized dtypes, float dtypes,
+        # devices and zero point dtypes (integer only for per-tensor), compares quantize then
+        # dequantize (done on cpu) against the fake quantize op. Fails if neither mode ran.
         r"""Comparing numerical consistency between quantize/dequantize op and the fake quantize op across devices and dtypes
         """
         torch.random.manual_seed(NP_RANDOM_SEED)
@@ -1062,6 +1213,8 @@ class TestFakeQuantizeOps(TestCase):
 
     @skipIfTorchDynamo("Not a suitable test for TorchDynamo")
     def test_fake_quantize_per_channel_affine_scale_dtypes(self):
+        # [FUNCTION DOC] Checks the per-channel op raises RuntimeError for scale dtypes other
+        # than float32 and works for float32. Skipped under Dynamo.
         """
         Ensure the error message is more helpful
         """
@@ -1087,6 +1240,9 @@ class TestFakeQuantizeOps(TestCase):
     @given(dtype=st.sampled_from([torch.float, torch.float64, torch.half, torch.bfloat16]),
            device=st.sampled_from(['cpu', 'cuda'] if torch.cuda.is_available() else ['cpu']))
     def test_fake_quantize_per_tensor_affine_inf(self, dtype, device) -> None:
+        # [FUNCTION DOC] Property test (regression for an infinity input issue): the per-tensor
+        # op on a tensor holding infinity for several float dtypes must equal the clamped
+        # reference value. Skipped under Dynamo.
         # https://github.com/pytorch/pytorch/issues/154328
         input_tensor = torch.tensor([torch.inf], dtype=dtype).to(device)
         scale = 0.01
@@ -1100,11 +1256,18 @@ class TestFakeQuantizeOps(TestCase):
 
 
 class TestFusedObsFakeQuant(TestCase):
+    # [CLASS DOC] Tests for the fused moving-average observer plus fake-quant operator, forward
+    # and backward.
     @given(device=st.sampled_from(['cpu', 'cuda'] if torch.cuda.is_available() else ['cpu']),
            sampled_dtype=st.sampled_from(['bf16', 'fp16', 'fp32']),
            symmetric_quant=st.booleans(), use_bool=st.booleans())
     @settings(deadline=None)
     def test_fused_obs_fake_quant_moving_avg(self, device, sampled_dtype, symmetric_quant, use_bool) -> None:
+        # [FUNCTION DOC] Property test: over ten iterations calls the fused operator with
+        # observer enabled after the third and fake quant after the fifth, using boolean or
+        # integer flags and optional symmetric quantization, and compares output, running min
+        # and max, scale and zero point with the Python references. Then checks an empty input
+        # gives an empty output of the right shape. Dtype is forced to float32 on cpu.
         """
         Tests the case where we call the fused_obs_fake_quant op multiple times
         and update the running_min and max of the activation tensors.
@@ -1200,6 +1363,11 @@ class TestFusedObsFakeQuant(TestCase):
            symmetric_quant=st.booleans(), use_bool=st.booleans())
     @settings(deadline=None)
     def test_fused_obs_fake_quant_moving_avg_per_channel(self, device, symmetric_quant, use_bool) -> None:
+        # [FUNCTION DOC] Property test: same flow as the per-tensor moving-average test but in
+        # per-channel mode over two input shapes, comparing with the per-row references and per-
+        # channel scale and zero point.
+        # KNOWN ISSUE: the inner loop over channels reuses the outer iteration variable name; it
+        # is harmless because the outer loop reassigns it, but is confusing.
         """
         Tests the case where we call the fused_obs_fake_quant op multiple times
         and update the running_min and max of the activation tensors.
@@ -1272,6 +1440,9 @@ class TestFusedObsFakeQuant(TestCase):
     @given(device=st.sampled_from(['cpu', 'cuda'] if torch.cuda.is_available() else ['cpu']),)
     @settings(deadline=None)
     def test_fused_obs_fake_quant_backward_op(self, device) -> None:
+        # [FUNCTION DOC] Property test: with observer and fake quant enabled, the fused op
+        # output equals the plain per-tensor fake quantize using qparams from the reference, and
+        # the input gradient equals the reference gradient with float32 dtype.
         n = m = k = 10
         input_shape = (m, n)
         output_shape = (m, n)
@@ -1323,6 +1494,9 @@ class TestFusedObsFakeQuant(TestCase):
     @given(device=st.sampled_from(['cpu', 'cuda'] if torch.cuda.is_available() else ['cpu']),)
     @settings(deadline=None)
     def test_fused_backward_op_fake_quant_off(self, device) -> None:
+        # [FUNCTION DOC] Property test: with observer and fake quant both off, the fused op
+        # passes the input through unchanged and the gradient equals the reference fake quantize
+        # gradient.
         n = m = 4
         input_shape = (m, n)
         output_shape = (m, n)
