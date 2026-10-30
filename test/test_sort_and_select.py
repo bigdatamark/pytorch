@@ -1,4 +1,7 @@
 # Owner(s): ["module: tests"]
+# [MODULE DOC] Tests for sorting and selection ops: sort, argsort, msort, topk, kthvalue,
+# unique, unique_consecutive and isin. Defines CPU-only, all-device and CUDA-only test classes,
+# each instantiated per device at import time.
 
 import random
 from itertools import permutations, product
@@ -33,7 +36,10 @@ from torch.testing._internal.common_utils import (
 
 
 class TestSortAndSelectCPU(TestCase):
+    # [CLASS DOC] CPU-only checks for sort behavior (unsupported complex dtype).
     def test_complex_unsupported_cpu(self, device):
+        # [FUNCTION DOC] Checks sort on a complex tensor raises a runtime error saying complex
+        # dtypes are unsupported on CPU.
         x = torch.tensor([3.0 + 2j, 4.0 + 3j], device=device)
         with self.assertRaisesRegex(
             RuntimeError, " Sort does not support complex dtypes on CPU"
@@ -42,7 +48,10 @@ class TestSortAndSelectCPU(TestCase):
 
 
 class TestSortAndSelect(TestCase):
+    # [CLASS DOC] Device-independent regression tests (no device argument) for sort and topk.
     def test_sort_stable_none(self):
+        # [FUNCTION DOC] Regression check: sort with stable set to None must not trigger an
+        # assertion and must return the ones tensor unchanged.
         # Called sort with stable=None used to trigger an assertion
         # See https://github.com/pytorch/pytorch/issues/117255
         x = torch.ones(10)
@@ -50,6 +59,7 @@ class TestSortAndSelect(TestCase):
         self.assertTrue(torch.all(y == torch.ones(10)).item())
 
     def test_topk_quantized_scalar_input(self):
+        # [FUNCTION DOC] Regression check: topk on a quantized 0-d tensor must not crash.
         # Calling topk on a quantized scalar input used to segfault,
         # see https://github.com/pytorch/pytorch/issues/116324
         x = torch.quantize_per_tensor(torch.randn(()), 0.1, 10, torch.qint8)
@@ -57,11 +67,20 @@ class TestSortAndSelect(TestCase):
 
 
 class TestSortAndSelectDevice(TestCase):
+    # [CLASS DOC] Device-generic tests for sort, topk, kthvalue, unique and isin, with helper
+    # methods for ordering checks and unique result verification.
     def assertIsOrdered(self, order, x, mxx, ixx, task):
+        # [FUNCTION DOC] HELPER: Asserts the sorted values mxx of a 2-d tensor x are ordered per
+        # row in the given order (ascending or descending, nan treated as last/first), and that for
+        # each row the indices ixx are a permutation of the positions and point at the sorted
+        # values. Raises ValueError for an unknown order. The task string only feeds failure
+        # messages.
         SIZE = x.size(1)
         if order == "descending":
 
             def check_order(a, b):
+                # [FUNCTION DOC] HELPER: True if every element of a is not nan or is at least the
+                # matching element of b (descending order check, nan allowed first).
                 # `a != a` because we put NaNs
                 # at the end of ascending sorted lists,
                 # and the beginning of descending ones.
@@ -70,6 +89,8 @@ class TestSortAndSelectDevice(TestCase):
         elif order == "ascending":
 
             def check_order(a, b):
+                # [FUNCTION DOC] HELPER: True if every element of b is nan or a is at most b
+                # (ascending order check, nan allowed last).
                 # see above
                 return ((b != b) | (a <= b)).all().item()
 
@@ -102,6 +123,11 @@ class TestSortAndSelectDevice(TestCase):
             self.assertEqual(len(seen), size)
 
     def test_sort(self, device):
+        # [FUNCTION DOC] Exercises sort and argsort on 4 rows of size 4 and 2049 (different CUDA
+        # paths): ascending and descending, in-place via out, out tensors, simple values, duplicate
+        # keys, stable argsort, and nan placement; order checked by assertIsOrdered.
+        # KNOWN ISSUE: the descending 'duplicate keys' check reuses the earlier random input, not
+        # a tensor with duplicates.
         # on CUDA 2048 vs >2048 have different code path for the dim being sorted
         for SIZE in (4, 2049):
             x = torch.rand(4, SIZE, device=device)
@@ -194,6 +220,8 @@ class TestSortAndSelectDevice(TestCase):
 
     @onlyAccelerator
     def test_sort_large_slice(self, device):
+        # [FUNCTION DOC] Accelerator only: stable sort of a 4 by 1024000 tensor (ascending and
+        # descending) compared against the CPU result for values and indices.
         # tests direct cub path
         x = torch.randn(4, 1024000, device=device)
         res1val, res1ind = torch.sort(x, stable=True)
@@ -210,6 +238,9 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(*all_types_and(torch.bool, torch.half, torch.bfloat16))
     def test_stable_sort(self, device, dtype):
+        # [FUNCTION DOC] Sorts alternating zero/one tensors of three sizes with stable set and
+        # checks the indices of zeros are the even positions and of ones the odd positions in
+        # order.
         sizes = (100, 1000, 10000)
         for ncopies in sizes:
             x = torch.tensor([0, 1] * ncopies, dtype=dtype, device=device)
@@ -227,6 +258,9 @@ class TestSortAndSelectDevice(TestCase):
     @dtypes(torch.float16)
     @largeTensorTest("200GB")  # Unfortunately 80GB A100 is not large enough
     def test_sort_large(self, device, dtype):
+        # [FUNCTION DOC] Accelerator only, needs 200GB: sorts a huge tensor of repeated
+        # permutations, then uses variance/mean per column to check sorted values and indices are
+        # consistent.
         t0 = torch.randperm(8192, device=device).to(dtype)
         t = t0.view(1, 8192).expand(2**18 + 1, -1).contiguous()
         v, i = t.sort()
@@ -242,6 +276,8 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(torch.float32)
     def test_sort_restride(self, device, dtype):
+        # [FUNCTION DOC] Checks sort with 0-d out tensors for a strided 1-d input: outputs are
+        # resized to dense strides and indexing the input with the indices gives the values.
         # Input: non-contiguous (stride: 5) 3-element array
         tensor = torch.randn((3, 5), dtype=dtype, device=device)[:, 0]
         # Outputs: 0-dim tensors
@@ -257,6 +293,10 @@ class TestSortAndSelectDevice(TestCase):
         self.assertEqual(tensor[indices], values)
 
     def _test_sort_discontiguous(self, device, dtype):
+        # [FUNCTION DOC] HELPER: For all orderings of sizes 5, 7, 2049 as shape, all dim
+        # permutations and all sort dims, checks sort of a permuted tensor equals sort of its
+        # contiguous copy, values are non-decreasing, segments do not mix, and on cuda strides are
+        # preserved.
         # on CUDA 2048 vs >2048 have different code path for the dim being sorted
         sizes = (5, 7, 2049)
         for shape in permutations(sizes):
@@ -295,6 +335,7 @@ class TestSortAndSelectDevice(TestCase):
     @onlyAccelerator
     @dtypes(torch.float32)
     def test_sort_discontiguous(self, device, dtype):
+        # [FUNCTION DOC] Accelerator only: runs the discontiguous sort check for float32.
         self._test_sort_discontiguous(device, dtype)
 
     # TODO: consolidate with test_sort_discontiguous once slowTest supports
@@ -303,12 +344,15 @@ class TestSortAndSelectDevice(TestCase):
     @onlyCPU
     @dtypes(torch.float32)
     def test_sort_discontiguous_slow(self, device, dtype):
+        # [FUNCTION DOC] Slow CPU variant: runs the discontiguous sort check for float32.
         self._test_sort_discontiguous(device, dtype)
 
     @slowTest  # this test is slow on CPU
     @onlyCPU
     @dtypes(*integral_types())
     def test_sort_1d_parallel(self, device, dtype):
+        # [FUNCTION DOC] Slow CPU test: stable sort of 100000 random integers; asserts the result
+        # is non-decreasing.
         low = 0 if dtype == torch.uint8 else -128
         tensor = torch.randint(
             low=low, high=127, size=(100000,), device=device, dtype=dtype
@@ -318,6 +362,8 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(torch.float32)
     def test_sort_1d_output_discontiguous(self, device, dtype):
+        # [FUNCTION DOC] Checks sort with strided out tensors gives the same values and indices as
+        # the default sort.
         tensor = torch.randn(12, device=device, dtype=dtype)[:6]
         values = torch.empty_like(tensor)[::2]
         indices = torch.empty(18, device=device, dtype=torch.long)[::3]
@@ -328,6 +374,8 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(torch.float32)
     def test_topk_1d_output_discontiguous(self, device, dtype):
+        # [FUNCTION DOC] Checks topk with strided out tensors, sorted and unsorted, equals the
+        # default result.
         tensor = torch.randn(12, device=device, dtype=dtype)
         values = torch.empty_like(tensor)[::2]
         indices = torch.empty(18, device=device, dtype=torch.long)[::3]
@@ -341,6 +389,10 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(*all_types_and(torch.bool, torch.half, torch.bfloat16))
     def test_stable_sort_against_numpy(self, device, dtype):
+        # [FUNCTION DOC] Compares stable sort indices against NumPy stable argsort over generated
+        # samples: binary tensors, random tensors, and tensors with inf, -inf and nan style fill
+        # values (inf stands in for nan on integral dtypes). Fill sentinels depend on the dtype;
+        # bfloat16 is converted to float for NumPy.
         if dtype in floating_types_and(torch.float16, torch.bfloat16):
             inf = float("inf")
             neg_inf = -float("inf")
@@ -357,6 +409,9 @@ class TestSortAndSelectDevice(TestCase):
             nan = inf
 
         def generate_samples():
+        # [FUNCTION DOC] HELPER: Generator yielding (tensor, dim) pairs: binary strings, and on
+        # non-cuda devices random tensors of several shapes plus versions filled at random places
+        # with subsets of the inf, -inf, nan values along each dim.
             from itertools import chain, combinations
 
             for sizes in [(1025,), (10000,)]:
@@ -370,6 +425,8 @@ class TestSortAndSelectDevice(TestCase):
             yield (torch.tensor([0, 1] * 100, dtype=dtype, device=device), 0)
 
             def repeated_index_fill(t, dim, idxs, vals):
+                # [FUNCTION DOC] HELPER: Applies index_fill for each index/value pair in turn on t
+                # along dim and returns the final tensor.
                 res = t
                 for idx, val in zip(idxs, vals):
                     res = res.index_fill(dim, idx, val)
@@ -412,7 +469,11 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(*all_types_and(torch.half, torch.bfloat16))
     def test_msort(self, device, dtype):
+        # [FUNCTION DOC] Compares msort (and its out form) with NumPy sort along dim 0 for several
+        # shapes including the empty and 0-d cases; bfloat16 goes through float.
         def test(shape):
+            # [FUNCTION DOC] HELPER: Builds a random tensor of the shape and checks msort and msort
+            # with out equal the NumPy reference (the input itself for 0-d).
             tensor = make_tensor(shape, dtype=dtype, device=device, low=-9, high=9)
             if tensor.size() != torch.Size([]):
                 if dtype is torch.bfloat16:
@@ -445,6 +506,8 @@ class TestSortAndSelectDevice(TestCase):
     @skipIfTorchDynamo("Fails on python 3.11")
     @dtypes(torch.float)
     def test_sort_expanded_tensor(self, device, dtype):
+        # [FUNCTION DOC] Regression check: stable descending sort of expanded tensors equals the
+        # sort of the contiguous equivalent, for a single element and a broadcast case.
         # https://github.com/pytorch/pytorch/issues/91420
         data = torch.scalar_tensor(True, device=device, dtype=dtype)
         data = data.expand([1, 1, 1])
@@ -461,11 +524,18 @@ class TestSortAndSelectDevice(TestCase):
         self.assertEqual(out, expected)
 
     def test_topk(self, device):
+        # [FUNCTION DOC] Compares topk against sorting (first k of sort) for random 3-d tensors,
+        # random k, dim, direction and transposes, plus large cases for the CUDA sort-based and
+        # multi-block paths. Values must match exactly; differing indices must gather equal values.
         def topKViaSort(t, k, dim, dir):
+            # [FUNCTION DOC] HELPER: Returns the first k values and indices along dim of a sort in
+            # the given direction.
             sorted, indices = t.sort(dim, dir)
             return sorted.narrow(dim, 0, k), indices.narrow(dim, 0, k)
 
         def compareTensors(t, res1, ind1, res2, ind2, dim):
+            # [FUNCTION DOC] HELPER: Asserts the values are exactly equal; when indices differ,
+            # asserts gathering the input with the second indices reproduces the first values.
             # Values should be exactly equivalent
             self.assertEqual(res1, res2, atol=0, rtol=0)
 
@@ -479,6 +549,8 @@ class TestSortAndSelectDevice(TestCase):
                 self.assertEqual(res1, vals, atol=0, rtol=0)
 
         def compare(t, k, dim, dir):
+            # [FUNCTION DOC] HELPER: Runs topk with sorted results and the sort-based reference and
+            # compares them.
             topKVal, topKInd = t.topk(k, dim, dir, True)
             sortKVal, sortKInd = topKViaSort(t, k, dim, dir)
             compareTensors(t, sortKVal, sortKInd, topKVal, topKInd, dim)
@@ -519,14 +591,25 @@ class TestSortAndSelectDevice(TestCase):
         compare(t, 2000, 1, False)
 
     def test_topk_arguments(self, device):
+        # [FUNCTION DOC] Checks topk raises a type error when a boolean is passed as the second
+        # positional argument (it must not be read as a dim).
         q = torch.randn(10, 2, 10, device=device)
         # Make sure True isn't mistakenly taken as the 2nd dimension (interpreted as 1)
         self.assertRaises(TypeError, lambda: q.topk(4, True))
 
     def test_unique_dim(self, device):
+        # [FUNCTION DOC] Checks unique along each dim (including bool, empty, nan, ill-formed
+        # shapes, the consecutive variant and NumPy dim ordering for 4-d data) for float, double,
+        # long, uint8 and bool, and that no unique_dim function exists in torch.
+        # KNOWN ISSUE: the unused expected value for the consecutive unique is kept with a lint
+        # suppression and never compared.
         self.assertFalse(hasattr(torch, "unique_dim"))
 
         def run_test(device, dtype):
+            # [FUNCTION DOC] HELPER: Runs all unique and unique_consecutive checks of the test for
+            # one dtype on the device: expectations per dim, empty and nan inputs (nan only for
+            # float types), RuntimeError for ill-formed empty shapes, and a NumPy comparison for a
+            # 4-d tensor.
             x = torch.tensor(
                 [
                     [[1.0, 1.0], [0.0, 1.0], [2.0, 1.0], [0.0, 1.0]],
@@ -809,6 +892,9 @@ class TestSortAndSelectDevice(TestCase):
         run_test(device, torch.bool)
 
     def _test_topk_dtype(self, device, dtype, integral, size):
+        # [FUNCTION DOC] HELPER: Creates a random 1-d tensor of the size (random ints over the full
+        # dtype range if integral, else normal values), and checks topk of half its size equals the
+        # reversed top half of the sorted tensor, and its indices point at those values.
         if integral:
             a = torch.randint(
                 torch.iinfo(dtype).min,
@@ -827,6 +913,7 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64)
     def test_topk_integral(self, device, dtype):
+        # [FUNCTION DOC] Runs the topk dtype check for integer dtypes at sizes 10, 4096 and 8192.
         small = 10
         large = 4096
         verylarge = 8192  # multi_block topk on cuda
@@ -835,6 +922,9 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64)
     def test_topk_integral_warp_sort_path(self, device, dtype):
+        # [FUNCTION DOC] Regression test for integer topk on slice sizes near the warp merge sort
+        # limit: for many slices, with largest true and false and several k, checks indices are in
+        # range and values equal the gathered input values. Seeds the RNG with a fixed seed.
         # Regression test for the warpMergeSortTopK integer-sentinel bug on
         # ROCm >= 7.0: slice sizes in (0, 256] and k == slice_size dispatched
         # through warpMergeSortTopK, which used numeric_limits::infinity() as a
@@ -873,6 +963,8 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(torch.bfloat16, torch.half)
     def test_topk_lower_precision(self, device, dtype):
+        # [FUNCTION DOC] Runs the topk dtype check for bfloat16 and half at sizes 10, 4096 and
+        # 8192.
         small = 10
         large = 4096
         verylarge = 8192  # multi_block topk on cuda
@@ -882,6 +974,8 @@ class TestSortAndSelectDevice(TestCase):
     @dtypesIfCUDA(*floating_types_and(torch.half, torch.bfloat16))
     @dtypes(torch.float, torch.double, torch.bfloat16, torch.half)
     def test_topk_nonfinite(self, device, dtype):
+        # [FUNCTION DOC] Checks topk with nan, inf and -inf: nan ranks largest, for the largest and
+        # smallest cases, comparing values and indices.
         x = torch.tensor(
             [float("nan"), float("inf"), 1e4, 0, -1e4, -float("inf")],
             device=device,
@@ -900,6 +994,8 @@ class TestSortAndSelectDevice(TestCase):
         self.assertEqual(idx, [5, 4, 3, 2])
 
     def test_topk_4d(self, device):
+        # [FUNCTION DOC] Checks topk with k of 2 along dim 1 of a 4-d tensor of ones with two
+        # larger slices, for sizes 128 and 8192, values and indices exact.
         small = 128
         large = 8192
         for size in (small, large):
@@ -918,6 +1014,8 @@ class TestSortAndSelectDevice(TestCase):
     @dtypesIfCUDA(*all_types_and(torch.bfloat16))
     @dtypes(*all_types_and(torch.bfloat16, torch.half))
     def test_topk_zero(self, device, dtype):
+        # [FUNCTION DOC] Checks topk with k zero returns empty values and indices of shape rows by
+        # 0.
         # https://github.com/pytorch/pytorch/issues/49205
         t = torch.rand(2, 2, device=device).to(dtype=dtype)
         val, idx = torch.topk(t, k=0, largest=False)
@@ -925,6 +1023,9 @@ class TestSortAndSelectDevice(TestCase):
         self.assertEqual(idx.size(), torch.Size([2, 0]))
 
     def _test_unique_scalar_empty(self, dtype, device, f):
+        # [FUNCTION DOC] HELPER: Given a unique-like function f, checks it on a 0-d tensor (one
+        # unique, scalar inverse, count of one) and on a zero-sized tensor (empty results, inverse
+        # of input shape).
         # test scalar
         x = torch.tensor(0, dtype=dtype, device=device)
         unique, inverse, counts = f(x, return_inverse=True, return_counts=True)
@@ -956,7 +1057,12 @@ class TestSortAndSelectDevice(TestCase):
         expected_counts,
         additional_shape,
     ):
+        # [FUNCTION DOC] HELPER: For all combinations of requesting inverse and counts, calls f on
+        # x and checks the output tuple length and values against expectations; then calls f on x
+        # viewed in additional_shape and checks unique, reshaped inverse and counts.
         def ensure_tuple(x):
+            # [FUNCTION DOC] HELPER: Wraps a lone tensor in a one-element tuple, else returns as
+            # is.
             if isinstance(x, torch.Tensor):
                 return (x,)
             return x
@@ -987,7 +1093,12 @@ class TestSortAndSelectDevice(TestCase):
     @dtypesIfCPU(*all_types_and(torch.bool, torch.float16, torch.bfloat16))
     @dtypes(*all_types_and(torch.half, torch.bool))
     def test_unique(self, device, dtype):
+        # [FUNCTION DOC] Checks unique (function and method; sorted and unsorted; contiguous and
+        # strided input) against fixed expectations for bool and numeric inputs. For unsorted, the
+        # unique values are only compared after sorting and inverse/counts are verified directly.
         def ensure_tuple(x):
+            # [FUNCTION DOC] HELPER: Wraps a lone tensor in a one-element tuple, else returns as
+            # is.
             if isinstance(x, torch.Tensor):
                 return (x,)
             return x
@@ -1063,6 +1174,8 @@ class TestSortAndSelectDevice(TestCase):
     @dtypesIfCPU(*all_types_and(torch.bool, torch.float16, torch.bfloat16))
     @dtypes(*all_types_and(torch.half, torch.bool))
     def test_unique_consecutive(self, device, dtype):
+        # [FUNCTION DOC] Checks unique_consecutive (function and method) with expected values for
+        # bool and numeric inputs, and the scalar and empty cases.
         if dtype is torch.bool:
             x = torch.tensor(
                 [True, False, False, False, True, True, False, False, False],
@@ -1102,6 +1215,9 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(torch.double)
     def test_kthvalue(self, device, dtype):
+        # [FUNCTION DOC] Checks kthvalue on a random double cube against sort: default dim, out
+        # tensors, dim 0, non-contiguous input, a known non-contiguous regression, input not
+        # modified, repeated values, and nan inputs for several k.
         SIZE = 50
         x = torch.rand(SIZE, SIZE, SIZE, dtype=dtype, device=device)
         x0 = x.clone()
@@ -1170,6 +1286,7 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(torch.float)
     def test_kthvalue_scalar(self, device, dtype):
+        # [FUNCTION DOC] Checks kthvalue of a 0-d tensor equals that of the one-element 1-d tensor.
         # Test scalar input (test case from https://github.com/pytorch/pytorch/issues/30818)
         # Tests that passing a scalar tensor or 1D tensor with 1 element work either way
         res = torch.tensor(2, device=device, dtype=dtype).kthvalue(1)
@@ -1180,7 +1297,11 @@ class TestSortAndSelectDevice(TestCase):
     @dtypes(*all_types())
     @dtypesIfCUDA(*all_types_and(torch.half))
     def test_isin(self, device, dtype):
+        # [FUNCTION DOC] Checks isin against NumPy for multi-dim, 0-d, empty and scalar inputs,
+        # then against hand-written expectations (with invert and assume_unique, repeated test
+        # elements) including the sort-based multi-dim path.
         def assert_isin_equal(a, b):
+            # [FUNCTION DOC] HELPER: Asserts torch isin equals the NumPy isin reference.
             # Compare to the numpy reference implementation.
             x = torch.isin(a, b)
             a = a.cpu().numpy() if torch.is_tensor(a) else np.array(a)
@@ -1212,6 +1333,8 @@ class TestSortAndSelectDevice(TestCase):
         assert_isin_equal(5, b)
 
         def define_expected(lst, invert=False):
+            # [FUNCTION DOC] HELPER: Builds the expected boolean tensor from a list, negated if
+            # invert.
             expected = torch.tensor(lst, device=device)
             if invert:
                 expected = expected.logical_not()
@@ -1318,6 +1441,8 @@ class TestSortAndSelectDevice(TestCase):
                     self.assertEqual(c, ec)
 
     def test_isin_different_dtypes(self, device):
+        # [FUNCTION DOC] Checks isin gives the same result when the two inputs have different
+        # dtypes, over supported types (half only off CPU), repetition and assume_unique options.
         supported_types = all_types() if device == "cpu" else all_types_and(torch.half)
         for mult in [1, 10]:
             for assume_unique in [False, True]:
@@ -1331,6 +1456,8 @@ class TestSortAndSelectDevice(TestCase):
     @onlyAccelerator
     @dtypes(*all_types())
     def test_isin_different_devices(self, device, dtype):
+        # [FUNCTION DOC] Accelerator only: checks isin raises a runtime error if the two tensors
+        # are on different devices, in either order.
         a = torch.arange(6, device=device, dtype=dtype).reshape([2, 3])
         b = torch.arange(3, 30, device="cpu", dtype=dtype)
         with self.assertRaises(RuntimeError):
@@ -1343,6 +1470,9 @@ class TestSortAndSelectDevice(TestCase):
 
     @dtypes(*integral_types())
     def test_sort_overflow(self, device, dtype):
+        # [FUNCTION DOC] Regression test: sorts a large integer tensor whose values include the
+        # dtype max with a single thread and checks two unique values; restores the thread count
+        # after.
         "Regression test for https://github.com/pytorch/pytorch/issues/111189"
         prev_num_threads = torch.get_num_threads()
         try:
@@ -1357,7 +1487,10 @@ class TestSortAndSelectDevice(TestCase):
 
 
 class TestSortAndSelectCUDA(TestCase):
+    # [CLASS DOC] CUDA-only tests for topk implementation paths.
     def test_topk_noncontiguous_gpu(self, device):
+        # [FUNCTION DOC] Checks topk on strided input equals topk on the contiguous copy, for sizes
+        # hitting single-block, multi-block and sort based paths.
         # test different topk paths on cuda
         single_block_t = torch.randn(20, device=device)[::2]
         multi_block_t = torch.randn(20000, device=device)[::2]
@@ -1377,6 +1510,9 @@ class TestSortAndSelectCUDA(TestCase):
     @largeTensorTest("72GB", "cuda")
     @parametrize("test_case", ["random", "identical"])
     def test_topk_large_k(self, device, dtype, test_case):
+        # [FUNCTION DOC] Slow, huge-memory test: topk with k above 2^32 on random or identical
+        # data; checks indices are in range and unique, and values match input chunkwise (random
+        # case) or equal the constant (identical case). Randomly chooses largest or smallest.
         """Test topk with k > 2^32 (integer overflow bug fix).
 
         Tests both random and edge case (all identical values) inputs.

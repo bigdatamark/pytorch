@@ -1,4 +1,7 @@
 # Owner(s): ["module: tests"]
+# [MODULE DOC] Device-generic tests for shape-manipulation ops: unbind, tolist, movedim,
+# diag/diagonal/trace, clamp/clip, flip family, rot90, nonzero, sparse_dim/dense_dim and unfold.
+# Many tests compare against NumPy. Instantiates per-device classes at import time.
 
 import random
 import unittest
@@ -39,6 +42,11 @@ from torch.testing._internal.common_utils import (
 
 # TODO: replace with make_tensor
 def _generate_input(shape, dtype, device, with_extremal):
+    # [FUNCTION DOC] HELPER: Builds a random test tensor of the given shape, dtype and device.
+    # An empty shape tuple gives an empty tensor. Floating/complex dtypes get scaled normal
+    # values with roughly half the entries zeroed, and when with_extremal is set some entries
+    # become nan, inf and -inf. Bool gets random True entries; other dtypes get random ints in
+    # the range 15 to 99. bfloat16 is generated in float32 then cast.
     if shape == ():
         x = torch.tensor((), dtype=dtype, device=device)
     else:
@@ -71,9 +79,17 @@ def _generate_input(shape, dtype, device, with_extremal):
 
 
 class TestShapeOps(TestCase):
+    # [CLASS DOC] Device-generic test case covering shape-related ops. Methods take a device
+    # argument (and a dtype when decorated) supplied by device-type instantiation; helper methods
+    # generate random shapes, clamp baselines and NumPy comparisons.
     # TODO: update to work on CUDA, too
     @onlyCPU
     def test_unbind(self, device):
+        # [FUNCTION DOC] CPU only: unbinds a random 4-d tensor along every dim via function and
+        # method forms, checks the number of slices equals the dim size and that slices match
+        # select.
+        # KNOWN ISSUE: the slice-comparison loop iterates up to the dim index rather than the dim
+        # size, so it checks only some of the slices.
         x = torch.rand(2, 3, 4, 5)
         for dim in range(4):
             res = torch.unbind(x, dim)
@@ -88,6 +104,8 @@ class TestShapeOps(TestCase):
     @skipIfTorchDynamo("TorchDynamo fails with an unknown error")
     @onlyCPU
     def test_tolist(self, device):
+        # [FUNCTION DOC] CPU only: checks tolist round-trips for empty, 1-d, 2-d tensors, a float
+        # storage, and a non-contiguous 3-d slice (which is asserted non-contiguous first).
         list0D = []
         tensor0D = torch.tensor(list0D)
         self.assertEqual(tensor0D.tolist(), list0D)
@@ -111,6 +129,9 @@ class TestShapeOps(TestCase):
 
     @dtypes(torch.int64, torch.float, torch.complex128)
     def test_movedim_invalid(self, device, dtype):
+        # [FUNCTION DOC] Checks movedim and its alias moveaxis raise errors: IndexError for
+        # out-of-range source or destination, RuntimeError for length mismatch between source and
+        # destination, and for repeated dims in either side. Uses a random 4-d tensor.
         shape = self._rand_shape(4, min_size=5, max_size=10)
         x = _generate_input(shape, dtype, device, False)
 
@@ -150,6 +171,10 @@ class TestShapeOps(TestCase):
 
     @dtypes(torch.int64, torch.float, torch.complex128)
     def test_movedim(self, device, dtype):
+        # [FUNCTION DOC] Compares movedim and moveaxis against NumPy for 0 to 4 dims. Covers
+        # integer source/destination pairs and random-length permutation sequences, randomly
+        # rewriting some dims as negative; also same-position moves and empty sequences on a fixed
+        # 5-d tensor.
         for fn in [torch.moveaxis, torch.movedim]:
             for nd in range(5):
                 shape = self._rand_shape(nd, min_size=5, max_size=10)
@@ -179,6 +204,12 @@ class TestShapeOps(TestCase):
                         continue
 
                     def make_index_negative(sequence, idx):
+                        # [FUNCTION DOC] HELPER: Intended to turn one entry of a sequence into its
+                        # negative dim form.
+                        # KNOWN ISSUE: it ignores its idx argument, reads the enclosing random_idx
+                        # instead, and returns the enclosing src_sequence rather than the modified
+                        # copy, so the destination case yields the source sequence unchanged (and
+                        # the negative-dim edit is lost).
                         sequence = list(sequence)
                         sequence[random_idx] = sequence[random_idx] - nd
                         return tuple(src_sequence)
@@ -232,6 +263,8 @@ class TestShapeOps(TestCase):
 
     @dtypes(torch.float, torch.bool)
     def test_diag(self, device, dtype):
+        # [FUNCTION DOC] Builds a random 100x100 matrix (bool or float) and checks diag with the
+        # out argument gives the same result as the functional call.
         if dtype is torch.bool:
             x = torch.rand(100, 100, device=device) >= 0.5
         else:
@@ -243,6 +276,8 @@ class TestShapeOps(TestCase):
         self.assertEqual(res1, res2)
 
     def test_diagonal(self, device):
+        # [FUNCTION DOC] Checks diagonal equals diag of a random 100x100 matrix, with default and
+        # offset 17.
         x = torch.randn((100, 100), device=device)
         result = torch.diagonal(x)
         expected = torch.diag(x)
@@ -256,6 +291,8 @@ class TestShapeOps(TestCase):
     @onlyCPU
     @dtypes(torch.float)
     def test_diagonal_multidim(self, device, dtype):
+        # [FUNCTION DOC] CPU only: compares diagonal of a random 4-d tensor with NumPy for several
+        # offset/dim argument sets (shape and values), and for a permuted non-contiguous input.
         x = torch.randn(10, 11, 12, 13, dtype=dtype, device=device)
         xn = x.numpy()
         for args in [(2, 2, 3), (2,), (-2, 1, 2), (0, -2, -1)]:
@@ -274,7 +311,11 @@ class TestShapeOps(TestCase):
     @dtypesIfCUDA(*all_types_and(torch.half))
     @dtypesIfXPU(*all_types_and(torch.half))
     def test_trace(self, device, dtype):
+        # [FUNCTION DOC] Checks trace against NumPy trace (using the dtype of a sum) for several
+        # rectangular and square integer/float matrices.
         def test(shape):
+            # [FUNCTION DOC] HELPER: Makes a random tensor of the given shape and asserts its trace
+            # matches the NumPy reference computed on the CPU copy.
             tensor = make_tensor(shape, dtype=dtype, device=device, low=-9, high=9)
             expected_dtype = tensor.sum().dtype
             expected_dtype = torch_to_numpy_dtype_dict[expected_dtype]
@@ -294,6 +335,9 @@ class TestShapeOps(TestCase):
             test(shape)
 
     def generate_clamp_baseline(self, device, dtype, *, min_vals, max_vals, with_nans):
+        # [FUNCTION DOC] HELPER: Returns a random 100 element tensor in the range -25 to 25 cast to
+        # dtype (optionally with random entries set to nan) and the NumPy-computed clip of it with
+        # the given min and max (tensors are converted to NumPy first).
         """
         Creates a random tensor for a given device and dtype, and computes the expected clamped
         values given the min_vals and/or max_vals.
@@ -320,6 +364,10 @@ class TestShapeOps(TestCase):
     # Tests clamp and its alias, clip
     @dtypes(torch.int64, torch.float32)
     def test_clamp(self, device, dtype):
+        # [FUNCTION DOC] Checks clamp, clip, and their method and in-place variants against the
+        # NumPy baseline for all min/max combinations except both None; also the out variant for
+        # the two function forms. Inputs are cloned so in-place ops do not alter the baseline
+        # input.
         op_list = (
             torch.clamp,
             torch.Tensor.clamp,
@@ -353,6 +401,8 @@ class TestShapeOps(TestCase):
                     self.assertEqual(Y_expected, Y_out)
 
     def test_clamp_propagates_nans(self, device):
+        # [FUNCTION DOC] Same op variants and bound combinations as the clamp test, but with nan
+        # values in the input; checks the positions of nan in the result match the reference.
         op_list = (
             torch.clamp,
             torch.Tensor.clamp,
@@ -391,6 +441,7 @@ class TestShapeOps(TestCase):
                     self.assertEqual(Y_expected, torch.isnan(Y_out))
 
     def test_clamp_scalar_nan_bounds(self, device):
+        # [FUNCTION DOC] Checks that a nan scalar as min or max makes the whole output nan.
         x = torch.ones(3, device=device)
         y = torch.clamp(x, None, float("nan"))
         self.assertTrue(torch.isnan(y).all())
@@ -398,6 +449,8 @@ class TestShapeOps(TestCase):
         self.assertTrue(torch.isnan(y).all())
 
     def test_clamp_raises_arg_errors(self, device):
+        # [FUNCTION DOC] Checks clamp (method, in-place method, function) raises a runtime error
+        # when neither min nor max is given.
         X = torch.randn(100, dtype=torch.float, device=device)
         error_msg = "At least one of 'min' or 'max' must not be None"
         with self.assertRaisesRegex(RuntimeError, error_msg):
@@ -410,11 +463,20 @@ class TestShapeOps(TestCase):
     @dtypes(*all_passthru_types())
     @dtypesIfCUDA(*all_passthru_types_and(torch.chalf))
     def test_flip(self, device, dtype):
+        # [FUNCTION DOC] Checks flip over many data cases: results for single/multiple dims,
+        # permuted dim orders, negative dims, non-contiguous, expanded, transposed, empty and
+        # size-1 inputs, vectorized image cases on CPU, plus quantized variants for float; then
+        # checks output size is preserved for several dim combinations.
         make_from_data = partial(torch.tensor, device=device, dtype=dtype)
         make_from_size = partial(make_tensor, device=device, dtype=dtype)
 
         def test_flip_impl(input_t, dims, output_t):
+            # [FUNCTION DOC] HELPER: For an input, dims and expected output, asserts flip gives the
+            # expected result (also with negative first dim and every permutation of tuple dims),
+            # and repeats for quantized copies when the dtype is float.
             def all_t():
+                # [FUNCTION DOC] HELPER: Generator yielding the plain input/output pair and, for
+                # float, per-tensor quantized pairs (quint8, qint8, qint32).
                 yield input_t, output_t
                 if dtype is torch.float:
                     # We generate quantized versions as well
@@ -440,6 +502,10 @@ class TestShapeOps(TestCase):
                             )
 
         def gen_data():
+            # [FUNCTION DOC] HELPER: Generator of (input, dims, expected output) triples: basic
+            # 2x2x2 cases (contiguous and not), expanded, transposed, rectangular, CPU image cases
+            # built with NumPy reversal, and no-op edge cases (size zero, empty dims, zero
+            # elements, size one).
             # Basic tests
             data = make_from_data([1, 2, 3, 4, 5, 6, 7, 8]).view(2, 2, 2)
             nonctg = make_from_size((2, 2, 2), noncontiguous=True).copy_(data)
@@ -547,6 +613,8 @@ class TestShapeOps(TestCase):
 
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     def test_flip_errors(self, device, dtype):
+        # [FUNCTION DOC] Checks flip raises: runtime error for a repeated dim, type error with no
+        # dims, index error for out-of-range dims.
         make_arg = partial(make_tensor, dtype=dtype, device=device)
         data = make_arg((2, 2, 2))
 
@@ -560,10 +628,14 @@ class TestShapeOps(TestCase):
         self.assertRaises(IndexError, lambda: data.flip(3))
 
     def _rand_shape(self, dim, min_size, max_size):
+        # [FUNCTION DOC] HELPER: Returns a tuple of dim random sizes between min_size and max_size
+        # inclusive (as 0-d tensors from a random integer draw).
         return tuple(torch.randint(min_size, max_size + 1, (dim,)))
 
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     def test_flip_numpy(self, device, dtype):
+        # [FUNCTION DOC] Compares flip with NumPy flip for random 3-d and 4-d shapes, over all
+        # combinations of axes.
         make_arg = partial(make_tensor, dtype=dtype, device=device)
 
         for ndim in [3, 4]:
@@ -585,6 +657,8 @@ class TestShapeOps(TestCase):
     )  # even for CUDA test, sufficient system memory is required
     @unittest.skipIf(IS_JETSON, "Too large for Jetson")
     def test_flip_large_tensor(self, device):
+        # [FUNCTION DOC] Accelerator only, needs large memory: flips a byte tensor with more than
+        # 2^32 elements along dim 0 and compares with NumPy, then frees the input.
         t_in = torch.empty(2**32 + 1, dtype=torch.uint8).random_()
         torch_fn = partial(torch.flip, dims=(0,))
         np_fn = partial(np.flip, axis=0)
@@ -595,6 +669,8 @@ class TestShapeOps(TestCase):
     @unittest.expectedFailure
     @dtypes(torch.quint4x2, torch.quint2x4)
     def test_flip_unsupported_dtype(self, dtype):
+        # [FUNCTION DOC] CPU only, marked expected failure: flip on a quantized sub-byte tensor is
+        # unsupported and is expected to raise.
         scale, zero_point = 0.1, 5
         qt = torch.quantize_per_tensor(
             torch.randn(16, 16), scale=scale, zero_point=zero_point, dtype=dtype
@@ -602,6 +678,9 @@ class TestShapeOps(TestCase):
         torch.flip(qt, dims=(0,))
 
     def _test_fliplr_flipud(self, torch_fn, np_fn, min_dim, max_dim, device, dtype):
+        # [FUNCTION DOC] HELPER: For each rank from min_dim to max_dim, builds random data of that
+        # rank (normal for float/complex, small ints otherwise) and compares the torch function
+        # with the NumPy function.
         for dim in range(min_dim, max_dim + 1):
             shape = self._rand_shape(dim, 5, 10)
             # Randomly scale the input
@@ -613,10 +692,12 @@ class TestShapeOps(TestCase):
 
     @dtypes(torch.int64, torch.double, torch.cdouble)
     def test_fliplr(self, device, dtype):
+        # [FUNCTION DOC] Compares fliplr with NumPy for ranks 2 to 4.
         self._test_fliplr_flipud(torch.fliplr, np.fliplr, 2, 4, device, dtype)
 
     @dtypes(torch.int64, torch.double, torch.cdouble)
     def test_fliplr_invalid(self, device, dtype):
+        # [FUNCTION DOC] Checks fliplr raises a runtime error for a 1-d and a 0-d input.
         x = torch.randn(42).to(dtype)
         with self.assertRaisesRegex(RuntimeError, "Input must be >= 2-d."):
             torch.fliplr(x)
@@ -625,14 +706,19 @@ class TestShapeOps(TestCase):
 
     @dtypes(torch.int64, torch.double, torch.cdouble)
     def test_flipud(self, device, dtype):
+        # [FUNCTION DOC] Compares flipud with NumPy for ranks 1 to 4.
         self._test_fliplr_flipud(torch.flipud, np.flipud, 1, 4, device, dtype)
 
     @dtypes(torch.int64, torch.double, torch.cdouble)
     def test_flipud_invalid(self, device, dtype):
+        # [FUNCTION DOC] Checks flipud raises a runtime error for a 0-d input.
         with self.assertRaisesRegex(RuntimeError, "Input must be >= 1-d."):
             torch.flipud(torch.tensor(42, device=device, dtype=dtype))
 
     def test_rot90(self, device):
+        # [FUNCTION DOC] Checks rot90 on a 2x2 tensor for k of 0..3, default args, reversed dims,
+        # k modulo behavior (including negative k), a 3-d case, and index/runtime errors for
+        # out-of-range, repeated, or wrong-count dims.
         data = torch.arange(1, 5, device=device).view(2, 2)
         self.assertEqual(torch.tensor([1, 2, 3, 4]).view(2, 2), data.rot90(0, [0, 1]))
         self.assertEqual(torch.tensor([2, 4, 1, 3]).view(2, 2), data.rot90(1, [0, 1]))
@@ -670,6 +756,7 @@ class TestShapeOps(TestCase):
     @skipIfTorchDynamo("TorchDynamo fails with an unknown error")
     @dtypes(torch.cfloat, torch.cdouble)
     def test_complex_rot90(self, device, dtype):
+        # [FUNCTION DOC] Compares rot90 for k from 0 to 3 on random complex tensors with NumPy.
         shape = self._rand_shape(random.randint(2, 4), 5, 10)
         for rot_times in range(4):
             data = torch.randn(*shape, device=device, dtype=dtype)
@@ -681,6 +768,7 @@ class TestShapeOps(TestCase):
     # Ensures nonzero does not throw a warning, even when the as_tuple argument
     #   is not provided
     def test_nonzero_no_warning(self, device):
+        # [FUNCTION DOC] Checks nonzero (function and method) emits no warnings.
         t = torch.randn((2, 2), device=device)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
@@ -690,6 +778,9 @@ class TestShapeOps(TestCase):
 
     @dtypes(*all_types_and(torch.half, torch.bool, torch.bfloat16))
     def test_nonzero(self, device, dtype):
+        # [FUNCTION DOC] For several shapes, builds a random 0/1 tensor, checks nonzero in plain,
+        # out and tuple forms against NumPy, that a wrong-dtype out raises (except on xla), and
+        # that an out on another device raises on cuda, xpu, or the privateuse1 device.
         shapes = [
             torch.Size((12,)),
             torch.Size((12, 1)),
@@ -700,6 +791,9 @@ class TestShapeOps(TestCase):
         ]
 
         def gen_nontrivial_input(shape, dtype, device):
+            # [FUNCTION DOC] HELPER: Returns random 0/1 values of the shape; for bfloat16 generates
+            # in float then casts, since integer random generation for it is not supported on
+            # Windows.
             if dtype != torch.bfloat16:
                 return torch.randint(2, shape, device=device, dtype=dtype)
             else:
@@ -752,6 +846,9 @@ class TestShapeOps(TestCase):
             self.assertEqual(tup2, np_result, atol=0, rtol=0)
 
     def test_nonzero_astuple_out(self, device):
+        # [FUNCTION DOC] Checks that as_tuple with out raises, that as_tuple false with out equals
+        # the default, that scripting a function using the as_tuple keyword raises, and that
+        # tracing it works and matches eager results.
         t = torch.randn((3, 3, 3), device=device)
         out = torch.empty_like(t, dtype=torch.long)
 
@@ -765,6 +862,8 @@ class TestShapeOps(TestCase):
         # Verifies that JIT script cannot handle the as_tuple kwarg
         # See Issue https://github.com/pytorch/pytorch/issues/45499.
         def _foo(t):
+            # [FUNCTION DOC] HELPER: Calls nonzero in tuple, non-tuple and out forms and returns
+            # all three results; scripting it is expected to fail.
             tuple_result = torch.nonzero(t, as_tuple=True)
             nontuple_result = torch.nonzero(t, as_tuple=False)
             out = torch.empty_like(nontuple_result)
@@ -785,6 +884,8 @@ class TestShapeOps(TestCase):
         self.assertEqual(traced_out, expected_nontuple)
 
     def test_nonzero_discontiguous(self, device):
+        # [FUNCTION DOC] Checks nonzero on a non-contiguous input equals the contiguous result,
+        # that an out tensor's storage is reused, and that a non-contiguous out keeps its strides.
         shape = (4, 4)
         tensor = torch.randint(2, shape, device=device)
         tensor_nc = torch.empty(shape[0], shape[1] * 2, device=device)[:, ::2].copy_(
@@ -811,12 +912,15 @@ class TestShapeOps(TestCase):
         self.assertEqual(strides, dst4.stride())
 
     def test_nonzero_non_diff(self, device):
+        # [FUNCTION DOC] Checks nonzero output does not require grad even if the input does.
         x = torch.randn(10, requires_grad=True)
         nz = x.nonzero()
         self.assertFalse(nz.requires_grad)
 
     @dtypes(torch.int64, torch.float, torch.complex128)
     def test_sparse_dense_dim(self, device, dtype):
+        # [FUNCTION DOC] Checks sparse_dim is 0 and dense_dim equals the rank for dense tensors of
+        # shapes 0-d, 1-d and 2-d.
         for shape in [(), (2,), (2, 3)]:
             if dtype.is_complex or dtype.is_floating_point:
                 x = torch.rand(shape, device=device, dtype=dtype)
@@ -826,6 +930,8 @@ class TestShapeOps(TestCase):
             self.assertEqual(x.dense_dim(), len(shape))
 
     def test_unfold_all_devices_and_dtypes(self, device):
+        # [FUNCTION DOC] For each dtype checks unfold of an empty tensor gives the expected shape.
+        # KNOWN ISSUE: the bool and non-bool branches are identical.
         for dt in all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16):
             if dt == torch.bool:
                 x = torch.empty((0, 1, 3, 0), dtype=dt, device=device)
@@ -835,6 +941,7 @@ class TestShapeOps(TestCase):
                 self.assertEqual((0, 1, 1, 0, 3), x.unfold(2, 3, 2).shape)
 
     def test_unfold_scalars(self, device):
+        # [FUNCTION DOC] Checks unfold on a 0-d tensor returns a 1-d tensor of the requested size.
         x = torch.tensor(0.5, device=device)
         # unfold on a 0-dimensional tensor should always return a 1-d dimensional
         # tensor of shape [size] (i.e., the second parameter to unfold)
@@ -844,6 +951,7 @@ class TestShapeOps(TestCase):
         self.assertEqual(torch.tensor([0.5], device=device), x.unfold(0, 1, 1))
 
     def test_unfold_errors(self, device):
+        # [FUNCTION DOC] Checks unfold raises a runtime error for negative size and negative step.
         x = torch.arange(1.0, 8, device=device)
         with self.assertRaisesRegex(RuntimeError, "size is -1 but must be >= 0"):
             x.unfold(0, -1, 1)
@@ -851,6 +959,8 @@ class TestShapeOps(TestCase):
             x.unfold(0, 1, -1)
 
     def test_unfold_backward_errors(self, device):
+        # [FUNCTION DOC] Checks the unfold_backward op raises a value error for step zero and a
+        # runtime error for negative size.
         grad_in = torch.randn(2, 3, device=device)
         input_sizes = [6]
 
