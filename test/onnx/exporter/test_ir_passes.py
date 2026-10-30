@@ -1,4 +1,7 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] Tests for the IR passes of the ONNX exporter: the helper that replaces symbolic
+# names inside shape expression strings and the pass that renames symbolic dimensions in a
+# model. No import-time side effects other than imports.
 """Unit tests for the _ir_passes module."""
 
 from __future__ import annotations
@@ -12,6 +15,8 @@ from torch.testing._internal import common_utils
 
 @common_utils.instantiate_parametrized_tests
 class ONNXIRPassesTest(common_utils.TestCase):
+    # [CLASS DOC] Parametrized test case for the ir passes module. Holds no state; each test
+    # builds its own inputs.
     @common_utils.parametrize(
         "shape_expr, expected_shape_expr",
         [
@@ -21,6 +26,9 @@ class ONNXIRPassesTest(common_utils.TestCase):
         ],
     )
     def test__replace_names_in_rename_axis(self, shape_expr, expected_shape_expr):
+        # [FUNCTION DOC] Parametrized over a shape expression string and the expected result.
+        # Applies the name replacement helper with a fixed ordered mapping of old names to new
+        # names and asserts the resulting string equals the expected one.
         rename_mapping = {
             "s1 + s11": "masked_sequence_length",
             "s11": "past_sequence_length",
@@ -33,6 +41,11 @@ class ONNXIRPassesTest(common_utils.TestCase):
     def test_rename_axis_succeeds_when_mapping_is_not_sorted_and_contains_the_str_not_in_the_model(
         self,
     ):
+        # [FUNCTION DOC] Builds an IR model with three float inputs whose shapes use symbolic
+        # dimension expressions, and one output. Applies the axis rename pass with a mapping
+        # that is not sorted by length and includes a name absent from the model. Asserts the
+        # input shapes were rewritten with the new names, with multi-name expressions replaced
+        # as a whole.
         model = ir.Model(
             ir.Graph(
                 inputs=[

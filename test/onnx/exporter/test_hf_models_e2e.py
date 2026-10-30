@@ -1,4 +1,8 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] End-to-end tests of the dynamo ONNX exporter on a Hugging Face causal language
+# model (a tiny random GPT-J with key-value cache inputs). Imports the transformers package at
+# import time; the helper builds the model by downloading pretrained weights, so tests need
+# network or cache access.
 """Unit LLM tests for the onnx dynamo exporter."""
 
 from __future__ import annotations
@@ -13,7 +17,13 @@ from torch.testing._internal import common_utils
 
 
 class DynamoExporterHfModelsTest(common_utils.TestCase):
+    # [CLASS DOC] Test case exporting a Hugging Face GPT-J model through torch.onnx.export
+    # with the dynamo path and validating the resulting ONNX program numerically.
     def export(self, model, args=(), kwargs=None, **options) -> torch.onnx.ONNXProgram:
+        # [FUNCTION DOC] HELPER: Exports the model with the dynamo exporter, passing
+        # arguments, keyword arguments and any extra options straight to the export function
+        # with verbosity off. Raises AssertionError if no program comes back; otherwise
+        # returns the ONNX program.
         onnx_program = torch.onnx.export(
             model,
             args,
@@ -27,6 +37,9 @@ class DynamoExporterHfModelsTest(common_utils.TestCase):
         return onnx_program
 
     def test_onnx_export_huggingface_llm_models_with_kv_cache(self):
+        # [FUNCTION DOC] Exports the tiny GPT-J model using legacy style dynamic axes mappings
+        # and explicit input and output names, then asserts the program's numerical outputs
+        # match eager using the testing helper.
         model, kwargs, dynamic_axes, input_names, output_names = (
             _prepare_llm_model_gptj_to_test()
         )
@@ -40,6 +53,11 @@ class DynamoExporterHfModelsTest(common_utils.TestCase):
         onnx_testing.assert_onnx_program(onnx_program)
 
     def test_onnx_export_with_custom_axis_names_in_dynamic_shapes(self):
+        # [FUNCTION DOC] Exports the model with explicit dynamic shapes mapping that gives
+        # custom names to the batch and sequence axes, with optimization disabled, and
+        # validates numerics. Then checks the dimension names in the ONNX input shapes: input
+        # ids, the ten key-value cache inputs (batch, fixed four, past length, fixed eight),
+        # the attention mask and the position ids, comparing them to the custom names.
         model, kwargs, _, input_names, output_names = _prepare_llm_model_gptj_to_test()
 
         dynamic_shapes = {
@@ -111,6 +129,11 @@ def _prepare_llm_model_gptj_to_test() -> tuple[
     list[str],
     list[str],
 ]:
+    # [FUNCTION DOC] HELPER: Loads the tiny random GPT-J causal language model from the hub
+    # and creates random inputs: token ids, a random binary attention mask longer than the
+    # input, fixed position ids and five layers of random key-value cache tensors. Returns the
+    # model, the keyword inputs mapping, dynamic axes mapping, input names and output names
+    # (logits and present key-value outputs).
     model = transformers.GPTJForCausalLM.from_pretrained(
         "hf-internal-testing/tiny-random-gptj"
     )

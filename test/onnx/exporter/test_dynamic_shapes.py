@@ -1,4 +1,10 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] Tests for the dynamic shapes conversion helpers of the ONNX exporter:
+# converting between the legacy dynamic axes format and the torch.export dynamic shapes
+# format, unflattening and flattening shape specifications against input trees, and
+# normalizing string or Dim entries. Defines three sample models; one test exports through the
+# legacy TorchScript path to a temporary file. No import-time side effects other than imports
+# and class definitions.
 """Unit tests for the _dynamic_shapes module."""
 
 from __future__ import annotations
@@ -15,11 +21,16 @@ from torch.utils import _pytree
 
 
 class SampleModelForDynamicShapes(torch.nn.Module):
+    # [CLASS DOC] HELPER: Sample model with two inputs returning the relu of the first and
+    # sigmoid of the second.
     def forward(self, x, b):
+        # [FUNCTION DOC] HELPER: Returns a tuple of the relu of x and the sigmoid of b.
         return x.relu(), b.sigmoid()
 
 
 class NestedModelForDynamicShapes(torch.nn.Module):
+    # [CLASS DOC] HELPER: Sample model with a tensor, a list of two tensors, a mapping with
+    # keys a and b, and a tensor input, used to test nested input handling.
     def forward(
         self,
         x: torch.Tensor,
@@ -27,6 +38,10 @@ class NestedModelForDynamicShapes(torch.nn.Module):
         zs: dict[str, torch.Tensor],
         c: torch.Tensor,
     ):
+        # [FUNCTION DOC] HELPER: Sums the two list tensors and two mapping tensors, then,
+        # depending on whether the first input is shorter than three and the last input length
+        # is not four, returns the first input plus or minus five, plus or minus the summed
+        # tensor, and the last input.
         y = ys[0] + ys[1] + zs["a"] + zs["b"]
         w = 5
         if x.shape[0] < 3 and c.shape[0] != 4:
@@ -36,6 +51,9 @@ class NestedModelForDynamicShapes(torch.nn.Module):
 
 
 class SingnatureOnlyLlamaModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Stand-in for a Llama causal language model that only provides the
+    # forward signature (many optional keyword arguments and extra keywords); its body does
+    # nothing. Used to resolve argument names for the conversion.
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -52,11 +70,15 @@ class SingnatureOnlyLlamaModel(torch.nn.Module):
         num_logits_to_keep: int = 0,
         **kwargs,
     ):
+        # [FUNCTION DOC] HELPER: Signature-only forward with the usual language model
+        # arguments; does nothing and returns None.
         pass
 
 
 @common_utils.instantiate_parametrized_tests
 class TestDynamicShapes(common_utils.TestCase):
+    # [CLASS DOC] Parametrized test case for the dynamic shapes conversion functions.
+    # Stateless; each test builds its own shapes and inputs.
     @common_utils.parametrize(
         "dynamic_shapes, input_names, expected_dynamic_axes",
         [
@@ -112,6 +134,11 @@ class TestDynamicShapes(common_utils.TestCase):
     def test_from_dynamic_shapes_to_dynamic_axes_success(
         self, dynamic_shapes, input_names, expected_dynamic_axes
     ):
+        # [FUNCTION DOC] Parametrized over a dynamic shapes specification, input names and the
+        # expected dynamic axes. Converts shapes to axes with a generic exception type and
+        # asserts the mapping from input name to the list of dynamic axis indices. Covers
+        # shapes keyed by name, positional tuples where None axes are skipped, and a partial
+        # specification needing fewer names.
         dynamic_axes = _dynamic_shapes.from_dynamic_shapes_to_dynamic_axes(
             dynamic_shapes=dynamic_shapes, input_names=input_names, exception=Exception
         )
@@ -120,6 +147,8 @@ class TestDynamicShapes(common_utils.TestCase):
     def test_from_dynamic_shapes_to_dynamic_axes_fails_when_input_names_is_less_than_flat_dynamic_shapes(
         self,
     ):
+        # [FUNCTION DOC] Passes four dynamic shape entries but only three input names to the
+        # shapes to axes conversion and asserts a ValueError is raised.
         dynamic_shapes = (
             {0: torch.export.Dim("dim")},
             {0: torch.export.Dim("dim")},
@@ -168,6 +197,12 @@ class TestDynamicShapes(common_utils.TestCase):
     def test_dynamic_shapes_supports_nested_input_model_with_input_names_assigned(
         self, dynamic_shapes
     ):
+        # [FUNCTION DOC] Parametrized over nested dynamic shape specifications (a single dim,
+        # a list, a mapping, and None; with or without a None axis). Converts them with six
+        # input names, asserts the expected axes for the first five inputs only, then exports
+        # the nested model through the legacy TorchScript exporter into a temporary directory
+        # using those axes and names. Loads the ONNX model and asserts every input except the
+        # last has a named dynamic first dimension.
         # kwargs can still be renamed as long as it's in order
         input_names = ["input_x", "input_y", "input_z", "d", "e", "f"]
         dynamic_axes = _dynamic_shapes.from_dynamic_shapes_to_dynamic_axes(
@@ -213,6 +248,10 @@ class TestDynamicShapes(common_utils.TestCase):
     # The test can't be parametrized because the torch.export.Dim generates objects,
     # and we need the exact same object to compare them.
     def test__unflatten_dynamic_shapes_with_inputs_tree_succeeds_on_tuple(self):
+        # [FUNCTION DOC] Unflattens a mapping of per-input shapes against a tuple of two
+        # tensors and asserts the result is a tuple of the per-input shapes in order. Not
+        # parametrized because Dim objects compare by identity so the exact same objects are
+        # reused.
         inputs = (torch.randn(1, 2, 3), torch.randn(1, 2, 3))
         x_dim = torch.export.Dim("x_dim_0")
         y_dim = torch.export.Dim("y_dim_1")
@@ -233,6 +272,8 @@ class TestDynamicShapes(common_utils.TestCase):
         self.assertEqual(unflatten_dynamic_shapes, expected_dynamic_shapes)
 
     def test__unflatten_dynamic_shapes_with_inputs_tree_succeeds_on_dict(self):
+        # [FUNCTION DOC] Same as the tuple case but the inputs form a mapping keyed x and y;
+        # asserts the result is a mapping with the same keys holding the shapes.
         inputs = {"x": torch.randn(1, 2, 3), "y": torch.randn(1, 2, 3)}
         x_dim = torch.export.Dim("x_dim_0")
         y_dim = torch.export.Dim("y_dim_1")
@@ -255,6 +296,10 @@ class TestDynamicShapes(common_utils.TestCase):
     def test__unflatten_dynamic_shapes_with_inputs_tree_succeeds_on_tuple_of_mixed_structure(
         self,
     ):
+        # [FUNCTION DOC] Unflattens a flat mapping keyed by leaf names against a tuple mixing
+        # a tensor, a tuple of mappings, a tuple of tensors and a list of tensors. Asserts the
+        # result reproduces the same nesting: tuple and list types preserved and nested
+        # mapping keys kept.
         inputs = (
             torch.randn(1, 2, 3),
             ({"x0": torch.randn(1, 2, 3)}, {"x1": torch.randn(1, 2, 3)}),
@@ -295,6 +340,9 @@ class TestDynamicShapes(common_utils.TestCase):
     def test__unflatten_dynamic_shapes_with_inputs_tree_succeeds_on_dict_of_mixed_structure(
         self,
     ):
+        # [FUNCTION DOC] Same as the mixed tuple case but the inputs are a mapping with a
+        # tensor, a tuple of mappings, a tuple of tensors and a list of tensors. Asserts the
+        # result reproduces the same nesting under the same keys.
         inputs = {
             "w": torch.randn(1, 2, 3),
             "x": ({"x0": torch.randn(1, 2, 3)}, {"x1": torch.randn(1, 2, 3)}),
@@ -335,6 +383,10 @@ class TestDynamicShapes(common_utils.TestCase):
     def test__flatten_dynamic_shapes_to_axes_with_leaves_that_are_supported_by_exported_program(
         self,
     ):
+        # [FUNCTION DOC] Flattens a nested dynamic shapes specification containing named dims,
+        # None axes, automatic and static markers, dynamic markers and integers. Asserts the
+        # flat list of leaf specifications is returned unchanged in order; the second returned
+        # value is ignored.
         dim = torch.export.Dim("dim")
         dynamic_shapes = (
             {
@@ -479,6 +531,11 @@ class TestDynamicShapes(common_utils.TestCase):
         dynamic_axes,
         expected_dynamic_shapes,
     ):
+        # [FUNCTION DOC] Parametrized with a signature-only Llama model, empty positional
+        # args, keyword inputs including cache tensors, names and legacy dynamic axes.
+        # Converts dynamic axes to dynamic shapes, discarding the other two results. Because
+        # Dim objects cannot be compared directly, only the tree structure of the result is
+        # compared against the expected structure.
         dynamic_shapes, _, _ = _dynamic_shapes.from_dynamic_axes_to_dynamic_shapes(
             model,
             args,
@@ -497,6 +554,9 @@ class TestDynamicShapes(common_utils.TestCase):
     def test_convert_str_to_export_dim_returns_the_original_dynamic_shapes_when_there_is_no_str_and_dim(
         self,
     ):
+        # [FUNCTION DOC] Calls the string to export dim conversion with shapes containing only
+        # automatic markers, first as a mapping and then as a tuple. Asserts the shapes are
+        # returned equal and the second result, needing an axis mapping, is False.
         # 1. Dict
         dynamic_shapes = {
             "input_x": [
@@ -540,6 +600,10 @@ class TestDynamicShapes(common_utils.TestCase):
     def test_convert_str_to_export_dim_returns_the_converted_dynamic_shapes_when_there_is_str_or_dim(
         self,
     ):
+        # [FUNCTION DOC] Calls the string to export dim conversion with shapes containing
+        # strings, static markers, automatic markers and Dim objects, as a mapping and as a
+        # tuple. Asserts strings become the dynamic marker while other entries are kept and
+        # the second result is True.
         dimx = torch.export.Dim("customx_dim_1")
 
         # 1. Dict
@@ -611,6 +675,8 @@ class TestDynamicShapes(common_utils.TestCase):
         self.assertTrue(need_axis_mapping)
 
     def test__any_str_or_dim_in_dynamic_shapes_returns_true(self):
+        # [FUNCTION DOC] Checks the any-string-or-Dim detector returns true for a mapping
+        # containing a Dim object and a string among automatic and static entries.
         dynamic_shapes = {
             "input_x": [
                 {
