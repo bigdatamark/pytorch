@@ -1,5 +1,20 @@
 # Owner(s): ["module: decompositions"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests that meta-tensor behavior agrees with real tensor behavior. It contains
+# tests of MetaConverter (conversion of real tensors, views, autograd leaves, complex and
+# channels-last tensors into metadata-equal meta tensors), plus operator-database-driven cross-
+# reference tests (TestMeta) that run each operator on real inputs and on meta inputs, via torch
+# function mode, torch dispatch mode and the python dispatcher, and compare dtype, shape,
+# strides, storage offset, grad and conj/neg flags. Large module-level tables list expected
+# failures and skips per operator and dtype, per device type. At import time it defines dtype
+# aliases, builds the combined foreach operator list, and (only if the PYTORCH_COLLECT_EXPECT
+# environment variable is 1) registers an exit hook that prints suggested expected-failure and
+# skip tables. Device-specific test classes are instantiated at the bottom of the file. In the
+# main block, if the XLA or text comparison environment variables name a file, it prints which of
+# the listed operators are skipped or expected to fail in the dispatch tables and exits, else it
+# runs the test runner.
+# KNOWN ISSUE: the dispatch device skip table for CUDA lists the softmax integer overload twice;
+# duplicate dictionary keys are silently collapsed.
 
 import itertools
 import torch
@@ -91,7 +106,16 @@ foreach_op_db = (
 
 
 class TestMetaConverter(TestCase):
+    # [CLASS DOC] Tests for MetaConverter. Each test builds a real tensor (view, leaf, non-leaf,
+    # channels-last, complex, strided) with a fresh converter, converts it, and checks that
+    # metadata (shape, strides, dtype, grad flags, view structure) matches the original. Also
+    # checks version counter sharing between views and that the converter's memo tables release
+    # entries when tensors die.
     def assertSameVersionCounter(self, m1, m2):
+        # [FUNCTION DOC] HELPER: Asserts that two meta views share one version counter: reads the
+        # first one's version, requires the second to equal it, bumps the base in place under no-
+        # grad, and requires the first version to change and the two to remain equal. Used
+        # because storage identity cannot be tested directly.
         # Cannot easily test m1 and m2 have same storage due to
         # lack of Storage bindings.  Use version counter.
         vc = m1._version
@@ -103,9 +127,14 @@ class TestMetaConverter(TestCase):
         self.assertEqual(m2._version, m1._version)
 
     def assertMetadataMatches(self, m1, m2):
+        # [FUNCTION DOC] HELPER: Compares the metadata of two tensors using the metadata
+        # comparison utility, with this test case's equality assertion as the checker.
         assert_metadata_eq(self.assertEqual, m1, m2)
 
     def test_view_of_non_leaf(self):
+        # [FUNCTION DOC] Converts two separate slices of a non-leaf tensor to meta with one
+        # converter and checks both are views of a non-leaf base, are distinct objects, match the
+        # metadata of their originals, and share a version counter.
         x = torch.randn(4, requires_grad=True)
         y = x.neg()
         z1 = y[:]
@@ -124,6 +153,9 @@ class TestMetaConverter(TestCase):
         self.assertSameVersionCounter(m1, m2)
 
     def test_view_of_leaf(self):
+        # [FUNCTION DOC] Same as the previous view test but the base is a leaf requiring grad:
+        # two slices of it are converted, must be views of a leaf base, distinct objects with
+        # matching metadata and a shared version counter.
         x = torch.randn(4, requires_grad=True)
         z1 = x[:]
         z2 = x[:]
@@ -141,6 +173,9 @@ class TestMetaConverter(TestCase):
         self.assertSameVersionCounter(m1, m2)
 
     def test_view_of_view_of_leaf(self):
+        # [FUNCTION DOC] Converts the base tensor and then a view of a view (whose middle view
+        # requires grad), and checks that the converted tensors' metadata matches the originals
+        # and that the final view is not a leaf.
         x = torch.randn(8)
         y = x.view(2, 4)
         y.requires_grad = True
@@ -156,6 +191,8 @@ class TestMetaConverter(TestCase):
         self.assertMetadataMatches(mz, z)
 
     def test_leaf(self):
+        # [FUNCTION DOC] Converts a leaf tensor that requires grad and checks the result is a
+        # leaf requiring grad with matching metadata.
         x = torch.randn(4, requires_grad=True)
         to_meta = MetaConverter()
         m = to_meta(x)
@@ -167,6 +204,8 @@ class TestMetaConverter(TestCase):
         self.assertMetadataMatches(m, x)
 
     def test_non_leaf(self):
+        # [FUNCTION DOC] Converts a non-leaf tensor requiring grad and checks the result is a
+        # non-leaf requiring grad with matching metadata.
         x = torch.randn(4, requires_grad=True)
         y = x.neg()
         to_meta = MetaConverter()
@@ -179,6 +218,8 @@ class TestMetaConverter(TestCase):
         self.assertMetadataMatches(m, y)
 
     def test_requires_grad_false(self):
+        # [FUNCTION DOC] Converts a tensor not requiring grad and checks the result does not
+        # require grad and metadata matches.
         x = torch.randn(4, requires_grad=False)
         to_meta = MetaConverter()
         m = to_meta(x)
@@ -189,6 +230,8 @@ class TestMetaConverter(TestCase):
         self.assertMetadataMatches(m, x)
 
     def test_channels_last(self):
+        # [FUNCTION DOC] Converts a channels-last formatted empty tensor and checks the result is
+        # a leaf with matching metadata (including strides).
         x = torch.empty(2, 3, 4, 5, memory_format=torch.channels_last)
         to_meta = MetaConverter()
         m = to_meta(x)
@@ -199,6 +242,8 @@ class TestMetaConverter(TestCase):
         self.assertMetadataMatches(m, x)
 
     def test_channels_last_leaf(self):
+        # [FUNCTION DOC] Converts a channels-last leaf tensor that requires grad and checks the
+        # result requires grad, is a leaf, and has matching metadata.
         x = torch.empty(2, 3, 4, 5, memory_format=torch.channels_last, requires_grad=True)
         to_meta = MetaConverter()
         m = to_meta(x)
@@ -210,6 +255,11 @@ class TestMetaConverter(TestCase):
         self.assertMetadataMatches(m, x)
 
     def test_channels_last_non_leaf(self):
+        # [FUNCTION DOC] Converts a non-leaf result of arithmetic on a channels-last
+        # tensor requiring grad; checks strides were preserved by the arithmetic, the meta
+        # copy is a non-leaf requiring grad with matching metadata, and that autograd can
+        # compute a gradient of its sum with respect to itself without error (regression
+        # for a linked issue).
         x = torch.empty(2, 3, 4, 5, memory_format=torch.channels_last, requires_grad=True)
         y = x + 2
 
@@ -232,6 +282,8 @@ class TestMetaConverter(TestCase):
         torch.autograd.grad(loss, m)
 
     def test_empty_strided_non_dense_leaf(self):
+        # [FUNCTION DOC] Converts a leaf tensor with non-dense strides that requires grad and
+        # checks it stays a leaf requiring grad with matching metadata.
         x = torch.empty_strided((2, 2), (4, 2), requires_grad=True)
 
         to_meta = MetaConverter()
@@ -244,6 +296,9 @@ class TestMetaConverter(TestCase):
         self.assertMetadataMatches(m, x)
 
     def test_view_mutate(self):
+        # [FUNCTION DOC] Converts a view of a zeros tensor and then performs in-place addition of
+        # a grad-requiring random tensor on the real view and of a meta grad-requiring tensor on
+        # the meta view. Only checks that neither raises.
         x = torch.zeros(4)
         y = x.view(2, 2)
 
@@ -254,6 +309,9 @@ class TestMetaConverter(TestCase):
         m.add_(torch.randn(2, 2, device='meta', requires_grad=True))
 
     def test_non_leaf_torture(self):
+        # [FUNCTION DOC] Builds a leaf tensor requiring grad whose storage is re-pointed, under
+        # no-grad, with an offset and a different size and stride, then converts it and checks it
+        # is a leaf requiring grad with matching metadata.
         x = torch.empty(20, requires_grad=True)
         with torch.no_grad():
             x.set_(x.storage(), 10, (2,), (2,))
@@ -271,35 +329,48 @@ class TestMetaConverter(TestCase):
     # we have a blanket exclusion for complex conversion
 
     def test_view_as_real(self):
+        # [FUNCTION DOC] Converts the real-view of a complex tensor and checks metadata
+        # matches. Complex conversion is noted in a comment as not really exercised because of
+        # a blanket exclusion.
         x = torch.randn(4, dtype=torch.complex64)
         y = torch.view_as_real(x)
         m = MetaConverter()(y)
         self.assertMetadataMatches(m, y)
 
     def test_complex_noncontiguous_bug(self):
+        # [FUNCTION DOC] Regression test: converts a noncontiguous slice of a half-precision
+        # complex tensor and checks metadata matches.
         x = torch.randn((2, 2, 4, 9), dtype=torch.complex32)[:, 0, :, :]
         m = MetaConverter()(x)
         self.assertMetadataMatches(m, x)
 
     def test_view_as_complex(self):
+        # [FUNCTION DOC] Converts the complex view of a float tensor with trailing dimension two
+        # and checks metadata matches.
         x = torch.randn((4, 2), dtype=torch.float32)
         y = torch.view_as_complex(x)
         m = MetaConverter()(y)
         self.assertMetadataMatches(m, y)
 
     def test_view_dtype(self):
+        # [FUNCTION DOC] Converts a float tensor reinterpreted as 32-bit integers through the
+        # dtype view and checks metadata matches.
         x = torch.randn(4, dtype=torch.float32)
         y = x.view(dtype=torch.int32)
         m = MetaConverter()(y)
         self.assertMetadataMatches(m, y)
 
     def test_imag(self):
+        # [FUNCTION DOC] Converts the imaginary-part view of a complex tensor and
+        # checks metadata matches.
         x = torch.randn(4, dtype=torch.complex64)
         y = x.imag
         m = MetaConverter()(y)
         self.assertMetadataMatches(m, y)
 
     def test_inplace_set_storage(self):
+        # [FUNCTION DOC] Sets a scalar-shaped meta tensor to use the storage of a real tensor and
+        # checks the real storage size did not change.
         x = torch.tensor([0, 1], dtype=torch.int64)
         storage = x.untyped_storage()
         ssize = storage.size()
@@ -309,6 +380,12 @@ class TestMetaConverter(TestCase):
 
     @xfailIfTorchDynamo
     def test_weakref(self):
+        # [FUNCTION DOC] Checks memoization and lifetime. Converting the same tensor twice
+        # returns the same object, and the converter's tensor and storage memos and the describer
+        # lookup tables each hold one entry. Deleting the real tensor empties the describer
+        # tables but not the memos; deleting the meta tensors empties the memos. Repeats with
+        # four tensors held in lists and checks entries drop as lists are deleted. Marked
+        # expected failure under Dynamo.
         x = torch.randn(4, 4, 4)
         m = MetaConverter()
         y = m(x)
@@ -349,6 +426,9 @@ class TestMetaConverter(TestCase):
 
     @xfailIfTorchDynamo
     def test_tensor_outlives_converter(self):
+        # [FUNCTION DOC] Checks that deleting a converter after converting a tensor lets the
+        # converter be garbage collected (a weak reference to it becomes empty) even though a
+        # converted tensor still exists. Marked expected failure under Dynamo.
         m = MetaConverter()
         ref = weakref.ref(m)
         x = torch.randn([4, 4])
@@ -408,11 +488,19 @@ CHECK_CONJ_SKIPS = {
 }
 
 class CheckStrides(Enum):
+    # [CLASS DOC] Enumeration of how strictly output strides are compared: not at all, only
+    # significant strides (ignoring size-one dimensions and similar), or all strides.
     NONE = 0
     SIGNIFICANT = 1
     ALL = 2
 
 def should_check_strides(func):
+    # [FUNCTION DOC] Decides the stride-check level for an operator. Membership in the check-
+    # all set gives all, the check set gives significant, the skip set gives none. Anything
+    # that is not an operator overload gives none; prims namespace and every remaining
+    # overload give significant.
+    # KNOWN ISSUE: the view-detection branch and the final fallthrough both return significant,
+    # so the view check has no effect (a TODO about tensor iterator is left in the code).
     if func in CHECK_ALL_STRIDES:
         return CheckStrides.ALL
     if func in CHECK_STRIDES:
@@ -432,11 +520,21 @@ def should_check_strides(func):
     return CheckStrides.SIGNIFICANT
 
 def assert_ref_meta_equal(test_case, func, meta_rs, rs, msg_callable):
+    # [FUNCTION DOC] Compares real outputs with meta outputs of one operator call. Flattens both
+    # with pytree, requires equal leaf counts, then for each real tensor leaf checks the meta
+    # leaf is a tensor with the same dtype, shape, storage offset and requires_grad, strides per
+    # the stride-check level, and conj and neg bits (conj skipped for operators in the conj skip
+    # set). Raises a runtime error with the output index and the message transformed by
+    # msg_callable on the first mismatch. Non-tensor leaves are skipped.
+    # KNOWN ISSUE: the message for the not-a-tensor check reads that the real result is a Tensor,
+    # which is worded confusingly.
     flat_meta_rs = pytree.tree_leaves(meta_rs)
     flat_rs = pytree.tree_leaves(rs)
     test_case.assertEqual(len(flat_meta_rs), len(flat_rs))
     for i, meta_r, r in zip(range(len(flat_rs)), flat_meta_rs, flat_rs):
         def test_assert(cond, msg):
+            # [FUNCTION DOC] HELPER: If the condition is false, raises a runtime error naming the
+            # current output index and the message passed through the enclosing msg_callable.
             if not cond:
                 raise RuntimeError(f"output {i}: {msg_callable(msg)}")
         if not isinstance(r, torch.Tensor):
@@ -484,10 +582,18 @@ seen_succeeded = {}
 seen_failed = {}
 failed_reasons = defaultdict(set)
 def print_seen():
+    # [FUNCTION DOC] HELPER: Exit hook used when expectation collection is enabled. For each
+    # operator that failed on some dtypes it resolves a printable name, splits failed dtypes into
+    # those that never succeeded (expected failures) and those that both failed and succeeded
+    # (skips), optionally appends the recorded failure reasons as a comment, sorts the lines and
+    # prints two dictionary-style tables for pasting into the expectation lists. Reads module-
+    # level global records only.
     expected_failures = []
     skips = []
 
     def fmt_dtypes(dtypes):
+        # [FUNCTION DOC] HELPER: Formats a collection of dtypes as a brace-wrapped comma-
+        # separated sorted list of their short abbreviations.
         r = ', '.join(sorted(dtype_abbrs[d] for d in dtypes))
         return '{' + r + '}'
 
@@ -523,14 +629,23 @@ TestExpect = Enum("TestExpect", ("SUCCESS", "XFAILURE", "SKIP"))
 
 # unlike print produce strides
 def verbose_print(e):
+    # [FUNCTION DOC] HELPER: Returns a string form of a (possibly nested) structure of values
+    # where each dense tensor is shown together with its strides; sparse tensors and non-tensors
+    # are left as they are.
     class Lit:
+        # [CLASS DOC] HELPER: Wrapper around a string whose repr is exactly that string, so a
+        # custom text appears unquoted inside a printed container.
         def __init__(self, s):
+            # [FUNCTION DOC] HELPER: Stores the text.
             self.s = s
 
         def __repr__(self):
+            # [FUNCTION DOC] HELPER: Returns the stored text unchanged.
             return self.s
 
     def go(t):
+        # [FUNCTION DOC] HELPER: Maps a leaf to a text wrapper including strides when it is a
+        # dense tensor, and returns sparse tensors and other values unchanged.
         if is_sparse_any(t):
             return t
         elif isinstance(t, torch.Tensor):
@@ -551,6 +666,22 @@ def run_meta_crossref(
     device_type,
     run_symbolic_meta: bool
 ):
+    # [FUNCTION DOC] Core cross-reference check for one operator call. Runs the real function on
+    # the given args and kwargs (any failure raises an assertion error saying the operator-info
+    # sample is broken). Unless the expectation is skip, args are converted to meta tensors first
+    # (conversion failure raises a runtime error). If every tensor converted, it patches the meta
+    # args for special cases: tensor_split and repeat_interleave without an output size keep real
+    # data-dependent args, indexing keeps real integer-8 or boolean index tensors, and list-
+    # length ctc_loss forces expected success; a device keyword becomes the meta device. It then
+    # runs the function on meta args with warnings suppressed, optionally under the python
+    # dispatcher for symbolic meta mode. A failure on meta returns the real result if failure was
+    # expected; otherwise it records the dtype as failed (and the missing-kernel reason when the
+    # error is a not-implemented one), returns quietly in collect mode, or raises a runtime error
+    # describing the call. If meta ran, it compares outputs with the output comparison helper; a
+    # mismatch is handled the same way (expected failure returns, collect mode records and
+    # returns, else re-raises); a match records success and raises a runtime error for an
+    # unexpected success when failure was expected and collect mode is off. Returns the real
+    # result. Mutates the module-level seen and reason records.
     to_meta = MetaConverter()
     do_meta = test_expect is not TestExpect.SKIP
     if do_meta:
@@ -798,17 +929,32 @@ meta_function_device_skips['cuda'] = {
 # https://github.com/pytorch/pytorch/pull/75994  The big benefit is it is
 # A LOT more efficient that torch dispatch mode (at the cost of less coverage)
 class MetaCrossRefFunctionMode(torch.overrides.TorchFunctionMode):
+    # [CLASS DOC] Torch function mode that, for each intercepted torch API call, runs the real
+    # call, reruns it with meta tensors and compares the outputs via the cross-reference helper.
+    # Holds the test case, the device type string, the dtype under test and whether the variant
+    # is in-place. The expectation (success, expected failure, or skip) for each function is
+    # looked up from the module-level function skip and failure tables, including device-specific
+    # and conditional tables.
     test_case: TestCase
     device_type: str
     dtype: torch.dtype
 
     def __init__(self, test_case, *, device, dtype, inplace):
+        # [FUNCTION DOC] Stores the test case, the device type derived from the given device, the
+        # dtype and the in-place flag.
         self.test_case = test_case
         self.device_type = torch.device(device).type
         self.dtype = dtype
         self.inplace = inplace
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Mode hook. While tracing, for script methods, or when the Python
+        # dispatch key is excluded in thread-local state, just calls the function normally with
+        # no comparison. Otherwise picks the expectation in priority order: skip tables (generic
+        # then device), expected-failure tables (generic then device), the conditional failure
+        # table (predicate called with the dtype and call arguments), the out-of-place-only
+        # device failure table (ignored for in-place variants); default is success. Then runs the
+        # cross-reference check with symbolic meta off and returns the real result it produces.
         kwargs = kwargs or {}
 
         if (
@@ -949,8 +1095,17 @@ meta_dispatch_device_skips['cuda'] = {
 }
 
 def get_strided_args(args):
+    # [FUNCTION DOC] Generator that yields tuples of argument lists to try different memory
+    # layouts. For each argument that is a dense, contiguous, non-sparse-compressed tensor it
+    # builds variants, and every other argument gets a single-item variant. Yields the cartesian
+    # product over all arguments.
 
     def get_strided_variants(t, include_storage_offset=False):
+        # [FUNCTION DOC] HELPER: Returns a list of layouts of a tensor: itself, a transposed-
+        # layout copy when it has more than one dimension, a non-dense strided one (every other
+        # element along the last dimension) when it has at least one dimension, channels-last for
+        # four-dimensional, channels-last-3d for five-dimensional, and when requested a copy
+        # placed at storage offset one.
         variants = []
 
         # contiguous
@@ -997,12 +1152,21 @@ def get_strided_args(args):
     yield from itertools.product(*strided_args)
 
 class MetaCrossRefDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
+    # [CLASS DOC] Torch dispatch mode performing the same real-versus-meta comparison as the
+    # function mode but at the operator-overload level. Attributes: test case, device type,
+    # dtype, flags for symbolic meta, in-place and whether the operator supports an out argument,
+    # and the precision and relative tolerance saved from the test case. A class-level set
+    # remembers operator packets known to have no out overload. Also checks out-overloads of
+    # operators that have none at the user level.
     test_case: TestCase
     device: torch.device
     dtype: torch.dtype
     aten_olp_no_out_overload: set = set()
 
     def __init__(self, test_case, *, device, dtype, symbolic_meta: bool, inplace: bool, supports_out: bool):
+        # [FUNCTION DOC] Stores the test case, the precision and relative tolerance read from it
+        # (saved because thread-local state is not visible later), the device type from the
+        # device, the dtype and the symbolic meta, in-place and supports-out flags.
         self.test_case = test_case
         # save TLS
         self.precision = test_case.precision
@@ -1015,6 +1179,15 @@ class MetaCrossRefDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
 
     @staticmethod
     def try_resolve_aten_out_overload(ol, args, kwargs, num_outputs):
+        # [FUNCTION DOC] Finds an out-variant overload that matches a call to the given
+        # overload. Returns a triple of the overload, the names of its out arguments and a
+        # keyword dictionary, or a triple of nothing when none is found. Packets already known
+        # to lack out overloads return early, and are added to the class-level cache when no
+        # overload of the packet takes an out argument. A candidate matches when it has more
+        # arguments than positional args supplied, the positional argument types equal, its
+        # trailing out arguments count equals num_outputs, and each remaining argument is either
+        # given in kwargs, has a default, or is optional (optional boolean gets false, other
+        # optional gets nothing).
 
         ol_args = ol._schema.arguments
         olp: OpOverloadPacket = ol._overloadpacket
@@ -1079,6 +1252,9 @@ class MetaCrossRefDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
         return None, None, None
 
     def _get_expected_test_result(self, func: OpOverload):
+        # [FUNCTION DOC] Looks up expectation for an operator overload: skip if the dtype is in
+        # the generic or device skip tables, expected failure if in the failure tables, else
+        # success. Returns the expectation value.
         if self.dtype in meta_dispatch_skips.get(func, set()):
             test_expect = TestExpect.SKIP
         elif self.dtype in meta_dispatch_device_skips[self.device_type].get(func, set()):
@@ -1092,6 +1268,13 @@ class MetaCrossRefDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
         return test_expect
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Mode hook. Restores the saved precision and tolerance on the test case,
+        # determines the expectation and runs the cross-reference check with this mode's symbolic
+        # setting to get the real result. If the variant is out-of-place, the operator lacks an
+        # out argument, the expectation is success and the result is a tensor or iterable, it
+        # tries to find a matching out overload; if found it fills the out arguments with the
+        # real result (one tensor or one per output), looks up that overload's expectation and
+        # runs the cross-reference check on it too. Returns the real result.
         kwargs = kwargs or {}
         self.test_case.precision = self.precision
         self.test_case.rel_tol = self.rel_tol
@@ -1155,11 +1338,25 @@ class MetaCrossRefDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
 # with the inconsistencies but this takes time.
 @unMarkDynamoStrictTest
 class TestMeta(TestCase):
+    # [CLASS DOC] Operator-database-driven meta tests, generated per device and dtype. Out-of-
+    # place and in-place tests run each sample input under the function mode; dispatch tests run
+    # them under the dispatch mode, with and without symbolic meta, and with all stride layouts
+    # on CUDA only. Further tests check specific meta kernels directly (quantized empty,
+    # nan_to_num, broadcast errors, custom op without autograd kernel, huber and normalization
+    # backward shapes). Per-operator expected failures and skips are given by decorators and the
+    # module-level tables.
     # Copies inputs to inplace operations to avoid inplace modifications
     #   to leaves requiring gradient
     def _get_safe_inplace(self, inplace_variant):
+        # [FUNCTION DOC] HELPER: Wraps an in-place callable so that its first argument (a
+        # tensor, or each tensor of a list) is cloned before the call, protecting leaves that
+        # require grad from in-place modification. Returns the wrapper, which keeps the
+        # metadata of the original.
         @wraps(inplace_variant)
         def _fn(t, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Calls the wrapped in-place function on clones of the first
+            # argument (a list is cloned element-wise) with the remaining arguments unchanged,
+            # returning its result.
             if isinstance(t, list):
                 return inplace_variant([x.clone() for x in t], *args, **kwargs)
             else:
@@ -1198,6 +1395,14 @@ class TestMeta(TestCase):
     ))
     @ops(itertools.chain(op_db, foreach_op_db))
     def test_meta_outplace(self, device, dtype, op):
+        # [FUNCTION DOC] Out-of-place cross-reference test for one operator and dtype. Skips
+        # scaled matrix multiply operators (no meta support) and, under Dynamo, a few flaky
+        # operators. For each sample input it calls the operator inside the function mode and,
+        # when the result is a tensor and the operator supports an out argument, calls it again
+        # with that result as output. For samples with a device keyword on a like-operator, it
+        # also runs with a fixed random seed once as is and once with the first argument moved to
+        # the meta device, and checks the two results are equal (except for empty_like, which is
+        # not deterministic). Raises if the first argument of such a sample is not a tensor.
         if "_scaled_mm" in op.name:
             raise unittest.SkipTest("_scaled_mm dose not support meta device")
         skip_op_names = (
@@ -1295,6 +1500,11 @@ class TestMeta(TestCase):
     ))
     @ops(itertools.chain(op_db, foreach_op_db))
     def test_meta_inplace(self, device, dtype, op):
+        # [FUNCTION DOC] In-place cross-reference test. Skips if the operator has no in-place
+        # variant, if it promotes integers to float and the dtype is not floating point, or if
+        # it is in the in-place skip set. Wraps the in-place function so inputs are cloned,
+        # then for every sample not broadcasting its input runs it inside the function mode
+        # with the in-place flag on.
         func = op.get_inplace()
         if not func:
             self.skipTest("No inplace variable for this op")
@@ -1313,6 +1523,15 @@ class TestMeta(TestCase):
                 expected = func(*args, **kwargs)
 
     def _run_dispatch_meta_test(self, device, dtype, op, symbolic_meta, inplace, all_stride_variants=False):
+        # [FUNCTION DOC] HELPER: Shared driver for the dispatch-mode tests. Skips scaled matrix
+        # multiply operators, picks the in-place or out-of-place function (skipping the test when
+        # no in-place variant exists or integers would be promoted to float), skips functions in
+        # the dispatch early-skip set, and wraps in-place functions to clone inputs. For each
+        # sample (in-place samples that broadcast the input are skipped) it optionally expands
+        # the arguments into stride layout variants (only when five or fewer tensors are
+        # present), and for each variant calls the function with the dispatch mode pushed using
+        # the given symbolic, in-place and supports-out settings; for tensor results of out-of-
+        # place operators supporting out it also calls with the result as the output.
         if "_scaled_mm" in op.name:
             raise unittest.SkipTest("_scaled_mm dose not support meta device")
         if inplace:
@@ -1386,6 +1605,8 @@ class TestMeta(TestCase):
     ))
     @ops(itertools.chain(op_db, foreach_op_db))
     def test_dispatch_meta_outplace(self, device, dtype, op):
+        # [FUNCTION DOC] Dispatch-mode meta test for the out-of-place variant with regular (non-
+        # symbolic) meta kernels; delegates to the shared driver.
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=False, inplace=False)
 
     @skipIfCrossRef
@@ -1440,6 +1661,8 @@ class TestMeta(TestCase):
     ))
     @ops(itertools.chain(op_db, foreach_op_db))
     def test_dispatch_meta_inplace(self, device, dtype, op):
+        # [FUNCTION DOC] Dispatch-mode meta test for the in-place variant with regular (non-
+        # symbolic) meta kernels; delegates to the shared driver.
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=False, inplace=True)
 
     @skipIfCrossRef
@@ -1473,6 +1696,8 @@ class TestMeta(TestCase):
     ))
     @ops(itertools.chain(op_db, foreach_op_db))
     def test_dispatch_symbolic_meta_outplace(self, device, dtype, op):
+        # [FUNCTION DOC] Dispatch-mode meta test for the out-of-place variant using symbolic meta
+        # (python dispatcher); delegates to the shared driver.
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=False)
 
 
@@ -1529,6 +1754,8 @@ class TestMeta(TestCase):
     ))
     @ops(itertools.chain(op_db, foreach_op_db))
     def test_dispatch_symbolic_meta_inplace(self, device, dtype, op):
+        # [FUNCTION DOC] Dispatch-mode meta test for the in-place variant using symbolic meta
+        # (python dispatcher); delegates to the shared driver.
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=True)
 
     @skipIfCrossRef
@@ -1560,6 +1787,9 @@ class TestMeta(TestCase):
     # Only test on CUDA, as CUDA kernel's stride is the reference
     @onlyCUDA
     def test_dispatch_symbolic_meta_outplace_all_strides(self, device, dtype, op):
+        # [FUNCTION DOC] Symbolic-meta out-of-place dispatch test that also tries several stride
+        # layouts of the inputs. CUDA only, using one common dtype per operator, since CUDA
+        # strides are the reference; delegates to the shared driver.
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=False, all_stride_variants=True)
 
     @skipIfCrossRef
@@ -1585,6 +1815,9 @@ class TestMeta(TestCase):
     # Only test on CUDA, as CUDA kernel's stride is the reference
     @onlyCUDA
     def test_dispatch_symbolic_meta_inplace_all_strides(self, device, dtype, op):
+        # [FUNCTION DOC] Symbolic-meta in-place dispatch test that also tries several
+        # stride layouts of the inputs. CUDA only, one common dtype per operator; delegates
+        # to the shared driver.
         self._run_dispatch_meta_test(device, dtype, op, symbolic_meta=True, inplace=True, all_stride_variants=True)
 
     @skipIfCrossRef
@@ -1605,12 +1838,19 @@ class TestMeta(TestCase):
     # Only test on CUDA, as CUDA kernel's stride is the reference
     @onlyCUDA
     def test_binary_ufuncs_mixed_dtype(self, device, dtype, op):
+        # [FUNCTION DOC] CUDA-only test, float32 only, of binary pointwise operators with a
+        # float32 first input and a float16 second input. It copies the operator info, replaces
+        # its sample generator with one yielding that single mixed-dtype pair, and runs the
+        # shared dispatch driver with symbolic meta, out-of-place.
         make_arg = partial(
             make_tensor,
             device=device,
         )
 
         def sample_input(op, device, dtype, requires_grad, **kwargs):
+            # [FUNCTION DOC] HELPER: Generator that yields one sample input: a float tensor of
+            # the test dtype and a half-precision tensor, both with the fixed size, made on the
+            # test device. Extra arguments are ignored.
             yield SampleInput(
                 make_arg((S,), dtype=dtype), make_arg((S,), dtype=torch.float16)
             )
@@ -1622,20 +1862,29 @@ class TestMeta(TestCase):
 
 
     def test_empty_quantized(self):
+        # [FUNCTION DOC] Creates a huge quantized empty tensor on the meta device and
+        # checks that it is on meta.
         r = torch.empty(2 ** 52, device='meta', dtype=torch.qint8)
         self.assertEqual(r.device.type, 'meta')
 
     def test_nan_to_num(self):
+        # [FUNCTION DOC] Applies nan_to_num to a meta tensor holding special float values and
+        # checks the result is on meta.
         t = torch.tensor([float('nan'), float('inf'), -float('inf'), 3.14], device='meta')
         r = t.nan_to_num()
         self.assertEqual(r.device.type, 'meta')
 
     def test_inplace_masked_fill_error(self):
+        # [FUNCTION DOC] Checks that in-place masked fill on a meta tensor with a mask that
+        # cannot be broadcast in place raises a runtime error mentioning the broadcast mismatch.
         t = torch.randn(3, 3, device='meta')
         with self.assertRaisesRegex(RuntimeError, "doesn't match the broadcast"):
             t.masked_fill_((t > 0).unsqueeze(0), 0.1)
 
     def test_inplace_bin_ops_error(self):
+        # [FUNCTION DOC] For each of several in-place binary operators (add, sub, mul, div,
+        # logical and, or, xor), checks calling it on a meta tensor with an operand whose
+        # broadcast shape is larger raises a runtime error mentioning the broadcast mismatch.
         t = torch.randn(3, 3, device='meta')
         for op in (torch.Tensor.add_, torch.Tensor.sub_, torch.Tensor.mul_, torch.Tensor.div_,
                    torch.Tensor.logical_and_, torch.Tensor.logical_or_, torch.Tensor.logical_xor_):
@@ -1644,10 +1893,16 @@ class TestMeta(TestCase):
 
     @onlyCPU
     def test_meta_autograd_no_error(self):
+        # [FUNCTION DOC] CPU-only. In temporary scoped library registrations it defines a custom
+        # operator with both CPU and meta implementations that add one, and calls it on a meta
+        # tensor. The test passes if there is no error, since a fallthrough exists for the
+        # autograd meta key of custom operators. Registrations are removed on exit.
         with torch.library._scoped_library("meta_test", "DEF") as lib:
             with torch.library._scoped_library("meta_test", "IMPL", "CPU") as impl_cpu:
                 with torch.library._scoped_library("meta_test", "IMPL", "Meta") as impl_meta:
                     def foo_impl(x):
+                        # [FUNCTION DOC] HELPER: Implementation registered for the custom
+                        # operator on CPU and meta; returns its input plus one.
                         return x + 1
 
                     lib.define("foo(Tensor a) -> Tensor")
@@ -1662,12 +1917,19 @@ class TestMeta(TestCase):
                     b = torch.ops.meta_test.foo.default(a)
 
     def test_huber_loss_backward(self):
+        # [FUNCTION DOC] Calls the huber loss backward operator on three huge meta tensors and
+        # checks the result is on meta with the shape of the first input.
         inps = [torch.rand(2**52, device='meta') for _ in range(3)]
         r = torch.ops.aten.huber_loss_backward(*inps, 0, 1.0)
         self.assertEqual(r.device.type, 'meta')
         self.assertEqual(r.shape, inps[0].shape)
 
     def _norm_backwards_test_helper(self, op, args, output_mask, expected_shapes):
+        # [FUNCTION DOC] HELPER: Shared checker for normalization backward on meta tensors. Calls
+        # the operator functionally with the output mask and checks gradient shapes against the
+        # expected shapes (a missing expected shape means a none gradient). Then calls it again
+        # passing preallocated empty out tensors, one per mask entry, and checks the shapes of
+        # those outputs against the expected shapes.
 
         dtype = torch.float32
         device = "meta"
@@ -1676,6 +1938,8 @@ class TestMeta(TestCase):
         grads = op(*args, output_mask)
 
         def assertEqualShapes(res, exp):
+            # [FUNCTION DOC] HELPER: Asserts a functional result is none when the expected shape
+            # is none, otherwise that its shape equals the expected shape.
             self.assertIsNone(res) if exp is None else self.assertEqual(exp, res.shape)
 
         assertEqualShapes(grads[0], expected_shapes[0])
@@ -1691,6 +1955,9 @@ class TestMeta(TestCase):
         grads = op(*args, output_mask, **out_kwargs)
 
         def assertEqualShapes(res, exp):
+            # [FUNCTION DOC] HELPER: Redefinition for the out-parameter phase: when an
+            # expected shape exists, asserts the result's shape equals it; when it is
+            # none, nothing is checked.
             self.assertEqual(exp, res.shape) if exp is not None else True
 
         assertEqualShapes(out_kwargs["out0"], expected_shapes[0])
@@ -1700,6 +1967,13 @@ class TestMeta(TestCase):
     @onlyCPU
     @parametrize("output_mask", list(itertools.product([True, False], [True, False], [True, False])))
     def test_layer_norm_backward(self, output_mask):
+        # [FUNCTION DOC] CPU-only, parameterized over all eight combinations of the three-
+        # entry output mask. For each layer norm sample input on the meta device (missing
+        # weight and bias padded with none), builds a gradient of ones, zero mean and
+        # reciprocal std-dev tensors of the reduced shape, computes expected gradient shapes
+        # (input shape, weight shape, bias shape or none depending on the mask and presence),
+        # and runs the shared normalization backward checker on the layer norm backward
+        # operator. Each sample is a subtest.
         from torch.testing._internal.common_methods_invocations import sample_inputs_layer_norm
 
         device = "meta"
@@ -1733,6 +2007,12 @@ class TestMeta(TestCase):
     @onlyCPU
     @parametrize("output_mask", list(itertools.product([True, False], [True, False], [True, False])))
     def test_group_norm_backward(self, output_mask):
+        # [FUNCTION DOC] CPU-only, parameterized over the eight output masks. For each group norm
+        # sample on meta it builds ones gradient, zero mean and std-dev per batch and group, and
+        # a zero weight with channel size; expected shapes are the input shape and the weight
+        # shape (used for both weight and bias gradients) as selected by the mask. Runs the
+        # shared checker on the group norm backward operator with batch, channel, spatial size
+        # and group count arguments.
         from torch.testing._internal.common_methods_invocations import sample_inputs_group_norm
 
         # input, (args) num_groups, (kwargs) weight, bias eps
@@ -1764,6 +2044,12 @@ class TestMeta(TestCase):
     @onlyCPU
     @parametrize("output_mask", list(itertools.product([True], [True, False], [True, False])))
     def test_batch_norm_backward(self, output_mask):
+        # [FUNCTION DOC] CPU-only, parameterized over output masks whose first entry is always
+        # true. For each batch norm sample on meta with at least two dimensions it builds a ones
+        # gradient and, in training mode, zero saved mean and inverse std-dev of channel size
+        # (none otherwise), and the argument list for the batch norm backward operator. Expected
+        # shapes are the input shape, then the channel size shape for the weight and bias
+        # gradients per the mask. Runs the shared checker.
         from torch.testing._internal.common_methods_invocations import sample_inputs_batch_norm
 
         # input, (args) num_groups, (kwargs) weight, bias eps
@@ -1795,6 +2081,9 @@ class TestMeta(TestCase):
                                                  args, output_mask, expected_shapes)
 
     def test_fill__alias_relationship(self):
+        # [FUNCTION DOC] On a huge meta tensor, checks the in-place fill operator
+        # returns the very same object (same identity) while the out-of-place fill
+        # returns a different object.
         inps = torch.rand(2**52, device='meta')
         r = torch.ops.aten.fill_(inps, 1.0)
         # aten.fill_ returns an alias
@@ -1805,6 +2094,11 @@ class TestMeta(TestCase):
         self.assertNotEqual(id(inps), id(r2))
 
     def test_meta__fused_moving_avg_obs_fq_helper(self, device):
+        # [FUNCTION DOC] Runs the fused moving-average observer fake-quantize helper operator on
+        # a real tensor and on its meta conversion, with the observer/fake-quant flags from a
+        # module, for three keyword settings (default, per-row off with symmetric off, per-row
+        # off with symmetric on). For each, checks the first two outputs have equal sizes and
+        # strides on real and meta. Takes a device argument.
         from torch.ao.quantization import FusedMovingAvgObsFakeQuantize
         to_meta = MetaConverter()
 
@@ -1855,6 +2149,9 @@ class TestMeta(TestCase):
             self.assertEqual(ref_out[1].stride(), meta_out[1].stride())
 
     def test_cdist_forward(self, device):
+        # [FUNCTION DOC] Calls the cdist forward operator for each of the three compute modes
+        # (none, one, two) on real and meta-converted inputs and checks the meta result is on
+        # meta with the same shape as the real one.
         to_meta = MetaConverter()
         x1 = torch.rand([3, 2], device=device)
         x2 = torch.rand([2, 2], device=device)
@@ -1866,6 +2163,11 @@ class TestMeta(TestCase):
             self.assertEqual(ref.shape, res.shape)
 
     def test_quantized_embedding_bag(self):
+        # [FUNCTION DOC] Builds a random float table, packs it with the byte prepack quantization
+        # operator, and creates random indices and offsets. Calls the rowwise-offsets embedding-
+        # bag byte operator with all inputs moved to meta, sum mode, no per-sample weights and
+        # including the last offset. Checks the result shape is 32 by 128, dtype float32 and that
+        # its storage has null data pointer.
         tab_shape = [8, 128]
         emb_size, ind_len, off_len = tab_shape[0], 32, 33
         f_table = torch.from_numpy((np.random.random_sample(tab_shape) + 1).astype(np.float32))
@@ -1897,6 +2199,10 @@ class TestMeta(TestCase):
     # To test sum, need to manually compute offset2bag
     @parametrize("mode", [1, 2])
     def test_embedding_bag_dense_backward(self, mode):
+        # [FUNCTION DOC] Parameterized over mean and max modes. Runs the embedding bag forward to
+        # get intermediate tensors, then the dense backward operator on real tensors and on meta-
+        # converted tensors, and checks the real gradient converted to meta equals the meta
+        # result. Sum mode is not tested because of its fast path (see comment above).
         weight = torch.randn(4, 3, requires_grad=True)
         indices = torch.tensor([1, 0, 2, 1, 3])
         offsets = torch.tensor([0, 2, 3, 5])
@@ -1924,6 +2230,9 @@ class TestMeta(TestCase):
         self.assertEqual(grad_weight.to('meta'), meta_grad_weight)
 
     def test_segment_reduce_backward(self):
+        # [FUNCTION DOC] Calls the segment reduce backward operator with max reduction on real
+        # and meta tensors and checks shape, stride, dtype and layout agree. Repeats with
+        # noncontiguous gradient and data (a column slice of a two-column tensor).
         grad = torch.ones(16, dtype=torch.float)
         output = torch.ones(16, dtype=torch.float)
         data = torch.ones(16, dtype=torch.float)
@@ -1960,6 +2269,9 @@ class TestMeta(TestCase):
         self.assertEqual(out.layout, out_meta.layout)
 
     def test_embedding_bag_dense_backward_per_sample_weights(self):
+        # [FUNCTION DOC] Runs embedding bag forward with per-sample weights, then the per-sample-
+        # weights backward operator on real tensors and on meta-converted ones, and checks the
+        # real result converted to meta equals the meta result.
         weight = torch.randn(4, 3, requires_grad=True)
         indices = torch.tensor([1, 0, 2, 1, 3])
         offsets = torch.tensor([0, 2, 3, 5])
@@ -1986,6 +2298,9 @@ class TestMeta(TestCase):
         self.assertEqual(grad_weight.to('meta'), meta_grad_weight)
 
     def _assert_fft_meta_stride_matches_eager(self, op, *args):
+        # [FUNCTION DOC] HELPER: Converts every tensor among the arguments to meta, calls
+        # the operator on real and meta arguments, and asserts the sizes and strides of
+        # the outputs are equal.
         to_meta = MetaConverter()
         meta_args = tree_map_only(torch.Tensor, to_meta, args)
         ref_out = op(*args)
@@ -1996,6 +2311,9 @@ class TestMeta(TestCase):
     @onlyCUDA
     @unittest.skipIf(torch.version.hip, "cuFFT-specific stride behavior")
     def test_fft_multi_dim_cufft_stride_matches_meta(self, device):
+        # [FUNCTION DOC] CUDA-only, skipped on ROCm. Checks that meta stride of multi-dimensional
+        # complex-to-complex and complex-to-real FFT operators matches the strides produced on
+        # the GPU for five-dimensional inputs, by using the stride comparison helper for each.
         self._assert_fft_meta_stride_matches_eager(
             aten._fft_c2c.default,
             torch.randn((5, 5, 5, 5, 5), device=device, dtype=torch.complex64),
@@ -2014,6 +2332,12 @@ class TestMeta(TestCase):
     # opinfo test is using aten.fill_, it's not testing aten.fill
     @onlyCUDA
     def test_fill_stride(self):
+        # [FUNCTION DOC] CUDA-only (comment says the operator-database test covers only the in-
+        # place fill). For each stride layout variant of a small four-dimensional random tensor
+        # with scalar value, compares size and stride of the out-of-place fill on real and meta-
+        # converted arguments.
+        # KNOWN ISSUE: the tensors are created on the default device, not on CUDA, despite the
+        # CUDA-only decorator.
         to_meta = MetaConverter()
         sample_args = [torch.rand(2, 2, 2, 2), 1.0]
 
@@ -2026,6 +2350,9 @@ class TestMeta(TestCase):
 
 
     def test_map_location_deserialize(self):
+        # [FUNCTION DOC] Saves a random tensor to an in-memory buffer and loads it back with a
+        # location mapping to the meta device; checks the loaded tensor is on meta with the same
+        # shape and dtype and that its storage data pointer is zero.
         import io
 
         t = torch.rand(10)
@@ -2040,6 +2367,9 @@ class TestMeta(TestCase):
         self.assertEqual(r.storage().data_ptr(), 0)
 
     def test_embedding_bag_byte_prepack(self):
+        # [FUNCTION DOC] For three embedding sizes, packs a random float weight with the byte
+        # prepack operator on a meta tensor and checks the result has eight more entries in the
+        # last dimension, float32 dtype and a null storage pointer.
         batch_size = 10
         num_embeddings = 80
         embedding_dim = [128, 256, 512]
@@ -2052,6 +2382,9 @@ class TestMeta(TestCase):
             self.assertEqual(res.untyped_storage().data_ptr(), 0)
 
     def test_embedding_bag_byte_unpack(self):
+        # [FUNCTION DOC] For three embedding sizes (each with eight extra packed entries),
+        # unpacks a meta tensor with the byte unpack operator and checks the result has eight
+        # fewer entries in the last dimension, float32 dtype and a null storage pointer.
         batch_size = 10
         num_embeddings = 80
         embedding_dim = [128, 256, 512]
@@ -2064,7 +2397,11 @@ class TestMeta(TestCase):
             self.assertEqual(res.untyped_storage().data_ptr(), 0)
 
     def test_index_select_out(self):
+        # [FUNCTION DOC] Under the python dispatcher, calls index_select with a preallocated out
+        # tensor, all on meta, and checks the output shape is ten by sixteen.
         def f():
+            # [FUNCTION DOC] HELPER: Makes meta input, index and out tensors and returns the
+            # result of index_select with the out argument.
             input = torch.randn([8, 16], device='meta')
             index = torch.tensor([2, 1, 6, 7, 3, 1, 7, 5, 6, 7], device='meta')
             out = torch.empty([10, 16], device='meta')
@@ -2074,11 +2411,17 @@ class TestMeta(TestCase):
             self.assertEqual(out.shape, [10, 16])
 
     def test_local_scalar_dense_call(self):
+        # [FUNCTION DOC] Checks that calling item on a meta tensor raises a runtime error saying
+        # it cannot be called on meta tensors.
         with self.assertRaisesRegex(RuntimeError, "cannot be called on meta tensors"):
             meta_tensor = torch.randn(1, device='meta')
             meta_tensor.item()
 
     def test_triangular_solve_out(self):
+        # [FUNCTION DOC] Computes triangular solve on a real example to get reference
+        # outputs, converts the outputs to meta, calls triangular solve on meta inputs with
+        # those meta outputs as the out argument, and checks shape and dtype of both outputs
+        # match the reference.
         # Get what's the expected output for the given example.
         A = torch.randn(2, 2).triu()
         b = torch.randn(2, 3)
@@ -2096,9 +2439,15 @@ class TestMeta(TestCase):
         self.assertEqual(out[1].dtype, meta_out[1].dtype)
 
     def test_meta_consistency_out_dtype_mismatch_pow_Tensor_Scalar(self):
+        # [FUNCTION DOC] Checks consistency of errors between CPU and meta for pow of a float32
+        # tensor by an integer with a float64 out tensor. If one device raises and the other does
+        # not, raises a runtime error chained to the real exception.
         S = (5,)
 
         def run(device):
+            # [FUNCTION DOC] HELPER: Runs the pow call with a float32 random tensor, an integer
+            # exponent and a float64 out tensor on the given device; returns the exception if one
+            # is raised, otherwise nothing.
             a = torch.rand(S, device=device, dtype=torch.float32)
             b = 2
             out = torch.empty(S, device=device, dtype=torch.float64)
@@ -2117,6 +2466,9 @@ class TestMeta(TestCase):
             raise RuntimeError("cpu failed, but meta didn't.") from cpu_err
 
     def test_nonzero(self):
+        # [FUNCTION DOC] With the config flag making meta nonzero assume every element nonzero,
+        # checks nonzero on a meta tensor of 2x3x4 has int64 dtype, meta device, shape 24 by 3
+        # and strides 1 and 24.
         t = torch.randn(2, 3, 4, device='meta')
         with exp_config.patch(meta_nonzero_assume_all_nonzero=True):
             nz = t.nonzero()
@@ -2127,6 +2479,8 @@ class TestMeta(TestCase):
 
 
     def test_stride_for_index_Tensor(self):
+        # [FUNCTION DOC] Indexes a channels-last-derived 5D tensor with two index tensors in
+        # eager mode and under fake tensor mode, and checks the resulting strides are equal.
         from torch._subclasses import FakeTensorMode
         x = torch.randn((24, 16, 32, 32)).to(memory_format=torch.channels_last)
         x = x.view(2, 12, 16, 32, 32)
@@ -2149,11 +2503,19 @@ class TestMeta(TestCase):
     @parametrize("in_dtype", [torch.float32, torch.float16])
     @parametrize("bias_dtype", [torch.float32, torch.float16, None])
     def test_mixed_dtype_for_native_layer_norm_backward(self, in_dtype, bias_dtype):
+        # [FUNCTION DOC] Parameterized over input dtype (float32 or float16) and bias dtype
+        # (float32, float16 or none); skips the half input with float32 bias combination.
+        # Computes layer norm and gradients with respect to input (and weight and bias when
+        # present) on meta tensors and checks the gradient dtypes equal the input dtype first and
+        # the bias dtype for weight and bias.
         if in_dtype == torch.float16 and bias_dtype == torch.float32:
             self.skipTest(f"not supported input dtype is {in_dtype} and bias dtype is {bias_dtype}")
         device = "meta"
 
         def fn(input, weight, bias, need_grad_input):
+            # [FUNCTION DOC] HELPER: Applies layer norm over the last dimension, back-
+            # propagates a gradient of ones, and returns the gradients with respect to the
+            # given list of tensors.
             outputs = torch.nn.functional.layer_norm(input, input.shape[-1:], weight, bias)
             grad_outs = torch.ones_like(outputs)
             grad_ins = torch.autograd.grad(outputs, need_grad_input, grad_outs)
@@ -2184,9 +2546,15 @@ class TestMeta(TestCase):
 
     @parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
     def test_scaled_dot_product_flash_attention_for_cpu_logsumexp_dtype(self, dtype):
+        # [FUNCTION DOC] Parameterized over four float dtypes. Calls the CPU flash attention
+        # operator on random query, key and value on CPU and on meta, and checks both the output
+        # dtype and the log-sum-exp dtype agree.
         B, H, L, E = 2, 4, 8, 16
 
         def run(device):
+            # [FUNCTION DOC] HELPER: Makes random query, key and value of the fixed batch, head,
+            # length and embedding sizes on the device, calls the CPU flash attention operator,
+            # and returns the dtypes of the output and the log-sum-exp.
             query = torch.randn(B, H, L, E, device=device, dtype=dtype)
             key = torch.randn(B, H, L, E, device=device, dtype=dtype)
             value = torch.randn(B, H, L, E, device=device, dtype=dtype)
@@ -2203,8 +2571,14 @@ class TestMeta(TestCase):
         self.assertEqual(cpu_logsumexp_dtype, meta_logsumexp_dtype)
 
 class TestMetaKernelConv(TestCase):
+    # [CLASS DOC] Tests of raw meta kernels for convolution backward.
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_convolution_backward_meta_kernel_channels_last(self):
+        # [FUNCTION DOC] Calls convolution backward directly on meta tensors (no fake tensor
+        # mode). With channels-last gradient output and contiguous input and weight it requires
+        # input and weight gradients to be contiguous; with contiguous gradient output and
+        # channels-last input it requires both gradients to be channels-last contiguous.
+        # Skipped under Dynamo.
         """Test the meta kernel directly (device='meta', no FakeTensorMode).
         This exercises the @register_meta path used by torch.export, which
         does NOT go through the FakeTensor intercept in fake_impls.py.
@@ -2256,8 +2630,13 @@ class TestMetaKernelConv(TestCase):
 
 
 class TestMetaKernelRegistrations(TestCase):
+    # [CLASS DOC] Tests that individual meta kernels and decompositions match eager CPU behavior
+    # (shapes, strides, dtypes and raised errors). Most tests are skipped under Dynamo because
+    # they exercise raw meta kernels.
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_aminmax_out_dtype_mismatch(self):
+        # [FUNCTION DOC] Calls aminmax with out tensors of float64 for a float meta input and
+        # checks a runtime error saying the out tensor dtype was unexpected.
         inp = torch.rand(10, 10, device="meta")
         out_min = torch.empty(10, dtype=torch.float64, device="meta")
         out_max = torch.empty(10, dtype=torch.float64, device="meta")
@@ -2268,12 +2647,20 @@ class TestMetaKernelRegistrations(TestCase):
             )
 
     def test_grid_sampler_2d_cpu_fallback_meta(self):
+        # [FUNCTION DOC] Checks the CPU-fallback grid sampler forward and both backward outputs:
+        # for contiguous, channels-last and transposed-contiguous inputs the fake tensor results
+        # must have equal shape, stride and dtype to eager results. Then with a five-dimensional
+        # input and grid, checks eager, fake forward and fake backward all raise a runtime error
+        # expecting a four-dimensional input.
         # The meta kernels' whole contract is output metadata, so compare
         # shape/stride/dtype against eager for the forward and both backward
         # outputs. Covers contiguous, channels_last and non-contiguous inputs.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         def check(inp, grid):
+            # [FUNCTION DOC] HELPER: Runs the CPU-fallback grid sampler forward and backward in
+            # eager mode and in fake tensor mode for the given input and grid and asserts shape,
+            # stride and dtype of the three outputs agree.
             expected = torch._grid_sampler_2d_cpu_fallback(inp, grid, 0, 0, True)
             grad_out = torch.randn_like(expected)
             bwd = torch.ops.aten._grid_sampler_2d_cpu_fallback_backward
@@ -2315,6 +2702,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_make_dep_token(self):
+        # [FUNCTION DOC] Creates a dependency token on CPU and on meta and checks the shapes and
+        # dtypes are equal. Skipped under Dynamo.
         cpu_result = torch.ops.aten._make_dep_token(device=torch.device("cpu"))
         meta_result = torch.ops.aten._make_dep_token(device=torch.device("meta"))
         self.assertEqual(cpu_result.shape, meta_result.shape)
@@ -2322,6 +2711,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_rrelu_backward_small_range(self):
+        # [FUNCTION DOC] Compares the rrelu backward from the native operator and from the Python
+        # decomposition for a tiny lower and upper range with training mode, and checks they are
+        # equal. Skipped under Dynamo.
         from torch._decomp.decompositions import rrelu_with_noise_backward
 
         x = torch.randn(5, requires_grad=True)
@@ -2338,6 +2730,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_linalg_eig_strides_cpu(self):
+        # [FUNCTION DOC] Computes eigen decomposition of a three by three matrix eagerly and
+        # under fake tensor mode, and checks the eigenvector shape, stride and dtype are equal.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         matrix = torch.randn(3, 3)
@@ -2351,6 +2745,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_zero_preserves_input_strides(self):
+        # [FUNCTION DOC] Zeroes a transposed tensor with the zero operator on CPU, a meta tensor
+        # with the same strides, and a fake tensor, and checks shape and stride of results match
+        # the CPU result in both cases (strides are preserved).
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         x = torch.randn(5, 4).t()
@@ -2369,6 +2766,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_randint_like_tensor_dtype_kwarg(self):
+        # [FUNCTION DOC] Calls random-integer-like with a tensor upper bound and an explicit
+        # int32 dtype on CPU and meta and checks dtype and shape agree.
         x_cpu = torch.randn(3, 4)
         high_cpu = torch.tensor(10)
         y_cpu = torch.ops.aten.randint_like.Tensor(x_cpu, high_cpu, dtype=torch.int32)
@@ -2382,6 +2781,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_randint_like_tensor_preserves_default(self):
+        # [FUNCTION DOC] Calls random-integer-like with a tensor upper bound and no dtype on
+        # half-precision inputs on CPU and meta and checks dtype and shape agree (the input
+        # dtype is preserved).
         x_cpu = torch.randn(3, 4, dtype=torch.float16)
         high_cpu = torch.tensor(10)
         y_cpu = torch.ops.aten.randint_like.Tensor(x_cpu, high_cpu)
@@ -2393,6 +2795,10 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_pad_sequence_decomp_left(self):
+        # [FUNCTION DOC] Pads a list of two one-dimensional integer tensors on the left with
+        # batch first using the decomposition, and checks the values equal the expected
+        # padded matrix. Then runs the decomposition on meta tensors and checks the shape
+        # equals the CPU shape.
         from torch._decomp import decompositions
 
         a = torch.tensor([1, 2, 3])
@@ -2411,6 +2817,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_pad_sequence_decomp_left_not_batch_first(self):
+        # [FUNCTION DOC] Checks left padding with the decomposition when batch first is false
+        # gives the expected transposed padded matrix.
         from torch._decomp import decompositions
 
         a = torch.tensor([1, 2, 3])
@@ -2423,6 +2831,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_pad_sequence_decomp_mixed_dtype_padding_value(self):
+        # [FUNCTION DOC] For float and complex first sequences paired with an int32 sequence and
+        # a negative float padding value, checks the decomposition's padded result equals the
+        # native pad sequence operator result with right padding and batch first false.
         from torch._decomp import decompositions
 
         for first_sequence in (
@@ -2441,6 +2852,9 @@ class TestMetaKernelRegistrations(TestCase):
     @skipIfXpu(msg="https://github.com/pytorch/pytorch/issues/181490")
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_padded_dense_to_jagged_total_L_zero(self):
+        # [FUNCTION DOC] Skipped on XPU (linked issue) and under Dynamo. Calls the padded dense
+        # to jagged forward operator with total length zero and all-zero offsets on CPU and in
+        # fake tensor mode, and checks shapes and dtypes agree.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         cpu_padded = torch.randn(2, 3, 4)
@@ -2459,6 +2873,10 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_padded_dense_to_jagged_total_L_none(self):
+        # [FUNCTION DOC] Calls the padded dense to jagged forward operator with no total
+        # length on CPU and in fake tensor mode using a shape environment that allows dynamic
+        # output shapes, and checks the rank and dtype of results agree (the data-dependent
+        # size is not compared).
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -2479,6 +2897,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_segment_reduce_2d(self):
+        # [FUNCTION DOC] Runs segment reduce with sum along axis zero on CPU and meta data and
+        # checks shape and dtype agree.
         data_cpu = torch.randn(10, 5)
         lengths = torch.tensor([3, 4, 3])
         cpu_result = torch.segment_reduce(data_cpu, "sum", lengths=lengths, axis=0)
@@ -2491,6 +2911,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_segment_reduce_batched_shape(self):
+        # [FUNCTION DOC] Runs segment reduce on a meta tensor with a two-dimensional lengths
+        # tensor along axis one in unsafe mode and checks the shape is ten by three. Only meta is
+        # verified because the CPU run is noted to crash.
         # axis=1 with 2D lengths exercises the shape fix (using data.shape
         # as base instead of lengths.shape). CPU segfaults for this case
         # so we verify shape on meta only.
@@ -2503,6 +2926,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_avg_pool3d_divisor_zero_error(self):
+        # [FUNCTION DOC] Checks that average pooling in three dimensions with a zero divisor
+        # override raises a runtime error mentioning the divisor, for both CPU and meta inputs.
         x_cpu = torch.randn(1, 1, 4, 4, 4)
         with self.assertRaisesRegex(RuntimeError, "divisor"):
             torch.nn.functional.avg_pool3d(x_cpu, kernel_size=2, divisor_override=0)
@@ -2512,6 +2937,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_avg_pool3d_backward_divisor_zero_error(self):
+        # [FUNCTION DOC] Checks that the three-dimensional average pooling backward operator
+        # with a zero divisor override raises a runtime error mentioning the divisor, for both
+        # CPU and meta tensors.
         grad_cpu = torch.randn(1, 1, 2, 2, 2)
         with self.assertRaisesRegex(RuntimeError, "divisor"):
             torch.ops.aten.avg_pool3d_backward(
@@ -2529,6 +2957,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_fill_tensor_dim_check(self):
+        # [FUNCTION DOC] Checks that in-place fill with a two-dimensional value tensor raises a
+        # runtime error mentioning the zero-dimension requirement, on CPU and on meta.
         x_cpu = torch.randn(3, 4)
         value_cpu = torch.randn(2, 3)
         with self.assertRaisesRegex(RuntimeError, "0-dimension"):
@@ -2540,6 +2970,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_fill_tensor_scalar_ok(self):
+        # [FUNCTION DOC] Checks in-place fill with a zero-dimensional tensor value works on CPU
+        # and meta and that the result shapes and dtypes agree.
         x_cpu = torch.randn(3, 4)
         value_cpu = torch.tensor(1.0)
         cpu_result = x_cpu.fill_(value_cpu)
@@ -2551,6 +2983,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_fill_out_of_place_tensor_dim_check(self):
+        # [FUNCTION DOC] Checks that out-of-place fill with a two-dimensional value tensor raises
+        # a runtime error mentioning the zero-dimension requirement, on CPU and on meta.
         x_cpu = torch.randn(3, 4)
         value_cpu = torch.randn(2, 3)
         with self.assertRaisesRegex(RuntimeError, "0-dimension"):
@@ -2562,6 +2996,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_fill_out_of_place_tensor_scalar_ok(self):
+        # [FUNCTION DOC] Checks out-of-place fill with a zero-dimensional tensor value works on
+        # CPU and meta and that result shapes and dtypes agree.
         x_cpu = torch.randn(3, 4)
         value_cpu = torch.tensor(1.0)
         cpu_result = torch.fill(x_cpu, value_cpu)
@@ -2573,6 +3009,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_weight_int8pack_mm_inner_dim_mismatch(self):
+        # [FUNCTION DOC] Checks the int8 weight-packed matrix multiply operator raises a runtime
+        # error, on CPU and meta, when the inner dimensions of the two matrices differ.
         A_cpu = torch.randn(4, 8)
         B_cpu = torch.randint(-128, 127, (3, 16), dtype=torch.int8)
         scales_cpu = torch.randn(3)
@@ -2586,6 +3024,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_weight_int8pack_mm_scales_mismatch(self):
+        # [FUNCTION DOC] Checks the int8 weight-packed matrix multiply operator raises a runtime
+        # error, on CPU and meta, when the scales length does not match the weight rows.
         A_cpu = torch.randn(4, 8)
         B_cpu = torch.randint(-128, 127, (3, 8), dtype=torch.int8)
         scales_cpu = torch.randn(5)
@@ -2599,6 +3039,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_miopen_batch_norm_save_dtype(self):
+        # [FUNCTION DOC] On meta tensors with half-precision input and float32 weights, calls the
+        # ROCm-only batch norm operator and checks the saved mean and saved variance outputs have
+        # the dtype of the weight, as the native code does.
         # miopen_batch_norm is ROCm-only with no CPU implementation.
         # Test that meta kernel outputs use weight's dtype (matching C++ behavior).
         input_t = torch.randn(2, 3, 4, 4, device="meta", dtype=torch.float16)
@@ -2615,6 +3058,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_reflection_pad2d_channels_last(self):
+        # [FUNCTION DOC] Pads a channels-last four-dimensional tensor with reflection on CPU
+        # and under fake tensor mode; checks shape and stride match and the fake result is
+        # channels-last contiguous.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         x_cpu = torch.randn(1, 3, 4, 4).to(memory_format=torch.channels_last)
@@ -2632,6 +3078,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_reflection_pad2d_contiguous(self):
+        # [FUNCTION DOC] Pads a contiguous four-dimensional tensor with reflection on CPU and
+        # meta and checks shape and stride match and the meta result is contiguous.
         x_cpu = torch.randn(1, 3, 4, 4)
         cpu_result = torch.nn.functional.pad(x_cpu, (1, 1, 1, 1), mode="reflect")
         x_meta = torch.randn(1, 3, 4, 4, device="meta")
@@ -2642,6 +3090,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_replication_pad2d_channels_last(self):
+        # [FUNCTION DOC] Pads a channels-last four-dimensional tensor with replication on CPU
+        # and under fake tensor mode; checks shape and stride match and the fake result is
+        # channels-last contiguous.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         x_cpu = torch.randn(1, 3, 4, 4).to(memory_format=torch.channels_last)
@@ -2659,6 +3110,8 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_replication_pad2d_contiguous(self):
+        # [FUNCTION DOC] Pads a contiguous four-dimensional tensor with replication on CPU and
+        # meta and checks shape and stride match and the meta result is contiguous.
         x_cpu = torch.randn(1, 3, 4, 4)
         cpu_result = torch.nn.functional.pad(x_cpu, (1, 1, 1, 1), mode="replicate")
         x_meta = torch.randn(1, 3, 4, 4, device="meta")
@@ -2671,6 +3124,9 @@ class TestMetaKernelRegistrations(TestCase):
 
     @skipIfTorchDynamo("tests raw meta kernel, not dynamo")
     def test_mkldnn_rnn_backward_dtype(self):
+        # [FUNCTION DOC] Skips if MKLDNN or its bfloat16 support is unavailable. Runs an LSTM
+        # layer forward in bfloat16 on CPU, then the layer backward on CPU and on meta-converted
+        # tensors, and checks every returned gradient has equal shape and dtype across the two.
         if not torch.backends.mkldnn.is_available():
             self.skipTest("MKLDNN not available")
         if not torch.ops.mkldnn._is_mkldnn_bf16_supported():
@@ -2714,6 +3170,10 @@ class TestMetaKernelRegistrations(TestCase):
         "https://github.com/pytorch/pytorch/issues/190240"
     )
     def test_mkldnn_rnn_backward_gru_bias_shape(self):
+        # [FUNCTION DOC] Permanently skipped (disabled for CI failures, linked issue).
+        # Calls the layer backward on meta tensors in GRU mode and checks both bias
+        # gradients have a length of four times the hidden size, per the comment on
+        # shuffled bias handling in the native code.
         # GRU backward is not supported on CPU via oneDNN, so we verify
         # the meta kernel's bias shape against the expected value from
         # the C++ _shuffle_bias logic (num_bias_gates=4 for GRU).
@@ -2748,6 +3208,11 @@ instantiate_device_type_tests(TestMeta, globals())
 
 
 def print_op_str_if_not_supported(op_str):
+    # [FUNCTION DOC] HELPER: Parses an operator name string with optional overload, looks up the
+    # aten overload (default when none is named), and prints the overload with a skip marker if
+    # it is in the dispatch skip tables (generic or CUDA), and prints it plain if in the dispatch
+    # expected-failure tables (generic or CUDA). Used by the main block when comparing against
+    # external operator lists.
     op = OperatorName.parse(op_str)
     packet = getattr(torch.ops.aten, str(op.name))
     overload = getattr(packet, op.overload_name if op.overload_name else "default")
