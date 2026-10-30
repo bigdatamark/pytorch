@@ -1,4 +1,12 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Codegen checks for dynamic shapes. Reuses the shared inductor CommonTemplate
+# tests, cloned with dynamic shapes enabled, but replaces the normal model check with
+# check_codegen, which also verifies that generated C++ has a symbolic loop bound or that a
+# Triton kernel was generated. Defines the xfail/skip table, CPU and GPU test classes, and a
+# few CPU tests of the assert_dynamic_dims mechanism. Import-time side effects: requires
+# filelock, appends the test directory to sys.path, imports sibling test modules, merges the
+# dynamic-shapes failure table into the local one, and registers copied tests on the classes
+# (CPU only if available, GPU if available and not under ASAN).
 import contextlib
 import importlib
 import os
@@ -54,6 +62,16 @@ def check_codegen(
     copy_to_gpu: bool = True,
     assert_dynamic_dims=None,
 ):
+    # [FUNCTION DOC] Compiles model on example_inputs with fullgraph and checks the generated
+    # code is dynamic. For non-C++ codegen the model is moved to device when it has a to
+    # method and, if copy_to_gpu, each tensor input is replaced by a stride-preserving copy
+    # on device (non-tensors untouched). Resets dynamo, clears the FX graph cache and
+    # inductor metrics, then compiles through a compile_fx wrapper that asserts the dims
+    # given by assert_dynamic_dims are symbolic and records that it was entered. For C++ it
+    # runs and passes the source through the dynamic-loop check; otherwise it asserts the
+    # Triton source contains a Triton kernel definition. Raises AssertionError if the compile
+    # backend was never called; resets dynamo again at the end. kwargs (default empty) are
+    # passed to the model.
     kwargs = kwargs or {}
 
     if is_cpp_code is False:
@@ -61,6 +79,9 @@ def check_codegen(
             model = model.to(device=device)
 
         def copy_fn(x):
+            # [FUNCTION DOC] HELPER: Returns non-tensor values unchanged; for a tensor returns
+            # a new tensor on device with the same size, stride and dtype holding the same
+            # values.
             # preserve strides of the input on the device
             if not isinstance(x, torch.Tensor):
                 return x
@@ -78,6 +99,8 @@ def check_codegen(
     called = False
 
     def mark_called():
+        # [FUNCTION DOC] HELPER: Sets the enclosing flag called to true so the check can tell
+        # the compile backend ran.
         nonlocal called
         called = True
 
@@ -90,6 +113,8 @@ def check_codegen(
     )
 
     def run(*ex, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the model with the given positional and keyword
+        # arguments; this wrapper is what gets compiled.
         return model(*ex, **kwargs)
 
     run = torch.compile(run, backend=compile_fx_wrapper, fullgraph=True)
@@ -514,8 +539,15 @@ DynamicShapesCodegenCommonTemplate = make_dynamic_cls(
 
 
 class DynamicShapesCodegenTestCase(TestCase):
+    # [CLASS DOC] Base test case for the GPU dynamic-shape codegen tests. For the whole class
+    # it enables the inductor test_configs flags for runtime Triton dtype and shape assertions
+    # via a config patch kept open in an ExitStack stored on the class.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Runs the parent setUpClass, creates an ExitStack stored as
+        # _triton_assert_stack and enters an inductor config patch turning on the runtime
+        # Triton dtype assert and shape assert. Side effect: those global config values stay
+        # patched until tearDownClass.
         super().setUpClass()
         cls._triton_assert_stack = contextlib.ExitStack()
         cls._triton_assert_stack.enter_context(
@@ -529,6 +561,8 @@ class DynamicShapesCodegenTestCase(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Closes the ExitStack so the config patch is undone, then runs
+        # the parent tearDownClass.
         cls._triton_assert_stack.close()
         super().tearDownClass()
 
@@ -536,12 +570,24 @@ class DynamicShapesCodegenTestCase(TestCase):
 if HAS_CPU:
 
     class DynamicShapesCodegenCpuTests(TestCase):
+        # [CLASS DOC] CPU test class that receives copies of the dynamic-shape common tests
+        # (added by copy_tests after the definition, with xfail/skip from the failure table),
+        # plus a few direct tests of assert_dynamic_dims. Attributes: maxDiff unlimited and
+        # device set to cpu. common is the hook the copied tests call.
         maxDiff = None
         device = "cpu"
 
         @torch._dynamo.config.patch(assume_static_by_default=False)
         def test_assert_dynamic_dims_rejects_specialized_dim(self):
+            # [FUNCTION DOC] Dynamo assume_static_by_default is off. The function branches on
+            # whether the first dimension of its input equals three, which specializes that
+            # dimension; the test expects the common check with assert_dynamic_dims for input
+            # 0 dims 0 and 1 to raise BackendCompilerFailed with the message that input 0 dim
+            # 0 should be dynamic.
             def fn(x):
+                # [FUNCTION DOC] HELPER: Adds one if the first dimension of x is three,
+                # otherwise subtracts one; the comparison forces a guard that
+                # specializes the dimension.
                 if x.size(0) == 3:
                     return x + 1
                 return x - 1
@@ -558,13 +604,22 @@ if HAS_CPU:
 
         @torch._dynamo.config.patch(assume_static_by_default=False)
         def test_assert_dynamic_dims_indexes_user_inputs_not_parameters(self):
+            # [FUNCTION DOC] Dynamo assume_static_by_default is off. Checks that the
+            # dynamic-dim assertion indexes only user tensor inputs, not module parameters or
+            # buffers: a module with a parameter and a buffer is run with an assertion on
+            # input 0 dim 0 and is expected to pass without raising.
             class Model(torch.nn.Module):
+                # [CLASS DOC] HELPER: Small module holding a parameter weight and a buffer
+                # bias, both random with four elements; forward adds both to the input.
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: Calls the parent initializer, creates the random
+                    # weight parameter and registers the random bias buffer.
                     super().__init__()
                     self.weight = torch.nn.Parameter(torch.randn(4))
                     self.register_buffer("bias", torch.randn(4))
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Returns the input plus the weight plus the bias.
                     return x + self.weight + self.bias
 
             self.common(
@@ -575,7 +630,13 @@ if HAS_CPU:
 
         @torch._dynamo.config.patch(assume_static_by_default=False)
         def test_assert_dynamic_dims_preserves_keyword_input_order(self):
+            # [FUNCTION DOC] Dynamo assume_static_by_default is off. Checks that keyword
+            # inputs are numbered in the order of the keyword mapping: input 0 is z (three
+            # rows, specialized by the size comparison) and input 1 is a. Expects
+            # BackendCompilerFailed saying input 0 dim 0 is not dynamic.
             def fn(*, z, a):
+                # [FUNCTION DOC] HELPER: Keyword-only function: if z has three rows returns
+                # the sum of z plus a, else the sum of z minus a.
                 if z.size(0) == 3:
                     return z.sum() + a
                 return z.sum() - a
@@ -593,7 +654,12 @@ if HAS_CPU:
 
         @torch._dynamo.config.patch(assume_static_by_default=False)
         def test_assert_dynamic_dims_rejects_eliminated_input(self):
+            # [FUNCTION DOC] Dynamo assume_static_by_default is off. The function ignores its
+            # first argument so it is dropped from the Dynamo graph; the test expects
+            # BackendCompilerFailed saying user tensor input 0 is not present in the graph
+            # when asserting dims for input 0.
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Returns y plus one and never uses x.
                 return y + 1
 
             with self.assertRaisesRegex(
@@ -608,7 +674,15 @@ if HAS_CPU:
 
         @torch._dynamo.config.patch(assume_static_by_default=False)
         def test_assert_dynamic_dims_sorts_positional_inputs_numerically(self):
+            # [FUNCTION DOC] Dynamo assume_static_by_default is off. Passes eleven positional
+            # tensors with different row counts so input numbering needs numeric rather than
+            # text ordering (input 2 before input 10). Input 2 has four rows and is
+            # specialized by a size comparison, so the check for input 2 dim 0 is expected to
+            # raise BackendCompilerFailed saying it is not dynamic.
             def fn(*xs):
+                # [FUNCTION DOC] HELPER: Starts from the sum of the eleventh input; adds the
+                # sum of the third input only when it has four rows (specializing it), then
+                # adds the sums of all other inputs and returns the scalar.
                 result = xs[10].sum()
                 if xs[2].size(0) == 4:
                     result = result + xs[2].sum()
@@ -635,6 +709,10 @@ if HAS_CPU:
             assert_dynamic_dims=None,
             **_rest,
         ):
+            # [FUNCTION DOC] Adapter used by the copied tests. Forwards model, inputs, kwargs
+            # and assert_dynamic_dims to check_codegen with this class's device; C++ checking
+            # is used exactly when the inductor cpu_backend config is cpp. Extra keyword
+            # arguments are ignored.
             return check_codegen(
                 self=self,
                 model=model,
@@ -656,6 +734,9 @@ if HAS_CPU:
 if HAS_GPU and not TEST_WITH_ASAN:
 
     class DynamicShapesCodegenGPUTests(DynamicShapesCodegenTestCase):
+        # [CLASS DOC] GPU test class (defined only when a GPU is present and not under ASAN)
+        # that receives copies of the dynamic-shape common tests for the GPU type. Inherits
+        # the Triton assertion config from its base. device is the GPU type.
         maxDiff = None
         device = GPU_TYPE
 
@@ -668,6 +749,9 @@ if HAS_GPU and not TEST_WITH_ASAN:
             assert_dynamic_dims=None,
             **_rest,
         ):
+            # [FUNCTION DOC] Adapter used by the copied tests. Forwards model, inputs, kwargs,
+            # copy_to_gpu and assert_dynamic_dims to check_codegen with this class's device
+            # and C++ checking off. Extra keyword arguments are ignored.
             return check_codegen(
                 self=self,
                 model=model,
