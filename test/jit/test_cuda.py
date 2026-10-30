@@ -1,6 +1,13 @@
 # Owner(s): ["oncall: jit"]
 # ruff: noqa: F841
 
+# [MODULE DOC] Tests of the torch.cuda streams, events and device API as compiled by
+# TorchScript. Defines one JitTestCase subclass, TestCUDA, whose heavy tests are scripted
+# functions nested inside test bodies. Import-time side effects: extends sys.path with the
+# test directory; if CUDA is unavailable prints a notice to stderr and rebinds JitTestCase to
+# the NoTest placeholder so nothing runs; if CUDA is available creates a CUDA tensor to
+# initialize the context and sets TEST_LARGE_TENSOR to whether device 0 has at least 5e9 bytes
+# of memory. Running the file directly is rejected.
 import gc
 import os
 import sys
@@ -38,21 +45,37 @@ if TEST_CUDA:
 
 
 class TestCUDA(JitTestCase):
+    # [CLASS DOC] Suite for the CUDA stream, event and device-context API in TorchScript. Many
+    # tests need two GPUs or large memory and are skipped otherwise. tearDown frees memory
+    # between tests. The big test_streams_and_events method holds many nested scripted
+    # functions that are each called and checked inside that single method.
     """
     A suite of tests for the CUDA API in TorchScript.
     """
 
     def tearDown(self):
+        # [FUNCTION DOC] Run garbage collection and empty the CUDA caching allocator, then run
+        # the base class tearDown. Side effect: releases cached GPU memory between tests.
         gc.collect()
         torch.cuda.empty_cache()
         super().tearDown()
 
     @unittest.skipIf(not TEST_MULTIGPU, "detected only one GPU")
     def test_cuda_synchronize(self):
+        # [FUNCTION DOC] Needs at least two GPUs. Script two functions that call device
+        # synchronization with no argument, a string, an integer and a device object, and
+        # check the current device index is unchanged afterwards. The test only asserts that
+        # the scripted objects are truthy and that the graphs contain the synchronize
+        # operator; the functions are never called.
+        # KNOWN ISSUE: the scripted functions are never executed, so the returned comparison
+        # is not checked at run time; only compilation and graph content are verified.
         # Test device synchronization.
 
         @torch.jit.script
         def test_device_synchronize():
+            # [FUNCTION DOC] HELPER: Record the current device index, synchronize with several
+            # argument forms including devices 0 and 1, and return whether the current device
+            # index is unchanged.
             prev_current_device_index = torch.cuda.current_device()
             torch.cuda.synchronize()
             torch.cuda.synchronize("cuda")
@@ -67,6 +90,9 @@ class TestCUDA(JitTestCase):
 
         @torch.jit.script
         def test_multi_device_synchronize():
+            # [FUNCTION DOC] HELPER: Synchronize device 0, record the current device,
+            # synchronize device 1 by index, and return whether the current device
+            # index is unchanged.
             torch.cuda.synchronize(torch.device("cuda:0"))
             prev_current_device_index = torch.cuda.current_device()
             torch.cuda.synchronize(1)
@@ -82,25 +108,40 @@ class TestCUDA(JitTestCase):
         FileCheck().check("cuda::synchronize(").run(test_multi_device_synchronize.graph)
 
     def test_stream_args(self):
+        # [FUNCTION DOC] Compile scripted functions that construct streams with default
+        # arguments, a priority only, a device only and both device and priority. Only
+        # truthiness of the scripted function objects is asserted, so they are compiled but
+        # never run.
+        # KNOWN ISSUE: the functions are not called, and the names of the second and third
+        # helpers are swapped relative to what they construct (the one named for the device
+        # passes only a priority; the one named for the priority passes only a device).
         # Test stream creation with default arguments
         @torch.jit.script
         def stream_default_args() -> bool:
+            # [FUNCTION DOC] HELPER: Create a stream with defaults and return whether its
+            # device index equals the current device.
             s = torch.cuda.Stream()
             return s.device_index() == torch.cuda.current_device()
 
         @torch.jit.script
         def stream_default_args_for_device() -> bool:
+            # [FUNCTION DOC] HELPER: Create a stream with priority zero and return whether its
+            # device index equals the current device.
             s = torch.cuda.Stream(priority=0)
             return s.device_index() == torch.cuda.current_device()
 
         @torch.jit.script
         def stream_default_args_for_priority() -> bool:
+            # [FUNCTION DOC] HELPER: Create a stream on device cuda:1 and return whether its
+            # device index is one.
             d = torch.device("cuda:1")
             s = torch.cuda.Stream(d)
             return s.device_index() == 1
 
         @torch.jit.script
         def stream_args_all() -> bool:
+            # [FUNCTION DOC] HELPER: Create a stream on device cuda:0 with priority zero and
+            # return whether its device index is zero.
             d = torch.device("cuda:0")
             s = torch.cuda.Stream(d, 0)
             return s.device_index() == 0
@@ -111,9 +152,12 @@ class TestCUDA(JitTestCase):
         self.assertTrue(stream_args_all)
 
     def test_event_args(self):
+        # [FUNCTION DOC] Compile a scripted function that creates a default event and asserts
+        # only that the scripted function object is truthy; the function is never run.
         # Test Event creation with default arguments
         @torch.jit.script
         def event_default_args() -> bool:
+            # [FUNCTION DOC] HELPER: Create a default event and return whether it exists.
             e = torch.cuda.Event()
             return e is not None
 
@@ -121,10 +165,16 @@ class TestCUDA(JitTestCase):
 
     @unittest.skipIf(not TEST_MULTIGPU, "detected only one GPU")
     def test_current_stream(self):
+        # [FUNCTION DOC] Needs two GPUs. Script functions that query the current stream via a
+        # device object and via an integer device index, for the current device, device 1 and
+        # device 0, and return the stream device indexes. Calls them and checks the indexes
+        # are zero, one and zero.
         # Test current stream on the device and check if the stream device index
         # matches with the device ID
         @torch.jit.script
         def fn():
+            # [FUNCTION DOC] HELPER: Return the device indexes of the current streams on the
+            # current device, cuda:1 and cuda:0, each looked up with a device object.
             device_index = torch.cuda.current_device()
             device = torch.device("cuda:" + str(device_index))
             s0 = torch.cuda.current_stream(device)
@@ -144,6 +194,9 @@ class TestCUDA(JitTestCase):
         # and check if the stream device index matches with the device ID
         @torch.jit.script
         def fn_with_device_index_args():
+            # [FUNCTION DOC] HELPER: Return the device indexes of the current streams
+            # for the current device, device one and device zero, each looked up with
+            # an integer index.
             device_index = torch.cuda.current_device()
             s0 = torch.cuda.current_stream(device_index)
             s1 = torch.cuda.current_stream(1)
@@ -162,10 +215,17 @@ class TestCUDA(JitTestCase):
     @unittest.skipIf(not TEST_LARGE_TENSOR, "not enough memory")
     @skipCUDANonDefaultStreamIf(True)
     def test_streams_and_events(self):
+        # [FUNCTION DOC] Needs two GPUs and enough memory; skipped when tests run on a
+        # non-default CUDA stream. Defines and runs many nested scripted functions covering
+        # default streams, no-op context managers, stream properties, nested streams across
+        # devices, events and event waiting, then asserts on their returned values. The nested
+        # save/load function is defined here but never called.
         # Test default_stream API by passing device ID as an argument and
         # and check if the stream device index matches with the device ID
         @torch.jit.script
         def test_default_streams_with_device_index_args():
+            # [FUNCTION DOC] HELPER: Return the device indexes of the default streams of
+            # devices 0 and 1 given as integers.
             s0 = torch.cuda.default_stream(0)
             s1 = torch.cuda.default_stream(1)
             return s0.device_index(), s1.device_index()
@@ -178,6 +238,11 @@ class TestCUDA(JitTestCase):
         # This test checks for the default stream ID is set to 0 on the device
         @torch.jit.script
         def test_default_streams():
+            # [FUNCTION DOC] HELPER: Return device indexes of the default streams of cuda:0
+            # and cuda:1 plus flags: current stream id on device 0 equals the default id, same
+            # for device 1 inside a device context for cuda:1, whether the current device
+            # matches in each case, and whether the device is back on device 0 after the
+            # context exits.
             s0 = torch.cuda.default_stream(torch.device("cuda:0"))
             s1 = torch.cuda.default_stream(torch.device("cuda:1"))
 
@@ -231,6 +296,9 @@ class TestCUDA(JitTestCase):
         # when the stream is none for `with torch.cuda.stream`
         @torch.jit.script
         def test_set_none_stream():
+            # [FUNCTION DOC] HELPER: Enter the stream context manager and device handling with
+            # a none stream, and return whether the current device, current stream id and
+            # default stream id are all unchanged inside it.
             device_index = torch.cuda.current_device()
             device = torch.device("cuda:" + str(device_index))
             current_stream = torch.cuda.current_stream(device)
@@ -261,6 +329,8 @@ class TestCUDA(JitTestCase):
         # when the device is none for `with torch.cuda.device`
         @torch.jit.script
         def test_set_device_none():
+            # [FUNCTION DOC] HELPER: Enter the device context manager with a none device and
+            # return whether the current device index stayed the same inside it.
             device_index = torch.cuda.current_device()
             # When device is none, check if this operation is a no-op
             with torch.cuda.device(None):
@@ -274,6 +344,8 @@ class TestCUDA(JitTestCase):
         # on the current_device
         @torch.jit.script
         def test_simple_stream():
+            # [FUNCTION DOC] HELPER: Create a stream and return whether its device index
+            # equals the current device index.
             device_index = torch.cuda.current_device()
             s = torch.cuda.Stream()
             return device_index == s.device_index()
@@ -282,6 +354,9 @@ class TestCUDA(JitTestCase):
 
         # Class used to store results for the test: test_get_stream.
         class Result(NamedTuple):
+            # [CLASS DOC] HELPER: Named tuple of results collected by the stream-properties
+            # test: two tensors, five booleans about stream identity and reset behavior, a
+            # query flag, and the integer ids of the default and a user stream.
             t1: torch.Tensor
             t2: torch.Tensor
             is_current_and_default_stream_same: bool
@@ -295,6 +370,10 @@ class TestCUDA(JitTestCase):
         # The test aims at checking different stream properties.
         @torch.jit.script
         def test_get_stream():
+            # [FUNCTION DOC] HELPER: Create a user stream, compare ids of current, default and
+            # user streams, enter the stream context to check the current stream switches and
+            # is restored, run a large matrix multiplication, synchronize the default stream,
+            # query it, and return all findings packed into the result named tuple.
             device_index = torch.cuda.current_device()
             device = torch.device("cuda:" + str(device_index))
             current_stream = torch.cuda.current_stream(device)
@@ -358,6 +437,10 @@ class TestCUDA(JitTestCase):
         # to the user stream on using the stream context manager.
         @torch.jit.script
         def test_stream_context():
+            # [FUNCTION DOC] HELPER: Create a user stream, run a matrix multiplication on it
+            # inside the stream context, synchronize, and return the input, the product,
+            # whether the current stream was the user stream inside, and whether the previous
+            # stream is restored.
             device_index = torch.cuda.current_device()
             device = torch.device("cuda:" + str(device_index))
             current_stream = torch.cuda.current_stream(device)
@@ -389,6 +472,10 @@ class TestCUDA(JitTestCase):
         # This test has been adapted from the eager mode tests available at test/test_cuda.py
         @torch.jit.script
         def test_multiple_stream():
+            # [FUNCTION DOC] HELPER: Create streams on cuda:0 and cuda:1, nest their contexts,
+            # do a matrix multiplication in each, and return both inputs, both products and
+            # booleans for whether stream and device were correct at every nesting level and
+            # restored after exit.
             prev_device_index = torch.cuda.current_device()
             device = torch.device("cuda:" + str(prev_device_index))
             prev_current_stream = torch.cuda.current_stream(device)
@@ -447,6 +534,10 @@ class TestCUDA(JitTestCase):
         # Test multiple streams waiting on each other for the operations to be completed.
         @torch.jit.script
         def test_data_dependency_between_streams():
+            # [FUNCTION DOC] HELPER: Run a product on stream one, record an event there, make
+            # stream two wait on it, then run a second product on stream two that depends on
+            # the first. Returns the input, both products and whether current streams were
+            # correct and restored throughout.
             device_index = torch.cuda.current_device()
             device = torch.device("cuda:" + str(device_index))
             prev_current_stream = torch.cuda.current_stream(device)
@@ -492,6 +583,8 @@ class TestCUDA(JitTestCase):
         # Test a simple CUDA event. Test if the CUDA event was created successfully
         @torch.jit.script
         def test_simple_event():
+            # [FUNCTION DOC] HELPER: Create an event with timing enabled and return
+            # whether it exists.
             e = torch.cuda.Event(True, False, False)
             return e is not None
 
@@ -502,6 +595,12 @@ class TestCUDA(JitTestCase):
         # an adaption from eager mode CUDA tests available at test/test_cuda.py
         @torch.jit.script
         def test_event():
+            # [FUNCTION DOC] HELPER: Record start and end events around a huge matrix
+            # multiplication on the current stream, synchronize, and return the elapsed time,
+            # or minus one if the event query was not true.
+            # KNOWN ISSUE: the tensor shape of one billion by one billion elements
+            # cannot be allocated on any real device, so running this would fail with
+            # an out-of-memory error.
             device_index = torch.cuda.current_device()
             device = torch.device("cuda:" + str(device_index))
             stream = torch.cuda.current_stream(device)
@@ -525,6 +624,11 @@ class TestCUDA(JitTestCase):
         # computed on the stream. The stream.query should be true once the synchronization is done
         @torch.jit.script
         def test_stream_synchronize() -> float:
+            # [FUNCTION DOC] HELPER: Record a timing event, run a huge product on a
+            # new stream, synchronize the stream, record and synchronize a second
+            # event, and return the elapsed time between events, or minus one if the
+            # stream query is false.
+            # KNOWN ISSUE: the one billion by one billion tensor shape cannot be allocated.
             device_index = torch.cuda.current_device()
             s = torch.cuda.Stream()
             e_tik = torch.cuda.Event(True, False, False)
@@ -552,6 +656,11 @@ class TestCUDA(JitTestCase):
         # and the stream.query evaluates to true.
         @torch.jit.script
         def test_event_synchronize() -> float:
+            # [FUNCTION DOC] HELPER: Like the stream synchronize variant, but records the
+            # second event through the stream record-event call and synchronizes the event
+            # before the stream. Returns elapsed time between the events or minus one if the
+            # stream query is false.
+            # KNOWN ISSUE: the one billion by one billion tensor shape cannot be allocated.
             s = torch.cuda.Stream()
             e_tik = torch.cuda.Event(True, False, False)
             e_tok = torch.cuda.Event(True, False, False)
@@ -579,6 +688,10 @@ class TestCUDA(JitTestCase):
         # test/test_cuda.py
         @torch.jit.script
         def test_event_wait() -> float:
+            # [FUNCTION DOC] HELPER: Run products on two streams ordered by an event wait,
+            # then synchronize and return the elapsed time between two events, or minus one if
+            # any stream or event query is false.
+            # KNOWN ISSUE: the one billion by one billion tensor shapes cannot be allocated.
             device_index = torch.cuda.current_device()
             device = torch.device("cuda:" + str(device_index))
             s0 = torch.cuda.current_stream(device)
@@ -613,6 +726,10 @@ class TestCUDA(JitTestCase):
         # Test for stream wait_event. Checks if the stream waits on the event
         @torch.jit.script
         def test_wait_event():
+            # [FUNCTION DOC] HELPER: On device cuda:1 run a large product and record an event
+            # on its current stream; then make the current stream of cuda:0 wait for it,
+            # synchronize, and return whether the event and both streams report completion.
+            # KNOWN ISSUE: the one billion by one billion tensor shape cannot be allocated.
             d1 = torch.device("cuda:1")
 
             with torch.cuda.device(d1):
@@ -632,8 +749,18 @@ class TestCUDA(JitTestCase):
 
         # Test if a scripted module with cuda streams can be saved, loaded and executed
         def test_save_load(self):
+            # [FUNCTION DOC] HELPER: Intended save/load check for a scripted module that uses a
+            # stream. Scripts the module, runs it and checks outputs, then round trips it
+            # through the export and import helper and re-checks the outputs.
+            # KNOWN ISSUE: it is a nested function with a self parameter and is never called,
+            # so it never runs and is not a collected test.
             class Model(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module whose forward uses a new CUDA stream to concatenate
+                # two random tensors, used for the save and load round trip.
                 def forward(self):
+                    # [FUNCTION DOC] HELPER: Create a stream and two random CUDA tensors,
+                    # concatenate them on the stream, synchronize, and return whether the current
+                    # stream was the new one, both inputs and the concatenation.
                     s = torch.cuda.Stream()
                     a = torch.rand(3, 4, device="cuda")
                     b = torch.rand(3, 4, device="cuda")
@@ -662,7 +789,12 @@ class TestCUDA(JitTestCase):
     # Make sure that cuda._exchange_device doesn't get DCE'ed
     @unittest.skipIf(not TEST_CUDA, "Cuda not available")
     def test__exchange_device_op(self):
+        # [FUNCTION DOC] Script a function that calls the exchange-device operator and check
+        # the graph contains it, before and after inlining, so the call is not removed as dead
+        # code. The graph is inspected only; nothing is executed on a device.
         def fn(device: int, tensor):
+            # [FUNCTION DOC] HELPER: Call the exchange-device operator, then return the cosine
+            # of the tensor passed through relu.
             torch.cuda._exchange_device(device)
             return tensor.cos().relu()
 
@@ -677,7 +809,11 @@ class TestCUDA(JitTestCase):
     # Make sure that cuda._maybe_exchange_device doesn't get DCE'ed
     @unittest.skipIf(not TEST_CUDA, "Cuda not available")
     def test__maybe_exchange_device_op(self):
+        # [FUNCTION DOC] Same as the exchange-device graph check but for the maybe-exchange-
+        # device operator: it must remain in the graph before and after inlining.
         def fn(device: int, tensor):
+            # [FUNCTION DOC] HELPER: Call the maybe-exchange-device operator, then return the
+            # cosine of the tensor passed through relu.
             torch.cuda._maybe_exchange_device(device)
             return tensor.cos().relu()
 

@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: jit"]
 
+# [MODULE DOC] Informational test of how much control flow and non-tensor work remains in
+# optimized TorchScript graphs for generated nn.functional and nn.Module tests.
+# Defines two graph-statistic helpers and one TestCase; it only prints statistics and
+# asserts nothing. Run directly, the file raises RuntimeError because it is not wired
+# into discover_tests. No import-time side effects besides extending sys.path with the
+# test directory.
 import contextlib
 import os
 import sys
@@ -27,6 +33,10 @@ from torch.testing._internal.jit_utils import enable_profiling_mode, JitTestCase
 
 
 def num_ifs_loops(graph):
+    # [FUNCTION DOC] HELPER: Count loop and if nodes in the body of a graph. Converts the graph
+    # to text, keeps only the text before the first occurrence of the word return, and returns
+    # the number of Loop plus If node mentions there. If no return is found the slice silently
+    # drops the last character instead, which is harmless for counting.
     graph_str = str(graph)
     # only look at body of graph
     graph_body = graph_str[0 : graph_str.find("return")]
@@ -34,6 +44,11 @@ def num_ifs_loops(graph):
 
 
 def num_non_tensor_nodes(block):
+    # [FUNCTION DOC] HELPER: Recursively count nodes in a block that produce no Tensor output.
+    # Skips constants, bailout nodes and attribute getters (kind substring match). For every
+    # other node it first adds the counts from its nested blocks, then adds one if none of its
+    # outputs has a type whose text mentions Tensor (a node with no outputs counts as one).
+    # Returns the integer total.
     num_non_tensor = 0
     for node in block.nodes():
         kind = node.kind()
@@ -53,7 +68,12 @@ def num_non_tensor_nodes(block):
 
 
 class TestComplexity(JitTestCase):
+    # [CLASS DOC] JitTestCase that prints, per generated nn.functional test and per nn.Module
+    # test, the number of if/loop nodes and non-tensor nodes in the last optimized graph.
+    # Gradient mode is disabled and the default dtype is double for every test.
     def setUp(self):
+        # [FUNCTION DOC] Remember whether grad mode was enabled, then disable grad mode and enter
+        # the set_default_dtype context (double) through an ExitStack kept on the instance.
         super().setUp()
         self.grad_enabled = torch.is_grad_enabled()
         torch.set_grad_enabled(False)
@@ -61,12 +81,19 @@ class TestComplexity(JitTestCase):
         self._stack.enter_context(set_default_dtype(torch.double))
 
     def tearDown(self):
+        # [FUNCTION DOC] Undo setUp: close the ExitStack (restoring the default dtype), restore the
+        # saved grad mode, then run the base class tearDown.
         self._stack.close()
         torch.set_grad_enabled(self.grad_enabled)
         super().tearDown()
 
     @suppress_warnings
     def test_generated_functional_tests(self):
+        # [FUNCTION DOC] Under profiling mode, for every generated nn.functional test spec
+        # build the scripted function and inputs, run it six times so the profiling executor
+        # optimizes it, then record the test name with if/loop and non-tensor counts of the
+        # last executed optimized graph. Prints a header row and one row per test; there are
+        # no assertions. Warnings are suppressed by the decorator.
         with enable_profiling_mode():
             stats = [("Name", "Ifs/Loops", "non-tensor ops")]
             for test in get_nn_functional_tests():
@@ -84,6 +111,11 @@ class TestComplexity(JitTestCase):
     @suppress_warnings
     @unittest.skipIf(IS_FBCODE, "Causes a RecursionError in fbcode")
     def test_nn_module_tests(self):
+        # [FUNCTION DOC] Same statistics as the functional variant, but over all generated
+        # nn.Module tests. Specs for which no compiled module can be built are skipped. Each
+        # module is run six times in profiling mode before reading the last optimized graph;
+        # rows are printed and nothing is asserted. Skipped under fbcode because it hits a
+        # RecursionError there.
         with enable_profiling_mode():
             stats = [("Name", "Ifs/Loops", "non-tensor ops")]
             for test in get_all_nn_module_tests():
