@@ -1,5 +1,12 @@
 # Owner(s): ["oncall: quantization"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for quantized tensors (per-tensor and per-channel affine, sub-byte
+# types): creation, quantize/dequantize, memory formats, device moves, fill, masked_fill,
+# index_put, index_select, view/resize/reshape/unsqueeze, copy/clone, serialization
+# (save/load, pickle, TorchScript), fp16 saturation, optimized qparam search, and the
+# quantized_decomposed ops. Also holds numpy reference helpers. Import calls
+# hu.assert_deadline_disabled to turn off hypothesis deadlines. Direct execution raises
+# RuntimeError.
 
 import numpy as np
 import math
@@ -22,11 +29,24 @@ import itertools
 import tempfile
 
 class Foo(torch.nn.Module):
+    # [CLASS DOC] HELPER: Minimal module holding a qscheme attribute set to
+    # per_tensor_symmetric; used to test pickling of a qscheme.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Call the base initializer and store the
+        # per_tensor_symmetric qscheme in the qscheme attribute.
         super().__init__()
         self.qscheme = torch.per_tensor_symmetric
 
 def _calculate_dynamic_qparams(X, dtype, reduce_range=False):
+    # [FUNCTION DOC] HELPER: Numpy reference for dynamic quantization parameters. Accepts a
+    # tensor or array (tensors are moved to cpu and converted), a quantized dtype (qint8 or
+    # otherwise treated as quint8) and an optional reduce_range flag that narrows the integer
+    # range. Extends the observed min and max to include zero, derives a scale from the range,
+    # picks the zero point from whichever end has smaller error, and clamps and rounds it into
+    # the integer range. Returns a list of a float32 scale and an int zero point.
+    # KNOWN ISSUE: when the scale is zero or its inverse is infinite the scale is replaced by
+    # 0.1 and a local zero_point is set, but that value is never used; the zero point is
+    # recomputed afterwards from the replaced scale.
     """Calculate the dynamic quantization parameters (scale, zero_point)
     according to the min and max element of the tensor"""
     if isinstance(X, torch.Tensor):
@@ -74,6 +94,13 @@ def _calculate_dynamic_qparams(X, dtype, reduce_range=False):
 # the default casting in Python often resulting in double precision and to make
 # sure we're doing the same numerics as C++ code.
 def param_search_greedy(x, bit_rate, n_bins=200, ratio=0.16):
+    # [FUNCTION DOC] HELPER: Numpy reference of the greedy range search used by optimized
+    # qparam selection (mirrors C++ numerics). Starting from the full min and max of the input
+    # it repeatedly tries shrinking either the left or right end by one step (range divided by
+    # n_bins) using the simplified compress routine to measure loss, moves toward the lower
+    # loss, and records local optima, stopping once the range drops below n_bins times one
+    # minus ratio of steps. Returns a pair holding the max and then the min of the lowest-loss
+    # local optimum, or of the full range when none was found.
     xmin, xmax = np.min(x), np.max(x)
     stepsize = (xmax - xmin) / np.float32(n_bins)
     min_bins = np.float32(n_bins) * (np.float32(1) - np.float32(ratio))
@@ -110,6 +137,11 @@ def param_search_greedy(x, bit_rate, n_bins=200, ratio=0.16):
 
 
 def _compress_uniform_simplified(X, bit_rate, xmin, xmax, fp16_scale_bias=True):
+    # [FUNCTION DOC] HELPER: Numpy reference that quantizes a vector to bit_rate bits over
+    # the interval xmin to xmax and reconstructs it. Optionally rounds xmin and the scale
+    # through float16 (fp16_scale_bias). A zero data range uses scale one. Computes the l2
+    # loss between input and reconstruction with eight interleaved partial sums to match the
+    # C++ accumulation order. Returns the reconstructed values and the loss.
     # affine transform to put Xq in [0,2**bit_rate - 1]
     # Xq = (2 ** bit_rate - 1) * (Xq - xmin) / data_range
     if fp16_scale_bias:
@@ -140,17 +172,30 @@ def _compress_uniform_simplified(X, bit_rate, xmin, xmax, fp16_scale_bias=True):
     return Xq, loss
 
 class TestQuantizedTensor(TestCase):
+    # [CLASS DOC] Test case for quantized tensor behavior; most tests have cpu and cuda
+    # variants built on private helper methods that take a device.
     def test_quantized_tensor_creation_deprecation_warning(self):
+        # [FUNCTION DOC] Asserts that creating a quantized tensor with the per-tensor
+        # quantize function emits a UserWarning matching the deprecated-and-will-be-removed
+        # text, exactly once.
         with self.assertWarnsOnceRegex(UserWarning, ".*deprecated and will be removed"):
             torch.quantize_per_tensor(torch.randn(4), 0.1, 10, torch.quint8)
 
     def test_qtensor_equal(self):
+        # [FUNCTION DOC] Quantizes the same random five-element input twice with identical
+        # parameters to quint4x2 and asserts that torch.equal reports the two quantized
+        # tensors equal.
         x = torch.rand(5)
         x_q = torch.quantize_per_tensor(x, 0.1, 10, torch.quint4x2)
         y_q = torch.quantize_per_tensor(x, 0.1, 10, torch.quint4x2)
         self.assertTrue(torch.equal(x_q, y_q))
 
     def test_per_tensor_qtensor_to_memory_format(self):
+        # [FUNCTION DOC] With a random four dimensional float input and random qint dtype,
+        # checks that converting a per-tensor quantized tensor to channels_last via the to
+        # method gives the same strides as calling contiguous with that format and as the
+        # float tensor. For two degenerate shapes (trailing size-one dims, or one channel)
+        # asserts the strides from the two paths differ.
         n = np.random.randint(1, 10)
         c = np.random.randint(2, 10)
         h = np.random.randint(2, 10)
@@ -183,6 +228,10 @@ class TestQuantizedTensor(TestCase):
         self.assertNotEqual(qx_nhwc_using_to.stride(), qx_nhwc_using_contiguous.stride())
 
     def test_per_channel_qtensor_to_memory_format(self):
+        # [FUNCTION DOC] For a random four dimensional input and random qint dtype,
+        # quantizes per channel along every axis with random scales and zero points and
+        # asserts that converting to channels_last gives the same strides as the float tensor
+        # converted the same way.
         n = np.random.randint(1, 10)
         c = np.random.randint(2, 10)
         h = np.random.randint(2, 10)
@@ -202,14 +251,22 @@ class TestQuantizedTensor(TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is available.")
     def test_qtensor_cuda(self):
+        # [FUNCTION DOC] CUDA test: runs the shared qtensor and dynamic-qtensor checks on
+        # the cuda device; skipped if no gpu.
         self._test_qtensor(torch.device('cuda'))
         self._test_qtensor_dynamic(torch.device('cuda'))
 
     def test_qtensor_cpu(self):
+        # [FUNCTION DOC] Runs the shared qtensor and dynamic-qtensor checks on the cpu
+        # device.
         self._test_qtensor(torch.device('cpu'))
         self._test_qtensor_dynamic(torch.device('cpu'))
 
     def _test_qtensor_dynamic(self, device):
+        # [FUNCTION DOC] HELPER: Builds a random float tensor of one to three dims (sizes up
+        # to 19) on the device, then for qint8 and quint8 compares dynamic per-tensor
+        # quantization against the per-tensor quantize call using parameters from the numpy
+        # reference function; asserts equality.
         # max number of tensor dimensions
         max_tensor_order = 4
         # max size for any tensor dimension
@@ -228,6 +285,12 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(q_d, q_s)
 
     def _test_qtensor(self, device):
+        # [FUNCTION DOC] HELPER: For qint8, quint8 and qint32 quantizes a ones vector of ten
+        # with scale one and zero point two on the device, checks the scale, zero point,
+        # is_quantized flag, qscheme and integer representation (all three), slicing,
+        # dequantized round trip, and that printing an empty quantized tensor yields the
+        # expected whitespace-normalized text including device, size, dtype, scheme, scale and
+        # zero point.
         device = str(device)
         num_elements = 10
         scale = 1.0
@@ -263,6 +326,9 @@ class TestQuantizedTensor(TestCase):
                              "scale=1.0, zero_point=2)")
 
     def test_qtensor_int_repr(self):
+        # [FUNCTION DOC] Quantizes a single-element tensor to quint2x4 and asserts the
+        # packed integer representation has one byte holding the value three, so at least one
+        # byte is allocated when the bit count is below eight.
         # to catch edge case when num elements * bit rate < 8, make sure at lease allocate one byte to hold the int repr
         num_elements = 1
         device = torch.device('cpu')
@@ -277,17 +343,29 @@ class TestQuantizedTensor(TestCase):
         self.assertEqual(int_repr[0], 3)
 
     def test_qtensor_sub_byte_aligned_cols(self):
+        # [FUNCTION DOC] Runs the sub-byte helper for one row of four columns with quint4x2
+        # expecting two bytes of value 51 and quint2x4 (expect one byte of 255), where columns
+        # fill whole bytes.
         # Packed 4 entries, each of value 3, look like 00110011, 00110011 for torch.qunit4x2, or 11111111 for torch.quint2x4
         self._test_qtensor_sub_byte(1, 4, torch.quint4x2, 2, [51, 51])
         self._test_qtensor_sub_byte(1, 4, torch.quint2x4, 4, [255])
 
     def test_qtensor_sub_byte_not_aligned_cols(self):
+        # [FUNCTION DOC] Runs the sub-byte helper for one row of five columns with quint4x2
+        # expecting bytes 51, 51 and 3 and quint2x4 expecting bytes 255 and 3, where the last
+        # byte is partially filled.
         # Packed 5 entries, each of value 3, look like 00110011, 00110011, 00000011 for torch.qunit4x2,
         # or 11111111, 00000011 for torch.quint2x4
         self._test_qtensor_sub_byte(1, 5, torch.quint4x2, 2, [51, 51, 3])
         self._test_qtensor_sub_byte(1, 5, torch.quint2x4, 4, [255, 3])
 
     def _test_qtensor_sub_byte(self, rows, cols, dtype, elements_per_byte, expected_packed_vals):
+        # [FUNCTION DOC] HELPER: Quantizes a ones matrix of the given rows and columns to
+        # the sub-byte dtype (scale one, zero point two), checks scale, zero point, flags,
+        # storage size equal to rows times the ceiling of cols over elements per byte, and
+        # that the integer representation equals the expected packed byte values. Also checks
+        # an empty affine tensor storage size, and that saving and loading with weights_only
+        # both true and false preserves the integer representation.
         num_elements = rows * cols
         scale = 1.0
         zero_point = 2
@@ -319,6 +397,12 @@ class TestQuantizedTensor(TestCase):
                 self.assertEqual(int_repr, loaded_int_repr)
 
     def test_qtensor_channel_float_assignment(self):
+        # [FUNCTION DOC] For every axis of a four dimensional tensor and each qint dtype,
+        # quantizes two float tensors per channel with the same random parameters, then
+        # assigns float values into the first via scalar, 1D through 4D indexing and slices
+        # and checks each equals the corresponding part of the second. Assigning into a non-
+        # contiguous slice must raise RuntimeError about quantized copy needing contiguous or
+        # NHWC tensors.
         t1 = torch.rand(2, 3, 5, 5)
         t2 = torch.rand(2, 3, 5, 5)
         for axis in range(t1.ndim):
@@ -361,6 +445,10 @@ class TestQuantizedTensor(TestCase):
                     qt1[:, 0] = t2[:, 0]
 
     def test_qtensor_float_assignment(self):
+        # [FUNCTION DOC] For cpu (and cuda when available) and each qint dtype, quantizes a
+        # one-element ones tensor, checks item values, assigns a float into an element and a
+        # slice, and verifies the resulting value (11, then 15) and the printed text including
+        # device on cuda.
         # Scalar Tensor
         # item
         scale = 1.0
@@ -394,6 +482,10 @@ class TestQuantizedTensor(TestCase):
                                      "scale=1.0, zero_point=2)")
 
     def test_qtensor_quant_dequant(self):
+        # [FUNCTION DOC] For every supported device, both memory formats and each qint
+        # dtype, quantizes a random tensor in range minus two to two and checks the
+        # dequantized result is close to the input with a loose tolerance; repeats for 5D
+        # tensors.
         scale = 0.02
         zero_point = 2
         for device in get_supported_device_types():
@@ -414,6 +506,8 @@ class TestQuantizedTensor(TestCase):
 
     # legacy constructor/new doesn't support qtensors
     def test_qtensor_legacy_new_failure(self):
+        # [FUNCTION DOC] Asserts the legacy new constructor path raises RuntimeError for a
+        # quantized tensor when given a device, storage, tensor, size or list.
         r = torch.rand(3, 2, dtype=torch.float) * 4 - 2
         scale = 0.02
         zero_point = 2
@@ -425,9 +519,13 @@ class TestQuantizedTensor(TestCase):
         self.assertRaises(RuntimeError, lambda: qr.new([6]))
 
     def test_per_channel_qtensor_creation_cpu(self):
+        # [FUNCTION DOC] Runs the per-channel creation helper on the cpu device.
         self._test_per_channel_qtensor_creation(torch.device('cpu'))
 
     def _test_dequantize_fp16(self, device):
+        # [FUNCTION DOC] HELPER: Converts a random float tensor to float16, calls dequantize
+        # on it and asserts the result has float32 dtype and equals the plain float32
+        # conversion.
         data_orig = torch.randn(1, 2, 4, 4, dtype=torch.float, device=device)
         data_fp16 = data_orig.to(torch.float16)
         data_fp16_dequant = data_fp16.dequantize()
@@ -436,17 +534,26 @@ class TestQuantizedTensor(TestCase):
         self.assertTrue(torch.allclose(data_fp16_fp32, data_fp16_dequant))
 
     def test_dequantize_fp16_cpu(self):
+        # [FUNCTION DOC] Runs the fp16 dequantize helper on cpu.
         self._test_dequantize_fp16(torch.device('cpu'))
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is available.")
     def test_dequantize_fp16_cuda(self):
+        # [FUNCTION DOC] CUDA test: runs the fp16 dequantize helper on cuda; skipped without
+        # a gpu.
         self._test_dequantize_fp16(torch.device('cuda'))
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is available.")
     def test_per_channel_qtensor_creation_cuda(self):
+        # [FUNCTION DOC] CUDA test: runs the per-channel creation helper on cuda; skipped
+        # without a gpu.
         self._test_per_channel_qtensor_creation(torch.device('cuda'))
 
     def _test_per_channel_qtensor_creation(self, device):
+        # [FUNCTION DOC] HELPER: Creates empty per-channel affine quantized tensors for
+        # qint8 and quint8 with float and integer zero points, checks the stored scales, zero
+        # points and axis; then builds per-channel tensors from a uint8 tensor and checks
+        # integer representation, scales, zero points and axis.
         numel = 10
         ch_axis = 0
         scales = torch.rand(numel, device=device)
@@ -469,6 +576,10 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(ch_axis, q.q_per_channel_axis())
 
     def test_qtensor_creation(self):
+        # [FUNCTION DOC] For each supported device creates an empty per-tensor affine
+        # quantized tensor and checks scale and zero point; builds one from a uint8 tensor and
+        # checks integer representation; checks empty_like keeps scale, zero point and dtype,
+        # and that empty_like with a different dtype raises RuntimeError.
         scale = 0.5
         zero_point = 10
         numel = 10
@@ -498,6 +609,9 @@ class TestQuantizedTensor(TestCase):
                 torch.empty_like(q, dtype=torch.qint8)
 
     def test_qtensor_dtypes(self):
+        # [FUNCTION DOC] Quantizes a random float matrix to qint8, quint8, qint32, quint4x2
+        # and quint2x4, dequantizes it and asserts closeness to the input within a loose
+        # tolerance.
         r = torch.rand(3, 2, dtype=torch.float) * 4 - 2
         scale = 0.2
         zero_point = 2
@@ -508,6 +622,8 @@ class TestQuantizedTensor(TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is available.")
     def test_per_tensor_to_device(self):
+        # [FUNCTION DOC] CUDA test: for each qint dtype moves a cpu quantized tensor to cuda
+        # and a cuda-quantized tensor to cpu and asserts the resulting device types.
         dtypes = [
             torch.quint8,
             torch.qint8,
@@ -528,6 +644,9 @@ class TestQuantizedTensor(TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is available.")
     def test_per_channel_to_device(self):
+        # [FUNCTION DOC] CUDA test: for several dtype and zero point type combinations
+        # quantizes per channel, moves the tensor between cpu and cuda and asserts the device
+        # type of the tensor, its scales and zero points follow the move.
         dtype_and_zero_types = [
             (torch.quint8, torch.float),
             (torch.qint8, torch.float),
@@ -559,6 +678,9 @@ class TestQuantizedTensor(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), 'CUDA is not available')
     def test_compare_per_tensor_device_numerics(self):
+        # [FUNCTION DOC] CUDA test: quantizes the same random data per tensor on cpu and
+        # cuda for each qint dtype and asserts equal integer representations and close
+        # dequantized values.
         dtypes = [
             torch.quint8,
             torch.qint8,
@@ -580,6 +702,9 @@ class TestQuantizedTensor(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), 'CUDA is not available')
     def test_compare_per_channel_device_numerics(self):
+        # [FUNCTION DOC] CUDA test: repeated twenty times, per channel quantization on cpu
+        # and cuda for several dtype and zero point type combinations must give equal integer
+        # representations and close dequantized values.
         dtype_and_zero_types = [
             (torch.quint8, torch.float),
             (torch.qint8, torch.float),
@@ -606,8 +731,17 @@ class TestQuantizedTensor(TestCase):
                 self.assertTrue(np.allclose(dqr, dqr_cuda.cpu()))
 
     def _test_quantize_per_channel(self, r, scales, zero_points, axis, float_params):
+        # [FUNCTION DOC] HELPER: Checks per channel quantization of a 4D or 5D tensor along
+        # the given axis for contiguous and channels-last (or 3d) layouts. Compares the
+        # integer representation to a reference and the dequantized values to the input within
+        # tolerance. Uses the flag float_params to choose the float zero point formula.
 
         def _quantize_per_channel_ref_nd(data, scales, zero_points, float_params):
+            # [FUNCTION DOC] HELPER: Reference implementation: reshapes data to three dims
+            # around the axis and loops over every element, quantizing with the per-channel
+            # scale and zero point (multiply by inverse scale and add zero point when
+            # float_params, else divide and then add), rounds and clips to 0..255, then
+            # restores the original shape and returns a tensor.
             dims = data.size()
             data = data.view(-1, dims[axis], np.prod(dims[axis + 1:]))
             res = torch.empty_like(data)
@@ -635,12 +769,18 @@ class TestQuantizedTensor(TestCase):
             self.assertTrue(np.allclose(r.numpy(), rqr.numpy(), atol=2 / np.min(scales.numpy())))
 
     def test_qtensor_quantize_per_channel(self):
+        # [FUNCTION DOC] Compares per channel quantization of a 3x2 tensor (axis one, double
+        # scales, long zero points) with a loop reference and checks dequantization closeness;
+        # then runs the shared helper on 4D and 5D tensors for axes one and zero.
         r = torch.rand(3, 2, dtype=torch.float) * 4 - 2
         scales = torch.tensor([0.2, 0.03], dtype=torch.double)
         zero_points = torch.tensor([5, 10], dtype=torch.long)
         axis = 1
 
         def quantize_c(data, scales, zero_points):
+            # [FUNCTION DOC] HELPER: Reference for the 3x2 case: for each element divides by
+            # the channel scale, rounds, adds the channel zero point, clips to 0..255 and
+            # returns a 3x2 float tensor.
             res = torch.empty((3, 2))
             quant_min, quant_max = 0, 255
             for i in range(3):
@@ -673,6 +813,9 @@ class TestQuantizedTensor(TestCase):
         self._test_quantize_per_channel(r, scales, zero_points, 0, False)
 
     def test_quantize_per_channel_float_qparams(self):
+        # [FUNCTION DOC] Same checks as the integer qparam test but with float scales and
+        # float zero points, using a reference with float zero points; also runs the shared
+        # helper with the float flag for 4D and 5D tensors.
         r = torch.rand(3, 2, dtype=torch.float) * 4
         scales = torch.tensor([0.2, 0.03], dtype=torch.float)
         zero_points = torch.tensor([0.1, 0.2], dtype=torch.float)
@@ -680,6 +823,9 @@ class TestQuantizedTensor(TestCase):
 
         # Reference quantize function with FP zero_point.
         def quantize_ref(data, scales, zero_points):
+            # [FUNCTION DOC] HELPER: Reference for float zero points: multiplies each
+            # element by the inverse channel scale, adds the float zero point, rounds and
+            # clips to 0..255, returns a 3x2 float tensor.
             res = torch.empty((3, 2))
             quant_min, quant_max = 0, 255
             for i in range(3):
@@ -715,6 +861,10 @@ class TestQuantizedTensor(TestCase):
         self._test_quantize_per_channel(r, scales, zero_points, 0, True)
 
     def test_quantize_per_channel_sub_byte(self):
+        # [FUNCTION DOC] Checks per channel quantization to quint4x2 with float scales and
+        # zero points for a 3x2 input on axis zero and a 4D input on axis one, comparing the
+        # packed bytes with a reference packer and, for the first case, dequantization
+        # closeness.
         """ Tests the per channel quantization scheme for 4-bit qtensors.
         The scale and zero point for this have to be in floating point. """
         r = torch.rand(3, 2, dtype=torch.float) * 4
@@ -724,10 +874,16 @@ class TestQuantizedTensor(TestCase):
         dequant_tensor = qr.dequantize()
 
         def _get_qranges(bit_width):
+            # [FUNCTION DOC] HELPER: Returns the quantization min and max (0 and 15) for
+            # four bits; returns nothing (None) for any other bit width.
             if bit_width == 4:
                 return 0, 15
 
         def _quantize_per_channel_sub_byte_ref(data, scales, zero_points, axis, bit_width):
+            # [FUNCTION DOC] HELPER: Reference packer: reshapes data around the axis,
+            # quantizes each element with the float scale and zero point, clips to the bit
+            # range, and packs elements into bytes, first element in the low bits. Returns a
+            # uint8 tensor of the packed bytes.
             dims = data.size()
             data = data.view(-1, dims[axis], np.prod(dims[axis + 1:]))
             qtensor_size = math.ceil(data.numel() / 2)
@@ -761,6 +917,10 @@ class TestQuantizedTensor(TestCase):
         self.assertTrue(np.allclose(qr.int_repr(), ref_res))
 
     def test_qtensor_permute(self):
+        # [FUNCTION DOC] For each device and qint dtype, checks transpose then dequantize
+        # against numpy transpose, permute versus transpose equality of integer data, scale,
+        # zero point and dequantized values, contiguous after transpose, channels_last
+        # conversion preserving data, and that permuting a larger 64 by 64 tensor works.
         scale = 0.02
         zero_point = 1
         for device in get_supported_device_types():
@@ -803,6 +963,9 @@ class TestQuantizedTensor(TestCase):
                 qx.permute([1, 0])
 
     def test_qtensor_per_channel_permute(self):
+        # [FUNCTION DOC] For each device checks that transposing a per-channel quantized
+        # tensor across its axis raises RuntimeError, while converting to channels_last keeps
+        # integer data, scales, zero points, axis one and dequantized values.
         for device in get_supported_device_types():
             r = torch.rand(20, 10, 2, 2, dtype=torch.float, device=device) * 4 - 2
             dtype = torch.qint8
@@ -825,6 +988,10 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(qlast.dequantize(), qr.dequantize())
 
     def test_qtensor_load_save(self):
+        # [FUNCTION DOC] Saves a quantized tensor and a view of one of its columns together
+        # to a temp file for each qint dtype, loads them with weights_only true and false, and
+        # asserts equality and that both loaded tensors share one storage pointer. Uses cpu
+        # only.
         scale = 0.2
         zero_point = 10
         # storage is not accessible on the cuda right now
@@ -844,6 +1011,9 @@ class TestQuantizedTensor(TestCase):
                     self.assertEqual(qr2.storage().data_ptr(), qrv2.storage().data_ptr())
 
     def test_qtensor_per_channel_load_save(self):
+        # [FUNCTION DOC] For quint8, qint8 and quint4x2 quantizes per channel, then saves to
+        # a temp file and loads with weights_only true and false, asserting equality; quint4x2
+        # uses float zero points of ones.
         r = torch.rand(20, 10, dtype=torch.float) * 4 - 2
         scales = torch.rand(10, dtype=torch.double) * 0.02 + 0.01
         zero_points = torch.round(torch.rand(10) * 20 + 1).to(torch.long)
@@ -861,6 +1031,11 @@ class TestQuantizedTensor(TestCase):
                     self.assertEqual(qr, qr2)
 
     def test_qtensor_copy(self):
+        # [FUNCTION DOC] For each qint dtype and device tests copy_ between quantized
+        # tensors with equal and with different scale and zero point (the destination takes
+        # the source parameters), asserts copying quantized into a float tensor raises
+        # RuntimeError mentioning dequantize, and on cpu that copying float into quantized
+        # equals quantizing the float.
         scale = 0.5
         zero_point = 10
         numel = 10
@@ -901,6 +1076,8 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(q, qr)
 
     def test_torch_qtensor_deepcopy(self):
+        # [FUNCTION DOC] Builds a per-tensor quantized tensor from a uint8 tensor on cpu,
+        # deep copies it and asserts equality.
         # cuda is not supported yet
         device = "cpu"
         q_int = torch.randint(0, 100, [3, 5], device=device, dtype=torch.uint8)
@@ -910,6 +1087,9 @@ class TestQuantizedTensor(TestCase):
         self.assertEqual(qc, q)
 
     def test_clone(self):
+        # [FUNCTION DOC] For each device and qint dtype, creates empty per-tensor and per-
+        # channel quantized tensors, clones them and asserts the clones equal the originals,
+        # so scale and zero point are preserved.
         numel = 10
         scale = 0.5
         zero_point = 10
@@ -938,6 +1118,10 @@ class TestQuantizedTensor(TestCase):
                 self.assertEqual(q, q2)
 
     def test_qtensor_fill_per_tensor(self):
+        # [FUNCTION DOC] For each qint dtype, fill value (including negative and overflow
+        # values) and device, fills an empty per-tensor tensor and compares integer data and
+        # dequantized values with quantizing a tensor of that value; also asserts scale and
+        # zero point are unchanged.
         numel = 10
         scale = 0.5
         zero_point = 10
@@ -965,6 +1149,8 @@ class TestQuantizedTensor(TestCase):
 
     # Adapted from test_qtensor_fill_per_tensor but for a NHWC tensor (requires 4D)
     def test_qtensor_fill_per_tensor_nhwc(self):
+        # [FUNCTION DOC] Same as the per-tensor fill test but on a random 4D shape for both
+        # contiguous and channels_last memory formats.
         dims = torch.randint(low=1, high=10, size=(4, )).tolist()
         scale = 0.5
         zero_point = 10
@@ -991,6 +1177,9 @@ class TestQuantizedTensor(TestCase):
 
     # adapted from test_qtensor_fill_per_tensor
     def test_qtensor_fill_per_channel(self):
+        # [FUNCTION DOC] Fill test for per-channel tensors: fills empty per-channel
+        # quantized tensors with several values and compares against per-channel quantizing a
+        # constant tensor, and checks scales and zero points are unchanged.
         dims = [4, 5]
         axis = 0
         # adding a constant to avoid too small of a scale
@@ -1021,14 +1210,21 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(q_filled.q_per_channel_zero_points(), zero_points)
 
     def test_qtensor_masked_fill_cpu(self):
+        # [FUNCTION DOC] Runs the masked fill helper on cpu.
         self._test_qtensor_masked_fill('cpu')
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is available.")
     def test_qtensor_masked_fill_cuda(self):
+        # [FUNCTION DOC] CUDA test: runs the masked fill helper on cuda; skipped without a
+        # gpu.
         self._test_qtensor_masked_fill('cuda')
 
     # adapted from test_qtensor_fill_per_tensor
     def _test_qtensor_masked_fill(self, device):
+        # [FUNCTION DOC] HELPER: Checks masked_fill with a true scalar mask equals fill and
+        # the quantized reference, with scale and zero point unchanged; then for a random
+        # boolean mask over the tensor compares masked_fill with elementwise assignment for
+        # each dtype and value.
         numel = 10
         scale = 0.5
         zero_point = 10
@@ -1082,15 +1278,22 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(q_masked_fill.dequantize(), ref.dequantize())
 
     def test_qtensor_index_put_cpu(self):
+        # [FUNCTION DOC] Runs the index_put helpers (plain and deterministic non-accumulate)
+        # on cpu.
         self._test_qtensor_index_put('cpu')
         self._test_qtensor_index_put_non_accumulate_deterministic('cpu')
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is available.")
     def test_qtensor_index_put_cuda(self):
+        # [FUNCTION DOC] CUDA test: runs both index_put helpers on cuda; skipped without a
+        # gpu.
         self._test_qtensor_index_put('cuda')
         self._test_qtensor_index_put_non_accumulate_deterministic('cuda')
 
     def _test_qtensor_index_put(self, device):
+        # [FUNCTION DOC] HELPER: For each qint dtype and for a scalar value and a vector of
+        # random values, checks that assigning through index tuples into a quantized tensor
+        # equals quantizing the float tensor after the same assignment.
         n = 10
         m = 10
         x_orig = torch.rand(n, m, device=device)
@@ -1112,6 +1315,9 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(qx_ref, qx)
 
     def _test_qtensor_index_put_non_accumulate_deterministic(self, device):
+        # [FUNCTION DOC] HELPER: With deterministic algorithms enabled, for each qint dtype
+        # repeats three times a non-accumulating index_put on a quantized tensor with many
+        # repeated indices and checks it equals quantizing the float index_put output.
         with DeterministicGuard(True):
             scale = 0.5
             zero_point = 10
@@ -1137,6 +1343,9 @@ class TestQuantizedTensor(TestCase):
 
     # adapted from test_qtensor_fill_per_channel and test_qtensor_fill_per_tensor_nhwc
     def test_qtensor_fill_per_channel_nhwc(self):
+        # [FUNCTION DOC] Per-channel fill test on a random 4D shape for contiguous and
+        # channels_last memory formats, comparing fill results with quantizing a constant
+        # tensor and checking parameters stay unchanged.
         dims = torch.randint(low=1, high=10, size=(4, )).tolist()
         axis = 0
         # adding a constant to avoid too small of a scale
@@ -1168,12 +1377,17 @@ class TestQuantizedTensor(TestCase):
 
     @unittest.skipIf(not TEST_CUDA, "No gpu is available.")
     def test_qtensor_index_select_cuda(self):
+        # [FUNCTION DOC] CUDA test: runs the index_select helper on cuda; skipped without a
+        # gpu.
         self._test_qtensor_index_select('cuda')
 
     def test_qtensor_index_select_cpu(self):
+        # [FUNCTION DOC] Runs the index_select helper on cpu.
         self._test_qtensor_index_select('cpu')
 
     def _test_qtensor_index_select(self, device):
+        # [FUNCTION DOC] HELPER: For quint8 and qint8 checks that selecting indices along a
+        # random dimension of a quantized tensor equals quantizing the selected float values.
         for quant_type in [torch.quint8, torch.qint8]:
             dims = 3
             index = torch.randint(dims, [1]).item()
@@ -1191,6 +1405,10 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(x_quantized_selected, x_selected_quantized)
 
     def test_qtensor_view(self):
+        # [FUNCTION DOC] Tests view on quantized tensors: shape change keeps element count,
+        # a negative dimension infers, view after transpose changes strides and data so the
+        # results differ, and viewing a non-contiguous tensor raises RuntimeError about
+        # incompatible size and stride while the contiguous version works.
         scale, zero_point, dtype = 1.0, 2, torch.uint8
         for device in get_supported_device_types():
             q_int = torch.randint(0, 100, [1, 2, 3], device=device, dtype=dtype)
@@ -1225,6 +1443,10 @@ class TestQuantizedTensor(TestCase):
             b.contiguous().view(1, 4, 2, 3)
 
     def test_qtensor_resize(self):
+        # [FUNCTION DOC] Tests resize on quantized tensors: chains resizes between several
+        # shapes with the same element count, compares transposed versus resized original,
+        # asserts that resizing to a different element count raises RuntimeError, and that
+        # resizing contiguous and non-contiguous tensors is allowed.
         for device in get_supported_device_types():
             scale, zero_point, dtype = 1.0, 2, torch.uint8
             sizes1 = [1, 2, 3, 4]
@@ -1272,6 +1494,9 @@ class TestQuantizedTensor(TestCase):
             q4 = q1.contiguous().resize(*sizes2)
 
     def test_qtensor_reshape(self):
+        # [FUNCTION DOC] Tests reshape on quantized tensors: flattening and inferring a
+        # dimension keeps equality, reshape after transpose differs from the layout-preserving
+        # reshape, and reshaping a non-contiguous tensor succeeds.
         scale, zero_point, dtype = 1.0, 2, torch.uint8
         for device in get_supported_device_types():
             q_int = torch.randint(0, 100, [3, 5], dtype=dtype, device=device)
@@ -1302,6 +1527,10 @@ class TestQuantizedTensor(TestCase):
             c = b.reshape(1, 4, 2, 3)
 
     def test_qtensor_unsqueeze(self):
+        # [FUNCTION DOC] Tests unsqueeze and squeeze on per-tensor and per-channel quantized
+        # tensors, including the axis being shifted by unsqueeze, and that squeezing the
+        # channel axis raises RuntimeError saying squeeze is only possible on a non-axis
+        # dimension for per-channel; also squeeze without a dim argument.
         for device in get_supported_device_types():
             x = torch.randn((1, 3, 4), device=device)
             qx = torch.quantize_per_tensor(x, scale=1.0, zero_point=0, dtype=torch.quint8)
@@ -1336,6 +1565,8 @@ class TestQuantizedTensor(TestCase):
                 qz = qy.squeeze()
 
     def test_repeat(self):
+        # [FUNCTION DOC] For each device, repeats a quantized tensor and asserts equality
+        # with a quantized tensor built from the repeated integer data.
         scale, zero_point, dtype = 1.0, 2, torch.uint8
         for device in get_supported_device_types():
             q_int = torch.randint(0, 100, [3], dtype=dtype, device=device)
@@ -1347,6 +1578,8 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(q_ref, q_repeat)
 
     def test_qscheme_pickle(self):
+        # [FUNCTION DOC] Saves a Foo module to an in-memory buffer, loads it back with
+        # weights_only false and asserts its qscheme attribute is per_tensor_symmetric.
         f = Foo()
         buf = io.BytesIO()
         torch.save(f, buf)
@@ -1366,6 +1599,9 @@ class TestQuantizedTensor(TestCase):
         "this is broken without changes to any relevant code, "
         "we need to remove hypothesis testing in CI")
     def test_choose_qparams(self, X, reduce_range):
+        # [FUNCTION DOC] Skipped test (hypothesis based): compares the chosen per-tensor
+        # qparams from the library function with the numpy reference, scale to three decimals
+        # and zero point exactly.
         X, (scale, zero_point, torch_type) = X
         X = torch.from_numpy(X)
         X_scale, X_zp = _calculate_dynamic_qparams(X, torch.quint8, reduce_range=reduce_range)
@@ -1375,6 +1611,9 @@ class TestQuantizedTensor(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), 'CUDA is not available')
     def test_cuda_quantization_does_not_pin_memory(self):
+        # [FUNCTION DOC] CUDA test for a regression about issue 41115: creating a quantized
+        # tensor on cuda must not make later cpu allocations pinned; checks is_pinned is false
+        # before and after.
         # Context - https://github.com/pytorch/pytorch/issues/41115
         x = torch.randn(3)
         self.assertEqual(x.is_pinned(), False)
@@ -1388,6 +1627,9 @@ class TestQuantizedTensor(TestCase):
     # There's no way to actually pin the memory of a quantized tensor
     @unittest.skipIf(not torch.cuda.is_available(), 'CUDA is not available')
     def test_quant_pin_memory(self):
+        # [FUNCTION DOC] CUDA test: a pinned float tensor quantized is not pinned,
+        # empty_quantized with pin memory true is also not pinned, and calling pin_memory on a
+        # quantized tensor raises RuntimeError.
         x = torch.randn(3).pin_memory()
         self.assertEqual(x.is_pinned(), True)
         x_q = torch.quantize_per_tensor(x, 1, 0, torch.quint8)
@@ -1397,6 +1639,8 @@ class TestQuantizedTensor(TestCase):
         self.assertRaises(RuntimeError, lambda: x_q.pin_memory())
 
     def test_fp16_saturate_op(self):
+        # [FUNCTION DOC] Checks the saturate-to-fp16 op clamps values of plus and minus
+        # 65532 to the float16 limits plus and minus 65504.
         x = torch.ones(5, 5, dtype=torch.float32) * 65532
         x[0] = torch.ones(5) * -65532
         # range of fp16 value is [-65504, + 65504]
@@ -1406,6 +1650,9 @@ class TestQuantizedTensor(TestCase):
         self.assertEqual(y, ref)
 
     def test_choose_qparams_optimized(self):
+        # [FUNCTION DOC] For bit widths four and two compares the optimized qparam chooser
+        # on a random vector with the numpy greedy reference; also asserts it raises
+        # ValueError for an empty input saying the tensor has no data.
         for bit_width in [4, 2]:
             x = torch.randn(64, dtype=torch.float)
             y = torch.choose_qparams_optimized(x, numel=64, n_bins=200, ratio=0.16, bit_width=bit_width)
@@ -1417,16 +1664,26 @@ class TestQuantizedTensor(TestCase):
             torch.choose_qparams_optimized(torch.tensor([]), numel=0, n_bins=200, ratio=0.16, bit_width=8)
 
     def _test_pickle_checkpoint_qtensor(self, device):
+        # [FUNCTION DOC] HELPER: Inside a temporary file name, defines a scripted module
+        # that saves its two inputs to that file path during forward, runs it with a per-
+        # tensor and a per-channel quantized tensor, then loads the file with weights_only
+        # true and false and asserts equality with the originals.
         with TemporaryFileName() as fname:
             class M(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module with the file name as a constant;
+                # forward saves both tensor inputs to that file and returns the second.
                 __constants__ = ['fname']
 
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Stores the captured temp file name in the fname
+                    # attribute.
                     super().__init__()
                     self.fname = fname
 
                 @torch.jit.script_method
                 def forward(self, x, y):
+                    # [FUNCTION DOC] HELPER: Scripted method saving the pair of inputs to
+                    # the stored file name and returning y.
                     torch.save((x, y), self.fname)
                     return y
 
@@ -1446,11 +1703,21 @@ class TestQuantizedTensor(TestCase):
                     self.assertEqual(loaded_qc, qc)
 
     def test_pickle_checkpoint_qtensor(self):
+        # [FUNCTION DOC] Runs the pickle checkpoint helper on cpu.
         self._test_pickle_checkpoint_qtensor('cpu')
 
     def test_jit_serialization(self):
+        # [FUNCTION DOC] For per-tensor and per-channel cases builds a scripted module
+        # holding a quantized buffer, saves it with jit save into a buffer, loads it and
+        # asserts calling the loaded model equals the original output.
         class SimpleQTensor(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module that stores a quantized random 5x5 tensor
+            # (per tensor or per channel according to its constructor flag) as a buffer and
+            # returns it in forward.
             def __init__(self, per_channel):
+                # [FUNCTION DOC] HELPER: Creates a random float matrix, quantizes it per
+                # tensor or per channel depending on the flag and registers it as the buffer
+                # x.
                 super().__init__()
                 x = torch.rand(5, 5).float()
                 if not per_channel:
@@ -1463,6 +1730,8 @@ class TestQuantizedTensor(TestCase):
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Scripted method returning the stored quantized
+                # buffer.
                 return self.x
 
         for per_channel in [False, True]:
@@ -1474,12 +1743,17 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(model_loaded(), model())
 
     def test_bfp16_quantize(self):
+        # [FUNCTION DOC] Converts a random tensor to bfloat16 and back to float32 and
+        # asserts closeness with loose tolerances.
         X = torch.randn(5 , 10)
         quantized_X = X.to(torch.bfloat16)
         dedequantized_X = quantized_X.to(torch.float32)
         torch.testing.assert_close(X, dedequantized_X, rtol=1e-4, atol=5e-3)
 
     def test_decomposed_quantize_per_tensor(self):
+        # [FUNCTION DOC] Imports the decomposed op module to register ops, then for quint8,
+        # qint8 and qint32 compares the decomposed per-tensor quantize op with the regular
+        # quantize: output dtype and integer data must match.
         # register the ops
         import torch.ao.quantization.fx._decomposed
         X = torch.randn(5, 10)
@@ -1498,6 +1772,9 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(quantized_X.int_repr(), quantized_decomposed_X)
 
     def test_decomposed_quantize_per_tensor_bfloat16_input(self):
+        # [FUNCTION DOC] Checks the decomposed per-tensor quantize op accepts bfloat16 input
+        # and gives uint8 output equal to the integer data of regular quantization of the
+        # float32 input.
         # register the ops
         import torch.ao.quantization.fx._decomposed
         X = torch.randint(1, 10, (5, 5)).to(torch.float32)
@@ -1510,6 +1787,9 @@ class TestQuantizedTensor(TestCase):
         self.assertEqual(quantized_X.int_repr(), quantized_decomposed_X)
 
     def test_decomposed_dequantize_per_tensor(self):
+        # [FUNCTION DOC] For three quantized dtypes compares decomposed quantize and
+        # dequantize ops with the regular ones: integer data and dequantized values must
+        # match.
         import torch.ao.quantization.fx._decomposed
         X = torch.randn(5, 10)
         test_cases = [
@@ -1532,6 +1812,9 @@ class TestQuantizedTensor(TestCase):
             self.assertEqual(dequantized_X, dequantized_decomposed_X)
 
     def test_decomposed_dynamic_quant_pattern(self):
+        # [FUNCTION DOC] Compares the decomposed dynamic quantization pattern (choose
+        # qparams, quantize and dequantize tensor ops) with the regular dynamic path for
+        # uint8, checking integer data and dequantized values.
         import torch.ao.quantization.fx._decomposed
         X = torch.randn(5, 10)
         dtype = torch.uint8
@@ -1555,6 +1838,8 @@ class TestQuantizedTensor(TestCase):
         self.assertEqual(dequantized_X, dequantized_decomposed_X)
 
     def test_decomposed_quantize_per_channel(self):
+        # [FUNCTION DOC] Compares decomposed per-channel quantize with regular per-channel
+        # quantization for uint8 on axis zero: dtype and integer data.
         # register the ops
         import torch.ao.quantization.fx._decomposed
         X = torch.randn(5, 10)
@@ -1573,6 +1858,8 @@ class TestQuantizedTensor(TestCase):
         self.assertEqual(quantized_X.int_repr(), quantized_decomposed_X)
 
     def test_decomposed_quantize_per_channel_bfloat16_input(self):
+        # [FUNCTION DOC] Same as the per-channel decomposed test but the decomposed op
+        # receives bfloat16 input.
         # register the ops
         import torch.ao.quantization.fx._decomposed
         X = torch.randint(1, 10, (5, 5)).to(torch.float32)
@@ -1591,6 +1878,8 @@ class TestQuantizedTensor(TestCase):
         self.assertEqual(quantized_X.int_repr(), quantized_decomposed_X)
 
     def test_decomposed_dequantize_per_channel(self):
+        # [FUNCTION DOC] Compares decomposed per-channel quantize and dequantize with the
+        # regular ones for uint8: integer data and dequantized values.
         # register the ops
         import torch.ao.quantization.fx._decomposed
         X = torch.randn(5, 10)
@@ -1615,6 +1904,9 @@ class TestQuantizedTensor(TestCase):
         self.assertEqual(dequantized_X, dequantized_decomposed_X)
 
     def test_decomposed_choose_qparams_per_token_asymmetric_backward(self):
+        # [FUNCTION DOC] Computes per-token asymmetric qparams via the decomposed
+        # implementation on an input that requires grad, applies the affine transform and
+        # rounding and runs backward, checking only that no error is raised.
         # register the ops
         import torch.ao.quantization.fx._decomposed
         x = torch.randn(2, 3).requires_grad_()
@@ -1623,6 +1915,9 @@ class TestQuantizedTensor(TestCase):
         out.sum().backward()
 
     def test_decomposed_quantize_per_channel_group(self):
+        # [FUNCTION DOC] Quantizes and dequantizes a 100x256 tensor with the decomposed per-
+        # channel-group ops (group size 128, int8 values in minus eight to seven) and asserts
+        # exact equality with fake quantize per channel affine applied to the grouped reshape.
         # register the ops
         import torch.ao.quantization.fx._decomposed
         qmin, qmax = (-8, 7)
@@ -1650,6 +1945,9 @@ class TestQuantizedTensor(TestCase):
         torch.testing.assert_close(dq, fq, rtol=0, atol=0)
 
     def test_decomposed_quantize_per_token(self):
+        # [FUNCTION DOC] Same as the group test but with the decomposed per-token ops and
+        # per-row scales and zero points, compared with fake quantize per channel affine over
+        # rows with zero tolerance.
         # register the ops
         import torch.ao.quantization.fx._decomposed
         qmin, qmax = (-8, 7)
