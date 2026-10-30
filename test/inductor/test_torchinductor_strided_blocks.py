@@ -1,5 +1,13 @@
 # Owner(s): ["module: inductor"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests that inductor's triton codegen emits (strided, ND) block pointers or
+# tensor descriptors for pointwise, broadcast, reduction, welford and similar kernels, by
+# compiling small functions, comparing results with eager, and checking the generated code
+# (counts of block descriptors and kernels, tile dimensions, expected code
+# text). Defines shared helpers and xfail decorators, a base test class, and the device-
+# generic CommonTemplate mixin; later parts of the file instantiate it for CPU/GPU with the
+# different descriptor modes. At import it skips on Windows CI and requires the filelock
+# package to be importable.
 import contextlib
 import dataclasses
 import functools
@@ -57,6 +65,10 @@ max_block: int = TRITON_MAX_BLOCK["X"]
 
 
 def _get_no_split_threshold() -> int:
+    # [FUNCTION DOC] HELPER: Returns the reduction size threshold below which inductor does
+    # not split an inner reduction. On a machine with CUDA it asks the inductor choices object
+    # for the threshold using the current device properties, xnumel of one and the SM count;
+    # otherwise it returns the constant 8192.
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         # These tests reduce the whole view to one output, so xnumel is 1.
@@ -67,6 +79,10 @@ def _get_no_split_threshold() -> int:
 
 
 def tma_xfail(*args, cpu=False, extra_decorators=None):
+    # [FUNCTION DOC] HELPER: Builds a parametrization subtest for the given argument values
+    # that is marked as expected to fail with TMA tensor descriptors. The decorator list
+    # always has the CUDA tensor descriptor xfail, adds the CPU one when the cpu flag is true,
+    # and appends any extra decorators. Returns the subtest object.
     """Mark a subtest as expected to fail with TMA tensor descriptors.
 
     TMA restrictions (see Note: TMA API Restrictions in config.py):
@@ -90,28 +106,43 @@ tiled_reduction_config = {
 
 
 def xfail_if_cpu_tensor_descriptor(fn):
+    # [FUNCTION DOC] HELPER: Decorator that marks the function with the attribute
+    # _expected_failure_cpu_tensor_descriptor set to true and returns the same function.
     fn._expected_failure_cpu_tensor_descriptor = True
     return fn
 
 
 def xfail_if_cuda_tensor_descriptor(fn):
+    # [FUNCTION DOC] HELPER: Decorator that marks the function with the attribute
+    # _expected_failure_cuda_tensor_descriptor set to true and returns the same function.
     fn._expected_failure_cuda_tensor_descriptor = True
     return fn
 
 
 # These xfails are due to restrictions shared by the CPU and CUDA tensor descriptor paths.
 def xfail_if_tensor_descriptor(fn):
+    # [FUNCTION DOC] HELPER: Decorator for failures common to the CPU and CUDA tensor
+    # descriptor paths; sets both expected-failure attributes on the function and returns it.
     fn._expected_failure_cpu_tensor_descriptor = True
     fn._expected_failure_cuda_tensor_descriptor = True
     return fn
 
 
 class BlockDescriptorTestBase(InductorTestCase):
+    # [CLASS DOC] Base test case providing helpers for block descriptor tests: building padded
+    # non-contiguous tensors, asserting how many tile dimensions appear in generated code, and
+    # compiling a function with inductor while checking numerics and code properties. The
+    # class attribute block_descriptor_constructor_str is the text counted in generated code
+    # to find block descriptors; subclasses override it for other descriptor styles.
     block_descriptor_constructor_str = "tl.make_block_ptr"
 
     def _discontiguous_tensor(
         self, view_size: tuple[int, ...], device: torch.device | str
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Makes a random float tensor on the device (a string is
+        # converted to a device) whose size is double the requested view size in every
+        # dimension, then returns a strided view of the requested size that keeps the full
+        # tensor strides, so the view has gaps and is not contiguous.
         """
         Create a padded tensor of the given size.
         The strides correspond to a tensor that is twice as large in each dimension.
@@ -124,20 +155,30 @@ class BlockDescriptorTestBase(InductorTestCase):
         return view
 
     def _assert_pointwise_ndims(self, code, num_dims: int) -> None:
+        # [FUNCTION DOC] HELPER: Asserts the code uses exactly the first num_dims of the
+        # pointwise block names XBLOCK, YBLOCK, ZBLOCK, by delegating to the tiling dimension
+        # check.
         pointwise_blocks = ["XBLOCK", "YBLOCK", "ZBLOCK"]
         return self._assert_tiling_ndims(code, pointwise_blocks, num_dims)
 
     def _assert_reduction_ndims(self, code, num_dims: int) -> None:
+        # [FUNCTION DOC] HELPER: Asserts the code uses exactly the first num_dims of the
+        # reduction block names R0_BLOCK and R1_BLOCK, by delegating to the tiling dimension
+        # check.
         reduction_blocks = ["R0_BLOCK", "R1_BLOCK"]
         return self._assert_tiling_ndims(code, reduction_blocks, num_dims)
 
     def _assert_tiling_ndims(self, code, blocks: list[str], num_dims: int) -> None:
+        # [FUNCTION DOC] HELPER: Asserts that each of the first num_dims names in the blocks
+        # list appears in the code string and that none of the remaining names appears.
         for expected_block in blocks[:num_dims]:
             self.assertIn(expected_block, code)
         for unexpected_block in blocks[num_dims:]:
             self.assertNotIn(unexpected_block, code)
 
     def _get_lines_containing_substr(self, code: str, substr: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns the lines of the code string that contain the
+        # substring, joined by newlines.
         return "\n".join(line for line in code.split("\n") if substr in line)
 
     def _run_and_compare(
@@ -152,6 +193,14 @@ class BlockDescriptorTestBase(InductorTestCase):
         rtol: float | None = None,
         atol: float | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Compiles the function with the inductor backend (optional
+        # compile kwargs, under the given config patches), runs it on the arguments and
+        # fetches the generated code. Asserts each flattened output is close to eager output
+        # (rtol/atol only when given), that the number of generated programs equals
+        # expected_num_programs, that the count of jit kernel markers over all programs equals
+        # expected_num_triton_kernels, and, if expected_num_block_pointers is not None, that
+        # the count of block descriptor constructor text matches it. Returns the compiled
+        # result and the list of generated code strings.
         """
         Runs the module through Inductor, comparing to eager reference.
         """
@@ -161,6 +210,8 @@ class BlockDescriptorTestBase(InductorTestCase):
             config_patches = {}
 
         def flatten_tensors(tensors):
+            # [FUNCTION DOC] HELPER: Flattens a nested structure of tensors and returns the
+            # list of leaves, dropping the tree spec.
             flat, spec = pytree.tree_flatten(tensors)
             return flat
 
@@ -179,6 +230,8 @@ class BlockDescriptorTestBase(InductorTestCase):
             self.assertTrue(torch.allclose(ref, actual, **tol))
 
         def count_code(substr: str, expected: int | None):
+            # [FUNCTION DOC] HELPER: Sums occurrences of the substring over all generated
+            # programs and, when expected is not None, asserts the total equals it.
             count = sum(prog.count(substr) for prog in code)
             if expected is not None:
                 self.assertEqual(count, expected)
@@ -193,6 +246,9 @@ class BlockDescriptorTestBase(InductorTestCase):
 
 @instantiate_parametrized_tests
 class CommonTemplate:
+    # [CLASS DOC] Device-generic mixin (not a TestCase itself) with the block pointer tests,
+    # meant to be combined with a base class that supplies the device attribute and descriptor
+    # settings. The class itself is wrapped to expand parametrized tests.
     @parametrize(
         "expected_num_block_pointers,raises",
         [
@@ -203,11 +259,16 @@ class CommonTemplate:
     def test_expected_num_block_pointers(
         self, expected_num_block_pointers: int, raises: bool
     ):
+        # [FUNCTION DOC] Parametrized: passes with the true block pointer count of three and
+        # must raise AssertionError when nine is expected. Verifies the harness check on the
+        # number of block pointers by compiling an add of two random length-8 tensors.
         """
         Checks that the test harness verifies the number of block pointers correctly.
         """
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Function under test; returns the sum of its two
+            # arguments.
             return x + y
 
         device = torch.device(self.device)
@@ -264,6 +325,11 @@ class CommonTemplate:
         require_block_ptr: bool,
         prefer_nd_tiling: bool,
     ):
+        # [FUNCTION DOC] Parametrized over tilings and shapes. Builds two strided views with
+        # the given full size, view size, optional stride and storage offset, compiles an add
+        # of them with the ND tiling option set, and, when a block pointer is required,
+        # expects three block descriptors (two inputs and one output). Odd shapes with no
+        # requirement only check numerics/no crash.
         """
         Test generating strided ND block pointers for a pointwise kernel.
 
@@ -274,6 +340,9 @@ class CommonTemplate:
         """
 
         def get_input() -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Creates a random tensor of the full size on the test
+            # device and returns a strided view of the view size, using the given stride (or
+            # the original stride) and storage offset.
             device = torch.device(self.device)
             full = torch.randn(full_size).to(device)
 
@@ -309,12 +378,17 @@ class CommonTemplate:
     def test_broadcast(
         self, x_size: tuple[int, ...], y_size: tuple[int, ...], prefer_nd_tiling: bool
     ):
+        # [FUNCTION DOC] Parametrized. Builds two discontiguous inputs of different shapes
+        # with at least one size-one dimension, compiles a function that adds the first plus
+        # one to the second times two, and expects three block descriptors; asserts the shapes
+        # differ and some size is one.
         """
         Test that we can generate strided block pointers when inputs have different
         shapes, and they are broadcast together.
         """
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Function under test; returns x plus one plus y times two.
             a = x + 1
             b = y * 2
             return a + b
@@ -340,6 +414,11 @@ class CommonTemplate:
         )
 
     def test_broadcast_with_singleton_dims(self):
+        # [FUNCTION DOC] Regression test for a minified graph from a language model where
+        # tensors have both zero strides and singleton dimensions, which used to make the
+        # broadcasting dimensions list length disagree with the broadcast shape. Rebuilds the
+        # inputs with an input reader and expects four block descriptors; explicit tolerances
+        # (atol 1e-7, rtol 1e-5) on XPU/HIP.
         # This tests the case when the input / output contains both zero strides
         # and singleton dimensions. In this case the broadcasting dimensions
         # generated for the descriptor need to ignore dimensions that have zero
@@ -358,6 +437,10 @@ class CommonTemplate:
         # broadcast_shape=[((YBLOCK + 3)//4), Min(4, YBLOCK), XBLOCK]
         # error, len(broadcasting_dims) != broadcast_shape
         def forward(expand_4, permute_4, mul_7):
+            # [FUNCTION DOC] HELPER: Graph-style function under test. Clones the expanded
+            # input contiguous, views it as 1x4x64, takes its cosine, scales by 1.0, adds a
+            # dimension, multiplies by the permuted input, adds the third input, inserts
+            # another dimension and returns a one-tuple.
             clone = torch.ops.aten.clone.default(
                 expand_4, memory_format=torch.contiguous_format
             )
@@ -379,6 +462,9 @@ class CommonTemplate:
             return (unsqueeze_6,)
 
         def load_args(reader):
+            # [FUNCTION DOC] HELPER: Input loader. Uses the given reader to create three
+            # tensors on the test device: an expanded one with a zero stride (1x4x2x32), a
+            # permuted one (1x3x4x64) and a contiguous 1x3x4x64 one.
             buf0 = reader.storage(storage_hash=None, nbytes=512, device=self.device)
             reader.tensor(buf0, (1, 4, 2, 32), (128, 1, 0, 4), is_leaf=True)  # expand_4
             buf1 = reader.storage(storage_hash=None, nbytes=3072, device=self.device)
@@ -425,14 +511,22 @@ class CommonTemplate:
         ],
     )
     def test_expand_broadcast(self, x_size: tuple[int, ...], y_size: tuple[int, ...]):
+        # [FUNCTION DOC] Parametrized over input and expanded sizes. Checks the sizes differ
+        # and are a valid broadcast (same rank, equal wherever the input size is not one),
+        # then compiles an expand followed by clone and checks numerics and the default single
+        # program and kernel.
         """
         When the load and store have different shapes, we should use broadcast.
         """
 
         def foo(x, y_size):
+            # [FUNCTION DOC] HELPER: Function under test; expands x to the given size and
+            # clones it.
             return x.expand(y_size).clone()
 
         def get_input(size: tuple[int, ...]) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Creates a random tensor of the size on the test device
+            # and returns a strided view with the same size and strides.
             device = torch.device(self.device)
             full = torch.randn(size).to(device)
             view = torch.as_strided(full, size, full.stride())
@@ -456,6 +550,12 @@ class CommonTemplate:
     @parametrize("prefer_nd_tiling", [False, True])
     @config.patch("triton.skip_l1_cache", False)
     def test_pointwise_broadcast_nonzero_strides(self, prefer_nd_tiling: bool):
+        # [FUNCTION DOC] Compiles an add of an 8x8 tensor and an 8x1 column view, expecting
+        # three block descriptors with the l1-cache skip option off, for both tilings. Then
+        # compares the generated load and store lines against golden strings: with ND tiling
+        # the column is loaded as a one-dimensional block pointer and indexed to a column,
+        # without it the load is reshaped and broadcast; the store uses an explicit broadcast
+        # rather than zero strides. Marked as expected to fail with tensor descriptors.
         """
         Test that we emit tl.broadcast_to instead of using strides of 0.
         """
@@ -537,6 +637,11 @@ class CommonTemplate:
         num_triton_kernels: int,
         prefer_nd_tiling: bool,
     ):
+        # [FUNCTION DOC] Parametrized sum reduction over discontiguous views. On HIP some
+        # sizes are enlarged. When the expected two-kernel split would fit under the no-split
+        # threshold it expects one kernel and two fewer block pointers. Skips one long CPU
+        # case (it can crash the process pool). Expects the given counts of block pointers and
+        # kernels from the compiled sum.
         """
         Tests a reduction kernel.
         """
@@ -598,11 +703,15 @@ class CommonTemplate:
         num_block_pointers: int,
         num_triton_kernels: int,
     ):
+        # [FUNCTION DOC] Parametrized. Compiles a sum of the sum of two discontiguous inputs,
+        # expecting the given number of block pointers and kernels (None means unchecked, used
+        # for the large looped case that does not yet use block pointers).
         """
         Tests mixing pointwise with reduction ops.
         """
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Function under test; returns the total sum of x plus y.
             return torch.sum(x + y)
 
         inputs = [
@@ -619,12 +728,18 @@ class CommonTemplate:
 
     @xfail_if_cuda_tensor_descriptor
     def test_multiple_max_block_non_power_of_2(self):
+        # [FUNCTION DOC] Checks that a dimension of size n times the max block size, with n
+        # not a power of two, still gets block descriptors. Uses a view of shape (3 * max
+        # block, 2) cut from a tensor with last dim 3, asserts the view has a non power of two
+        # dimension and more than one dimension larger than one, compiles subtracting one and
+        # expects two block descriptors.
         """
         Check that we support dims of size n * MAX_BLOCK, where n is any positive integer, not
         necessarily a power of 2.
         """
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; returns x minus one.
             return x - 1
 
         device = torch.device(self.device)
@@ -654,6 +769,9 @@ class CommonTemplate:
         ],
     )
     def test_dynamic_shapes_pointwise(self, nd_tiling: bool, num_block_pointers: int):
+        # [FUNCTION DOC] Parametrized by whether ND tiling is on. Compiles a division of a 4x4
+        # discontiguous view by itself with dynamic shapes and expects two block pointers with
+        # tiling (index is affine) and one without.
         """
         Test a pointwise kernel with dynamic shapes.
         """
@@ -680,6 +798,9 @@ class CommonTemplate:
         ],
     )
     def test_dynamic_shapes_reduction(self, with_tiling: bool, num_block_pointers: int):
+        # [FUNCTION DOC] Parametrized by whether ND tiling and tiled reductions are on.
+        # Compiles a product reduction of a 4x4 discontiguous view with dynamic shapes;
+        # expects one block pointer with tiling and none without.
         """
         Test a reduction kernel with dynamic shapes.
         """
@@ -700,12 +821,19 @@ class CommonTemplate:
 
     @unittest.skip(reason="Dynamo tracing error")
     def test_dynamic_shapes_pointwise_multiple_max_block(self):
+        # [FUNCTION DOC] Skipped (dynamo tracing error). Intended to check that with dynamic
+        # shapes that are known multiples of the max block size, a block pointer can be
+        # generated. KNOWN ISSUE: the body calls the comparison helper without passing the
+        # function foo, so the test would not work even if unskipped.
         """
         Test dynamic shapes, where we know the shape is a multiple of the max block
         size. We should be able to generate a block pointer for this case.
         """
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Tiles x to dynamic multiples of the max block size, takes
+            # a strided view that drops part of the last dimension and returns the view added
+            # to itself.
             tile_dims = (3 * max_block * x.shape[0], 3 * x.shape[1])
             view_size = (3 * max_block * x.shape[0], 2 * x.shape[1])
             full = x.tile(tile_dims)
@@ -771,12 +899,19 @@ class CommonTemplate:
         num_block_pointers: int,
         num_tiles: int,
     ):
+        # [FUNCTION DOC] Parametrized over shapes with ND tiling enabled. Compiles an add of
+        # two strided views and expects the given number of block pointers, then asserts that,
+        # in every program, exactly the first num_tiles of XBLOCK, YBLOCK, ZBLOCK appear.
+        # Marked expected to fail with CUDA tensor descriptors except the contiguous three
+        # block pointer one-tile case.
         """
         Test odd shapes with ND tiling enabled.
         Uses a pointwise op.
         """
 
         def get_input() -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Creates a random tensor of the full size and returns a
+            # strided view of the view size with the original strides.
             device = torch.device(self.device)
             full = torch.randn(full_size).to(device)
             return torch.as_strided(full, view_size, full.stride())
@@ -822,6 +957,11 @@ class CommonTemplate:
         num_triton_kernels: int,
         reduction_op: Callable,
     ):
+        # [FUNCTION DOC] Parametrized over view sizes and reduction ops (sum, argmax,
+        # var_mean) with tiled reductions. Adjusts expectations for HIP sizes and for the
+        # single persistent kernel case. On HIP the block pointer count is checked manually to
+        # be within one below the expected count and not above. Always asserts the generated
+        # code uses two reduction dimensions.
         """
         Tests 2D reduction kernels. These arise from "odd" shapes which are not
         expressible with a 1D block pointer.
@@ -894,6 +1034,11 @@ class CommonTemplate:
         expected_num_triton_kernels: int,
         expect_fallback: bool,
     ):
+        # [FUNCTION DOC] Parametrized welford test with tiled reductions on var_mean of a
+        # discontiguous view. Adjusts size on HIP and for the single persistent kernel case,
+        # expects the given block pointer and kernel counts, asserts the word welford appears
+        # in the code only when no fallback is expected, and that two reduction dimensions are
+        # used.
         """
         Tests a 2D welford reduction.
 
@@ -935,6 +1080,11 @@ class CommonTemplate:
     def test_welford_non_block_pointer(
         self,
     ):
+        # [FUNCTION DOC] Skipped on Triton CPU as slow. Runs var_mean on a 259x311
+        # discontiguous view whose size defeats block pointer analysis, with ND tiling.
+        # Expects six block pointers and two kernels, or zero pointers and one kernel when
+        # cooperative reductions are configured or the view is small enough for one persistent
+        # kernel. Asserts the code mentions welford and uses only one reduction dimension.
         """
         Tests a welford reduction where block pointer analysis fails.
         The main loop will be a 1D reduction, instead of 2D.
@@ -974,6 +1124,9 @@ class CommonTemplate:
         self._assert_reduction_ndims(code, 1)
 
     def test_reduction_multiple_discontiguous_dims(self):
+        # [FUNCTION DOC] Sums a 3x7x11 discontiguous view with tiled reductions; expects zero
+        # block pointers, one kernel, and two reduction dimensions in the code, because too
+        # many discontiguous dimensions cannot be tiled into block pointers.
         """
         Test reducing a tensor with more than one discontiguous dimension. This case
         won't generate a block pointer, since we don'allow enough tiling dimensions.
@@ -994,12 +1147,18 @@ class CommonTemplate:
 
     @test_torchinductor.skip_if_triton_cpu  # Illegal instruction  File; cannot xfail because it crashes process
     def test_2d_reduction_multi_kernel(self):
+        # [FUNCTION DOC] Skipped on Triton CPU because the process crashes. Compiles a softmax
+        # over the flattened trailing dims of a discontiguous 2x4x1024 view with multi kernel
+        # mode and tiled reductions on; expects five block pointers and two kernels, that the
+        # code mentions multi kernel, and that two reduction dimensions are used.
         """
         Test a 2D reduction in multi kernel mode.
         """
         view = self._discontiguous_tensor((2, 4, 1024), self.device)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; reshapes x to two dimensions keeping
+            # dim zero and returns the softmax over the last dimension.
             """
             Reshape to 2D and take the softmax of all trailing dims.
             """
@@ -1027,11 +1186,16 @@ class CommonTemplate:
     def test_fused_2d_reduction(
         self,
     ):
+        # [FUNCTION DOC] Tiled reductions: compiles the sum of a tensor plus its argmax over a
+        # 5x7 discontiguous view and expects one block pointer, one kernel, and two reduction
+        # dimensions in the code. Marked as expected to fail with CUDA tensor descriptors.
         """
         Tests fusing multiple reductions on the same input, with 2D tiling.
         """
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; returns the total sum of x plus the
+            # argmax.
             return torch.sum(x) + torch.argmax(x)
 
         view_size = (5, 7)
@@ -1055,12 +1219,18 @@ class CommonTemplate:
         self,
         reduction_op: Callable,
     ):
+        # [FUNCTION DOC] Parametrized over sum and argmax, skipped on ROCm. Reduces one
+        # discontiguous and one contiguous 5x7 input in a single function with tiled
+        # reductions; no kernel or pointer counts are checked, only numerics and that two
+        # reduction dimensions appear in the code.
         """
         Tests a program with multiple reductions using different strides.
         These might not be fused.
         """
 
         def foo(*args):
+            # [FUNCTION DOC] HELPER: Function under test; applies the reduction op to every
+            # argument and returns the python sum of the results.
             return sum(reduction_op(arg) for arg in args)
 
         view_size = (5, 7)
@@ -1083,6 +1253,10 @@ class CommonTemplate:
         [False, subtest(True, decorators=[xfail_if_cuda_tensor_descriptor])],
     )
     def test_enable_tiled_reductions(self, tile_reductions: bool):
+        # [FUNCTION DOC] Parametrized over whether reductions are tiled. Compiles a sum of a
+        # 9x11 discontiguous view with ND tiling; expects one block pointer when tiled and
+        # none otherwise, one kernel, and two reduction dimensions in the code when tiled (one
+        # when not).
         """
         Tests enabling and disabling tiled reductions.
         """
@@ -1107,6 +1281,11 @@ class CommonTemplate:
     @test_torchinductor.xfail_if_triton_cpu
     @xfail_if_tensor_descriptor
     def test_reduction_padded_output_tiling(self):
+        # [FUNCTION DOC] Regression-style test of a reduction over the last dimension of a
+        # 9x11x2 random tensor with padded outputs (alignment 32 bytes, stride threshold
+        # zero), unrolling limit one and tiled reductions. Expects two block pointers (input
+        # and output), one kernel, two pointwise and one reduction dimension. Expected to fail
+        # on Triton CPU and with tensor descriptors.
         """
         Test a [Y, X, R0] reduction with tiled output dimensions.
         The key to elicit this test case is a padded output tensor.
@@ -1140,6 +1319,11 @@ class CommonTemplate:
         [False, subtest(True, decorators=[xfail_if_cpu_tensor_descriptor])],
     )
     def test_reduce_trailing_dims_discontiguous_input(self, unroll: bool):
+        # [FUNCTION DOC] Parametrized over reduction unrolling. Reduces the last two dims of a
+        # discontiguous 7x5x3x2 view by maximum. With unrolling it expects seven block
+        # pointers and no reduction dimension; without it expects two block pointers and two
+        # reduction dimensions. Both cases expect one kernel and two pointwise dimensions.
+        # Expected to fail with CUDA tensor descriptors, and with CPU ones when unrolled.
         """
         Test a [Y, X, R0, R1] reduction where the input tensor is discontiguous, but we
         only reduce over the last two dimensions.
@@ -1168,6 +1352,10 @@ class CommonTemplate:
         self._assert_reduction_ndims(code, 0 if unroll else 2)
 
     def test_2d_reduction_with_broadcast(self):
+        # [FUNCTION DOC] Regression test for a codegen error when a block pointer advances in
+        # only one of two reduction dimensions: sums a 64x128 matrix times a column-broadcast
+        # vector with tiled reductions and asserts correct results and two reduction
+        # dimensions in the code.
         """
         Tests 2D tiled reduction with a broadcasted 1D tensor.
 
@@ -1188,6 +1376,8 @@ class CommonTemplate:
         M, N = 64, 128
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test; multiplies x by y broadcast along
+            # columns and returns the total sum.
             # y is 1D (M,), x is 2D (M, N)
             # y[:, None] broadcasts to (M, N)
             # The y block_ptr only advances with R0, not R1
@@ -1208,7 +1398,14 @@ class CommonTemplate:
         self._assert_reduction_ndims(code, 2)
 
     def test_complex_reshape_block_ptr(self):
+        # [FUNCTION DOC] Compiles a function with reshape, permute, reshape, clone and a
+        # second permute and clone on an 8x2048 input added to itself, expecting two kernels
+        # and four block pointers, and checks the generated first program does not use a Min
+        # expression.
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Function under test; adds the inputs, reshapes to
+            # 8x16x128, permutes the last two dims, reshapes to 1024x16 and clones it, then
+            # returns that clone and a clone of its transpose.
             add_ = x + y
             reshape_0 = add_.reshape([8, 16, 128])
             permute_0 = reshape_0.permute([0, 2, 1])
@@ -1231,11 +1428,17 @@ class CommonTemplate:
     @xfail_if_tensor_descriptor
     @requires_gpu()  # FIXME this test failed on Triton-CPU
     def test_3d_permute_tiling(self):
+        # [FUNCTION DOC] Requires a GPU. Compiles a three-dimensional permute and add function
+        # on 51 cubed inputs with up to three tiles and ND tiling; expects one kernel, three
+        # block pointers and three pointwise tile dimensions. Expected to fail with tensor
+        # descriptors.
         """
         Test 3D tiling with permute.
         """
 
         def foo(x, y, z):
+            # [FUNCTION DOC] HELPER: Function under test; adds x with dims one and two swapped
+            # to y, and adds to that the swapped sum of z and y.
             dims = [0, 2, 1]
             a = x.permute(dims=dims) + y
             b = (z + y).permute(dims=dims)
@@ -1259,10 +1462,18 @@ class CommonTemplate:
     @torch._dynamo.config.patch({"capture_scalar_outputs": True})
     @parametrize("num_tile_candidates", (1, 2))
     def test_unbacked_size_on_non_contig_dim(self, num_tile_candidates: int):
+        # [FUNCTION DOC] Parametrized over the number of tiling candidates (one or two), with
+        # scalar output capture enabled. Repeats a tensor by an unbacked size read from a
+        # scalar tensor, permutes and takes the cosine; expects one kernel and no block
+        # pointers with ND tiling and up to three tiles. The repeat count constant is chosen
+        # to select the number of candidate tilings.
         # NUM_REPEAT should determine # of candidate_tilings.
         NUM_REPEAT = 2 if num_tile_candidates == 2 else 8
 
         def foo(x, length):
+            # [FUNCTION DOC] HELPER: Function under test; reads the length scalar as an
+            # unbacked integer, repeats x along dims one and two, permutes dims to 1, 2, 0 and
+            # returns the cosine.
             unbacked = length.item()
 
             repeated = x.repeat(1, unbacked, NUM_REPEAT)
@@ -1299,9 +1510,17 @@ class CommonTemplate:
     # Disable split_reductions on this test for now due to the interaction with LOAF
     @config.patch(split_reductions=False)
     def test_removed_buffers(self):
+        # [FUNCTION DOC] Checks block pointer advancement is skipped for buffers that were
+        # removed by fusion: a bernoulli draw fused with its sum, on a 200x200 tensor of 0.3,
+        # expecting one kernel and one block pointer with loose tolerances since the draw is
+        # random. Split reductions are off. Expected to fail on Triton CPU and with CPU tensor
+        # descriptors.
         from torch.ops import aten
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Function under test; draws a bernoulli sample from the
+            # probabilities and returns its sum divided by the element count of a tensor made
+            # from the input size.
             return aten.bernoulli(a).sum() / torch.prod(torch.tensor(a.size()))
 
         p = 0.3
@@ -1316,6 +1535,10 @@ class CommonTemplate:
 
     @xfail_if_tensor_descriptor
     def test_pointwise_index_order(self):
+        # [FUNCTION DOC] Adds two discontiguous 5x5x5 tensors with up to three tiles and ND
+        # tiling and expects one kernel and three block pointers. Compares the load, store and
+        # index lines of the generated code with golden text to check that Z is the leading
+        # dimension, then Y, then X. Expected to fail with tensor descriptors.
         """
         Test the order of indices in pointwise kernels. Expect Z to be the leading dim,
         then Y, then X.
@@ -1363,6 +1586,9 @@ class CommonTemplate:
         )
 
     def test_expand_clone_broadcast(self):
+        # [FUNCTION DOC] Expands a 1x32 input to 32x32 and clones it with up to three tiles
+        # and ND tiling; expects one kernel, two block pointers and exactly one explicit
+        # broadcast in the code.
         """
         Test expand followed by clone. This uses an explicit Triton broadcast.
         """
@@ -1370,6 +1596,8 @@ class CommonTemplate:
         expanded_size = (32, 32)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; expands x to the 32x32 size and
+            # clones it.
             return x.expand(*expanded_size).clone()
 
         inps = [torch.randn(base_size, device=self.device)]
@@ -1389,12 +1617,21 @@ class CommonTemplate:
         self.assertEqual(num_broadcasts, 1)
 
     def test_reduction_fused_with_as_strided_scatter_broadcast_error(self):
+        # [FUNCTION DOC] Regression test for a fused pointwise and reduction kernel whose side
+        # output is made by an as_strided scatter: the store must keep the singleton reduction
+        # dimension rather than reducing a two-dimensional temporary to one dimension. Runs
+        # the function with persistent reductions off and two tiles, expecting two kernels and
+        # atol 3e-5.
         # Regression test for a fused pointwise+reduction kernel where the side
         # output is materialized through as_strided_scatter. The pointwise load
         # is rank-expanded to match the reduction loop, and the immediate store
         # must preserve that singleton reduction dimension instead of lowering a
         # [XBLOCK, 1] temporary to a [XBLOCK] store.
         def fn(a, b, table):
+            # [FUNCTION DOC] HELPER: Function under test; builds a zero tensor one element
+            # wider in the last dim, scatters a into a strided slice at offset one, gathers
+            # embedding rows for a, adds them (broadcast) to b, sums the last dim, and returns
+            # the scattered tensor and the sum.
             dst = torch.zeros(
                 (a.shape[0], a.shape[1], a.shape[2] + 1),
                 dtype=a.dtype,
@@ -1427,7 +1664,13 @@ class CommonTemplate:
         )
 
     def test_mul_broadcast_multi_output(self):
+        # [FUNCTION DOC] Compiles a function with a vector broadcast multiplied into an
+        # 8x11x128 tensor and several derived outputs, with up to three tiles and ND tiling,
+        # expecting one kernel and seven block pointers. Asserts only two pointwise dimensions
+        # are used since singleton splits are discarded.
         def foo(x, y, z):
+            # [FUNCTION DOC] HELPER: Function under test; returns the product a of x and y, a
+            # scaled by 128, a times z, and x times z.
             a = x * y
             b = 128.0
             c = a * b
@@ -1465,7 +1708,14 @@ class CommonTemplate:
     # }
     # This is now fixed by ensuring that wild symbols only match integers
     def test_ensure_integral_dims_and_strides(self):
+        # [FUNCTION DOC] Integration regression test that dimension and stride matching of
+        # modular index expressions only yields integers. Compiles the unfold operation on a
+        # float16 zero tensor requiring grad, with full graph capture, expecting one kernel,
+        # and asserts that the block descriptor constructor text appears in the generated
+        # code.
         def model(data, *args):
+            # [FUNCTION DOC] HELPER: Function under test; applies the unfold operation to the
+            # data with the remaining arguments (kernel size, dilation, padding, stride).
             return torch.nn.functional.unfold(data, *args)
 
         data = torch.zeros(
@@ -1498,7 +1748,13 @@ class CommonTemplate:
     # constant_offset = 1911
     @xfail_if_tensor_descriptor
     def test_negative_strides(self):
+        # [FUNCTION DOC] Integration test of block analysis for index expressions with
+        # negative strides: adds a fully flipped discontiguous 8x8x8 tensor to another one,
+        # expecting one kernel and three block pointers. Expected to fail with tensor
+        # descriptors.
         def model(x, y):
+            # [FUNCTION DOC] HELPER: Function under test; flips x along all three dims and
+            # adds y.
             # Slice in reverse order via a negative stride
             return torch.flip(x, [0, 1, 2]) + y
 
@@ -1532,13 +1788,26 @@ class CommonTemplate:
     )
     @xfail_if_tensor_descriptor
     def test_boundary_check(self, block_multiple, ynumel_exceed_ygrid_size, include_z):
+        # [FUNCTION DOC] Parametrized with ND tiling and three tiles. Adds a discontiguous
+        # tensor and a second one with last dim one, using block size 8 forced through a
+        # choices handler so inputs stay small. Dim sizes are 8 or 9 (not a multiple of the
+        # block), the y size can exceed the maximum y grid, and z may be absent. Expects one
+        # kernel and three block pointers. If sizes are block multiples: when y exceeds the
+        # grid, the offset line uses the extra program id axis and exactly three boundary
+        # checks on dim zero appear; else no boundary checks. Otherwise three-dimensional and
+        # two-dimensional boundary checks must appear. Expected to fail with tensor
+        # descriptors.
         @dataclasses.dataclass
         class InputShape:
+            # [CLASS DOC] HELPER: Dataclass describing the test tensor extents: required x and
+            # y and an optional z, with to_list giving them in dimension order.
             x: int
             y: int
             z: int | None = None
 
             def to_list(self):
+                # [FUNCTION DOC] HELPER: Returns the sizes as a list ordered y then x, with z
+                # first when set.
                 out = [self.y, self.x]
                 if self.z is not None:
                     out.insert(0, self.z)
@@ -1552,7 +1821,13 @@ class CommonTemplate:
 
         # Use fixed block sizes to avoid having to generate very large input tensors
         class FixedBlockSizeChoices(InductorChoices):
+            # [CLASS DOC] HELPER: Choices handler forcing triton kernels to use a fixed
+            # configuration whose block sizes are all eight, one entry per present dimension.
             def triton_kernel_kwargs(self, kernel_cls, features, groups, kernel_kwargs):
+                # [FUNCTION DOC] HELPER: Fills the fixed_config kernel keyword with a fixed
+                # config built from a mapping of upper-cased dimension names plus BLOCK to the
+                # block size for each non-None extent of the enclosing test shape; returns the
+                # updated kernel_kwargs mapping.
                 block_sizes = {
                     f"{prefix.upper()}BLOCK": BLOCK_SIZE
                     for prefix, size in dataclasses.asdict(shape).items()
@@ -1567,6 +1842,7 @@ class CommonTemplate:
         b = self._discontiguous_tensor(b_shape, device=self.device)
 
         def func(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Function under test; returns the sum a plus b.
             return a + b
 
         with V.set_choices_handler(FixedBlockSizeChoices()):
@@ -1601,6 +1877,8 @@ class CommonTemplate:
 @unittest.skipIf(not HAS_GPU, "requires triton GPU backend")
 @config.patch("triton.use_block_ptr", True)
 class TritonBlockPointerTestGPU(BlockDescriptorTestBase):
+    # [CLASS DOC] Block pointer tests on a GPU with the block pointer option enabled. The test
+    # methods are copied from CommonTemplate below; skipped when no triton GPU backend exists.
     device = GPU_TYPE
 
 
@@ -1611,6 +1889,9 @@ test_torchinductor.copy_tests(CommonTemplate, TritonBlockPointerTestGPU, GPU_TYP
 @config.patch({"triton.use_tensor_descriptor": True, "cpu_backend": "triton"})
 @instantiate_parametrized_tests
 class TritonTensorDescriptorTestCPU(BlockDescriptorTestBase):
+    # [CLASS DOC] Tensor descriptor tests on CPU with the triton CPU backend. Uses the tensor
+    # descriptor constructor text for counting and takes expected failures from the CPU marker
+    # attribute. Skipped without a triton CPU backend.
     block_descriptor_constructor_str = "tl.make_tensor_descriptor"
     device = "cpu"
 
@@ -1624,6 +1905,9 @@ class TritonTensorDescriptorTestCPU(BlockDescriptorTestBase):
 @config.patch({"triton.use_tensor_descriptor": True, "assume_aligned_inputs": True})
 @instantiate_parametrized_tests
 class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
+    # [CLASS DOC] Tensor descriptor (TMA) tests on CUDA, needing compute capability 9 or
+    # higher and not ROCm. Counts tensor descriptor constructors in generated code and assumes
+    # aligned inputs; adds tests for transposes and TMA fallbacks to the shared copied tests.
     block_descriptor_constructor_str = "tl.make_tensor_descriptor"
     device = GPU_TYPE
 
@@ -1645,6 +1929,11 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
         num_tensor_descriptors: int,
         expect_transpose: bool,
     ):
+        # [FUNCTION DOC] Parametrized with transposed discontiguous tensor descriptors
+        # enabled. Multiplies a discontiguous tensor by a permuted one (its input shape is
+        # built so the permute yields the view size), with tiled reductions; expects the given
+        # number of descriptors, one kernel, and exactly one transpose in the code when a
+        # transpose is expected, else none.
         a = self._discontiguous_tensor(view_size, self.device)
         pre_permute_size = [1] * len(view_size)
         for i, value in zip(permute_order, view_size):
@@ -1653,6 +1942,8 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
         b = b.permute(permute_order)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Function under test; returns the elementwise product of a
+            # and b.
             return a * b
 
         result, (code,) = self._run_and_compare(
@@ -1668,12 +1959,17 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
         self.assertEqual(transpose_count, 1 if expect_transpose else 0)
 
     def test_rms_norm_backward_does_not_crash_with_tma(self):
+        # [FUNCTION DOC] Regression test that compiling the backward of an RMS norm over a
+        # very wide bfloat16 input (1x1024x40096) does not crash with TMA enabled; checks both
+        # gradients exist.
         B, S, D = 1, 1024, 40096
         with torch.device(self.device):
             x = torch.randn(B, S, D, dtype=torch.bfloat16, requires_grad=True)
             w = torch.randn(D, dtype=torch.bfloat16, requires_grad=True)
 
         def f(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Function under test; applies RMS norm with weight and a
+            # small epsilon then returns the sum of the result scaled by 0.1.
             y = torch.rms_norm(x, (D,), w, 1e-5)
             return (y * 0.1).sum()
 
@@ -1685,7 +1981,10 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
 
     @largeTensorTest("1GB", inductor=True)
     def test_large_tensor_pointwise(self):
+        # [FUNCTION DOC] Needs about 1 GB. Adds four to an int8 tensor with more than 2**30
+        # elements and asserts all results equal four, exercising 64-bit indexing.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Function under test; adds four to a.
             return a + 4
 
         t = torch.zeros(2**30 + 1, dtype=torch.int8, device=GPU_TYPE)
@@ -1694,9 +1993,14 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
         self.assertTrue((actual == 4).all())
 
     def test_slice_constant_offset_disables_tma(self):
+        # [FUNCTION DOC] Checks a slice that starts at element one (a four byte offset, not 16
+        # byte aligned) still compiles and matches eager, and that the code contains a plain
+        # load.
         """TMA requires 16-byte aligned base; x[1:] with float32 yields 4-byte offset."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test; drops the first element and adds
+            # one.
             return x[1:] + 1
 
         x = torch.randn(1025, device=GPU_TYPE)
@@ -1705,9 +2009,14 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
         self.assertIn("tl.load", code)
 
     def test_slice_view_dtype_unaligned_buffer(self):
+        # [FUNCTION DOC] Checks that a bfloat16 slice from offset two reinterpreted as float32
+        # and incremented gives the same results compiled and eager, covering an unaligned
+        # buffer.
         offset = 1
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Function under test; slices from element two, views as
+            # float32 and adds one.
             return x[2:].view(dtype=torch.float32) + 1
 
         x = torch.randn((128 + offset) * 2, dtype=torch.bfloat16, device=GPU_TYPE)
@@ -1716,6 +2025,10 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
         self.assertEqual(actual, expected)
 
     def test_persistent_reduction_store_small_rblock_skips_tma(self):
+        # [FUNCTION DOC] Batch norm in training mode on a 2x1 input has a persistent reduction
+        # block of two elements (8 bytes, under the 16 byte TMA minimum). Asserts compiled
+        # results match eager, the code has a store, and no tensor descriptor is created for
+        # it.
         """
         When a persistent reduction has rnumel < 16/element_size, the fixed
         R0_BLOCK cannot satisfy TMA's 16-byte minimum.  The store must fall
@@ -1723,6 +2036,8 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
         """
 
         def fn(x, running_mean, running_var, weight, bias):
+            # [FUNCTION DOC] HELPER: Function under test; batch norm in training mode with
+            # running stats, weight and bias.
             return torch.nn.functional.batch_norm(
                 x, running_mean, running_var, weight, bias, training=True
             )
@@ -1745,12 +2060,16 @@ class TritonTensorDescriptorTestCUDA(BlockDescriptorTestBase):
         self.assertNotIn("make_tensor_descriptor", code)
 
     def test_bool_dtype_skips_tma(self):
+        # [FUNCTION DOC] Checks a logical-not on a bool tensor of 16 elements compiles with no
+        # block pointers or descriptors, since bool maps to a type without a tensor map data
+        # type.
         """
         torch.bool buffers map to Triton tl.int1 which has no
         CUtensorMapDataType entry, so they should skip TMA.
         """
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Function under test; returns the logical not of a.
             return torch.logical_not(a)
 
         inp = torch.zeros(16, dtype=torch.bool, device=GPU_TYPE)
@@ -1773,11 +2092,21 @@ test_torchinductor.copy_tests(
 
 
 class TestTilingExtra(InductorTestCase):
+    # [CLASS DOC] Extra tiling regression tests that compile a large model graph on a GPU.
     @requires_gpu()
     def test_tiling_split_valid(self):
+        # [FUNCTION DOC] Requires a GPU. Regression test that a speech-encoder-like model
+        # (subsampler convolutions, two conformer-style layers with rotary attention,
+        # convolution module and feed-forward blocks) compiles with full graph capture and
+        # dynamic shapes, with a fixed seed, batch 13 and sequence length 1024 in float16.
+        # KNOWN ISSUE: the eager and compiled outputs are both computed but never compared, so
+        # only successful compile and run is checked.
         import torch.nn.functional as F
 
         class GraphModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding the traced forward pass of the model
+            # described above; has no parameters of its own, all weights and the two symbolic
+            # sizes are passed as arguments.
             def forward(
                 self,
                 sub_dense0_w,  # f16[64, 80]
@@ -1839,6 +2168,13 @@ class TestTilingExtra(InductorTestCase):
                 l1_norm_out_w,  # f16[64]
                 out_norm_w,  # f16[64]
             ):
+                # [FUNCTION DOC] HELPER: Forward pass taking weights as arguments plus batch
+                # size and sequence length. Applies a dense layer with relu, two strided
+                # convolutions with relu, a dense layer, computes rotary embeddings and a mask
+                # for the shortened sequence, then runs two layers of feed forward, rotary
+                # self attention with scaled dot product attention, a gated convolution module
+                # and a second feed forward, each with layer norm and weighted residuals taken
+                # from scalar tensors, and a final layer norm. Returns a one-tuple.
                 # Subsampler: dense_0 + relu
                 linear = torch._C._nn.linear(input_feat, sub_dense0_w, sub_dense0_b)
                 hidden_states = F.relu(linear, inplace=False)
@@ -2197,6 +2533,11 @@ class TestTilingExtra(InductorTestCase):
                 return (hidden_states_45,)
 
         def create_parameters(device="cuda", dtype=torch.float16):
+            # [FUNCTION DOC] HELPER: Builds and returns a mapping from parameter name to a
+            # random tensor for every weight the traced module takes, using the given device
+            # and dtype (defaults cuda and float16). Rotary frequency is float32; scale and
+            # residual weights are float64 scalars on the CPU; batch norm variances are made
+            # positive.
             """Create all the parameters needed by the GraphModule."""
             params = {}
 
@@ -2327,6 +2668,10 @@ class TestTilingExtra(InductorTestCase):
 )
 @instantiate_parametrized_tests
 class TritonHostSideTMATestCUDA(BlockDescriptorTestBase):
+    # [CLASS DOC] Runs the full pointwise and reduction suite with host-side TMA, where tensor
+    # descriptors are created in the kernel launcher instead of the kernel. Requires compute
+    # capability 9 or higher, not ROCm. Test methods are copied from CommonTemplate below,
+    # with selected skips and expected failures attached after the copy.
     """Run the full pointwise/reduction suite with host-side TMA.
     Block pointer count is skipped because host-side TMA creates
     descriptors in the launcher, not the kernel."""
@@ -2334,14 +2679,21 @@ class TritonHostSideTMATestCUDA(BlockDescriptorTestBase):
     device = GPU_TYPE
 
     def _run_and_compare(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Overrides the base comparison helper to force the block
+        # pointer count check off (sets that keyword to None) and delegates to the parent
+        # implementation.
         kwargs["expected_num_block_pointers"] = None
         return super()._run_and_compare(*args, **kwargs)
 
     def test_host_tma_codegen_markers(self):
+        # [FUNCTION DOC] Compiles an add of two bfloat16 1024x1024 tensors and asserts results
+        # match eager, that the kernel body has no in-kernel descriptor creation, and that the
+        # host descriptor argument metadata appears in the code.
         # Host-side TMA builds descriptors in the launcher, not the kernel: the
         # kernel body must have no in-kernel tl.make_tensor_descriptor, and the
         # inductor metadata must carry host_tma_descriptor_args.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Function under test; returns the sum a plus b.
             return a + b
 
         a = torch.randn(1024, 1024, device=self.device, dtype=torch.bfloat16)
@@ -2353,11 +2705,17 @@ class TritonHostSideTMATestCUDA(BlockDescriptorTestBase):
         self.assertIn("host_tma_descriptor_args", code)
 
     def test_misaligned_offset_disables_host_tma(self):
+        # [FUNCTION DOC] Compiles an increment of a slice starting at element one of a 1025
+        # element tensor (a four byte offset, not 16 byte aligned), asserts results match
+        # eager and the code contains a plain load, since that buffer cannot use host-side
+        # TMA.
         # A 4-byte (float32) storage offset is not 16-byte aligned, so the
         # misaligned input can't be host-TMA'd and falls back to a plain
         # tl.load. (Disabling is per-buffer: the aligned output may still use a
         # descriptor, so host_tma_descriptor_args can still appear.)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test; drops the first element and adds
+            # one.
             return x[1:] + 1
 
         x = torch.randn(1025, device=self.device)
@@ -2367,16 +2725,25 @@ class TritonHostSideTMATestCUDA(BlockDescriptorTestBase):
 
     @config.patch("use_static_triton_launcher", True)
     def test_static_launcher_runs_for_host_tma(self):
+        # [FUNCTION DOC] Runs with the static triton launcher enabled. Wraps the feature usage
+        # recorder in the triton heuristics module with one that records calls, then compiles
+        # silu on a bfloat16 1024x1024 tensor. Asserts host TMA descriptor metadata is
+        # present, no in-kernel descriptor creation, the static launcher feature was recorded
+        # as used, and results match.
         import torch._inductor.runtime.triton_heuristics as triton_heuristics
 
         feature_calls = []
         orig_set_feature_use = triton_heuristics.set_feature_use
 
         def tracking_set_feature_use(feature, usage):
+            # [FUNCTION DOC] HELPER: Appends the feature and usage pair to the enclosing list
+            # of recorded calls, then forwards to the original recorder and returns its
+            # result.
             feature_calls.append((feature, usage))
             return orig_set_feature_use(feature, usage)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test; applies silu to x.
             return torch.nn.functional.silu(x)
 
         x = torch.randn(1024, 1024, device=self.device, dtype=torch.bfloat16)
@@ -2454,9 +2821,14 @@ if GPU_TYPE == "cuda":
 
 
 class HostTMAHelperTest(InductorTestCase):
+    # [CLASS DOC] Unit tests for host-side TMA helper functions that need no GPU.
     """Device-independent unit tests for host-side TMA helpers."""
 
     def test_host_tma_aligned_clone_fallback(self):
+        # [FUNCTION DOC] Checks the alignment helper in the triton heuristics module: a tensor
+        # whose base is 16 byte aligned is returned as the very same object, while a
+        # misaligned slice (offset one element of float16) is returned as a new tensor with a
+        # 16 byte aligned base and equal values.
         from torch._inductor.runtime.triton_heuristics import _host_tma_aligned
 
         # 16-byte-aligned base -> returned as-is (no clone).
@@ -2480,6 +2852,8 @@ class HostTMAHelperTest(InductorTestCase):
     "Requires Triton CUDA backend and CUDA compute capability >= 9.0. Not supported on ROCm",
 )
 class TritonHostSideTMAConfigTestCUDA(InductorTestCase):
+    # [CLASS DOC] Config tests for host-side TMA, needing compute capability 9 or higher and
+    # not ROCm.
     @config.patch(
         {
             "triton.enable_host_side_tma": True,
@@ -2487,10 +2861,14 @@ class TritonHostSideTMAConfigTestCUDA(InductorTestCase):
         }
     )
     def test_enable_host_side_tma_without_prereqs_warns(self):
+        # [FUNCTION DOC] With host-side TMA on but tensor descriptors off, compiling a simple
+        # add must emit a UserWarning matching the text no effect, still produce correct
+        # results, and not emit host descriptor metadata.
         # enable_host_side_tma only selects the descriptor flavor; without
         # use_tensor_descriptor + assume_aligned_inputs it has no effect and
         # should warn rather than silently no-op.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test; returns x plus one.
             return x + 1
 
         x = torch.randn(1024, device=GPU_TYPE)

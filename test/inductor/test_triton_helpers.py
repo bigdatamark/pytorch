@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for helpers in inductor's runtime triton_helpers module: the decoupled
+# lookback exclusive scan (index dtype handling), select_one on 16-bit and wider dtypes, the
+# rand4x/randn4x packing order and distribution, and NaN/signed-zero semantics of minimum,
+# maximum and the min2/max2 reductions. When a GPU with triton is available, it defines small
+# triton test kernels at import time; all tests need a GPU, and the device-generic class is
+# instantiated for GPU_TYPE only. The main block runs tests only if a GPU exists.
 
 """Tests for triton_helpers functions.
 
@@ -33,10 +39,16 @@ if HAS_GPU:
     import triton  # @manual
     from triton import language as tl
 
+    # [FUNCTION DOC] HELPER: Triton combine function for scans; returns the sum of its two
+    # arguments. Doc placed above the jit decorator.
     @triton.jit
     def _add_combine_fn(a, b):
         return a + b
 
+    # [FUNCTION DOC] HELPER: Triton test kernel. Loads one block value and one index from the
+    # given pointers, calls the decoupled lookback 64-bit exclusive scan helper with the
+    # scratch buffer and the add combine function, and stores the resulting exclusive prefix
+    # to the result pointer. Doc placed above the jit decorator.
     @triton.jit
     def test_kernel_exclusive_scan(
         scratch_ptr,
@@ -56,6 +68,9 @@ if HAS_GPU:
 
         tl.store(result_ptr, exclusive_prefix)
 
+    # [FUNCTION DOC] HELPER: Triton test kernel. Loads BLOCK_SIZE values and a mask, applies
+    # the select_one helper along dimension zero, and stores the single selected value to the
+    # result pointer. Doc placed above the jit decorator.
     @triton.jit
     def test_kernel_select_one(
         x_ptr,
@@ -69,6 +84,13 @@ if HAS_GPU:
         result = select_one(x, mask, dim=0)
         tl.store(result_ptr, result)
 
+    # [FUNCTION DOC] HELPER: Triton test kernel comparing the rand4x/randn4x helper against
+    # the reference triton rand4x/randn4x or single-value random functions, chosen by the
+    # NORMAL flag. When BLOCK_SIZE is at least 4 and divisible by 4, the reference generates
+    # four streams over a quarter-size offset range and stores them interleaved (stride 4)
+    # into the expected buffer; otherwise the expected values come from the plain rand/randn
+    # over all offsets. The helper output always goes to the helper result buffer. Doc placed
+    # above the jit decorator.
     @triton.jit
     def test_kernel_random_4x_order(
         seed,
@@ -106,6 +128,9 @@ if HAS_GPU:
 
         tl.store(helper_result_ptr + offsets, helper)
 
+    # [FUNCTION DOC] HELPER: Triton test kernel. Each program computes global offsets from its
+    # program id and BLOCK_SIZE, fills the result buffer with rand4x or randn4x helper output
+    # (per NORMAL) for those offsets. Doc placed above the jit decorator.
     @triton.jit
     def test_kernel_random_4x_distribution(
         seed,
@@ -120,6 +145,9 @@ if HAS_GPU:
             result = rand4x(seed, offsets, BLOCK_SIZE)
         tl.store(result_ptr + offsets, result)
 
+    # [FUNCTION DOC] HELPER: Triton test kernel. Loads two blocks and stores their elementwise
+    # minimum and maximum, computed by the triton_helpers minimum and maximum, into two output
+    # buffers. Doc placed above the jit decorator.
     @triton.jit
     def test_kernel_minimum_maximum(
         a_ptr,
@@ -134,6 +162,10 @@ if HAS_GPU:
         tl.store(min_ptr + offsets, minimum(a, b))
         tl.store(max_ptr + offsets, maximum(a, b))
 
+    # [FUNCTION DOC] HELPER: Triton test kernel. Each program handles one row of BLOCK_SIZE
+    # elements, reduces it along axis zero to a min and a max and stores one value per row.
+    # With STRICT set it uses the min2_strict/max2_strict helpers, otherwise min2/max2. Doc
+    # placed above the jit decorator.
     @triton.jit
     def test_kernel_minmax_reduction(
         x_ptr,
@@ -154,10 +186,17 @@ if HAS_GPU:
 
 
 class ExclusiveScanDecoupledLookback64Test(TestCase):
+    # [CLASS DOC] Tests that the decoupled lookback scan handles the index dtype consistently
+    # (int64 and int32) in the branch where a previous block's inclusive prefix is already
+    # ready.
     """Test cases for exclusive_scan_decoupled_lookback_64 dtype fix."""
 
     @requires_gpu()
     def test_flag_2_branch_with_int64_index(self) -> None:
+        # [FUNCTION DOC] GPU test. Builds a scratch buffer whose block zero flag is 2
+        # (inclusive prefix ready) holding 10.0 as float64 bits, runs the scan kernel for
+        # block index 1 with an int64 index and block value 5.0, and asserts the exclusive
+        # prefix result equals 10.0.
         """Test `if flag == 2` branch with int64 index."""
         device = torch.device(GPU_TYPE)
 
@@ -182,6 +221,9 @@ class ExclusiveScanDecoupledLookback64Test(TestCase):
 
     @requires_gpu()
     def test_flag_2_branch_with_int32_index(self) -> None:
+        # [FUNCTION DOC] GPU test. Same setup as the int64 case (ready prefix of 10.0 in block
+        # zero, block value 5.0) but with an int32 index tensor; asserts the exclusive prefix
+        # equals 10.0.
         """Test `if flag == 2` branch with int32 index."""
         device = torch.device(GPU_TYPE)
 
@@ -206,6 +248,8 @@ class ExclusiveScanDecoupledLookback64Test(TestCase):
 
 
 class SelectOneTest(TestCase):
+    # [CLASS DOC] Tests select_one on 16, 32 and 64 bit float dtypes via a shared runner,
+    # covering the bitcast truncation fix for sub-32-bit types.
     """Test cases for select_one bitcast fix with sub-32-bit dtypes.
 
     The fix (D93872067) adds an intermediate .to(idtype) truncation before
@@ -215,6 +259,9 @@ class SelectOneTest(TestCase):
     """
 
     def _run_select_one(self, dtype: torch.dtype) -> None:
+        # [FUNCTION DOC] HELPER: Runs the select_one kernel on a four element tensor holding 1
+        # to 4 in the given dtype with a one-hot mask at index 2 on the GPU, and asserts the
+        # output is a single element equal to 3.
         device = torch.device(GPU_TYPE)
         BLOCK_SIZE = 4
 
@@ -230,29 +277,38 @@ class SelectOneTest(TestCase):
 
     @requires_gpu()
     def test_select_one_bfloat16(self) -> None:
+        # [FUNCTION DOC] GPU test running the select_one check with bfloat16.
         """Test select_one with bfloat16 (16-bit) — triggers the bitcast fix."""
         self._run_select_one(torch.bfloat16)
 
     @requires_gpu()
     def test_select_one_float16(self) -> None:
+        # [FUNCTION DOC] GPU test running the select_one check with float16.
         """Test select_one with float16 (16-bit) — triggers the bitcast fix."""
         self._run_select_one(torch.float16)
 
     @requires_gpu()
     def test_select_one_float32(self) -> None:
+        # [FUNCTION DOC] GPU test running the select_one check with float32.
         """Test select_one with float32 (32-bit) — baseline that always worked."""
         self._run_select_one(torch.float32)
 
     @requires_gpu()
     def test_select_one_float64(self) -> None:
+        # [FUNCTION DOC] GPU test running the select_one check with float64.
         """Test select_one with float64 (64-bit) — baseline that always worked."""
         self._run_select_one(torch.float64)
 
 
 class Random4xTest(TestCase):
+    # [CLASS DOC] GPU tests for the rand4x and randn4x helpers: element ordering against the
+    # reference triton functions, independence from block size, and statistical distribution.
     """Test cases for rand4x/randn4x helper packing order."""
 
     def _run_random_4x_order(self, normal: bool, block_size: int) -> None:
+        # [FUNCTION DOC] HELPER: Runs the order kernel with seed 1234 for the given block size
+        # and normal flag over a single program and asserts exactly equal (zero tolerances)
+        # helper and reference outputs.
         device = torch.device(GPU_TYPE)
         helper_result = torch.empty(block_size, dtype=torch.float32, device=device)
         expected_result = torch.empty(block_size, dtype=torch.float32, device=device)
@@ -269,29 +325,40 @@ class Random4xTest(TestCase):
 
     @requires_gpu()
     def test_rand4x_order(self) -> None:
+        # [FUNCTION DOC] GPU test: uniform rand4x order check with block size 16.
         self._run_random_4x_order(normal=False, block_size=16)
 
     @requires_gpu()
     def test_randn4x_order(self) -> None:
+        # [FUNCTION DOC] GPU test: normal randn4x order check with block size 16.
         self._run_random_4x_order(normal=True, block_size=16)
 
     @requires_gpu()
     def test_rand4x_order_quarter_block_size_2(self) -> None:
+        # [FUNCTION DOC] GPU test: uniform order check with block size 8 (quarter block of 2).
         self._run_random_4x_order(normal=False, block_size=8)
 
     @requires_gpu()
     def test_randn4x_order_quarter_block_size_2(self) -> None:
+        # [FUNCTION DOC] GPU test: normal order check with block size 8 (quarter block of 2).
         self._run_random_4x_order(normal=True, block_size=8)
 
     @requires_gpu()
     def test_rand4x_fallback_block_size_2(self) -> None:
+        # [FUNCTION DOC] GPU test: uniform check with block size 2, exercising the non-
+        # multiple-of-4 fallback path of the reference.
         self._run_random_4x_order(normal=False, block_size=2)
 
     @requires_gpu()
     def test_randn4x_fallback_block_size_2(self) -> None:
+        # [FUNCTION DOC] GPU test: normal check with block size 2, exercising the fallback
+        # path.
         self._run_random_4x_order(normal=True, block_size=2)
 
     def _run_random_4x_block_size_stability(self, normal: bool) -> None:
+        # [FUNCTION DOC] HELPER: Generates 1024 samples with seed 1234 once using programs of
+        # block size 8 and once using one program of block size 1024, and asserts the two
+        # outputs are close, i.e. the values do not depend on the block size.
         device = torch.device(GPU_TYPE)
         sample_count = 1024
         small_block_result = torch.empty(
@@ -318,14 +385,20 @@ class Random4xTest(TestCase):
 
     @requires_gpu()
     def test_rand4x_block_size_stability(self) -> None:
+        # [FUNCTION DOC] GPU test: uniform block size stability check.
         self._run_random_4x_block_size_stability(normal=False)
 
     @requires_gpu()
     def test_randn4x_block_size_stability(self) -> None:
+        # [FUNCTION DOC] GPU test: normal block size stability check.
         self._run_random_4x_block_size_stability(normal=True)
 
     @requires_gpu()
     def test_rand4x_distribution(self) -> None:
+        # [FUNCTION DOC] GPU test. Generates 131072 uniform samples (128 programs of 1024) and
+        # asserts the values lie in [0, 1), the mean is within 0.01 of 0.5, the biased
+        # variance is within 0.01 of one twelfth, and each of ten histogram buckets deviates
+        # from the expected count by less than 8 percent.
         device = torch.device(GPU_TYPE)
         block_size = 1024
         num_blocks = 128
@@ -350,6 +423,9 @@ class Random4xTest(TestCase):
 
     @requires_gpu()
     def test_randn4x_distribution(self) -> None:
+        # [FUNCTION DOC] GPU test. Generates 131072 normal samples and asserts the mean is
+        # within 0.02 of zero, the variance within 0.05 of one, and the skewness within 0.05
+        # of zero.
         device = torch.device(GPU_TYPE)
         block_size = 1024
         num_blocks = 128
@@ -374,7 +450,14 @@ class Random4xTest(TestCase):
 
 
 class MinimumMaximumTest(TestCase):
+    # [CLASS DOC] Device-generic tests (instantiated for GPU_TYPE only) of the minimum,
+    # maximum and min2/max2 helpers on NaN, infinity and signed-zero inputs, compared against
+    # torch.
     def test_elementwise_nan_and_signed_zero(self, device: str) -> None:
+        # [FUNCTION DOC] Runs the minimum/maximum kernel on eight-element float inputs with
+        # signed zeros, NaNs and infinities, and asserts results equal torch.minimum and
+        # torch.maximum. Also compares the int32 bit patterns of the first two entries to
+        # check that signed zeros are ordered like torch.
         a = torch.tensor(
             [
                 -0.0,
@@ -423,6 +506,9 @@ class MinimumMaximumTest(TestCase):
         )
 
     def test_reduction_nan(self, device: str) -> None:
+        # [FUNCTION DOC] Runs the non-strict row reduction kernel on a two-row tensor (one row
+        # with a NaN, one with infinities) and asserts per-row min and max equal torch.amin
+        # and torch.amax.
         x = torch.tensor(
             [
                 [1.0, -2.0, 3.0, float("nan")],
@@ -444,6 +530,9 @@ class MinimumMaximumTest(TestCase):
         self.assertEqual(actual_max, torch.amax(x, dim=1))
 
     def test_reduction_signed_zero(self, device: str) -> None:
+        # [FUNCTION DOC] Runs the strict row reduction kernel on four rows mixing positive and
+        # negative zeros and asserts the int32 bit patterns of per-row min and max match
+        # torch.amin and torch.amax, i.e. signed zero ordering is preserved.
         x = torch.tensor(
             [
                 [-0.0, 0.0, 0.0, 0.0],
@@ -469,6 +558,9 @@ class MinimumMaximumTest(TestCase):
         self.assertEqual(actual_max.view(torch.int32), expected_max.view(torch.int32))
 
     def test_reduction_relaxed_signed_zero(self, device: str) -> None:
+        # [FUNCTION DOC] Runs the non-strict row reduction on two rows of mixed signed zeros
+        # and asserts the min bits are negative zero for both rows and the max bits are
+        # positive zero, i.e. the relaxed variant does not preserve per-row signed zero order.
         x = torch.tensor(
             [
                 [-0.0, 0.0, 0.0, 0.0],

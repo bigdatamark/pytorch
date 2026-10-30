@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Runs the shared inductor test suite against the Triton CPU backend.
+# Only active when both HAS_CPU and TRITON_HAS_CPU are true. Defines the tuple
+# TRITON_CPU_SLOW_TESTS naming test cases to skip, then (when enabled) defines two test
+# classes patched to use the triton cpu_backend with dtype/shape runtime asserts disabled,
+# copies all CommonTemplate tests into CpuTritonTests, and wraps the slow ones with a skip.
+# The main block runs the tests (needing filelock) only if the CPU backend is available.
 import unittest
 
 from torch._inductor import config
@@ -36,6 +42,8 @@ if HAS_CPU and TRITON_HAS_CPU:
         }
     )
     class SweepInputsCpuTritonTest(test_torchinductor.SweepInputsCpuTest):
+        # [CLASS DOC] Sweep-inputs CPU test case re-run under the triton CPU backend config
+        # (class-level config patch). Adds no tests of its own; inherits SweepInputsCpuTest.
         pass
 
     @config.patch(
@@ -46,6 +54,10 @@ if HAS_CPU and TRITON_HAS_CPU:
         }
     )
     class CpuTritonTests(test_torchinductor.TestCase):
+        # [CLASS DOC] Test case for CPU tests compiled with the triton CPU backend (config
+        # patched at class level). Uses check_model as the common checker and device cpu; the
+        # CommonTemplate tests are copied in below, with expected-failure marks read from the
+        # _expected_failure_triton_cpu property.
         common = test_torchinductor.check_model
         device = "cpu"
 
