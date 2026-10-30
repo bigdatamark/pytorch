@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests that inductor preserves the exact strides an operator requires from its
+# inputs: a custom op with a layout-sensitive implementation behind a custom post-grad pattern
+# pass, and a triton kernel writing into a strided view under dynamic shapes. When a GPU and
+# triton are available it defines a small triton fill kernel at import time. The main block only
+# runs the tests on Linux with a GPU and triton.
 
 import torch
 import torch.utils._pytree as pytree
@@ -20,6 +25,10 @@ if HAS_GPU_AND_TRITON:
     import triton
     import triton.language as tl
 
+    # [FUNCTION DOC] HELPER: Triton kernel, one program per token. Programs with an index at or
+    # past num_tokens return immediately; the others write the value one into INNER elements of
+    # the buffer starting at the program index times stride_t, stepping by stride_i. Returns
+    # nothing; mutates the buffer.
     @triton.jit
     def _fill_kernel(
         buf_ptr,
@@ -36,8 +45,19 @@ if HAS_GPU_AND_TRITON:
 
 
 class TestNeedsExactStrides(InductorTestCase):
+    # [CLASS DOC] Test case for exact-stride handling in inductor, parametrized over dtype or
+    # size. Covers a custom op fed a transposed view, and a mutating triton kernel on a view of a
+    # dynamic size buffer.
     @parametrize("dtype", [torch.float, torch.float8_e8m0fnu])
     def test_custom_op(self, dtype):
+        # [FUNCTION DOC] Registers a custom post-grad pass that rewrites every permute into a
+        # permute followed by a custom op forcing channels-last output, defines a custom add op in
+        # a scoped library that checks its first argument, once transposed, and its second
+        # argument are both contiguous, then compiles a function calling that op on a transposed
+        # input with fullgraph and asserts the pattern callback ran. Parametrized over dtype.
+        # KNOWN ISSUE: the dtype argument is never used; the tensors are always created with the
+        #   float8_e8m0fnu dtype, so both parametrized cases run the same thing. The exception
+        #   class TestPassed is also never raised.
         device = (
             torch.accelerator.current_accelerator()
         )  # float8_e8m0fnu errors on "cpu"
@@ -45,10 +65,15 @@ class TestNeedsExactStrides(InductorTestCase):
         other = torch.ones(4, 4, 2, 2, device=device, dtype=torch.float8_e8m0fnu)
 
         class _CustomPass(PatternMatcherPass):
+            # [CLASS DOC] HELPER: Pattern matcher pass subclass used as the custom post-grad pass;
+            # calling it on a graph just applies its registered patterns. No extra state.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the parent constructor and does nothing else.
                 super().__init__()
 
             def __call__(self, g: torch.fx.Graph):
+                # [FUNCTION DOC] HELPER: Applies the registered patterns to the given FX graph in
+                # place and returns nothing.
                 self.apply(g)
 
         g = _CustomPass()
@@ -59,9 +84,16 @@ class TestNeedsExactStrides(InductorTestCase):
             pass_dict=g,
         )
         def _(match, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Pattern handler for permute calls. Flattens the match
+            # arguments with pytree, sets the enclosing flag recording that the pass ran, and
+            # replaces the match with a traced decomposition that permutes and then forces
+            # channels-last layout.
             flat_args, spec = pytree.tree_flatten((args, kwargs))
 
             def decomp(*flat_args):
+                # [FUNCTION DOC] HELPER: Decomposition used as the replacement: rebuilds the
+                # original arguments from the flat list and spec, permutes, and passes the result
+                # through the custom op that returns a channels-last clone.
                 args, kwargs = pytree.tree_unflatten(flat_args, spec)
                 return torch.ops.mylib.force_channels_last(
                     torch.ops.aten.permute(*args, **kwargs)
@@ -74,6 +106,8 @@ class TestNeedsExactStrides(InductorTestCase):
         from torch._inductor import config
 
         class TestPassed(RuntimeError):
+            # [CLASS DOC] HELPER: Marker exception type (runtime error subclass) meant to be
+            # caught around compilation; has no extra behavior.
             pass
 
         with torch.library._scoped_library("mylib", "FRAGMENT") as lib:
@@ -83,6 +117,8 @@ class TestNeedsExactStrides(InductorTestCase):
             )
 
             def impl2(x):
+                # [FUNCTION DOC] HELPER: Eager implementation of the channels-last op; returns a
+                # clone of the input in channels-last memory format.
                 return x.clone(memory_format=torch.channels_last)
 
             lib.impl("force_channels_last", impl2, "CompositeExplicitAutograd")
@@ -92,6 +128,9 @@ class TestNeedsExactStrides(InductorTestCase):
             )
 
             def impl(x, y):
+                # [FUNCTION DOC] HELPER: Eager implementation of the custom add op. Raises
+                # AssertionError unless the first argument (with dims 2 and 3 swapped) and
+                # the second argument are contiguous, then returns the float sum of the two.
                 if not x.transpose(2, 3).is_contiguous():
                     raise AssertionError
                 if not y.is_contiguous():
@@ -99,12 +138,16 @@ class TestNeedsExactStrides(InductorTestCase):
                 return x.float() + y.float()
 
             def meta(x, y):
+                # [FUNCTION DOC] HELPER: Meta (shape-only) implementation of the custom add op;
+                # returns the float sum of the two inputs without checking strides.
                 return x.float() + y.float()
 
             lib.impl("add_op", impl, "CompositeExplicitAutograd")
             lib.impl("add_op", meta, "Meta")
 
             def f(x, other):
+                # [FUNCTION DOC] HELPER: Function under compilation; calls the custom add op on
+                # the input with dims 2 and 3 transposed, and the other tensor.
                 return torch.ops.mylib.add_op.default(x.transpose(2, 3), other)
 
             with config.patch(
@@ -122,10 +165,17 @@ class TestNeedsExactStrides(InductorTestCase):
     def test_dynamic_size_one_leading_dim_view_triton_kernel_wrapper_functional(
         self, n
     ):
+        # [FUNCTION DOC] Compiles with inductor (fullgraph, dynamic) a function that allocates a
+        # padded float buffer, views it with size-one leading dim and non-contiguous strides,
+        # launches the triton fill kernel over it, and returns the view. Asserts the compiled
+        # output equals eager output on cloned inputs. Parametrized over the token count.
         device = torch.accelerator.current_accelerator()
         inner = 8
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Builds the strided buffer view described above (token count
+            # padded up to a multiple of four), runs the fill kernel on it in place with the view
+            # strides and returns the view.
             num_tokens = x.shape[0]
             aligned_num_tokens = ((num_tokens + 3) // 4) * 4
             buf = torch.empty(

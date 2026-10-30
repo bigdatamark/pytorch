@@ -1,4 +1,12 @@
 # Owner(s): ["module: mps"]
+# [MODULE DOC] Basic inductor tests for the MPS (Apple Metal) backend. Reuses the shared model
+# checker and dtype helper from the main inductor test module to compare compiled and eager
+# results for pointwise ops, reductions, norms, convolutions, linear algebra, attention and while
+# loops, plus an ahead-of-time (AOTI) export/compile/load test class. At import time it requires
+# the filelock package, builds the list of dtypes supported on MPS (double and complex double are
+# excluded, and bfloat16 on macOS before 14), and appends the parent test directory to the module
+# search path. A TODO in the file says it should eventually be removed. The main block runs the
+# tests only when MPS is available.
 import importlib
 import os
 import sys
@@ -40,12 +48,18 @@ from inductor.test_torchinductor import (  # @manual=fbcode//caffe2/test/inducto
 @unittest.skipUnless(torch.backends.mps.is_available(), "MPS not available")
 @instantiate_parametrized_tests
 class MPSBasicTests(TestCase):
+    # [CLASS DOC] Compile-and-compare tests on the MPS device, skipped when MPS is unavailable and
+    # expanded for parametrized tests. Class attributes bind the dtype-support helper and the
+    # common check function (shared GPU model checker) and fix the device name to mps.
     is_dtype_supported = CommonTemplate.is_dtype_supported
     common = check_model_gpu
     device = "mps"
 
     @parametrize("dtype", MPS_DTYPES)
     def test_add(self, dtype):
+        # [FUNCTION DOC] Compiles and compares an elementwise add of two random 1024 element
+        # tensors of the parametrized dtype (all MPS-supported dtypes) with the low-
+        # precision check disabled.
         self.common(
             lambda a, b: a + b,
             (
@@ -56,23 +70,32 @@ class MPSBasicTests(TestCase):
         )
 
     def test_log(self):
+        # [FUNCTION DOC] Compiled versus eager natural log of a random 1024 element tensor.
         self.common(lambda x: x.log(), (torch.rand(1024),))
 
     def test_acos(self):
+        # [FUNCTION DOC] Compiled versus eager arc cosine of a random 1024 element tensor.
         self.common(lambda x: x.acos(), (torch.rand(1024),))
 
     def test_atanh(self):
+        # [FUNCTION DOC] Compiled versus eager inverse hyperbolic tangent of a random
+        # 1024 element tensor.
         self.common(lambda x: x.atanh(), (torch.rand(1024),))
 
     def test_tanh(self):
+        # [FUNCTION DOC] Compiled versus eager hyperbolic tangent of a random 1024 element tensor.
         self.common(lambda x: x.tanh(), (torch.rand(1024),))
 
     def test_tanh_large_values(self):
+        # [FUNCTION DOC] Compiles tanh and applies it to values from minus 100 to 100; raises
+        # AssertionError unless the extreme results are minus one and plus one (saturation) and no
+        # result is NaN.
         # Test that tanh handles large values correctly (should saturate to ±1)
         x = torch.tensor([-100.0, -50.0, -15.0, 0.0, 15.0, 50.0, 100.0], device="mps")
 
         @torch.compile
         def fn(x):
+            # [FUNCTION DOC] HELPER: Hyperbolic tangent of the input.
             return x.tanh()
 
         result = fn(x)
@@ -84,12 +107,17 @@ class MPSBasicTests(TestCase):
             raise AssertionError("tanh should not produce NaN for large values")
 
     def test_erfc_tail_accuracy(self):
+        # [FUNCTION DOC] Regression test for erfc accuracy: compiled erfc over a fine grid from
+        # minus nine to nine must match double precision CPU erfc to a relative tolerance of 1e-6,
+        # and special values (zero, infinities, NaN, the clamp points, huge magnitudes) must match
+        # their exact expected results with zero tolerance.
         # gh-187806: compiled erfc must lower to c10::metal::erfc, not the
         # 1 - erf fallback that flushes the tail to zero past x ~ 3.9
         x = torch.arange(-9.0, 9.0, 2**-10, device="mps")
 
         @torch.compile
         def fn(x):
+            # [FUNCTION DOC] HELPER: Complementary error function of the input.
             return torch.erfc(x)
 
         actual = fn(x).cpu().double()
@@ -104,18 +132,27 @@ class MPSBasicTests(TestCase):
         self.assertEqual(fn(sp).cpu(), expected_sp, rtol=0, atol=0)
 
     def test_floor(self):
+        # [FUNCTION DOC] Compiled versus eager floor of a random 1024 element tensor.
         self.common(lambda x: x.floor(), (torch.rand(1024),))
 
     def test_sign(self):
+        # [FUNCTION DOC] Compiled versus eager sign of a random 1024 element tensor.
         self.common(lambda x: x.sign(), (torch.rand(1024),))
 
     def test_sliced_input(self):
+        # [FUNCTION DOC] Compares compiled and eager results for a function reading even and
+        # odd column slices (strided views) of a 32 by 1024 input, taking sin of one and cos
+        # of the other.
         self.common(
             lambda x: x[:, ::2].sin() + x[:, 1::2].cos(), (torch.rand(32, 1024),)
         )
 
     def test_where(self):
+        # [FUNCTION DOC] Compiled versus eager result of a function using a
+        # masked in-place assignment.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Square root of the absolute input, then sets entries where
+            # the input is negative to minus five in the result and returns it.
             rc = x.abs().sqrt()
             rc[x < 0] = -5
             return rc
@@ -124,33 +161,51 @@ class MPSBasicTests(TestCase):
 
     @parametrize("dtype", MPS_DTYPES)
     def test_cast(self, dtype):
+        # [FUNCTION DOC] Compares compiled and eager dtype conversion of a random float tensor to
+        # the parametrized dtype (all MPS-supported dtypes).
         self.common(lambda a: a.to(dtype), (torch.rand(1024),))
 
     def test_broadcast(self):
+        # [FUNCTION DOC] Compares compiled and eager add of a 32 by 1024 tensor with a
+        # 1024 vector (broadcast).
         self.common(torch.add, (torch.rand(32, 1024), torch.rand(1024)))
 
     def test_inplace(self):
+        # [FUNCTION DOC] Compares compiled and eager results for a function that increments its
+        # input in place.
         def inc_(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input in place and returns it
+            # (mutates the argument).
             x += 1
             return x
 
         self.common(inc_, (torch.rand(1024),))
 
     def test_rms_norm_nograd(self):
+        # [FUNCTION DOC] Regression test (issue 150629): rms norm under no-grad mode over the
+        # whole input with a weight must match eager.
         # Regression test for https://github.com/pytorch/pytorch/issues/150629
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Under no-grad mode, returns rms norm of x over its full shape
+            # with weight w.
             with torch.no_grad():
                 return torch.nn.functional.rms_norm(x, x.shape, w)
 
         self.common(fn, (torch.rand(10), torch.ones(10)))
 
     def test_batchnorm_train_running_stats(self):
+        # [FUNCTION DOC] Regression test for a missing threadgroup barrier in welford codegen:
+        # trains a BatchNorm2d on ten random batches on CPU eagerly and on MPS compiled, with the
+        # same seed, and asserts the running mean and variance match.
         # Regression test: missing closing threadgroup_barrier in
         # threadgroup_welford_{reduce,combine}
         torch.manual_seed(0)
         xs = [torch.randn(16, 8, 4, 4) for _ in range(10)]
 
         def run(device, compile_):
+            # [FUNCTION DOC] HELPER: Seeds the generator, builds a BatchNorm2d in train mode on
+            # the given device (compiled if requested), feeds it all the shared batches and
+            # returns CPU copies of its running mean and running variance.
             torch.manual_seed(0)
             bn = torch.nn.BatchNorm2d(8).to(device).train()
             f = torch.compile(bn) if compile_ else bn
@@ -164,13 +219,19 @@ class MPSBasicTests(TestCase):
         self.assertEqual(v_mps, v_ref)
 
     def test_compile_numpy_scalar(self):
+        # [FUNCTION DOC] Compares compiled and eager division of a tensor by a numpy float scalar.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Divides x by y.
             return x / y
 
         self.common(fn, (torch.rand(10), np.exp(0.3)))
 
     def test_conv_transpose_channels_last(self):
+        # [FUNCTION DOC] Compares compiled and eager transposed 2D convolution (stride one,
+        # padding one) with a channels-last input.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Transposed 2D convolution of x with kernel y, stride
+            # one, padding one.
             return torch.nn.functional.conv_transpose2d(x, y, stride=1, padding=1)
 
         self.common(
@@ -182,8 +243,12 @@ class MPSBasicTests(TestCase):
         )
 
     def test_conv_train(self):
+        # [FUNCTION DOC] Regression test (issue 161905): compares compiled and eager 2D
+        # convolution with a gradient-requiring input, also checking gradients.
         # Regression test for https://github.com/pytorch/pytorch/issues/161905
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: 2D convolution of x with kernel y without bias, stride,
+            # padding and dilation all one.
             return torch.nn.functional.conv2d(x, y, None, 1, 1, 1)
 
         self.common(
@@ -196,7 +261,10 @@ class MPSBasicTests(TestCase):
         )
 
     def test_cholesky(self):
+        # [FUNCTION DOC] Compares compiled and eager lower and upper Cholesky factors of an
+        # identity matrix, low precision check disabled.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the lower and upper Cholesky factors of x as a pair.
             return (
                 torch.linalg.cholesky(x, upper=False),
                 torch.linalg.cholesky(x, upper=True),
@@ -205,18 +273,26 @@ class MPSBasicTests(TestCase):
         self.common(fn, (torch.eye(64),), check_lowp=False)
 
     def test_reduced_max(self):
+        # [FUNCTION DOC] Compares compiled and eager max reduction over 16384 half precision
+        # values, with the low-precision check disabled.
         # inductor test do not validate that max of say 16K half elements can be computed
         self.common(torch.max, (torch.rand(16384, dtype=torch.half),), check_lowp=False)
 
     def test_linalg_inv(self):
+        # [FUNCTION DOC] Compares compiled and eager inverse of the Cholesky factor of a diagonal
+        # positive definite matrix, low precision check disabled.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Matrix inverse of the Cholesky factor of x.
             return torch.linalg.inv(torch.linalg.cholesky(x))
 
         A = torch.diag(torch.tensor([20.0, 0.5, 5.0], dtype=torch.float32) ** 2)
         self.common(fn, (A,), check_lowp=False)
 
     def test_large_reduction(self):
+        # [FUNCTION DOC] Compares compiled and eager sum of all pairwise differences between a 32
+        # element and a 64 element MPS vector.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Sums the matrix of pairwise differences of a and b.
             return (a[:, None] - b[None, :]).sum()
 
         a = torch.randn(32, device="mps")
@@ -231,11 +307,15 @@ class MPSBasicTests(TestCase):
 
     @parametrize("shape", [(4, 5000), (3, 1023), (7, 1025), (5, 32), (1, 30000)])
     def test_welford_reduction_dynamic_shape(self, shape):
+        # [FUNCTION DOC] Compiles variance over the last dim with dynamic shapes and checks it
+        # equals eager variance for the parametrized shape, covering single-stage, multi-stage and
+        # split (combined) welford reductions as the inline comment says. Marks dim 1 dynamic.
         # (5, 32): single-stage welford_reduce
         # (3, 1023), (4, 5000), (7, 1025): multistage welford_reduce
         # (1, 30000): split reduction -> welford_combine
         @torch.compile(dynamic=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Variance of the input over its last dimension.
             return x.var(dim=-1)
 
         x = torch.randn(*shape, device=self.device)
@@ -243,15 +323,22 @@ class MPSBasicTests(TestCase):
         self.assertEqual(fn(x), x.var(dim=-1))
 
     def test_while_loop_kernel_naming(self):
+        # [FUNCTION DOC] Regression test (issue 187852): compiles a function with a while loop
+        # whose condition and body are compiled separately, and asserts the loop result (counting
+        # by two up to four) equals four, guarding against duplicate generated kernel names.
         # Regression test for https://github.com/pytorch/pytorch/issues/187852
         # while_loop compiles cond and body as separate MetalScheduling instances,
         # each of which used to reset _kernel_fn_counter to 0, producing duplicate
         # "generated_kernel_0" names that caused a Metal mangled-name collision.
         def fn(iterations):
+            # [FUNCTION DOC] HELPER: Runs the while loop operator from zero, adding two each
+            # iteration while the counter is below the given bound, and returns the final counter.
             def cond(i):
+                # [FUNCTION DOC] HELPER: Loop condition: counter is below the outer bound.
                 return i < iterations
 
             def body(i):
+                # [FUNCTION DOC] HELPER: Loop body: returns a one-tuple with the counter plus two.
                 return (i + 2,)
 
             (out_i,) = torch._higher_order_ops.while_loop(
@@ -265,6 +352,9 @@ class MPSBasicTests(TestCase):
         self.assertEqual(result, torch.tensor(4, dtype=torch.int32, device=self.device))
 
     def test_welford_multistage_sibling_redeclare(self):
+        # [FUNCTION DOC] Regression test: trains a BatchNorm2d on MPS with copied weights,
+        # compiled, and compares its output with the CPU eager module on one input, guarding
+        # against undeclared sibling index variables in multistage welford codegen.
         # Regression test: BatchNorm2d-train emits two codegen passes on
         # the same multistage reduction root (welford + running-stats
         # update). Sibling indices (r0_1, r0_2) declared via the
@@ -281,6 +371,9 @@ class MPSBasicTests(TestCase):
         self.assertEqual(y_mps.cpu(), y_ref)
 
     def test_sdpa_split_qkv(self):
+        # [FUNCTION DOC] Regression test for a Metal compiler bug with fused divide-modulo: splits
+        # a linear layer's output into q, k and v heads (non-contiguous views) and compares
+        # compiled and eager causal attention with tolerance 1e-4.
         # regression test for metal compiler bug where fused (x / A) % B
         # produces wrong results, causing incorrect reads from non-contiguous.
         n_head, n_embd, seq_len = 6, 384, 1024
@@ -293,6 +386,7 @@ class MPSBasicTests(TestCase):
         v = v.view(16, seq_len, n_head, n_embd // n_head).transpose(1, 2)
 
         def fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Causal scaled dot product attention of q, k, v.
             return torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, is_causal=True
             )
@@ -301,10 +395,15 @@ class MPSBasicTests(TestCase):
 
     @parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
     def test_sdpa_prefill_strided(self, dtype):
+        # [FUNCTION DOC] Compares compiled and eager scaled dot product attention with an explicit
+        # mask for strided (transposed) q, k and v of shape batch one, 16 heads, sequence 1179,
+        # head dim 128, for float32, float16 and bfloat16.
         torch.manual_seed(0)
         B, H, S, D = 1, 16, 1179, 128
 
         def fn(q, k, v, mask):
+            # [FUNCTION DOC] HELPER: Transposes dims 1 and 2 of q, k, v and applies attention with
+            # the given mask.
             q, k, v = (t.transpose(1, 2) for t in (q, k, v))
             return torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask
@@ -317,6 +416,9 @@ class MPSBasicTests(TestCase):
         self.assertEqual(torch.compile(fn)(q, k, v, mask), fn(q, k, v, mask))
 
     def test_nested_masked_cat(self):
+        # [FUNCTION DOC] Regression test for nested masked operations in Metal codegen: runs a
+        # YOLO-style detection head on two scales, slice assignment then concatenation, and
+        # compares compiled and eager outputs.
         # Regression test for YOLOv3 compilation failure on MPS.
         # See https://github.com/pytorch/pytorch/actions/runs/23477894502
         # YOLOv3 detection heads do view/permute/clone, then in-place slice
@@ -329,6 +431,10 @@ class MPSBasicTests(TestCase):
         na, no = 3, 5
 
         def head(p, grid, anchor_wh):
+            # [FUNCTION DOC] HELPER: Reshapes predictions into per-anchor grid layout, clones,
+            # applies sigmoid plus grid to the first two channels, exponential times anchor size
+            # to the next two, sigmoid to the rest in place, and returns it flattened to batch by
+            # cells by outputs.
             bs, _, ny, nx = p.shape
             p = p.view(bs, na, no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
             io = p.clone()
@@ -338,6 +444,7 @@ class MPSBasicTests(TestCase):
             return io.view(bs, -1, no)
 
         def fn(p1, p2, grid1, grid2, anchor_wh1, anchor_wh2):
+            # [FUNCTION DOC] HELPER: Concatenates the head outputs of two scales along dim 1.
             return torch.cat(
                 [head(p1, grid1, anchor_wh1), head(p2, grid2, anchor_wh2)], dim=1
             )
@@ -357,7 +464,12 @@ class MPSBasicTests(TestCase):
 
 @unittest.skipUnless(torch.backends.mps.is_available(), "MPS not available")
 class MPSBasicTestsAOTI(TestCase):
+    # [CLASS DOC] Ahead-of-time compilation tests on MPS, skipped when MPS is unavailable; each
+    # test exports a small module, compiles and packages it, loads it and compares to eager.
     def check_model(self, m, inp, dynamic_shapes=None):
+        # [FUNCTION DOC] HELPER: Runs the module eagerly, exports it with the optional dynamic
+        # shape spec, AOT compiles and packages it, loads the package, runs the loaded model on
+        # the same inputs and raises AssertionError if the two results are not all close.
         res2 = m(*inp)
         ep = torch.export.export(m, inp, dynamic_shapes=dynamic_shapes)
         path = torch._inductor.aoti_compile_and_package(ep)
@@ -367,8 +479,11 @@ class MPSBasicTestsAOTI(TestCase):
             raise AssertionError
 
     def test_add_mps(self):
+        # [FUNCTION DOC] AOTI round trip for a module adding two MPS tensors.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds its two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns x plus y.
                 return x + y
 
         inp = (torch.ones(3, 3, device="mps"), torch.ones(3, 3, device="mps"))
@@ -376,9 +491,13 @@ class MPSBasicTestsAOTI(TestCase):
         self.check_model(m, inp)
 
     def test_tanh_codegen(self):
+        # [FUNCTION DOC] Exports and AOT compiles a module computing tanh, reads the generated C++
+        # source and asserts it mentions the precise Metal tanh.
         # Verify that tanh uses metal::precise::tanh in generated Metal shader
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward is hyperbolic tangent.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns tanh of x.
                 return x.tanh()
 
         example_inputs = (torch.randn(1024, device="mps"),)
@@ -393,8 +512,13 @@ class MPSBasicTestsAOTI(TestCase):
             FileCheck().check("metal::precise::tanh").run(src_code)
 
     def test_fallback_mps(self):
+        # [FUNCTION DOC] AOTI round trip for a module using a linear function that falls back to
+        # an external kernel.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies the linear function to
+            # input and weight.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns linear of x with weight y.
                 return torch.nn.functional.linear(x, y)
 
         inp = (
@@ -405,11 +529,18 @@ class MPSBasicTestsAOTI(TestCase):
         self.check_model(m, inp)
 
     def test_c10(self):
+        # [FUNCTION DOC] AOTI round trip for a module that splits its input along dim 1 into
+        # chunks of four and concatenates them along dim minus two.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with no parameters; forward splits and re-
+            # concatenates the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the parent constructor.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Splits x in chunks of four along dim 1 and concatenates
+                # them along the second to last dim.
                 return torch.cat(tensors=torch.split(x, 4, dim=1), dim=-2)
 
         inp = (torch.randn(2, 8, device="mps"),)
@@ -417,13 +548,19 @@ class MPSBasicTestsAOTI(TestCase):
         self.check_model(m, inp)
 
     def test_two_const(self):
+        # [FUNCTION DOC] AOTI round trip for a module holding two constant MPS tensors added
+        # to the input.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two plain tensor attributes, a ones tensor and a
+            # tensor filled with two, both on MPS.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two constant tensors stored as attributes.
                 super().__init__()
                 self.y = torch.ones(3, 3, device="mps")
                 self.z = torch.full((3, 3), 2, device="mps")
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x plus both constants.
                 return x + self.y + self.z
 
         inp = (torch.ones(3, 3, device="mps"),)
@@ -431,11 +568,16 @@ class MPSBasicTestsAOTI(TestCase):
         self.check_model(m, inp)
 
     def test_simple_dynamic(self):
+        # [FUNCTION DOC] AOTI round trip with a dynamic first dimension shared by both inputs
+        # (range 1 to 2048) for a module doing add followed by relu.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds then applies relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the parent constructor.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns relu of x plus y.
                 add_0 = x + y
                 return torch.nn.functional.relu(input=add_0, inplace=False)
 
@@ -450,11 +592,16 @@ class MPSBasicTestsAOTI(TestCase):
         self.check_model(m, inp, dynamic_shapes)
 
     def test_dynamic_cat(self):
+        # [FUNCTION DOC] AOTI round trip with independent dynamic first dimensions for two inputs
+        # concatenated along dim zero.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward concatenates its inputs along dim 0.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the parent constructor.
                 super().__init__()
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Returns the concatenation of a and b along dim 0.
                 return torch.cat([a, b], dim=0)
 
         a = torch.randn(2, 4, device="mps")
@@ -468,11 +615,18 @@ class MPSBasicTestsAOTI(TestCase):
         self.check_model(m, inp, dynamic_shapes)
 
     def test_reuse_kernel(self):
+        # [FUNCTION DOC] Exports and AOT compiles a module with a repeated sin and matmul pattern,
+        # then asserts the generated C++ source requests the kernel function lookup exactly once,
+        # i.e. the identical kernel is reused.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing sin, matmul, sin, matmul on its two inputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the parent constructor.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies sin to x, multiplies by y, takes sin of that,
+                # multiplies the previous product by it and returns the result.
                 a = torch.sin(x)
                 b = torch.mm(a, y)
                 c = torch.sin(b)

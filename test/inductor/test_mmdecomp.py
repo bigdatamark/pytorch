@@ -1,4 +1,10 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests comparing compiled (inductor) against eager results for matrix multiply
+# decompositions: mm, addmm, bmm and baddbmm on degenerate shapes, small-dimension pointwise mm
+# decomposition, outer-product bmm, and symbolic-shape safety of the mm decomposition. Defines
+# tolerance tables, tensor helpers and shape lists, and at import time instantiates the device
+# generic test class for CPU and the GPU type (XPU allowed). The main block runs the tests unless
+# on Windows.
 
 import math
 import unittest
@@ -44,6 +50,9 @@ def rand_math_tensor(
     requires_grad: bool = False,
     packed: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Returns a tensor of normally distributed random values of the given
+    # shape, device and dtype, with the requested requires_grad flag. The packed argument is
+    # accepted but ignored; despite the docstring no nested tensor is built.
     """Creates rand dense or nested tensor with given shape and type.
 
     Args:
@@ -60,10 +69,16 @@ def rand_math_tensor(
 
 
 def init_tensor(tensor_list, **kwargs) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Builds a tensor from a nested Python list and converts it with the
+    # forwarded keyword arguments (dtype and device); returns the converted tensor.
     return torch.Tensor(tensor_list).to(**kwargs)
 
 
 def run_comp_nocomp(function, *inputs, **kwargs):
+    # [FUNCTION DOC] HELPER: Compiles the function, runs both the eager and compiled versions on
+    # the inputs and, unless the atol or rtol keyword is infinite, asserts the two results are
+    # close using those keyword arguments as tolerances. The infinite case (bfloat16 table entry)
+    # skips the comparison but still runs both versions.
     c_function = torch.compile(function)
 
     f_res = function(*inputs)
@@ -75,22 +90,30 @@ def run_comp_nocomp(function, *inputs, **kwargs):
 
 # The test functions are used by several tests
 def torch_mm(a, b):
+    # [FUNCTION DOC] HELPER: Plain matrix product of the two inputs; shared test function.
     return torch.mm(a, b)
 
 
 def torch_addmm(add, b, c):
+    # [FUNCTION DOC] HELPER: Add-matrix-multiply of the three inputs (first is the addend); shared
+    # test function.
     return torch.addmm(add, b, c)
 
 
 def torch_bmm(a, b):
+    # [FUNCTION DOC] HELPER: Batched matrix product of the two inputs; shared test function.
     return torch.bmm(a, b)
 
 
 def torch_baddbmm(add, b, c, alpha, beta):
+    # [FUNCTION DOC] HELPER: Batched add-matrix-multiply with the given alpha and beta scalars;
+    # shared test function.
     return torch.baddbmm(add, b, c, alpha=alpha, beta=beta)
 
 
 def create_fake_tensor_with_dynamic_size(x, fake_mode):
+    # [FUNCTION DOC] HELPER: Under the given fake tensor mode, converts a real tensor to a fake
+    # tensor whose sizes are all dynamic (symbolic) and whose strides are inferred; returns it.
     with fake_mode:
         dynamic_sizes = [DimDynamic.DYNAMIC for _ in range(x.dim())]
         dynamic_strides = [DimDynamic.INFER_STRIDE for _ in range(x.dim())]
@@ -116,12 +139,18 @@ ts_list = [
 
 
 class TestDecomp(NNTestCase):
+    # [CLASS DOC] Device-generic neural-net test case for the mm/bmm decomposition behavior.
+    # Memory leak check and non-default stream use are enabled only for CUDA. Instantiated per
+    # device at module import; most tests are skipped without a GPU plus triton.
     _do_cuda_memory_leak_check = GPU_TYPE == "cuda"
     _do_cuda_non_default_stream = GPU_TYPE == "cuda"
 
     @unittest.skipIf(not HAS_GPU, "GPU tests require triton")
     @parametrize("dtype", [torch.float, torch.bfloat16])
     def test_simple_mm(self, device, dtype):
+        # [FUNCTION DOC] For each shape in the shared list, compares compiled and eager mm and
+        # addmm on random inputs of the parametrized dtype (float or bfloat16), with tolerances
+        # scaled by a fudge factor of ten from the default tables.
         fudge = 10
         rtol = default_rtol[dtype] * fudge
         atol = default_atol[dtype] * fudge
@@ -146,6 +175,10 @@ class TestDecomp(NNTestCase):
     @parametrize("m", [256, 4096])
     @parametrize("k,n", [(2, 3), (3, 4), (4, 4)])
     def test_small_mm_pointwise(self, device, dtype, m, k, n):
+        # [FUNCTION DOC] Skips on CPU. Clears dynamo counters, resets dynamo, then compiles mm for
+        # a small-k, small-n problem under a fresh cache, compares against eager with dtype-
+        # dependent tolerances, and asserts the decompose_mm_pointwise counter is exactly one.
+        # Parametrized over dtype, m, and (k, n).
         if device == "cpu":
             self.skipTest("small-dim mm pointwise is GPU-only")
         from torch._dynamo.utils import counters
@@ -173,6 +206,10 @@ class TestDecomp(NNTestCase):
     @parametrize("k,n", [(2, 3), (3, 4), (4, 4)])
     @parametrize("transpose", ["lhs", "rhs", "both"])
     def test_small_mm_pointwise_transposed(self, device, dtype, m, k, n, transpose):
+        # [FUNCTION DOC] Same as the small mm pointwise test but with the left, right, or both
+        # operands passed transposed (inputs are built with swapped shapes so the product shape is
+        # unchanged). Skips on CPU, compares with eager and asserts the pointwise-decomposition
+        # counter equals one.
         if device == "cpu":
             self.skipTest("small-dim mm pointwise is GPU-only")
         from torch._dynamo.utils import counters
@@ -188,6 +225,7 @@ class TestDecomp(NNTestCase):
             t2 = rand_math_tensor((k, n), dtype=dtype, device=device)
 
             def fn(a, b):
+                # [FUNCTION DOC] HELPER: Matrix product, first argument transposed.
                 return torch.mm(a.T, b)
 
         elif transpose == "rhs":
@@ -195,6 +233,7 @@ class TestDecomp(NNTestCase):
             t2 = rand_math_tensor((n, k), dtype=dtype, device=device)
 
             def fn(a, b):
+                # [FUNCTION DOC] HELPER: Matrix product, second argument transposed.
                 return torch.mm(a, b.T)
 
         else:
@@ -202,6 +241,7 @@ class TestDecomp(NNTestCase):
             t2 = rand_math_tensor((n, k), dtype=dtype, device=device)
 
             def fn(a, b):
+                # [FUNCTION DOC] HELPER: Matrix product with both arguments transposed.
                 return torch.mm(a.T, b.T)
 
         with fresh_cache():
@@ -210,6 +250,9 @@ class TestDecomp(NNTestCase):
 
     @unittest.skipIf(not HAS_GPU, "GPU tests require triton")
     def test_small_mm_no_pointwise_for_large_dims(self, device):
+        # [FUNCTION DOC] Skips on CPU. Compiles a mm with a 256 by 5 and a 5 by 5 operand and
+        # asserts the pointwise-decomposition counter stays at zero, i.e. the inner dimension is
+        # too large for that decomposition.
         if device == "cpu":
             self.skipTest("GPU-only test")
         from torch._dynamo.utils import counters
@@ -217,6 +260,7 @@ class TestDecomp(NNTestCase):
         counters.clear()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Matrix product of the two arguments.
             return torch.mm(a, b)
 
         a = torch.randn(256, 5, device=device)
@@ -227,6 +271,8 @@ class TestDecomp(NNTestCase):
     @unittest.skipIf(not HAS_GPU, "GPU tests require triton")
     @config.patch(max_autotune_gemm=True)
     def test_small_mm_no_pointwise_under_max_autotune(self, device):
+        # [FUNCTION DOC] Skips on CPU. With max_autotune_gemm enabled by the config patch,
+        # compiles a small mm and asserts the pointwise-decomposition counter stays at zero.
         if device == "cpu":
             self.skipTest("GPU-only test")
         from torch._dynamo.utils import counters
@@ -234,6 +280,7 @@ class TestDecomp(NNTestCase):
         counters.clear()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Matrix product of the two arguments.
             return torch.mm(a, b)
 
         a = torch.randn(256, 3, device=device)
@@ -248,6 +295,9 @@ class TestDecomp(NNTestCase):
     )
     @parametrize("bs", [1, 2, 4, 10])
     def test_batched_mm(self, device, dtype, bs):
+        # [FUNCTION DOC] For each shape in the shared list, compares compiled and eager bmm, and
+        # baddbmm for all combinations of alpha and beta from a fixed five-value set, using
+        # tolerances scaled by a factor of three. Parametrized over dtype and batch size.
         fudge = 3
         rtol = default_rtol[dtype] * fudge
         atol = default_atol[dtype] * fudge
@@ -270,6 +320,8 @@ class TestDecomp(NNTestCase):
     @unittest.skipIf(not HAS_GPU, "GPU tests require triton")
     @config.patch(coordinate_descent_tuning=True)
     def test_bmm_batch2_last_dim_size_is_one(self, device):
+        # [FUNCTION DOC] With coordinate descent tuning enabled by the config patch, compares
+        # compiled against eager bmm where the second operand has last dimension of size one.
         fudge = 3
         rtol = default_rtol[torch.float32] * fudge
         atol = default_atol[torch.float32] * fudge
@@ -281,6 +333,9 @@ class TestDecomp(NNTestCase):
 
     @config.patch(coordinate_descent_tuning=False)
     def test_bmm_outer_product_k_is_one(self, device):
+        # [FUNCTION DOC] With coordinate descent tuning disabled, checks the bmm decomposition on
+        # an outer product (inner dimension one) returns a real result, not NotImplemented, equal
+        # to the eager bmm.
         t1 = torch.randn(32, 8, 1, device=device)
         t2 = torch.randn(32, 1, 256, device=device)
         expected = torch.bmm(t1, t2)
@@ -292,6 +347,10 @@ class TestDecomp(NNTestCase):
 
     @unittest.skipIf(not HAS_GPU, "GPU tests require triton")
     def test_bmm_outer_product_k_is_one_with_unbacked_k(self, device):
+        # [FUNCTION DOC] Skips on CPU. Under a fake tensor mode with a shape environment, builds
+        # operands with unbacked symbolic sizes. The bmm decomposition must return a result when
+        # both inner dimensions are statically one, and NotImplemented when either one is an
+        # unbacked symbol.
         if device == "cpu":
             self.skipTest("unbacked symints require GPU fake tensors")
 
@@ -326,6 +385,10 @@ class TestDecomp(NNTestCase):
 
     @config.patch(coordinate_descent_tuning=False)
     def test_bmm_outer_product_permuted_inputs(self, device):
+        # [FUNCTION DOC] With coordinate descent tuning disabled, checks the bmm decomposition on
+        # outer products whose batch dimension was permuted on the left, right, both, or fully
+        # transposed. For each case the result must not be NotImplemented and must equal eager bmm
+        # including strides.
         B, M, N = 4, 8, 16
 
         cases = [
@@ -360,6 +423,9 @@ class TestDecomp(NNTestCase):
     @unittest.skipIf(not HAS_GPU, "GPU tests require triton")
     @parametrize("dtype", [torch.float, torch.bfloat16, torch.int])
     def test_some(self, device, dtype):
+        # [FUNCTION DOC] Compares compiled and eager mm for a column times a row and a row times a
+        # column of small integers. Returns early without testing for int dtype on the GPU, since
+        # that dtype is not fully supported there. Parametrized over dtype.
         # this Pytorch data type is not fully supported on cuda today
         # - unfortunately we can't skipIf because we don't see the actual params in skipIf
         if device.startswith(GPU_TYPE) and dtype == torch.int:
@@ -380,6 +446,9 @@ class TestDecomp(NNTestCase):
     @parametrize("dtype", [torch.float, torch.bfloat16, torch.int])
     @parametrize("bs", [1, 2, 4, 10])
     def test_some_batched(self, device, dtype, bs):
+        # [FUNCTION DOC] Batched version of the column/row and row/column small integer comparison
+        # using bmm with the given batch size. Returns early for int dtype on the GPU.
+        # Parametrized over dtype and batch size.
         # this Pytorch data type is not fully supported on cuda today
         # - unfortunately we can't skipIf because we don't see the actual params in skipIf
         if device.startswith(GPU_TYPE) and dtype == torch.int:
@@ -398,6 +467,11 @@ class TestDecomp(NNTestCase):
 
     @parametrize("dtype", [torch.float, torch.bfloat16])
     def test_dynamic_shape_mm(self, device, dtype):
+        # [FUNCTION DOC] Only runs on CPU (returns immediately otherwise). For each shape in the
+        # shared list, makes fake tensors with fully dynamic sizes, records the type of each
+        # symbolic size expression, calls the mm decomposition, and asserts the size expression
+        # types are unchanged, i.e. no symbol was evaluated. If the decomposition returned a
+        # result, also asserts its sizes match the operands' outer sizes and expression types.
         # Test that the mm decomp does not evaluate expressions for dynamic shapes
 
         shape_env = ShapeEnv()
