@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool for inductor performance regression runs on GitHub Actions.
+# Subcommands: launch dispatches the perf workflow for one or more device types and optionally
+# waits; summary downloads performance CSV artifacts from S3 for a run or branch and prints
+# absolute results (worst offenders and a terminal S-curve) or a comparison against a baseline
+# nightly (per-config table, regressions, delta S-curve); repro prints benchmark commands that
+# reproduce configs locally; prepare-repro prints suite setup commands from the CI pin files.
+# Shells out to the gh and git programs, downloads from a public S3 bucket, and caches extracted
+# CSVs under a per-user cache directory. Module level defines the workflow table, regexes,
+# metric definitions and group-key functions; there are no other import-time side effects. main
+# runs only when executed as a script.
 """
 CLI tool for launching, summarizing, and reproducing inductor perf regression runs.
 
@@ -108,6 +118,9 @@ SUITE_ALIASES = {
 
 
 def gh(*args: str, json_output: bool = False) -> str | dict | list:
+    # [FUNCTION DOC] Runs the gh command line program with the given arguments, capturing
+    # output. On a non-zero exit status prints the stderr text and terminates the process with
+    # status 1. Returns parsed JSON when json_output is set, otherwise the stripped stdout text.
     cmd = ["gh"] + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -119,11 +132,17 @@ def gh(*args: str, json_output: bool = False) -> str | dict | list:
 
 
 def git(*args: str) -> str:
+    # [FUNCTION DOC] Runs git with the given arguments and returns stripped stdout. Errors are
+    # not checked; a failing command gives an empty or partial string.
     result = subprocess.run(["git"] + list(args), capture_output=True, text=True)
     return result.stdout.strip()
 
 
 def gmean(values: list[float]) -> float:
+    # [FUNCTION DOC] Geometric mean of the values: exponential of the sum of logs of the
+    # positive values divided by the count of all values. Returns 0.0 for an empty list.
+    # KNOWN ISSUE: non-positive values are skipped in the sum but still counted in the divisor,
+    # which biases the result low; callers currently filter to positive values first.
     if not values:
         return 0.0
     return exp(sum(log(v) for v in values if v > 0) / max(len(values), 1))
@@ -131,6 +150,9 @@ def gmean(values: list[float]) -> float:
 
 @dataclass
 class Metric:
+    # [CLASS DOC] Dataclass describing a displayable metric: display name, the name of the
+    # attribute on ModelResult that holds it, a unit suffix, whether larger is better, and how
+    # to aggregate across models (gmean or mean). Instances live in the METRICS table.
     name: str
     field: str  # attribute on ModelResult
     unit: str  # display suffix
@@ -162,6 +184,10 @@ WORKFLOW_NAME_TO_NIGHTLY_ID["inductor-A100-perf-compare"] = WORKFLOWS["a100"]["i
 
 
 def _short_config(config: str, device: str = "") -> str:
+    # [FUNCTION DOC] HELPER: Builds a compact human label for a config name. Takes the part
+    # before the suite marker (huggingface, timm_models or torchbench) as the backend and strips
+    # the inductor prefix, detects training or inference, detects the suite, and joins the
+    # non-empty pieces of device, backend, suite and mode with spaces.
     """Compact label: e.g. 'a100 cudagraphs huggingface training'."""
     c = config
     backend = c
@@ -182,6 +208,10 @@ def _short_config(config: str, device: str = "") -> str:
 
 @dataclass
 class ModelResult:
+    # [CLASS DOC] Dataclass for one model's measurements from a CSV row: name, speedup, absolute
+    # latency, compilation latency, compression ratio, eager and dynamo peak memory, plus the
+    # config name and device it came from. Missing values default to zero, which later code
+    # treats as absent.
     name: str
     speedup: float
     abs_latency: float = 0.0
@@ -194,17 +224,25 @@ class ModelResult:
 
     @property
     def short_config(self) -> str:
+        # [FUNCTION DOC] Property returning the compact label of this result's config and
+        # device, via the short-config helper.
         return _short_config(self.config, self.device)
 
 
 @dataclass
 class PerfData:
+    # [CLASS DOC] Dataclass grouping all model results of one config name (one CSV) for one
+    # device. Properties derive suite, mode, dtype, backend short name and runtime by parsing
+    # the config string, which follows the pattern backend, suite, dtype, mode, runtime joined
+    # by underscores.
     config: str  # e.g. "inductor_with_cudagraphs_huggingface_amp_training_cuda"
     models: list[ModelResult] = field(default_factory=list)
     device: str = ""
 
     @property
     def suite(self) -> str:
+        # [FUNCTION DOC] Property returning which suite marker (huggingface, timm_models,
+        # torchbench) occurs in the config, or unknown.
         for s in ("huggingface", "timm_models", "torchbench"):
             if s in self.config:
                 return s
@@ -212,6 +250,8 @@ class PerfData:
 
     @property
     def mode(self) -> str:
+        # [FUNCTION DOC] Property returning training or inference depending on which word occurs
+        # in the config (training checked first), else unknown.
         if "training" in self.config:
             return "training"
         if "inference" in self.config:
@@ -220,6 +260,8 @@ class PerfData:
 
     @property
     def dtype(self) -> str:
+        # [FUNCTION DOC] Property returning the dtype token: the first underscore-separated word
+        # after the suite marker in the config, or unknown when no marker is present.
         # Config format: {backend}_{suite}_{dtype}_{mode}_{device}
         # e.g. inductor_with_cudagraphs_huggingface_amp_training_cuda
         for s in ("_huggingface_", "_timm_models_", "_torchbench_"):
@@ -233,6 +275,8 @@ class PerfData:
 
     @property
     def short_name(self) -> str:
+        # [FUNCTION DOC] Property returning the config text before the suite marker (the backend
+        # variant name), or the whole config when no marker is found.
         name = self.config
         for s in ("_huggingface_", "_timm_models_", "_torchbench_"):
             if s in name:
@@ -242,6 +286,10 @@ class PerfData:
 
     @property
     def runtime(self) -> str:
+        # [FUNCTION DOC] Property returning the last underscore-separated token of the config,
+        # or unknown when there is none.
+        # KNOWN ISSUE: for platform-suffixed runtimes such as cpu_x86_zen this yields only the
+        # final token, whereas the command builder treats the first token as the device.
         # Last token in config: e.g. "..._training_cuda" → "cuda"
         parts = self.config.rsplit("_", 1)
         if len(parts) == 2:
@@ -250,15 +298,21 @@ class PerfData:
 
     @property
     def qualified_config(self) -> str:
+        # [FUNCTION DOC] Property returning the config prefixed by the device and a slash when a
+        # device is set, otherwise the config alone.
         if self.device:
             return f"{self.device}/{self.config}"
         return self.config
 
     def gmean_speedup(self) -> float:
+        # [FUNCTION DOC] Geometric mean of the positive speedups of all models; zero when none.
         vals = [m.speedup for m in self.models if m.speedup > 0]
         return gmean(vals)
 
     def aggregate_metric(self, metric: Metric) -> float:
+        # [FUNCTION DOC] Aggregates the given metric over the models with a positive value:
+        # geometric mean when the metric asks for it, otherwise the arithmetic mean. Returns 0.0
+        # when no model has a positive value.
         vals = [
             getattr(m, metric.field)
             for m in self.models
@@ -277,6 +331,8 @@ class PerfData:
 
 
 def get_run_jobs(run_id: int) -> list[dict]:
+    # [FUNCTION DOC] Returns the list of job records for a GitHub Actions run by calling gh to
+    # view the run with the jobs field. Exits the process via the gh wrapper on failure.
     data = gh(
         "run",
         "view",
@@ -291,6 +347,10 @@ def get_run_jobs(run_id: int) -> list[dict]:
 
 
 def get_perf_jobs(jobs: list[dict]) -> list[dict]:
+    # [FUNCTION DOC] Filters job records to successful perf test jobs. A job is kept when its
+    # name matches the test-job pattern, its config matches the huggingface, timm or torchbench
+    # perf pattern, and its conclusion is success. Returns dictionaries with config, shard,
+    # num_shards, runner, job id, full name and job prefix.
     perf_jobs = []
     for job in jobs:
         m = JOB_RE.search(job["name"])
@@ -316,6 +376,8 @@ def get_perf_jobs(jobs: list[dict]) -> list[dict]:
 
 
 def s3_artifact_url(run_id: int, attempt: int, job: dict) -> str:
+    # [FUNCTION DOC] Builds the S3 URL of the test-reports zip artifact for one job, from the
+    # run id, attempt and job fields (prefix defaulting to test).
     config = job["config"]
     shard = job["shard"]
     num_shards = job["num_shards"]
@@ -332,6 +394,8 @@ CACHE_DIR = Path.home() / ".cache" / "perf_cli"
 
 
 def get_cache_dir(run_id: int, attempt: int) -> Path:
+    # [FUNCTION DOC] Returns the cache directory for a run and attempt under the per-user cache
+    # root, creating it (with parents) if missing.
     d = CACHE_DIR / f"{run_id}" / f"{attempt}"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -343,6 +407,13 @@ def download_and_extract_csvs(
     attempt: int = 1,
     no_cache: bool = False,
 ) -> list[tuple[str, str]]:
+    # [FUNCTION DOC] Downloads the test-report zip of each job and returns pairs of CSV file
+    # name and text for every performance CSV inside. For each job a done marker file in the
+    # cache directory is checked first; unless no_cache is set, a marked job is served from
+    # cached CSV files. Otherwise it fetches the zip, warns on stderr and skips the job when the
+    # HTTP request fails, extracts members whose names end with the performance suffix, caches
+    # each, touches the marker and deletes the zip. Prints how many shards were downloaded, or
+    # that cached data was used.
     """Download artifacts and return list of (csv_filename, csv_content) pairs."""
     cache = get_cache_dir(run_id, attempt)
     results = []
@@ -398,6 +469,11 @@ def download_and_extract_csvs(
 
 
 def parse_csvs(csv_pairs: list[tuple[str, str]], device: str = "") -> list[PerfData]:
+    # [FUNCTION DOC] Parses CSV contents into PerfData objects. The config name is the file name
+    # without the performance suffix. Rows whose speedup cannot be parsed as a number are
+    # skipped; the other numeric columns default to zero when empty or missing, and a missing
+    # name becomes a question mark. Models are grouped by config; the result is sorted by config
+    # and each entry carries the given device.
     grouped: dict[str, list[ModelResult]] = defaultdict(list)
 
     for csv_name, content in csv_pairs:
@@ -434,6 +510,9 @@ def parse_csvs(csv_pairs: list[tuple[str, str]], device: str = "") -> list[PerfD
 
 
 def subsample(items: list, max_rows: int) -> list:
+    # [FUNCTION DOC] Returns the list unchanged when it has at most max_rows items; otherwise
+    # returns an evenly spaced subset of that size at most, always including the first and last
+    # items, in original order.
     """Evenly subsample a sorted list, always keeping first and last."""
     n = len(items)
     if n <= max_rows:
@@ -452,6 +531,14 @@ def render_scurve(
     term_width: int | None = None,
     term_height: int | None = None,
 ):
+    # [FUNCTION DOC] Prints a terminal S-curve of one metric for the models of a config: models
+    # with a positive value are sorted ascending, subsampled to fit the terminal height
+    # (terminal size is taken from the system when not given), and each gets a name, formatted
+    # value and a row of dots whose length is proportional to the value. Ratio metrics are
+    # anchored with a marker column at 1.0; absolute metrics start at 0. The scale upper bound
+    # is derived from the 95th percentile. Prints a header with count and aggregate. Returns
+    # without output when there is no data.
+    # KNOWN ISSUE: the top_n argument is accepted but never used.
     if not perf.models:
         return
 
@@ -481,6 +568,8 @@ def render_scurve(
     print(f"  {'─' * min(len(header), term_width - 4)}")
 
     def fmt_val(v: float) -> str:
+        # [FUNCTION DOC] HELPER: Formats a value with the metric unit: one decimal in a wider
+        # field for seconds or milliseconds, two decimals otherwise.
         if metric.unit == "s" or metric.unit == "ms":
             return f"{v:7.1f}{metric.unit}"
         return f"{v:5.2f}{metric.unit}"
@@ -493,6 +582,7 @@ def render_scurve(
     plot_width = max(term_width - prefix_len - 1, 20)
 
     def get_val(m):
+        # [FUNCTION DOC] HELPER: Returns the metric attribute value of a model result.
         return getattr(m, metric.field)
 
     min_val = get_val(sorted_models[0])
@@ -517,6 +607,8 @@ def render_scurve(
         span = 1
 
     def val_to_col(v: float) -> int:
+        # [FUNCTION DOC] HELPER: Maps a value to a plot column index by linear scaling over the
+        # plot range, clamped to the plot width.
         return max(
             0, min(plot_width - 1, int((v - plot_min) / span * (plot_width - 1)))
         )
@@ -545,7 +637,11 @@ def render_scurve(
 
 
 def print_worst_offenders(perf: PerfData, metric: Metric, top_n: int = 5):
+    # [FUNCTION DOC] Prints the top_n worst models for a metric (lowest values when higher is
+    # better, highest otherwise) among models with a positive value, with numbered rows showing
+    # name, value and short config. Prints nothing when no model qualifies.
     def get_val(m):
+        # [FUNCTION DOC] HELPER: Returns the metric attribute value of a model result.
         return getattr(m, metric.field)
 
     live = [m for m in perf.models if get_val(m) > 0]
@@ -572,6 +668,10 @@ def print_worst_offenders(perf: PerfData, metric: Metric, top_n: int = 5):
 
 
 def build_dispatch_inputs(args) -> list[str]:
+    # [FUNCTION DOC] Builds the list of flag arguments for dispatching the workflow. For each of
+    # the known boolean inputs (training, inference, default, dynamic, cppwrapper, cudagraphs,
+    # freezing_cudagraphs, aotinductor, maxautotune) that is not None on the args object it adds
+    # a field assignment of true or false, and adds the benchmark_configs input when provided.
     """Build -f flags for workflow dispatch inputs from CLI args."""
     flags = []
     bool_inputs = [
@@ -595,6 +695,12 @@ def build_dispatch_inputs(args) -> list[str]:
 
 
 def dispatch_one(device: str, ref: str, extra_flags: list[str]) -> int | None:
+    # [FUNCTION DOC] Dispatches the perf workflow of a device on a ref using gh, waits five
+    # seconds, then lists the latest run of that workflow on that branch name and prints its id,
+    # URL and status. Returns the run id, or None (after printing a hint) when no run is found.
+    # Side effects: starts a real workflow run.
+    # KNOWN ISSUE: the run is found by branch name and newest first, so concurrent runs or a
+    # commit hash used as the ref can pick the wrong run or none.
     wf = WORKFLOWS[device]
     print(f"\nLaunching {wf['name']} on ref: {ref}")
 
@@ -641,6 +747,9 @@ def dispatch_one(device: str, ref: str, extra_flags: list[str]) -> int | None:
 
 
 def wait_for_runs(pending: dict[str, int]) -> dict[str, int]:
+    # [FUNCTION DOC] Polls the given runs (device to run id mapping) every 30 seconds with gh
+    # until all have completed, printing each conclusion and a still-waiting line with
+    # timestamp. Returns the mapping of devices whose run concluded with success.
     """Poll all runs until they complete. Returns dict of successful runs."""
     print(f"\nWaiting for {len(pending)} run(s)...", flush=True)
     remaining = dict(pending)
@@ -675,6 +784,12 @@ def wait_for_runs(pending: dict[str, int]) -> dict[str, int]:
 
 
 def cmd_launch(args):
+    # [FUNCTION DOC] Handler of the launch subcommand. Uses the ref argument or the current git
+    # branch (or the commit hash if HEAD is detached), builds dispatch flags, exits with status
+    # 1 on an unknown device, and dispatches each device. If waiting was requested and something
+    # was launched, waits for runs; with wait-and-summarize it then builds a summary argument
+    # namespace for the successful runs (baseline latest, speedup metric, top 5) and calls the
+    # summary handler.
     ref = args.ref or git("rev-parse", "--abbrev-ref", "HEAD")
     if ref == "HEAD":
         ref = git("rev-parse", "HEAD")
@@ -716,6 +831,9 @@ def cmd_launch(args):
 
 
 def filter_perf(all_perf: list[PerfData], args) -> list[PerfData]:
+    # [FUNCTION DOC] Filters PerfData by optional attributes of the args object: config regex
+    # (case-insensitive search), suite (aliases resolved), mode, backend regex on the short
+    # name, dtype and runtime. Missing attributes are ignored. Returns the filtered list.
     result = all_perf
     if getattr(args, "config", None):
         pattern = re.compile(args.config, re.IGNORECASE)
@@ -749,6 +867,11 @@ GROUP_CHOICES = sorted(GROUP_KEY_FNS.keys())
 
 
 def group_perf(all_perf: list[PerfData], group_by: list[str] | None) -> list[PerfData]:
+    # [FUNCTION DOC] Merges PerfData into groups by composite key. With no group keys all models
+    # go into a single group named all. Otherwise each key name is looked up in the group-key
+    # table (unknown key prints a message and exits with status 1), the key strings of a
+    # PerfData are joined with a slash separator, and models are concatenated per key. Result is
+    # sorted by key; grouped entries carry no device.
     if not group_by:
         all_models = []
         for p in all_perf:
@@ -764,6 +887,8 @@ def group_perf(all_perf: list[PerfData], group_by: list[str] | None) -> list[Per
         fns.append(fn)
 
     def composite_key(p: PerfData) -> str:
+        # [FUNCTION DOC] HELPER: Builds the composite group key string for a PerfData from the
+        # selected key functions.
         return " / ".join(fn(p) for fn in fns)
 
     groups: dict[str, list[ModelResult]] = defaultdict(list)
@@ -782,6 +907,9 @@ NIGHTLY_WORKFLOW_IDS = {k: v["id"] for k, v in WORKFLOWS.items() if k != "a100-c
 
 
 def _find_latest_run(
+    # [FUNCTION DOC] Finds the most recent successful nightly perf run for a branch and device
+    # using gh. Returns a dictionary with database id, creation time and head sha, or None when
+    # the device has no nightly workflow or no run is found.
     branch: str,
     device: str,
 ) -> dict | None:
@@ -816,6 +944,9 @@ def _find_latest_run(
 
 
 def resolve_run(branch: str, device: str) -> int:
+    # [FUNCTION DOC] Resolves the latest successful nightly run id for a branch and device.
+    # Prints an error to stderr and exits with status 1 when none exists; otherwise prints the
+    # resolved id and date and returns the id.
     """Find the latest successful perf nightly run for a branch + device."""
     run = _find_latest_run(branch, device)
     if not run:
@@ -831,6 +962,10 @@ def resolve_run(branch: str, device: str) -> int:
 
 
 def discover_runs(branch: str) -> dict[str, int]:
+    # [FUNCTION DOC] Finds all devices that have a successful nightly run on a branch. Picks
+    # the commit of the most recently created run and returns the mapping from device to run id
+    # for runs on that commit, printing a line for each. Exits with status 1 when no device has
+    # a run.
     """Auto-discover all devices with successful runs for a branch.
 
     Finds the latest commit SHA that has runs, then returns all runs matching
@@ -867,6 +1002,8 @@ def discover_runs(branch: str) -> dict[str, int]:
 
 
 def resolve_runs(branch: str, devices: list[str]) -> dict[str, int]:
+    # [FUNCTION DOC] Resolves the latest run id for each given device on a branch and returns
+    # the device to run id mapping; exits via the single-run resolver if any is missing.
     """Resolve the latest successful run for each device. Returns {device: run_id}."""
     result = {}
     for device in devices:
@@ -875,6 +1012,10 @@ def resolve_runs(branch: str, devices: list[str]) -> dict[str, int]:
 
 
 def resolve_baseline(head_run_id: int) -> int:
+    # [FUNCTION DOC] Finds a baseline for a run: looks up the workflow name of the head run,
+    # maps it to the corresponding nightly workflow (exits with status 1 if unknown), lists the
+    # five most recent successful runs on main and returns the first one that is not the head
+    # run itself. Exits with status 1 when none is suitable.
     """Find the latest successful nightly on main, skipping the head run itself."""
     run_data = gh(
         "run",
@@ -925,6 +1066,8 @@ def resolve_baseline(head_run_id: int) -> int:
 
 
 def device_for_workflow(workflow_name: str) -> str:
+    # [FUNCTION DOC] Returns the device key whose workflow name equals the argument, or an empty
+    # string when none matches.
     """Reverse-lookup device key from workflow name."""
     for k, v in WORKFLOWS.items():
         if v["name"] == workflow_name:
@@ -934,6 +1077,8 @@ def device_for_workflow(workflow_name: str) -> str:
 
 @dataclass
 class RunMeta:
+    # [CLASS DOC] Dataclass with metadata of a workflow run: run id, head commit sha, branch,
+    # workflow name, creation timestamp and trigger event.
     run_id: int
     head_sha: str
     head_branch: str
@@ -943,14 +1088,19 @@ class RunMeta:
 
     @property
     def short_sha(self) -> str:
+        # [FUNCTION DOC] Property returning the first ten characters of the head sha.
         return self.head_sha[:10]
 
     @property
     def date(self) -> str:
+        # [FUNCTION DOC] Property returning the date part (first ten characters) of the
+        # creation timestamp.
         return self.created_at[:10]
 
 
 def fetch_run_meta(run_id: int) -> RunMeta:
+    # [FUNCTION DOC] Fetches metadata for a run through the GitHub API via gh with a query that
+    # renames fields, and returns a RunMeta; missing fields become the text unknown.
     data = gh(
         "api",
         f"repos/{REPO}/actions/runs/{run_id}",
@@ -973,6 +1123,10 @@ def print_run_header(
     metas: list[RunMeta],
     configs: list[str] | None = None,
 ):
+    # [FUNCTION DOC] Prints a section header with an underline, followed by run details: for a
+    # single run its id, workflow and commit info; for several runs the commit of the first
+    # and a list of run ids and workflows. When configs are given prints their count and
+    # sorted names.
     print(f"\n  {label}")
     print(f"  {'─' * len(label)}")
     if len(metas) == 1:
@@ -998,6 +1152,10 @@ def fetch_run_perf(
     device: str = "",
     allow_empty: bool = False,
 ) -> list[PerfData]:
+    # [FUNCTION DOC] Fetches the performance data of a run: lists jobs, keeps successful perf
+    # jobs, downloads and parses their CSVs for the given device. When there are no perf jobs or
+    # no CSVs, returns an empty list if allow_empty is set (after a stderr note), otherwise
+    # prints an error and exits with status 1.
     """Fetch and parse perf data for a run."""
     jobs = get_run_jobs(run_id)
     perf_jobs = get_perf_jobs(jobs)
@@ -1019,6 +1177,8 @@ def fetch_run_perf(
 
 @dataclass
 class ModelDelta:
+    # [CLASS DOC] Dataclass for a model's metric in baseline and head runs, with config and
+    # device. delta_pct is the percent change from base to head.
     name: str
     base_val: float
     head_val: float
@@ -1027,17 +1187,23 @@ class ModelDelta:
 
     @property
     def delta_pct(self) -> float:
+        # [FUNCTION DOC] Property returning the percent change of head relative to base, or 0.0
+        # when the base value is zero.
         if self.base_val == 0:
             return 0.0
         return (self.head_val - self.base_val) / self.base_val * 100
 
     @property
     def short_config(self) -> str:
+        # [FUNCTION DOC] Property returning the compact label of the config and device.
         return _short_config(self.config, self.device)
 
 
 @dataclass
 class ConfigAgg:
+    # [CLASS DOC] Dataclass of per-config aggregates: aggregate and count of positive models for
+    # base and head, plus the geometric mean of head over base ratios over models present in
+    # both and the number of such pairs.
     base_agg: float
     base_count: int
     head_agg: float
@@ -1049,6 +1215,11 @@ class ConfigAgg:
 def compute_deltas(
     head_perf: list[PerfData], base_perf: list[PerfData], metric: Metric
 ) -> tuple[list[ModelDelta], dict[str, ConfigAgg]]:
+    # [FUNCTION DOC] Joins head and base results on device, config and model name, considering
+    # only models with a positive metric value on both sides. Returns a tuple of the list of
+    # per-model deltas and a mapping from qualified config to aggregate information. The
+    # aggregates are computed only for head configs that also exist in base, using aggregate
+    # values of each side and the paired geometric mean ratio of head over base.
     """Join head and base on (device, config, model_name) and compute deltas.
 
     Returns (per_model_deltas, per_config_aggregates).
@@ -1118,6 +1289,10 @@ def compute_deltas(
 
 
 def print_comparison_table(config_aggs: dict[str, ConfigAgg], metric: Metric):
+    # [FUNCTION DOC] Prints a comparison table, one row per qualified config sorted by name,
+    # showing base and head aggregates with counts and the paired ratio. A row is flagged with
+    # two exclamation marks for a regression beyond the 5 percent threshold and with two plus
+    # signs for an improvement beyond it, according to whether higher is better for the metric.
     u = metric.unit
     print(f"\n{'Config':<55} {'base':>16} {'new':>16} {'head/base':>18}")
     print("─" * 108)
@@ -1140,6 +1315,10 @@ def print_comparison_table(config_aggs: dict[str, ConfigAgg], metric: Metric):
 
 
 def print_regressions(deltas: list[ModelDelta], metric: Metric, top_n: int):
+    # [FUNCTION DOC] Prints models whose change is worse than the 5 percent threshold in the bad
+    # direction (decrease when higher is better, increase otherwise), sorted by severity,
+    # showing at most top_n with base and head values, percent change and config. Prints a no
+    # regressions message when none.
     # For higher_is_better metrics, regression = negative delta
     # For lower_is_better metrics, regression = positive delta
     if metric.higher_is_better:
@@ -1168,6 +1347,11 @@ def render_delta_scurve(
     term_width: int | None = None,
     term_height: int | None = None,
 ):
+    # [FUNCTION DOC] Prints a terminal S-curve of percent deltas sorted ascending, subsampled to
+    # the terminal height. The horizontal range is symmetric about zero, sized from the 5th and
+    # 95th percentile with a minimum of 10 percent; each row draws dots between the zero column
+    # and the value column. Prints nothing when there are no deltas.
+    # KNOWN ISSUE: the metric argument is accepted but not used.
     if not deltas:
         return
 
@@ -1207,6 +1391,8 @@ def render_delta_scurve(
         span = 1
 
     def pct_to_col(pct: float) -> int:
+        # [FUNCTION DOC] HELPER: Maps a percent value to a plot column by linear scaling over
+        # the range, clamped to the plot width.
         return max(
             0, min(plot_width - 1, int((pct - range_lo) / span * (plot_width - 1)))
         )
@@ -1233,6 +1419,8 @@ def render_delta_scurve(
 
 
 def print_summary_table(all_perf: list[PerfData], metric: Metric):
+    # [FUNCTION DOC] Prints a table with one row per PerfData giving the qualified config,
+    # number of models with a positive value and the aggregate of the metric.
     agg_label = metric.aggregate
     print(f"\n{'Config':<65} {'Models':>6} {agg_label:>10}")
     print("─" * 85)
@@ -1243,6 +1431,13 @@ def print_summary_table(all_perf: list[PerfData], metric: Metric):
 
 
 def _resolve_head_runs(args) -> dict[str, int]:
+    # [FUNCTION DOC] Determines which runs to use from the parsed arguments, returning a mapping
+    # from device to run id. Pre-resolved ids on the args object are returned directly. If the
+    # run argument is an integer it is a run id and the device is inferred from the run workflow
+    # name; otherwise it is a branch resolved for the listed devices, or auto-discovered across
+    # all devices when none are listed.
+    # KNOWN ISSUE: the integer conversion and the metadata fetch share one try block, so a value
+    # error raised while fetching would be misread as a branch name.
     """Parse run_id arg into {device: run_id} mapping.
 
     run_id can be:
@@ -1269,6 +1464,13 @@ def _resolve_head_runs(args) -> dict[str, int]:
 
 
 def cmd_summary(args):
+    # [FUNCTION DOC] Handler of the summary subcommand. Resolves head runs, fetches and filters
+    # their perf data (skipping empty runs only when devices were auto-discovered) and exits
+    # with status 1 if nothing matches. With a baseline other than none it resolves baseline
+    # runs (latest main nightly, a run id, or a branch), fetches them, prints headers,
+    # comparison table, regressions and delta S-curve, exiting with status 1 when nothing
+    # matches. Without a baseline prints header, summary table, and for each group the worst
+    # offenders and S-curve.
     attempt = args.attempt
     metric = METRICS[args.metric]
 
@@ -1367,6 +1569,14 @@ CONFIG_RE = re.compile(
 
 
 def config_to_command(
+    # [FUNCTION DOC] Converts a config name into a shell command line that reruns that
+    # benchmark, or None when the name does not match the config pattern. Builds the python
+    # invocation for the suite script with mode and dtype flags, inductor backend and the
+    # device (first token of the runtime). Flags and environment assignments are added
+    # according to words in the backend variant: no cudagraphs, dynamic, cpp wrapper (also sets
+    # an environment variable), freezing, max autotune (environment variable), aot inductor.
+    # Adds performance and cold start flags, an optional single-model filter and the output
+    # file name.
     config: str,
     suite: str,
     model: str | None = None,
@@ -1421,6 +1631,10 @@ def config_to_command(
 
 
 def cmd_repro(args):
+    # [FUNCTION DOC] Handler of the repro subcommand. Resolves runs, fetches their perf data and
+    # run metadata, filters by arguments (exits with status 1 if nothing matches), prints a
+    # header, then prints one reproduction command per distinct config, each preceded by a
+    # comment line with the config name, skipping configs that do not parse.
     run_ids = _resolve_head_runs(args)
 
     # Fetch perf data to discover configs
@@ -1469,6 +1683,9 @@ PIN_DIR = Path(".ci/docker/ci_commit_pins")
 
 
 def read_pin(name: str) -> str:
+    # [FUNCTION DOC] Reads a pin file from the CI pins directory (relative to the current
+    # working directory) and returns its stripped text, or a placeholder text naming the file
+    # when it does not exist.
     """Read a pinned commit or requirements file."""
     path = PIN_DIR / name
     if not path.exists():
@@ -1477,6 +1694,12 @@ def read_pin(name: str) -> str:
 
 
 def cmd_prepare_repro(args):
+    # [FUNCTION DOC] Handler of the prepare-repro subcommand. Prints shell setup commands for
+    # the selected suite or all three: pip installs from the huggingface requirements pin, timm
+    # install at a pinned commit, torchbench clone and checkout at a pinned commit, runtime
+    # dependencies and cache environment variable exports. Unless no_repro is set and a run id
+    # is given, also prints the benchmark commands via the repro handler with a namespace built
+    # from its arguments.
     suites = set()
     if args.suite:
         suite = SUITE_ALIASES.get(args.suite, args.suite)
@@ -1562,6 +1785,10 @@ def cmd_prepare_repro(args):
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Builds the argument parser with launch, summary, repro and
+    # prepare-repro subcommands and their options (device choices, filters, metric, grouping,
+    # baseline, cache and attempt controls) and dispatches to the matching handler by
+    # subcommand name.
     parser = argparse.ArgumentParser(
         description="CLI tool for inductor perf regression runs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
