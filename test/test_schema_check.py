@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: jit"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for SchemaCheckMode, a dispatch mode that checks that operators honor the
+# mutation and alias annotations of their schemas. Defines deliberately wrong custom ops
+# (registered in a library named bad_schemas for CPU and Meta) and a wrapper tensor subclass that
+# violates schemas, a TestSchemaCheck case, and an OpInfo-driven sweep over all operators on cpu
+# and cuda. Import-time side effects: defines and implements the bad_schemas ops, extends sys.path
+# with the repository test directory, and instantiates device-specific test classes.
 
 import os
 import sys
@@ -21,13 +27,21 @@ sys.path.append(pytorch_test_dir)
 
 
 def secretly_aliasing(x):
+    # [FUNCTION DOC] HELPER: Implementation of a custom op whose schema claims no aliasing, yet it
+    # returns a view of its input, so SchemaCheckMode must flag an undeclared alias.
     return x.view(-1)
 
 def secretly_mutating(x):
+    # [FUNCTION DOC] HELPER: Implementation of a custom op whose schema claims no mutation, yet it
+    # multiplies its input in place by two before returning a new tensor, so SchemaCheckMode must
+    # flag an undeclared mutation.
     x.mul_(2)
     return x * 3
 
 def output_is_input(x):
+    # [FUNCTION DOC] HELPER: Implementation of a custom op that returns its input object
+    # unchanged. Its schema does declare the alias, but custom ops may not directly return inputs,
+    # which SchemaCheckMode rejects.
     return x
 
 custom_lib = torch.library.Library("bad_schemas", "DEF")  # noqa: SCOPED_LIBRARY
@@ -49,6 +63,11 @@ custom_lib_meta.impl("output_is_input", output_is_input)
 # which is then used to test that SchemaCheckMode behaves as expected
 
 class IncorrectAliasTensor(torch.Tensor):
+# [CLASS DOC] Wrapper tensor subclass (holds the real tensor in the elem attribute) that simulates
+# operators with wrong schemas. Class sets name the ops to corrupt: ALIAS_ARG_OUT (add) makes the
+# first argument start aliasing the result, MUTATE_ARGS_OUT (sub) silently replaces the first
+# argument contents with random values, ALIAS_OUT_OUT (aminmax) makes the first output alias the
+# second. Everything else just unwraps, runs and rewraps.
     ALIAS_ARG_OUT = {"aten::add"}
     ALIAS_OUT_OUT = {"aten::aminmax"}
     MUTATE_ARGS_OUT = {"aten::sub"}
@@ -59,6 +78,10 @@ class IncorrectAliasTensor(torch.Tensor):
 
     @staticmethod
     def __new__(cls, elem, *args, **kwargs):
+        # [FUNCTION DOC] Creates the wrapper tensor with the same size, strides, offset, dtype,
+        # layout and device as elem, without allocating its own storage, and stores elem (detached
+        # if the wrapper requires grad) as the elem attribute. Takes an optional requires_grad
+        # keyword. Returns the wrapper.
         # The wrapping tensor (IncorrectAliasTensor) shouldn't hold any
         # memory for the class in question, but it should still
         # advertise the same device as before
@@ -74,14 +97,25 @@ class IncorrectAliasTensor(torch.Tensor):
         return r
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the standard tensor repr but with the contents shown being those
+        # of the wrapped elem tensor.
         return super().__repr__(tensor_contents=f"{self.elem}")
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Dispatch hook: unwraps wrapper arguments, calls the real op, then applies
+        # the deliberate schema violation if the schema name is in one of the class sets (rebinds
+        # the first argument elem to the output, to random data, or duplicates output index one
+        # into index zero). Returns the output rewrapped as this subclass. Mutates the first
+        # argument for add and sub.
         def unwrap(e):
+            # [FUNCTION DOC] HELPER: Returns the wrapped elem tensor for an instance of this
+            # subclass, else the value unchanged.
             return e.elem if isinstance(e, cls) else e
 
         def wrap(e):
+            # [FUNCTION DOC] HELPER: Wraps a plain tensor into this subclass, leaving non-tensors
+            # unchanged.
             return cls(e) if isinstance(e, torch.Tensor) else e
         unwrapped_args = tree_map(unwrap, args)
         out = func(*unwrapped_args, **tree_map(unwrap, kwargs))
@@ -98,13 +132,20 @@ class IncorrectAliasTensor(torch.Tensor):
 
 # Tests various schema checking functionalities.
 class TestSchemaCheck(JitTestCase):
+# [CLASS DOC] Tests of SchemaCheckMode: recorded op order, recorded mutations and aliasing,
+# unchanged numerics while the mode is active, errors for wrong schemas (via the subclass above
+# and the bad_schemas custom ops), and the private schema-info helpers in torch._C.
     def setUp(self):
+        # [FUNCTION DOC] Skips every test when running under torch dynamo (the mode is ignored
+        # there), otherwise runs the base class setup.
         if TEST_WITH_TORCHDYNAMO:
             self.skipTest("SchemaCheckMode is ignored by dynamo")
         super().setUp()
 
     # Tests that SchemaCheckMode records operator order with grad
     def test_schema_check_mode_operator_order(self):
+        # [FUNCTION DOC] With a grad-requiring input, runs relu then sin under the mode and checks
+        # the recorded op list is rand, relu, detach, sin in order.
         with SchemaCheckMode() as schema_check:
             x = torch.rand((3, 3), requires_grad=True)
             x.relu().sin()
@@ -112,6 +153,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode records operator order without grad
     def test_schema_check_mode_operator_order_without_grad(self):
+        # [FUNCTION DOC] Same as the op-order test but without requires_grad, so the recorded list
+        # has no detach entry: rand, relu, sin.
         with SchemaCheckMode() as schema_check:
             x = torch.rand((3, 3), requires_grad=False)
             x.relu().sin()
@@ -119,6 +162,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode records mutations and aliases with none expected
     def test_schema_check_mode_mutated_aliasing_none(self):
+        # [FUNCTION DOC] Runs non-mutating ops under the mode and checks that both the mutated and
+        # the aliasing records are empty.
         # NB: previously requires_grad=True, but this induces a detach for
         # saved variable
         x = torch.rand((3, 3))
@@ -129,6 +174,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode records mutations and aliases with mutation expected
     def test_schema_check_mode_mutated_aliasing_mutation(self):
+        # [FUNCTION DOC] Runs an in-place op under the mode and checks the mutated record names
+        # its input and the aliasing record shows input aliasing output_0.
         actual = torch.rand((3, 3), requires_grad=False)
         with SchemaCheckMode() as schema_check:
             actual.sinh_()
@@ -137,6 +184,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode records mutations and aliases with resize_
     def test_schema_check_mode_mutated_aliasing_resize_(self):
+        # [FUNCTION DOC] Same record check for an in-place resize: the input is reported as
+        # mutated and aliasing output_0.
         actual = torch.rand((3, 3), requires_grad=False)
         with SchemaCheckMode() as schema_check:
             actual.resize_(9)
@@ -145,6 +194,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode records mutations and aliases with aliasing inputs
     def test_schema_check_mode_mutated_aliasing_aliasing_inputs(self):
+        # [FUNCTION DOC] In-place add with the same tensor passed as both operands: both input and
+        # other are reported mutated and aliasing output_0, in that order.
         actual = torch.rand((3, 3))
         y = actual
         with SchemaCheckMode() as schema_check:
@@ -166,6 +217,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode records mutations and alias with as_strided
     def test_schema_check_mode_mutated_aliasing_as_strided(self):
+        # [FUNCTION DOC] In-place as_strided call under the mode: input is recorded as mutated and
+        # as aliasing output_0.
         x = torch.rand((3, 6, 4))
         with SchemaCheckMode() as schema_check:
             x.as_strided_([3, 6, 4], [9, 1, 1])
@@ -184,6 +237,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode records mutations and aliases with multiple outputs
     def test_schema_check_mode_mutated_aliasing_multiple_outputs(self):
+        # [FUNCTION DOC] Calls frexp with two out tensors: mantissa and exponent are recorded as
+        # mutated, aliasing output_0 and output_1 respectively.
         x = torch.arange(9.)
         m_actual = torch.arange(9.)
         e_actual = torch.zeros([9], dtype=torch.int32)
@@ -206,6 +261,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode records mutations and aliases with aliasing outputs
     def test_schema_check_mode_mutated_aliasing_aliasing_outputs(self):
+        # [FUNCTION DOC] Calls aminmax with the same tensor passed for both outputs: min and max
+        # are recorded as mutated, and each is recorded as aliasing both output_0 and output_1.
         x = torch.rand((3, 3))
         actual = torch.zeros(3)
         with SchemaCheckMode() as schema_check:
@@ -229,6 +286,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps torch.Tensor
     def test_schema_check_mode_functionality(self):
+        # [FUNCTION DOC] Checks that results computed under the mode equal the results computed
+        # without it, for a grad-requiring relu then sin chain.
         x = torch.rand((3, 3), requires_grad=True)
         expected = x.relu().sin()
         with SchemaCheckMode():
@@ -237,6 +296,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps torch.Tensor when an argument's default is overridden
     def test_schema_check_mode_functionality_default_replaced(self):
+        # [FUNCTION DOC] Same equality check when a defaulted argument (alpha) is explicitly
+        # overridden.
         x = torch.rand((3, 3), requires_grad=True)
         expected = x.add(x, alpha=2)
         with SchemaCheckMode():
@@ -245,6 +306,7 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps torch.Tensor when there is a Tensor[] argument
     def test_schema_check_mode_functionality_list_input(self):
+        # [FUNCTION DOC] Same equality check for an op taking a list of tensors (multi-dot).
         a = torch.rand((3, 3))
         b = torch.rand((3, 3))
         c = torch.rand((3, 3))
@@ -255,6 +317,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps torch.Tensor with an op that has the (a -> *) notation
     def test_schema_check_mode_functionality_wildcard_after(self):
+        # [FUNCTION DOC] Same equality check for chunk, whose schema returns a list of aliasing
+        # tensors.
         x = torch.rand((3, 3))
         expected = x.chunk(6)
         with SchemaCheckMode():
@@ -264,6 +328,8 @@ class TestSchemaCheck(JitTestCase):
     # Tests that SchemaCheckMode wraps torch.Tensor when there is a kwarg tensor input
     @unittest.skipIf(not torch._C.has_spectral, "ATen not built with FFT.")
     def test_schema_check_mode_functionality_kwarg_tensor(self):
+        # [FUNCTION DOC] Same equality check for stft, where a tensor is passed as a keyword
+        # argument. Skipped if ATen was built without FFT support.
         x = torch.rand((3, 5))
         w = torch.rand(4)
         expected = torch.stft(x, 4, win_length=4, window=w, return_complex=True)
@@ -273,6 +339,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps torch.Tensor with a mutable op
     def test_schema_check_mode_functionality_mutable_inputs(self):
+        # [FUNCTION DOC] Same equality check for an in-place op: a cloned tensor mutated under the
+        # mode must equal the one mutated without it.
         expected = torch.rand((3, 3), requires_grad=False)
         actual = torch.clone(expected)
         expected.sinh_()
@@ -282,6 +350,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps Torch.tensor when inputs alias
     def test_schema_check_mode_functionality_aliasing_inputs(self):
+        # [FUNCTION DOC] Same equality check when an in-place add receives the same tensor as both
+        # operands.
         expected = torch.rand((3, 3))
         x = expected
         actual = torch.clone(expected)
@@ -293,6 +363,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps Torch.tensor with multiple tensor outputs
     def test_schema_check_mode_functionality_with_multiple_outputs(self):
+        # [FUNCTION DOC] Same equality check for frexp writing into two out tensors; both outputs
+        # compared.
         x = torch.arange(9.)
         m_expected, e_expected = torch.frexp(x)
         m_actual = torch.arange(9.)
@@ -304,6 +376,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps Torch.tensor with aliasing outputs due to aliasing inputs
     def test_schema_check_mode_functionality_with_multiple_outputs_aliasing(self):
+        # [FUNCTION DOC] Checks aminmax with the same tensor for both outputs gives the same
+        # result under the mode as the reference column maximum.
         x = torch.rand((3, 3))
         actual = torch.zeros(3)
         with SchemaCheckMode():
@@ -312,6 +386,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps Torch.tensor in ops with real Device input
     def test_schema_check_mode_functionality_device_input(self):
+        # [FUNCTION DOC] Creates a double tensor with an explicit device argument and adds it to
+        # itself under the mode, checking the result matches an addition outside the mode.
         with SchemaCheckMode():
             x = torch.rand((3, 3), device="cpu", dtype=torch.double)
             y = x + x
@@ -319,6 +395,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps Torch.tensor in special training op edge case
     def test_schema_check_mode_functionality_training_op(self):
+        # [FUNCTION DOC] Checks a BatchNorm1d layer with running stats in training mode gives the
+        # same output under the mode as outside it.
         x = torch.rand((3, 3), requires_grad=True)
         batch = torch.nn.BatchNorm1d(3, track_running_stats=True)
         expected = batch(x)
@@ -328,6 +406,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps Torch.tensor with nested training op edge case
     def test_schema_check_mode_functionality_nested_training_op(self):
+        # [FUNCTION DOC] Applies several in-place ops and then batch norm under the mode and
+        # compares with the same sequence run outside the mode.
         actual = torch.rand((3, 3))
         batch = torch.nn.BatchNorm1d(3, track_running_stats=True)
         expected = torch.clone(actual)
@@ -345,6 +425,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaCheckMode wraps Torch.tensor with empty list input
     def test_schema_check_mode_empty_list_input(self):
+        # [FUNCTION DOC] Checks an op called with an empty list input gives the same result under
+        # the mode.
         expected = torch.atleast_1d([])
         with SchemaCheckMode():
             actual = torch.atleast_1d([])
@@ -352,6 +434,9 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that an exception is raised for a mismatching mutation
     def test_mutation_check_fail(self):
+        # [FUNCTION DOC] Expects a RuntimeError saying the input is not defined as mutable but was
+        # mutated, raised when the sub operation on the schema-violating wrapper tensors runs
+        # under the mode.
         with self.assertRaisesRegex(RuntimeError, "Argument input is not defined as mutable but was mutated"):
             x = torch.rand((3, 3))
             y = torch.rand((3, 3))
@@ -360,6 +445,8 @@ class TestSchemaCheck(JitTestCase):
 
     # # Tests that an exception is raised for a mismatching mutation over multiple ops
     def test_mutation_check_fail_multiple_operators(self):
+        # [FUNCTION DOC] Same mutation error, but the offending sub comes after other ops (sin,
+        # cos), so detection must work over a chain of operators.
         with self.assertRaisesRegex(RuntimeError, "Argument input is not defined as mutable but was mutated"):
             x = torch.rand((3, 3))
             y = torch.rand((3, 3))
@@ -368,6 +455,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that an exception is raised for a mismatching alias
     def test_alias_check_fail_simple(self):
+        # [FUNCTION DOC] Expects a RuntimeError that the input is not defined to alias output but
+        # was aliasing, from an add on the schema-violating wrapper tensors.
         with self.assertRaisesRegex(RuntimeError, "Argument input is not defined to alias output but was aliasing"):
             x = torch.rand((3, 3), requires_grad=True)
             y = torch.rand((3, 3))
@@ -376,6 +465,7 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that an exception is raised for a mismatching alias over multiple ops
     def test_alias_check_fail_multiple_operators(self):
+        # [FUNCTION DOC] Same alias error but the offending add is at the end of a chain of ops.
         with self.assertRaisesRegex(RuntimeError, "Argument input is not defined to alias output but was aliasing"):
             x = torch.rand((3, 3), requires_grad=True)
             y = torch.zeros((3, 3), requires_grad=True)
@@ -384,6 +474,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that an exception is raised for a centered mismatching alias over multiple ops
     def test_alias_check_fail_multiple_operators_centered(self):
+        # [FUNCTION DOC] Same alias error but the offending add is in the middle of a chain of
+        # ops.
         with self.assertRaisesRegex(RuntimeError, "Argument input is not defined to alias output but was aliasing"):
             x = torch.rand((3, 3), requires_grad=True)
             y = torch.zeros((3, 3), requires_grad=True)
@@ -392,6 +484,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that an exception is raised for a centered mismatching alias over multiple ops
     def test_alias_check_fail_outputs_unexpectedly_aliasing(self):
+        # [FUNCTION DOC] Expects a RuntimeError that outputs 0 and 1 alias unexpectedly, from
+        # aminmax on the wrapper tensor that makes both outputs the same.
         with self.assertRaisesRegex(RuntimeError, "Outputs 0 and 1 alias unexpectedly"):
             x = torch.rand((3, 3))
             with SchemaCheckMode() as s:
@@ -401,7 +495,11 @@ class TestSchemaCheck(JitTestCase):
     # It's probably worth re-writing the entire file to use it,
     # but instead I just added extra tests.
     def test_alias_check_fail_custom_ops_secretly_aliasing(self):
+        # [FUNCTION DOC] Calls the bad_schemas op that secretly returns a view of its input under
+        # the mode and expects a RuntimeError about an argument not defined to alias output but
+        # aliasing.
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls the bad_schemas secretly_aliasing op on its argument.
             return torch.ops.bad_schemas.secretly_aliasing(x)
 
         x = torch.rand((3, 3))
@@ -410,7 +508,10 @@ class TestSchemaCheck(JitTestCase):
                 out = f(x)
 
     def test_alias_check_fail_custom_ops_secretly_mutating(self):
+        # [FUNCTION DOC] Calls the bad_schemas op that secretly mutates its input under the mode
+        # and expects a RuntimeError about an argument not defined as mutable but mutated.
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls the bad_schemas secretly_mutating op on its argument.
             return torch.ops.bad_schemas.secretly_mutating(x)
 
         x = torch.rand((3, 3))
@@ -419,7 +520,10 @@ class TestSchemaCheck(JitTestCase):
                 out = f(x)
 
     def test_alias_check_fail_custom_ops_output_is_input(self):
+        # [FUNCTION DOC] Calls the bad_schemas op returning its input directly under the mode and
+        # expects a RuntimeError that custom ops are not allowed to directly return inputs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls the bad_schemas output_is_input op on its argument.
             return torch.ops.bad_schemas.output_is_input(x)
 
         x = torch.rand((3, 3))
@@ -429,6 +533,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that is_alias_of returns as expected
     def test_is_alias_of_basic(self):
+        # [FUNCTION DOC] Checks the private alias test: a tensor aliases itself, but not a result
+        # of a non-aliasing add.
         x = torch.rand((3, 3), requires_grad=True)
         y = torch.rand((3, 3), requires_grad=True)
         y = x.add(x, alpha=2)
@@ -437,6 +543,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that is_alias_of returns as expected with empty containers
     def test_is_alias_of_empty_container(self):
+        # [FUNCTION DOC] Checks the alias test returns false when given an empty list, both
+        # against itself and against a tensor.
         x = []
         y = torch.rand((3, 3), requires_grad=True)
         self.assertFalse(torch._C._is_alias_of(x, x))
@@ -444,6 +552,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that overlaps returns as expected
     def test_overlaps_basic(self):
+        # [FUNCTION DOC] Checks the private overlap test: true for a tensor with itself, false for
+        # two distinct tensors, and true between a list holding both and either member.
         x = torch.rand((3, 3), requires_grad=True)
         y = torch.rand((3, 3), requires_grad=True)
         z = [x, y]
@@ -454,6 +564,8 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that overlaps returns correctly with empty containers
     def test_overlaps_empty_container(self):
+        # [FUNCTION DOC] Checks the overlap test with an empty list: false against a non-empty
+        # list, while a non-empty list overlaps itself.
         x = []
         y = [torch.rand((3, 3), requires_grad=True)]
         # Empty containers return false
@@ -462,11 +574,24 @@ class TestSchemaCheck(JitTestCase):
 
     # Tests that SchemaInfo Bindings work as expected
     def test_schema_info_bind_basic(self):
+        # [FUNCTION DOC] Verifies the SchemaInfo binding: before argument values are added two
+        # inputs of an add may not alias, and after adding them (one at a time or all at once)
+        # they may alias. The check runs inside a custom dispatch mode on an add of a tensor with
+        # itself.
         class SchemaInfoBindTestMode(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Dispatch mode used by the test; holds a reference to the running
+            # test case and asserts on SchemaInfo may_alias answers for every dispatched op before
+            # executing it.
             def __init__(self, test_self):
+                # [FUNCTION DOC] HELPER: Stores the owning test case for later assertions.
                 self.test_self = test_self
 
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] Normalizes the call to keyword arguments, builds two SchemaInfo
+                # objects, checks inputs 0 and 1 do not may-alias, adds argument values
+                # (individually to one, together to the other), checks they now may-alias, then
+                # runs and returns the real op. Assumes every dispatched op has at least two
+                # inputs.
                 named_arg_list = normalize_function(
                     func,
                     args,
@@ -497,9 +622,15 @@ class TestSchemaCheck(JitTestCase):
             x.add(x)
 
 class TestSchemaCheckModeOpInfo(JitTestCase):
+# [CLASS DOC] Runs SchemaCheckMode over every operator in the OpInfo database, for the cpu and
+# cuda device types.
     @ops(op_db, dtypes=OpDTypes.supported)
     @slowTestIf(IS_WINDOWS)
     def test_schema_correctness(self, device, dtype, op):
+        # [FUNCTION DOC] For one op and dtype, runs the op under SchemaCheckMode on every sample
+        # input (no grad). Skips the complex32 and bcomplex32 dtypes, since torch.equal does not
+        # support them. Fails if SchemaCheckMode raises a schema violation. Marked slow on
+        # Windows.
         # Currently torch.equal isn't supported with torch.complex32 or torch.bcomplex32.
         # There's also errors with complex64 and complex128
         if (dtype in (torch.complex32, torch.bcomplex32)):

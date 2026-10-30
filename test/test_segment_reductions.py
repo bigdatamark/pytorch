@@ -1,4 +1,10 @@
 # Owner(s): ["module: scatter & gather ops"]
+# [MODULE DOC] Tests for the private segment reduction operator torch._segment_reduce, which
+# reduces contiguous segments of a data tensor along an axis (max, mean, min, sum, prod) given
+# segment lengths or offsets. Defines the list of reduction names, a helper giving the empty
+# segment default for each reduction, and a device-generic test case covering 1-D, empty, multi-D
+# data, pytorch_scatter reference cases, gradients, and the unsafe flag. Instantiated per device
+# type at import time.
 
 from itertools import product
 from functools import partial
@@ -22,6 +28,10 @@ reductions = ["max", "mean", "min", "sum", "prod"]
 
 
 def get_default_value(initial_value, reduction):
+    # [FUNCTION DOC] HELPER: Returns the value expected for an empty segment: initial_value if it
+    # is not None, else the identity of the reduction (negative infinity for max, nan for mean,
+    # positive infinity for min, zero for sum, one for prod). Returns None for an unknown
+    # reduction.
     if initial_value is not None:
         return initial_value
     if reduction == "max":
@@ -37,6 +47,9 @@ def get_default_value(initial_value, reduction):
 
 
 class TestSegmentReductions(TestCase):
+    # [CLASS DOC] Device-generic tests of torch._segment_reduce forward values, gradients and
+    # error checking. The class attribute marks the tests as needing an accelerator-class
+    # hardware.
     hw_classification = HardwareClassification.ACCELERATOR
 
     def _test_common(
@@ -54,6 +67,16 @@ class TestSegmentReductions(TestCase):
         check_backward,
         lengths_dtype=torch.int,
     ):
+        # [FUNCTION DOC] HELPER: Shared checker. Builds lengths and the matching offsets
+        # (cumulative sum with a leading zero) from lengths_arr, builds a grad-requiring data
+        # tensor and expected result and gradient tensors of dtype dtype, and runs
+        # torch._segment_reduce with lengths and then with offsets, comparing with loose tolerance
+        # and equal nan. When check_backward is true, sums the result, backpropagates and compares
+        # the data gradient with expected_grad, then for float64 and other dtypes except half,
+        # bfloat16 and float runs gradcheck on nan-free data.
+        # KNOWN ISSUE: the return that skips backward when check_backward is false sits inside the
+        # loop over the two modes, so in that case only the lengths mode is ever checked and the
+        # offsets mode is skipped.
         lengths = torch.tensor(lengths_arr, device=device, dtype=lengths_dtype)
         # generate offsets from lengths
         zeros_shape = list(lengths.shape)
@@ -126,6 +149,12 @@ class TestSegmentReductions(TestCase):
         )
     )
     def test_simple_1d(self, device, dtypes):
+        # [FUNCTION DOC] Tests a one-dimensional data with a nan value and four segments
+        # (including an empty one) for each reduction, initial value zero or none, both axes
+        # (first and last) and both unsafe settings, with value dtypes half, bfloat16, float,
+        # double and lengths dtypes int and int64. Table of expected values and gradients per
+        # reduction; backward is checked only when an initial value is given. Delegates to the
+        # shared checker.
         val_dtype, length_type = dtypes
         lengths = [1, 2, 3, 0]
         data = [1, float("nan"), 3, 4, 5, 5]
@@ -183,6 +212,9 @@ class TestSegmentReductions(TestCase):
         )
     )
     def test_simple_zero_length(self, device, dtypes):
+        # [FUNCTION DOC] Tests two empty segments over empty data for each reduction, with and
+        # without an initial value, both unsafe settings; expects every segment to equal the
+        # reduction default and an empty gradient.
         val_dtype, length_type = dtypes
         lengths = [0, 0]
         data = torch.ones(0)
@@ -240,6 +272,10 @@ class TestSegmentReductions(TestCase):
         )
     )
     def test_multi_d_simple(self, device, dtypes):
+        # [FUNCTION DOC] Tests a two-dimensional data (segments along axis zero, a nan in some
+        # columns) for every reduction with and without an initial value, and both unsafe
+        # settings; expected results and gradients are listed per reduction. The lengths dtype is
+        # ignored, so the shared checker uses its default integer lengths.
         val_dtype, _ = dtypes
         axis = 0
         lengths = [1, 2, 3, 0]
@@ -369,6 +405,15 @@ class TestSegmentReductions(TestCase):
     )
     @parametrize("reduce", ['sum', 'prod', 'min', 'max', 'mean'])
     def test_pytorch_scatter_test_cases(self, device, dtypes, reduce):
+        # [FUNCTION DOC] Parametrized over the reduction. Runs a set of reference cases taken from
+        # pytorch_scatter (1-D to 3-D data with index-pointer arrays of segment boundaries)
+        # through torch._segment_reduce using both lengths (derived by differencing the pointers)
+        # and offsets and compares with expected results; empty segments are filled with the
+        # reduction identity. For float64 also tries gradcheck with a nested function with chosen
+        # initial values.
+        # KNOWN ISSUE: in the nested function the positional arguments are built as a set holding
+        # the data and the reduction name, whose order is undefined, and gradcheck receives the
+        # data as a bare tensor rather than a tuple, so the gradcheck part is unreliable.
         val_dtype, length_dtype = dtypes
         # zero-length segments are filled with reduction inits contrary to pytorch_scatter.
         tests = [
@@ -465,6 +510,11 @@ class TestSegmentReductions(TestCase):
 
             if val_dtype == torch.float64:
                 def fn(x, mode='lengths'):
+                    # [FUNCTION DOC] HELPER: Function under gradcheck. Picks an initial value
+                    # (one, or a large positive or negative number for min and max so empty
+                    # segments do not produce nan or infinity in the numerical Jacobian) and calls
+                    # torch._segment_reduce on x with the lengths or offsets captured from the
+                    # enclosing test, selected by mode. Returns the reduced tensor.
                     initial = 1
                     # supply initial values to prevent gradcheck from failing for 0 length segments
                     # where nan/inf are reduction identities that produce nans when calculating the numerical jacobian
@@ -490,6 +540,10 @@ class TestSegmentReductions(TestCase):
         )
     )
     def test_multi_d(self, device, dtypes):
+        # [FUNCTION DOC] Tests three-dimensional data (5 by 2 by 5) with segments along axis zero
+        # including empty segments at both ends, for every reduction. Expected results are
+        # computed with numpy over the data slices and the reduction initial value fills empty
+        # segments; both unsafe settings. Gradients are not checked.
         val_dtype, _ = dtypes
         axis = 0
         lengths = [0, 2, 3, 0]
@@ -555,6 +609,9 @@ class TestSegmentReductions(TestCase):
 
     @dtypes(torch.int, torch.int64)
     def test_unsafe_flag(self, device, dtype):
+        # [FUNCTION DOC] Checks that with unsafe false and lengths that do not sum to the data
+        # size, torch._segment_reduce raises a RuntimeError mentioning the expected row length
+        # sums, for one-dimensional lengths and for a two-dimensional case along the last axis.
         length_type = dtype
         lengths = torch.tensor([0, 2, 3, 0], device=device, dtype=length_type)
         data = torch.arange(6, dtype=torch.float, device=device)
