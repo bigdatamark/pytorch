@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Tests for torch.compiler.precompile and its load counterpart, which capture a
+# function and its module arguments with make_fx and return a pair of self-contained python
+# source text and a cache blob of the compiled artifact. Covers the inductor and eager backends:
+# constant tensor rejection, cache envelope contents, structural and input validation errors,
+# spec serialization degradation, tied weights, dynamic shapes and related behaviors. At import
+# time it creates a global tensor and registers a custom pytree node type used by some tests.
 import copy
 import io
 import os
@@ -35,7 +41,11 @@ _GLOBAL_TENSOR = torch.randn(3)
 # unregistered-namedtuple NotImplementedError path). Registered once at module load and
 # used by test_unserializable_context_in_spec_still_compiles.
 class _UnserializableCtxInput:
+    # [CLASS DOC] HELPER: Test input type with two fields registered as a pytree node whose
+    # context is a set, which cannot be dumped as JSON, so serializing its tree spec raises
+    # TypeError.
     def __init__(self, a, b):
+        # [FUNCTION DOC] HELPER: Stores the two constructor arguments in the fields a and b.
         self.a = a
         self.b = b
 
@@ -49,6 +59,9 @@ _pytree.register_pytree_node(
 
 
 def _strip_artifact(cache: bytes) -> bytes:
+    # [FUNCTION DOC] HELPER: Takes the serialized cache bytes, loads the envelope mapping (safe
+    # unpickler), sets its artifact entry to None, re-saves it and returns the new bytes.
+    # Loading that cache forces the inlined path that compiles from the python source.
     """Return the cache envelope with its compiled artifact removed, forcing load()
     onto the inlined (no-cache) path that JIT-compiles from python_code. Many tests
     reload the same artifact both cache-primed and stripped to check they agree."""
@@ -60,6 +73,9 @@ def _strip_artifact(cache: bytes) -> bytes:
 
 
 def _default_and_inlined_loaders(code: str, cache: bytes, backend: str):
+    # [FUNCTION DOC] HELPER: Generator yielding (label, loaded function) pairs. Always yields
+    # the default load of the cache, labeled default. Only for the inductor backend does it also
+    # yield the load of the artifact-stripped cache, labeled inlined.
     """Yield (label, loaded_fn) for the load paths a backend exposes: the default
     (cache-primed) path always, plus -- on inductor only -- the inlined path that
     strips the artifact to force JIT from python_code. The eager backend has a single
@@ -75,12 +91,19 @@ def _default_and_inlined_loaders(code: str, cache: bytes, backend: str):
 @skipIfTorchDynamo("precompile's make_fx capture is incompatible with dynamo wrapping")
 @instantiate_parametrized_tests
 class TestPrecompile(TestCase):
+    # [CLASS DOC] Tests of precompile and load. Skipped entirely under the dynamo wrapped test
+    # mode since the make_fx capture cannot trace a dynamo-optimized function.
     def test_decompositions_kwarg(self):
+        # [FUNCTION DOC] Passes a custom decomposition table (relu replaced by a masked multiply
+        # that records being called) to precompile, checks it was called during capture and that
+        # the loaded function matches the eager module output.
         # The decompositions table is threaded into make_fx during capture; a
         # custom decomposition is invoked and the result still matches eager.
         called = []
 
         def my_relu_decomp(x):
+            # [FUNCTION DOC] HELPER: Decomposition for relu; appends to the closed-over list so
+            # the test can see it ran, and returns the input multiplied by the positive mask.
             called.append(True)
             return (x > 0) * x
 
@@ -96,16 +119,22 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, x), m(x))
 
     def test_constant_tensor_is_rejected(self):
+        # [FUNCTION DOC] Checks that precompile raises PrecompileError mentioning hard-coded
+        # when the function closes over a tensor created outside it.
         captured = torch.randn(3)
         with self.assertRaisesRegex(PrecompileError, "hard-coded"):
             torch.compiler.precompile(lambda x: x + captured, torch.randn(3))
 
     def test_global_tensor_rejected_unlike_make_fx(self):
+        # [FUNCTION DOC] Shows that plain make_fx bakes a referenced global tensor into the
+        # graph as an attribute constant, then checks precompile on the same function raises
+        # PrecompileError mentioning hard-coded.
         # Vanilla make_fx silently bakes a referenced global tensor into the
         # GraphModule as a get_attr constant; precompile must instead error.
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds the module-level global tensor to its input.
             return x + _GLOBAL_TENSOR
 
         gm = make_fx(f)(torch.randn(3))
@@ -121,15 +150,23 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(f, torch.randn(3))
 
     def test_unregistered_module_tensor_attr_is_rejected(self):
+        # [FUNCTION DOC] Checks that a module with a plain tensor attribute (not a parameter or
+        # buffer) used in forward makes precompile raise PrecompileError mentioning hard-coded.
         # A plain tensor attribute (not a registered parameter/buffer) is not
         # lifted, so referencing it would bake it in -- this must error.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a parameter matrix and a plain tensor attribute
+            # scale that is not registered; forward multiplies the matrix product by the scale.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the parameter and the unregistered scale
+                # attribute.
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.randn(4, 4))
                 self.scale = torch.randn(4)  # plain attr, NOT a buffer/parameter
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns matrix product of input and weight times the
+                # scale attribute.
                 return (x @ self.weight) * self.scale
 
         m = M().eval()
@@ -137,13 +174,21 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(lambda model, x: model(x), m, torch.randn(2, 4))
 
     def test_export_and_reload_roundtrip(self):
+        # [FUNCTION DOC] Round trip: precompile a small module, check the python source mentions
+        # the inductor output code, a forward definition and the parameter name list, then load
+        # it and check the result equals the eager module output.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer and a registered buffer; forward
+            # applies relu to the linear output and adds the buffer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear layer and registers a random buffer
+                # named b2.
                 super().__init__()
                 self.lin = torch.nn.Linear(4, 3)
                 self.register_buffer("b2", torch.randn(3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns relu of the linear output plus the buffer.
                 return torch.relu(self.lin(x)) + self.b2
 
         m = M().eval()
@@ -158,6 +203,9 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, x), m(x))
 
     def test_self_contained_exec_needs_no_cache(self):
+        # [FUNCTION DOC] Uses the default backend and checks that the returned python source can
+        # be executed on its own with no cache: after exec, its forward function called with the
+        # module and input matches eager.
         # python_code runs standalone with NO cache: exec it and call forward().
         # The default eager backend has no kernels; the captured graph is
         # interpreted directly from the inlined source and the cache is always
@@ -175,6 +223,10 @@ class TestPrecompile(TestCase):
     )
     @torch._inductor.config.patch({"compile_threads": 1})
     def test_cache_reload_without_eager_static_launcher_rehydration(self):
+        # [FUNCTION DOC] Needs CUDA, patched to one compile thread. Skips if inductor caches are
+        # disabled or the FX graph cache or static CUDA launcher is off. Precompiles a CUDA
+        # module, then loads within a fresh cache and checks the result and that the triton
+        # bundler static autotuner load counter stays at zero.
         # A cold load should use JIT instead of eagerly rehydrating the static launcher.
         import torch._inductor.config as ind_config
 
@@ -206,15 +258,22 @@ class TestPrecompile(TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA for Triton autotuning")
     def test_cache_bundles_autotune_artifacts(self):
+        # [FUNCTION DOC] Needs CUDA. Precompiles a two-linear softmax module, loads it in a
+        # fresh inductor cache and checks the result matches eager.
         from torch._inductor.utils import fresh_cache
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two 512 wide linear layers; forward is softmax of
+            # the second layer applied to relu of the first.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two linear layers.
                 super().__init__()
                 self.l1 = torch.nn.Linear(512, 512)
                 self.l2 = torch.nn.Linear(512, 512)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns softmax over the last dim of the second layer
+                # applied to relu of the first layer output.
                 return torch.softmax(self.l2(torch.relu(self.l1(x))), dim=-1)
 
         m = M().cuda().eval()
@@ -225,6 +284,11 @@ class TestPrecompile(TestCase):
             self.assertEqual(f_c(m, x), m(x))
 
     def test_dtensor_subclass(self):
+        # [FUNCTION DOC] Skips without gloo. Starts a one-rank gloo process group on a free port
+        # (env variables restored afterwards, group destroyed), makes a linear module with
+        # replicated distributed tensor parameters and checks precompile source handles the
+        # subclass via the tensor unflatten protocol. Checks the loaded function and the exec'd
+        # standalone forward both match the eager local result.
         import torch.distributed as dist
 
         if not dist.is_available() or not dist.is_gloo_available():
@@ -278,6 +342,10 @@ class TestPrecompile(TestCase):
                     os.environ[k] = v
 
     def test_cache_holds_only_artifact(self):
+        # [FUNCTION DOC] Checks the cache envelope has exactly the keys artifact, format,
+        # version, backend and code_hash with the expected format, version and inductor backend
+        # values, an artifact of bytes, that metadata (backend name, module positions) is parsed
+        # from the python source, and that load works.
         # The cache is purely an acceleration: the only COMPILED blob it carries is the
         # ``artifact`` (no weights, no calling-convention metadata -- that lives in
         # python_code, the single source of truth, and load() parses it back from
@@ -311,6 +379,9 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, x), m(x))
 
     def test_inlined_fallback_when_artifact_absent(self):
+        # [FUNCTION DOC] Strips the artifact from the cache and checks load falls back to the
+        # inlined python and still matches eager; first checks the original artifact was not
+        # None.
         # When the cache holds no serialized artifact, load() falls back to
         # executing the inlined python (recompiling kernels). Force that branch by
         # stripping the artifact and check it still matches eager; this also
@@ -326,6 +397,9 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, x), m(x))
 
     def test_cache_envelope_is_weights_only_safe(self):
+        # [FUNCTION DOC] Checks the cache loads with the weights-only unpickler, has exactly the
+        # expected keys, correct format, version and backend, and the code hash is a plain
+        # string.
         # The cache is a plain {"artifact": bytes, "format"/"version"/"backend": ...}
         # envelope of only str/int/bytes: it loads with the safe unpickler
         # (weights_only=True). The executable part is the inner artifact bytes, fed to
@@ -349,6 +423,8 @@ class TestPrecompile(TestCase):
         self.assertIsInstance(blob["code_hash"], str)
 
     def test_wrong_param_count_model_rejected(self):
+        # [FUNCTION DOC] Loads a function traced on a linear module and calls it with a deeper
+        # sequential model; checks PrecompileError saying structurally identical is raised.
         # Invariant 2: a runtime model whose param/buffer count differs from the
         # traced model is rejected with a clear error rather than an opaque inner
         # failure. This exercises the default eager load path, which execs
@@ -365,6 +441,9 @@ class TestPrecompile(TestCase):
             f_c(bigger, x)
 
     def test_wrong_param_count_rejected_inlined(self):
+        # [FUNCTION DOC] Same check as the previous test but on the artifact-stripped (inlined)
+        # load path: a structurally different model raises PrecompileError mentioning
+        # structurally identical.
         # The same guard fires on the inlined (no-cache) path with the same exception
         # type as the cached path (PrecompileError): strip the artifact so load()
         # execs python_code, then call with a structurally different model.
@@ -380,6 +459,8 @@ class TestPrecompile(TestCase):
             f_c(bigger, x)
 
     def test_runtime_input_structure_mismatch_rejected(self):
+        # [FUNCTION DOC] Calls a loaded function with a list where a single tensor was traced
+        # and checks PrecompileError mentioning different structure is raised.
         # Invariant 3: a runtime input whose pytree structure differs from the traced
         # example (here a list where a bare tensor was traced) is rejected via the
         # IN_SPEC check, rather than silently flattening to the wrong leaves.
@@ -391,6 +472,9 @@ class TestPrecompile(TestCase):
             f_c(m, [x, x])
 
     def test_unserializable_in_spec_still_compiles(self):
+        # [FUNCTION DOC] Uses an unregistered namedtuple as input: checks the generated source
+        # has the input spec set to None and the loaded function still computes the same result
+        # as eager.
         # A runtime input whose pytree TreeSpec is not JSON-serializable (an unregistered
         # collections.namedtuple) must still compile/run on the default eager backend:
         # IN_SPEC degrades to None and the structure check is skipped rather than
@@ -408,6 +492,8 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, inp), m(inp.x + inp.y))
 
     def test_unserializable_context_in_spec_still_compiles(self):
+        # [FUNCTION DOC] Same as above for the custom pytree node whose context cannot be dumped
+        # as JSON: input spec degrades to None and the result still matches eager.
         # A registered pytree node whose context is not JSON-dumpable makes
         # treespec_dumps raise TypeError (not NotImplementedError); IN_SPEC must still
         # degrade to None rather than crashing precompile.
@@ -421,6 +507,9 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, inp), m(inp.a + inp.b))
 
     def test_unserializable_out_spec_hard_fails(self):
+        # [FUNCTION DOC] A function returning an unregistered namedtuple makes precompile raise
+        # PrecompileError saying it cannot serialize the output structure (the output spec
+        # cannot be dropped).
         # OUT_SPEC is load-bearing (the driver rebuilds fn's output via tree_unflatten),
         # so unlike IN_SPEC it CANNOT degrade to None. An fn that RETURNS an unregistered
         # collections.namedtuple has a non-JSON-serializable output TreeSpec and must
@@ -434,6 +523,9 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(lambda x: Out(x + 1, x + 2), torch.randn(4))
 
     def test_input_leaf_count_mismatch_rejected_when_spec_unserializable(self):
+        # [FUNCTION DOC] For both inductor and eager backends with an unserializable input spec,
+        # calling the loaded function with an input flattening to a different leaf count raises
+        # PrecompileError mentioning flattened to.
         # When IN_SPEC degrades to None the structural in_spec check is skipped; a runtime
         # input flattening to a DIFFERENT leaf count must still raise a clean
         # PrecompileError (not a raw zip/unpack error) on the live and eager-inlined paths.
@@ -449,6 +541,9 @@ class TestPrecompile(TestCase):
                 f(m, torch.randn(5, 4))  # one leaf vs the traced two
 
     def test_user_input_error_precedes_structural_error(self):
+        # [FUNCTION DOC] Checks that for the cached, inlined and eager loaded functions, calling
+        # with a different model and double dtype input reports the dtype error, i.e. user input
+        # checks run before the structural model check.
         # All three load paths run the user-input checks BEFORE the structural model-name
         # check, so a call violating BOTH (wrong dtype and a different model) reports the
         # user-input (dtype) error, keeping the first-reported error consistent.
@@ -456,12 +551,16 @@ class TestPrecompile(TestCase):
         x = torch.randn(5, 4)
 
         class B(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two linear layers (named l0, l1) but a different
+            # parameter naming from the sequential model used for tracing.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two linear layers.
                 super().__init__()
                 self.l0 = torch.nn.Linear(4, 4)
                 self.l1 = torch.nn.Linear(4, 3)
 
             def forward(self, t):
+                # [FUNCTION DOC] HELPER: Returns second layer applied to the first layer output.
                 return self.l1(self.l0(t))
 
         code, cache = torch.compiler.precompile(lambda mm, t: mm(t), m, x)
@@ -478,6 +577,10 @@ class TestPrecompile(TestCase):
                 )  # wrong model AND wrong dtype -> dtype reported first
 
     def test_unserializable_out_spec_rejected(self):
+        # [FUNCTION DOC] For inductor and eager backends checks precompile raises
+        # PrecompileError mentioning output structure for an unregistered namedtuple output;
+        # then registers another namedtuple (deregistered on cleanup) and checks both backends
+        # round trip with equal fields.
         # OUT_SPEC is load-bearing (the driver rebuilds fn's output via tree_unflatten),
         # so unlike IN_SPEC it cannot degrade to None: a fn returning an unregistered
         # namedtuple must fail with a clear PrecompileError, not a raw pytree error, on
@@ -510,6 +613,9 @@ class TestPrecompile(TestCase):
             self.assertEqual((out.p, out.q), ref)
 
     def test_cached_and_inlined_paths_agree(self):
+        # [FUNCTION DOC] Traces a backward step over three modules with two sharing a tied
+        # weight, loads it once with the cache and once with the artifact stripped, runs each on
+        # deep copies and checks the resulting gradients match.
         # Both load paths exec the SAME inlined driver in python_code; the only difference
         # is whether the cache primed the kernels first (warm) or not (cold JIT). They must
         # produce identical results -- cross-check via identical scattered grads from a
@@ -526,11 +632,16 @@ class TestPrecompile(TestCase):
         target = torch.randn(2, 3)
 
         def step(ma, mb, mc, x, target):
+            # [FUNCTION DOC] HELPER: Training step: forward through three modules with relu in
+            # between, mean squared error loss against the target, then backward. Returns
+            # nothing.
             loss_fn(mc(mb(torch.relu(ma(x)))), target).backward()
 
         code, cache = torch.compiler.precompile(step, a, b, c, x, target)
 
         def grads(ms):
+            # [FUNCTION DOC] HELPER: Returns the list of gradients of all parameters of the
+            # modules given.
             return [p.grad for m in ms for p in m.parameters()]
 
         # deepcopy the three together so the a/b weight tie is preserved.
@@ -548,6 +659,9 @@ class TestPrecompile(TestCase):
             self.assertEqual(cg, ig)
 
     def test_eager_param_ordering_agrees_with_inductor(self):
+        # [FUNCTION DOC] Same tied-weight multi-module backward step is run through the inductor
+        # cached path and the eager backend path on deep copies; checks the parameter gradients
+        # agree and have the same count.
         # Both backends now emit the same _extract_param_buffers (from
         # torch._precompile_driver), which must stay in sync with
         # torch._precompile._intern_param_buffers. The test above cross-checks only the
@@ -564,9 +678,14 @@ class TestPrecompile(TestCase):
         target = torch.randn(2, 3)
 
         def step(ma, mb, mc, x, target):
+            # [FUNCTION DOC] HELPER: Training step: forward through three modules with relu in
+            # between, mean squared error loss against the target, then backward. Returns
+            # nothing.
             loss_fn(mc(mb(torch.relu(ma(x)))), target).backward()
 
         def grads(ms):
+            # [FUNCTION DOC] HELPER: Returns the list of gradients of all parameters of the
+            # modules given.
             return [p.grad for m in ms for p in m.parameters()]
 
         # deepcopy the three together so the a/b weight tie is preserved.
@@ -591,6 +710,8 @@ class TestPrecompile(TestCase):
             self.assertEqual(ig, eg)
 
     def test_non_module_at_module_position_rejected(self):
+        # [FUNCTION DOC] Calling a loaded function with a tensor in the module slot raises
+        # PrecompileError mentioning the nn.Module requirement.
         # Passing a non-nn.Module where the traced fn took a module yields a clear
         # PrecompileError citing invariant 2, not a bare AttributeError.
         m = torch.nn.Linear(4, 3).eval()
@@ -601,6 +722,9 @@ class TestPrecompile(TestCase):
             f_c(x, x)  # tensor at the module slot
 
     def test_wrong_arg_count_rejected(self):
+        # [FUNCTION DOC] With the module as second argument, for the cached, inlined and eager
+        # loaded functions checks too few or too many positional arguments raise PrecompileError
+        # about the expected count while the correct call still matches eager.
         # A runtime call with the wrong number of positional args raises a clear
         # PrecompileError (invariant 2) -- not a raw IndexError -- on all three load
         # paths, including when a module is at a non-zero position (where args[i] would
@@ -627,15 +751,22 @@ class TestPrecompile(TestCase):
                 self.assertEqual(f_c(x, m), m(x))  # correct arity still works
 
     def test_buffer_requiring_grad_rejected(self):
+        # [FUNCTION DOC] A module with a buffer requiring grad that receives a gradient in the
+        # traced backward makes precompile raise PrecompileError saying a buffer received a
+        # gradient.
         # A registered buffer with requires_grad=True that receives a gradient is not
         # harvested (only params are), so precompile rejects it rather than silently
         # dropping the grad.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a registered buffer requiring grad; forward
+            # returns the sum of the input times the buffer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Registers a random buffer b with requires_grad enabled.
                 super().__init__()
                 self.register_buffer("b", torch.randn(4, requires_grad=True))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the sum of the input multiplied by the buffer.
                 return (x * self.b).sum()
 
         m = M()
@@ -644,6 +775,9 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(lambda model, x: model(x).backward(), m, x)
 
     def test_user_input_requiring_grad_rejected(self):
+        # [FUNCTION DOC] A user input requiring grad that receives a gradient in the traced
+        # backward makes precompile raise PrecompileError saying a user input received a
+        # gradient.
         # Sibling of the buffer guard: a requires_grad USER INPUT (not a param) that
         # receives a gradient during the traced backward is not harvested (only params
         # are), so precompile rejects it rather than silently dropping the grad.
@@ -652,15 +786,23 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(lambda t: (t * t).sum().backward(), x)
 
     def test_control_flow_subgraph_rejected(self):
+        # [FUNCTION DOC] A function using torch.cond (captured as a higher order op with
+        # subgraph submodules) makes precompile raise PrecompileError mentioning control-flow
+        # subgraph.
         # torch.cond captures as a HOP with get_attr subgraph submodules, which the
         # standalone artifact cannot inline; reject it at capture with a clear message.
         def f(x):
+            # [FUNCTION DOC] HELPER: Branches with torch.cond on whether the input sum is
+            # positive, adding one or subtracting one.
             return torch.cond(x.sum() > 0, lambda t: t + 1, lambda t: t - 1, (x,))
 
         with self.assertRaisesRegex(PrecompileError, "control-flow subgraph"):
             torch.compiler.precompile(f, torch.randn(4))
 
     def test_load_falls_back_when_cache_unreconstructable(self):
+        # [FUNCTION DOC] Replaces the cache artifact with garbage bytes, re-saves the envelope,
+        # and checks load still works (does not raise) and matches eager by falling back to the
+        # python source.
         # The cache is only an acceleration; python_code always runs standalone. A
         # corrupt / stale cache must degrade to the inlined JIT path, not crash.
         m = torch.nn.Sequential(torch.nn.Linear(4, 3)).eval()
@@ -676,6 +818,8 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, x), m(x))
 
     def test_load_falls_back_on_corrupt_cache_envelope(self):
+        # [FUNCTION DOC] Checks load given bytes that are not even a valid saved envelope does
+        # not raise and the function still matches eager.
         # Not just a bad inner artifact -- a corrupt/truncated cache ENVELOPE (not even
         # a valid torch.save blob) must also degrade to the inlined python_code path,
         # since the cache is purely an acceleration.
@@ -688,6 +832,8 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, x), m(x))
 
     def test_load_invalid_python_code_rejected(self):
+        # [FUNCTION DOC] Checks load of syntactically invalid python source raises
+        # PrecompileError with a message saying it is not valid Python (not a raw SyntaxError).
         # load() surfaces a clear PrecompileError (not a raw SyntaxError) when
         # python_code is not valid Python.
         buf = io.BytesIO()
@@ -696,6 +842,10 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile.load("def (:::", buf.getvalue())
 
     def test_untrusted_input_warning_fires_per_load(self):
+        # [FUNCTION DOC] Loads twice from the inductor cache and twice from the eager cache,
+        # capturing logs from the precompile logger at warning level; each load must warn about
+        # untrusted input, and the eager loads must also mention EXEC, showing the warning is
+        # per load, not once.
         # The trust warning is emitted PER load (not warning_once) via log.warning on the
         # torch._precompile logger: load() always execs python_code (through
         # _make_inlined_forward), which warns before the exec, whether or not the cache
@@ -730,6 +880,10 @@ class TestPrecompile(TestCase):
             )
 
     def test_no_compute_graph_rejected_inductor(self):
+        # [FUNCTION DOC] For inductor, functions returning a constant, a bare input or a
+        # detached alias make precompile raise PrecompileError mentioning no compute; the eager
+        # backend handles a passthrough and a constant and the loaded functions return the
+        # expected values.
         # The inductor backend produces no runnable module for a graph with no compute
         # to lower -- one that returns inputs or Python constants unchanged (a constant,
         # a bare passthrough, or an alias like .detach()). Reject with a clear
@@ -746,6 +900,10 @@ class TestPrecompile(TestCase):
         self.assertEqual(torch.compiler.precompile.load(code, cache)(x), 7)
 
     def test_same_count_different_structure_rejected(self):
+        # [FUNCTION DOC] Traces a sequential of two linears, checks the baked parameter name
+        # list, then loads (cached and artifact-stripped) and calls with a module of the same
+        # parameter count but different submodule names; expects PrecompileError saying names do
+        # not match the traced model.
         # Invariant 2: the structural check now compares the baked PARAM_NAMES /
         # BUFFER_NAMES against the runtime model's extracted param/buffer names, so a
         # same-count-but-different-structure (here, differently-NAMED submodules) model
@@ -760,12 +918,16 @@ class TestPrecompile(TestCase):
         )
 
         class B(torch.nn.Module):  # same 4 params (same count/shapes), different names
+            # [CLASS DOC] HELPER: Module with the same parameter shapes as the traced sequential
+            # model but named l0 and l1; forward sums both layers applied to the input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two linear layers.
                 super().__init__()
                 self.l0 = torch.nn.Linear(4, 4)
                 self.l1 = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the sum of both layers applied to the input.
                 return self.l0(x) + self.l1(x)
 
         b = B().eval()
@@ -781,6 +943,9 @@ class TestPrecompile(TestCase):
                     f_c(b, x)
 
     def test_same_count_different_structure_rejected_eager(self):
+        # [FUNCTION DOC] Eager backend counterpart of the previous test: a model with the same
+        # parameter count but different names makes the loaded function raise PrecompileError
+        # saying names do not match the traced model.
         # The eager driver's _check_structure rejects a same-param-COUNT but
         # different-NAME model (here differently-named submodules) rather than
         # silently running the traced graph with the wrong weights (invariant 2).
@@ -796,12 +961,16 @@ class TestPrecompile(TestCase):
         )
 
         class B(torch.nn.Module):  # same 4 params (same count/shapes), different names
+            # [CLASS DOC] HELPER: Module with the same parameter shapes as the traced sequential
+            # model but named l0 and l1; forward sums both layers applied to the input.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two linear layers.
                 super().__init__()
                 self.l0 = torch.nn.Linear(4, 4)
                 self.l1 = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the sum of both layers applied to the input.
                 return self.l0(x) + self.l1(x)
 
         b = B().eval()
@@ -815,6 +984,9 @@ class TestPrecompile(TestCase):
     # Only effectful ops are rejected up front (see test_effectful_op_unsupported).
 
     def test_effectful_op_unsupported(self):
+        # [FUNCTION DOC] Registers a custom effectful op in a scoped library (ordered effect
+        # type, undone in a finally block) and checks precompile of a function calling it raises
+        # PrecompileError saying effectful ops are not supported yet.
         # Effectful custom ops are rejected up front by _assert_supported, which
         # detects the with_effects HOP in the captured graph -- the effect cannot
         # be lowered to standalone source, so capture fails cleanly.
@@ -838,6 +1010,10 @@ class TestPrecompile(TestCase):
                 _register_effectful_op(op, None)
 
     def test_public_api_surface(self):
+        # [FUNCTION DOC] Checks the public surface: precompile is listed in the compiler package
+        # exports but not in the top-level torch exports and is not a torch attribute;
+        # precompile and its load are callable, the error type is reachable through it, and its
+        # module name is torch.compiler.
         # precompile is a public API under the compiler namespace
         # (torch.compiler.precompile), with a load method and a public error type;
         # it is deliberately NOT a top-level torch.* verb.
@@ -855,6 +1031,8 @@ class TestPrecompile(TestCase):
         self.assertEqual(torch.compiler.precompile.__module__, "torch.compiler")
 
     def test_backend_invalid_raises(self):
+        # [FUNCTION DOC] Checks an invalid backend name raises ValueError saying backend must be
+        # inductor or eager.
         a, b = torch.randn(4, 4), torch.randn(4, 4)
         with self.assertRaisesRegex(
             ValueError, "backend must be 'inductor' or 'eager'"
@@ -862,6 +1040,8 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(lambda x, y: x + y, a, b, backend="nope")
 
     def test_tracer_default_and_explicit_make_fx(self):
+        # [FUNCTION DOC] Checks the default tracer and explicitly passing the make_fx tracer
+        # both give a loaded function equal to eager.
         # tracer defaults to "make_fx"; passing it explicitly is equivalent and works.
         m = torch.nn.Linear(4, 3).eval()
         x = torch.randn(5, 4)
@@ -872,6 +1052,8 @@ class TestPrecompile(TestCase):
             self.assertEqual(torch.compiler.precompile.load(code, cache)(m, x), m(x))
 
     def test_tracer_dynamo_not_implemented(self):
+        # [FUNCTION DOC] Checks requesting the dynamo tracer raises NotImplementedError rather
+        # than falling back to make_fx.
         # "dynamo" is a valid (planned) tracer value but is not implemented yet; it must
         # raise NotImplementedError, not silently fall back to make_fx.
         m = torch.nn.Linear(4, 3).eval()
@@ -882,11 +1064,15 @@ class TestPrecompile(TestCase):
             )
 
     def test_tracer_invalid_raises(self):
+        # [FUNCTION DOC] Checks an invalid tracer name raises ValueError listing the allowed
+        # tracers.
         a, b = torch.randn(4, 4), torch.randn(4, 4)
         with self.assertRaisesRegex(ValueError, "tracer must be 'make_fx' or 'dynamo'"):
             torch.compiler.precompile(lambda x, y: x + y, a, b, tracer="nope")
 
     def test_backend_default_is_inductor(self):
+        # [FUNCTION DOC] Checks the default backend is inductor by looking for the inductor
+        # output code marker in the generated python source.
         # The default lowers through Inductor: the generated code inlines the Inductor
         # output module. Use a graph_partition-agnostic marker (the ``call = runner.call``
         # form is only emitted when config.graph_partition is on, which is off in fbcode).
@@ -896,6 +1082,9 @@ class TestPrecompile(TestCase):
         self.assertIn("Inductor output code", code)
 
     def test_inductor_graph_partition_off(self):
+        # [FUNCTION DOC] With the inductor graph partition setting off, checks precompile still
+        # works, the generated source lacks the runner call form, and the loaded function
+        # matches eager (regression for source extraction that handled only one call form).
         # graph_partition defaults off in fbcode; the Inductor output module then exposes
         # a top-level ``def call(args):`` instead of ``call = runner.call``. The source
         # extractor must still find it (regression: it previously matched only the
@@ -911,6 +1100,9 @@ class TestPrecompile(TestCase):
             self.assertEqual(f_c(m, x), m(x))
 
     def test_inductor_caches_disabled(self):
+        # [FUNCTION DOC] With caches disabled (two config variants), checks precompile still
+        # returns runnable source and a cache whose artifact is None; the exec'd source and the
+        # loaded function both match eager.
         # Source is captured off codegen (GraphLowering.save_output_code), not the cache
         # bundle, so precompile must work even when caching is disabled -- producing a
         # runnable python_code with an empty cache, not a misleading "non-cacheable HOP"
@@ -940,6 +1132,8 @@ class TestPrecompile(TestCase):
                 )
 
     def test_inductor_cpp_wrapper_pinned_off(self):
+        # [FUNCTION DOC] With the cpp wrapper config enabled ambiently, checks precompile still
+        # produces a working python artifact whose loaded function matches eager.
         # cpp_wrapper would make Inductor emit a C++ ``call`` (no python module); a
         # python artifact cannot come from it, so compile_to_python pins it off. With
         # cpp_wrapper=True ambient, precompile must still produce a working python artifact.
@@ -953,6 +1147,9 @@ class TestPrecompile(TestCase):
             self.assertEqual(f_c(m, x), m(x))
 
     def test_example_grad_restored_when_fn_raises(self):
+        # [FUNCTION DOC] Checks that when the traced function runs backward and then raises, the
+        # error propagates and the example module parameters have no gradients afterwards
+        # (restored).
         # If fn runs a backward then raises during the make_fx trace, the example
         # model's .grad must be restored (the snapshot/restore is in a finally), not
         # left clobbered -- precompile does not mutate the example model's grads.
@@ -963,6 +1160,8 @@ class TestPrecompile(TestCase):
             self.assertIsNone(p.grad)
 
         def boom(model, xx):
+            # [FUNCTION DOC] HELPER: Runs forward and backward on the model, then raises
+            # ValueError with message boom.
             model(xx).sum().backward()  # populates .grad on the lifted example params
             raise ValueError("boom")
 
@@ -972,6 +1171,10 @@ class TestPrecompile(TestCase):
             self.assertIsNone(p.grad, f"{n}: example .grad must be restored on failure")
 
     def test_unbacked_capture_with_preexisting_grad(self):
+        # [FUNCTION DOC] Regression test: a model with existing gradients from a warmup step is
+        # traced with a function that runs backward and an input dimension marked unbacked.
+        # Checks the source records a dynamic first input dim and that the model's original
+        # gradients are restored afterwards.
         # Regression: in the mark_unbacked path the example params are fakeified BEFORE
         # the grad clear. A model with a pre-existing .grad (the warmup-step-then-
         # precompile flow) plus a backward in fn must still capture -- the clear must
@@ -990,6 +1193,10 @@ class TestPrecompile(TestCase):
             self.assertEqual(p.grad, saved[n])  # warmup grad restored, not clobbered
 
     def test_backend_eager_no_inductor_lowering(self):
+        # [FUNCTION DOC] Precompiles with the eager backend and checks the source declares the
+        # eager backend, lacks the inductor call entry point, embeds the readable aten graph,
+        # and has the backend tag. The cache envelope has the standard keys and tags but a None
+        # artifact.
         # backend="eager" skips Inductor: the generated code has no inductor ``call``
         # entry point, and instead embeds the readable captured ATen graph and the
         # eager driver. The eager backend has no kernels to accelerate, so the cache
@@ -1019,6 +1226,8 @@ class TestPrecompile(TestCase):
         self.assertEqual(blob["backend"], "eager")
 
     def test_backend_eager_self_contained_exec(self):
+        # [FUNCTION DOC] Executes eager backend python source standalone (no cache) and checks
+        # its forward function result equals the eager module output.
         # The eager python_code execs standalone with NO cache (the captured graph
         # is inlined) and runs, matching eager.
         m = torch.nn.Sequential(torch.nn.Linear(4, 3), torch.nn.ReLU()).eval()
@@ -1032,6 +1241,10 @@ class TestPrecompile(TestCase):
         self.assertEqual(ns["forward"](m, x), m(x))
 
     def test_preexisting_param_grad_capture_succeeds(self):
+        # [FUNCTION DOC] Runs a warmup backward so the module has gradients, then precompiles a
+        # function doing backward. Checks capture leaves the example gradients unchanged, and a
+        # loaded run on a fresh copy (starting without gradients) produces the same gradients as
+        # a plain backward.
         # Precompiling a backward fn on a model whose params already carry a .grad (the
         # common warmup-step-then-precompile flow) must capture cleanly: the pre-existing
         # grad must be cleared before tracing, not baked as a constant (invariant 1).
@@ -1059,6 +1272,9 @@ class TestPrecompile(TestCase):
             self.assertEqual(p.grad, rp.grad, n)
 
     def test_nontensor_output_inductor_clean_error(self):
+        # [FUNCTION DOC] For inductor, float, complex and string values in the output make
+        # precompile raise PrecompileError mentioning non-tensor Python value; int and None
+        # extras lower and round trip; the eager backend returns the float unchanged.
         # A non-tensor python value (float, complex, str, ...) in fn's output trips the
         # inductor backend's codegen assert; surface a clear PrecompileError (not a raw
         # InductorError) pointing to backend="eager". int / None outputs lower fine, and
@@ -1081,6 +1297,10 @@ class TestPrecompile(TestCase):
         self.assertEqual(torch.compiler.precompile.load(ecode, ecache)(m, x)[1], 3.14)
 
     def test_input_layout_mismatch_inductor_clean_error(self):
+        # [FUNCTION DOC] Traces with a transposed (non-contiguous) input. A contiguous input of
+        # the same shape makes the cached and artifact-stripped inductor loads raise
+        # PrecompileError mentioning memory format, a matching-stride input works, and the eager
+        # backend accepts the other layout.
         # The inductor backend bakes each input's stride / memory format (invariant 6);
         # a same-shape input with a different layout must raise a clear PrecompileError
         # (not a raw assert_size_stride AssertionError) on BOTH the cached and inlined
@@ -1111,6 +1331,9 @@ class TestPrecompile(TestCase):
         self.assertEqual(torch.compiler.precompile.load(ecode, ecache)(m, xrt), m(xrt))
 
     def test_input_layout_mismatch_enforced_without_size_asserts(self):
+        # [FUNCTION DOC] With inductor size asserts disabled, checks that a differently laid out
+        # input still raises PrecompileError mentioning memory format on both cached and inlined
+        # paths (the driver check does not rely on the inductor assertion).
         # The layout guard must be a PROACTIVE driver check, not a reliance on inductor's
         # assert_size_stride: with size_asserts=False the assert is elided, so a naive
         # try/except would silently read wrong strides. Both load paths must still raise.
@@ -1129,6 +1352,9 @@ class TestPrecompile(TestCase):
                 )  # inlined
 
     def test_input_shape_mismatch_clean_error(self):
+        # [FUNCTION DOC] Calls a function traced on a six by eight input with a seven by eight
+        # input on cached and inlined paths and checks PrecompileError mentions shape, and that
+        # the message does not blame memory format.
         # A same-structure but wrong-SHAPE input is an invariant-3 (shape) mismatch, NOT
         # an invariant-6 layout one: the driver must say "shape" / invariant 3 and not
         # misadvise a no-op .contiguous() (both inputs here are already contiguous).
@@ -1149,6 +1375,9 @@ class TestPrecompile(TestCase):
             self.assertNotIn("memory format", str(e))
 
     def test_size1_dim_stride_exempt_like_inductor(self):
+        # [FUNCTION DOC] Checks that a size one dimension with a different stride (from slicing
+        # a row of a wider tensor) is accepted on cached and inlined paths and matches eager,
+        # since the stride of a size one dim is exempt from the layout check.
         # A size-1 dim's stride is irrelevant (one element); inductor's assert_size_stride
         # ignores it (guards.cpp), so the proactive layout check must too -- a kept-dim
         # slice x[i:i+1] (size-1 dim with a wider stride) must RUN, not raise.
@@ -1167,6 +1396,9 @@ class TestPrecompile(TestCase):
         )
 
     def test_empty_input_shape_is_still_checked(self):
+        # [FUNCTION DOC] Traces a sum over an empty input; checks an empty input of a different
+        # shape raises PrecompileError mentioning shape and that an empty input of the traced
+        # shape works.
         # The numel==0 exemption must relax ONLY the (meaningless) stride check, not the
         # shape check: an empty runtime input whose shape differs from the example must
         # still raise invariant 3, not silently return the traced-shape output.
@@ -1178,11 +1410,18 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(torch.randn(0, 4)), torch.randn(0, 4).sum(0))
 
     def test_shape_only_input_is_layout_flexible(self):
+        # [FUNCTION DOC] An input used only for its leading size (not data) may have a different
+        # stride: the transposed square input still runs and matches eager. An input with a
+        # different leading size is rejected with PrecompileError mentioning shape.
         # An input used only for its .shape (not its data) is not stride-consumed by the
         # kernel, so inductor emits no assert_size_stride for it; a transposed version
         # (same shape) must RUN, not be wrongly rejected as a memory-format mismatch.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward multiplies the second input by the first
+            # dim size of the first input.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the second argument times the leading dimension
+                # size of the first argument.
                 return y * x.shape[0]
 
         m = M().eval()
@@ -1198,6 +1437,9 @@ class TestPrecompile(TestCase):
             f_c(m, torch.randn(5, 4), y)
 
     def test_dynamic_shapes_static_dim_still_checked(self):
+        # [FUNCTION DOC] With the batch dim marked unbacked, checks a different batch size runs
+        # and gives the right output shape, while a mismatch on the static feature dim raises
+        # PrecompileError mentioning dynamic dim.
         # The non-marked (feature) dim stays specialized: a mismatch on it is rejected,
         # while the marked (batch) dim is free.
         m = torch.nn.Linear(4, 3).eval()
@@ -1210,6 +1452,8 @@ class TestPrecompile(TestCase):
             f_c(m, torch.randn(16, 5))  # static feature dim mismatched
 
     def test_dynamic_shapes_guard_required_rejected(self):
+        # [FUNCTION DOC] With the batch dim marked unbacked, a function that branches on its
+        # size makes precompile raise PrecompileError saying it must guard on a marked dim.
         # A graph that must guard on the dynamic dim fails LOUDLY at capture (the unbacked
         # dim cannot be guarded), as a clear PrecompileError rather than a silent artifact.
         m = torch.nn.Linear(4, 3).eval()
@@ -1217,6 +1461,9 @@ class TestPrecompile(TestCase):
         mark_unbacked(x, 0)
 
         def needs_guard(mm, t):
+            # [FUNCTION DOC] HELPER: Returns the module output for sizes above four on the
+            # leading dim, else the output plus one; the data dependent branch forces a guard on
+            # the marked dim.
             if t.shape[0] > 4:
                 return mm(t)
             return mm(t) + 1
@@ -1225,6 +1472,9 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(needs_guard, m, x)
 
     def test_dynamic_shapes_eager_rejected(self):
+        # [FUNCTION DOC] Checks an unbacked-marked input with the eager backend raises
+        # NotImplementedError saying dynamic shapes are only supported with the inductor
+        # backend.
         m = torch.nn.Linear(4, 3).eval()
         x = torch.randn(8, 4)
         mark_unbacked(x, 0)
@@ -1235,6 +1485,8 @@ class TestPrecompile(TestCase):
 
     @parametrize("path", ("cached", "inlined"))
     def test_dtype_mismatch_rejected(self, path):
+        # [FUNCTION DOC] Parametrized by path (cached or artifact-stripped inlined). Traces on
+        # float32 and checks a double input raises PrecompileError mentioning dtype.
         # Each dense input's dtype is baked at capture (invariant 6); a runtime input of
         # a different dtype is rejected up front on BOTH the cached and inlined paths.
         m = torch.nn.Linear(4, 3).eval()
@@ -1249,6 +1501,8 @@ class TestPrecompile(TestCase):
     @unittest.skipUnless(TEST_CUDA, "needs CUDA for a cpu-vs-cuda device mismatch")
     @parametrize("path", ("cached", "inlined"))
     def test_device_mismatch_rejected(self, path):
+        # [FUNCTION DOC] Needs CUDA. Parametrized by path (cached or inlined). Traces on a CPU
+        # input and checks a CUDA input raises PrecompileError mentioning device.
         # Each dense input's device is baked at capture (invariant 6); a cpu-traced
         # artifact rejects a cuda input up front on BOTH load paths.
         m = torch.nn.Linear(4, 3).eval()
@@ -1261,6 +1515,8 @@ class TestPrecompile(TestCase):
             f_c(m, x.cuda())
 
     def test_mark_dynamic_backed_rejected(self):
+        # [FUNCTION DOC] Checks an input marked with the backed dynamic mark makes precompile
+        # raise PrecompileError mentioning mark_dynamic.
         # Backed dynamic marks (mark_dynamic) have no analogue in the static/unbacked
         # capture path; precompile rejects them loudly rather than silently dropping
         # them and baking a wrong artifact (invariant 3).
@@ -1271,6 +1527,8 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(lambda mm, t: mm(t), m, x)
 
     def test_mark_unbacked_hint_override_honored(self):
+        # [FUNCTION DOC] Checks an unbacked mark carrying a hint override is accepted: the
+        # loaded function matches eager for the traced size and for a larger size.
         # A mark_unbacked hint_override is a perf-only autotuning size hint (never a
         # guard), so precompile does NOT reject it; the single artifact is valid for any
         # runtime size and the hint is threaded onto the capture ShapeEnv's symbol.
@@ -1284,6 +1542,8 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, x2), m(x2))
 
     def test_mark_unbacked_specialize_on_rejected(self):
+        # [FUNCTION DOC] Checks an unbacked mark with a specialize_on list makes precompile
+        # raise PrecompileError mentioning specialize_on.
         # A mark_unbacked specialize_on list cannot be honored (precompile produces a
         # single artifact, not per-value specializations); it is rejected at capture.
         m = torch.nn.Linear(4, 3).eval()
@@ -1293,6 +1553,9 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(lambda mm, t: mm(t), m, x)
 
     def test_mark_unbacked_subclass_rejected(self):
+        # [FUNCTION DOC] Skips without gloo. With a one-rank gloo group on a free port (env
+        # restored, group destroyed in cleanup), an unbacked mark on a distributed tensor makes
+        # precompile raise PrecompileError mentioning tensor subclass.
         # A mark_unbacked dim on a tensor subclass (DTensor) cannot be honored: the
         # dynamic capture refakes a marked leaf via torch.empty, which drops the subclass
         # and would trace on a plain dense tensor. mark_unbacked stamps its marks on the
@@ -1328,6 +1591,9 @@ class TestPrecompile(TestCase):
 
     @parametrize("path", ("cached", "inlined"))
     def test_shape_id_mismatched_sizes_rejected(self, path):
+        # [FUNCTION DOC] Parametrized by path (cached or artifact-stripped). Two inputs share
+        # one unbacked symbol via a common shape id; calling with unequal sizes for those dims
+        # raises PrecompileError mentioning shape or memory format.
         # Two inputs sharing a shape_id reuse ONE unbacked symbol, so their marked dims
         # are equal by construction. A runtime call passing MISMATCHED sizes for those
         # dims violates the baked equality and is rejected with a clear PrecompileError.
@@ -1352,6 +1618,9 @@ class TestPrecompile(TestCase):
 
     @parametrize("path", ("cached", "inlined"))
     def test_shape_id_bounds_from_both_occurrences_enforced(self, path):
+        # [FUNCTION DOC] Parametrized by path (cached or inlined). Two inputs share a shape id,
+        # one with a min and the other with a max. Sizes 2, 8 and 64 run and match eager; size 1
+        # raises PrecompileError naming the min bound and size 65 one naming the max bound.
         # Bounds from BOTH occurrences of a shared shape_id are applied to the single
         # shared symbol at capture: a min on one input and a max on the other are each
         # threaded onto the same unbacked symbol (see _fakeify_with_unbacked) AND baked as
@@ -1385,6 +1654,9 @@ class TestPrecompile(TestCase):
 
     @parametrize("path", ("cached", "inlined"))
     def test_mark_unbacked_min_enforced_at_runtime(self, path):
+        # [FUNCTION DOC] Parametrized by path (cached or inlined). An unbacked dim marked with a
+        # min of four: checks the source records the bounds, a batch of two raises
+        # PrecompileError naming the min, and a batch of eight runs and matches eager.
         # mark_unbacked(x, 0, min=4) promises (in its docstring) a runtime check that the
         # dim is >= min. The capture-time torch._check on the unbacked symint never becomes
         # a runtime guard, so precompile bakes USER_INPUT_BOUNDS and the driver enforces it:
@@ -1408,6 +1680,8 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, xt), m(xt))
 
     def test_eager_backend_wrong_static_shape_rejected(self):
+        # [FUNCTION DOC] With the eager backend, calling with a wrong static input shape raises
+        # PrecompileError mentioning shape.
         # The eager driver now checks USER_INPUT_SHAPES too: a wrong static shape is
         # rejected (invariant 3).
         m = torch.nn.Linear(4, 3).eval()
@@ -1420,6 +1694,8 @@ class TestPrecompile(TestCase):
             f_c(m, torch.randn(7, 4))
 
     def test_eager_backend_dtype_mismatch_rejected(self):
+        # [FUNCTION DOC] With the eager backend, calling with a double input where float32 was
+        # traced raises PrecompileError mentioning dtype.
         # The eager driver checks USER_INPUT_DTYPES too: a dtype mismatch is rejected
         # (invariant 6).
         m = torch.nn.Linear(4, 3).eval()
@@ -1432,6 +1708,8 @@ class TestPrecompile(TestCase):
             f_c(m, x.double())
 
     def test_cache_integrity_tampered_backend_rejected(self):
+        # [FUNCTION DOC] Changes the backend tag in the cache envelope to eager though the
+        # source says inductor, and checks load raises PrecompileError mentioning backend.
         # The cache envelope's backend tag is an integrity check: a tampered backend
         # (here flipped to a value that does not match python_code's BACKEND) makes
         # load() raise a clear PrecompileError rather than reconstruct a foreign cache.
@@ -1447,6 +1725,9 @@ class TestPrecompile(TestCase):
 
     @parametrize("tag", ("format", "version"))
     def test_cache_format_version_mismatch_degrades(self, tag):
+        # [FUNCTION DOC] Parametrized by tag (format or version). Corrupts that envelope field,
+        # then checks load does not raise, logs a warning mentioning a different torch build,
+        # and the loaded function falls back to JIT and matches eager.
         # The cache is acceleration-only, so a FORMAT or VERSION mismatch (a foreign or
         # different-build envelope) is NOT fatal: load() DEGRADES to JIT'ing from
         # python_code rather than hard-failing. The reloaded callable must still run and
@@ -1471,6 +1752,8 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m, x), m(x))  # JIT fallback runs and is correct
 
     def test_missing_calling_convention_metadata_rejected(self):
+        # [FUNCTION DOC] Checks load of a valid envelope paired with source lacking the required
+        # metadata globals raises PrecompileError saying calling-convention metadata is missing.
         # Syntactically valid python_code that lacks a required metadata global is not a
         # precompile artifact; load() raises a clear PrecompileError naming the gap.
         buf = io.BytesIO()
@@ -1489,6 +1772,8 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile.load("x = 1\n", buf.getvalue())
 
     def test_singleton_pickle_deepcopy_roundtrip(self):
+        # [FUNCTION DOC] Checks the precompile singleton survives pickle and deep copy as the
+        # same object and that its representation is the public dotted name.
         # torch.compiler.precompile is a process-wide singleton; pickle and deepcopy
         # must round-trip to the SAME object (it carries no per-call state), and its
         # repr is the stable public name.
@@ -1498,6 +1783,10 @@ class TestPrecompile(TestCase):
         self.assertEqual(repr(p), "torch.compiler.precompile")
 
     def test_standalone_runtime_artifact_execs_in_fresh_process(self):
+        # [FUNCTION DOC] Precompiles a transpose (output aliasing) and checks the source imports
+        # the standalone runtime alias helper. Writes the source to a temporary file and runs it
+        # in a fresh subprocess that only imports torch, with a timeout, checking exit code zero
+        # and an OK marker printed. The temporary file is removed afterwards.
         # A generated artifact that imports a standalone_runtime helper (here output-
         # aliasing, which emits ``from ...standalone_runtime import gen_alias_from_base``)
         # must EXEC in a FRESH process whose only prior import is ``torch`` -- a
@@ -1540,6 +1829,9 @@ class TestPrecompile(TestCase):
         self.assertIn("FRESH_OK", proc.stdout)
 
     def test_load_rejects_mismatched_code_cache_pair(self):
+        # [FUNCTION DOC] Compiles two different functions on the same module, checks the sources
+        # differ, and that loading one source with the other's cache raises PrecompileError
+        # mentioning the code hash. The matching pair still works.
         # The cache envelope's code_hash (sha256 of python_code) binds a cache to the
         # EXACT python_code it accelerates. Two artifacts from the SAME backend but
         # DIFFERENT fn produce different python_code (hence different code_hash), so
@@ -1557,6 +1849,10 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_a(m, x), m(x) * 2)
 
     def test_non_size_stride_assertion_propagates_unchanged(self):
+        # [FUNCTION DOC] Rewrites an artifact's source so the inductor call function raises a
+        # custom assertion error, recomputes the cache code hash, drops the artifact to force
+        # the inlined path, and checks the original assertion message propagates and is not
+        # relabeled as a layout error.
         # The inductor driver's forward() wraps the inlined ``call`` in a try/except
         # AssertionError that relabels ONLY inductor's own assert_size_stride failure
         # (a layout/shape mismatch) as a "shape or memory format" PrecompileError. A
@@ -1593,6 +1889,8 @@ class TestPrecompile(TestCase):
             self.assertNotIn("shape or memory format", str(e))
 
     def test_public_identity_module_and_qualname(self):
+        # [FUNCTION DOC] Checks the error class and load function report the public
+        # torch.compiler module and qualified names under precompile.
         # PrecompileError and load are public under torch.compiler.precompile, so their
         # __module__ / __qualname__ must report that public location (so Sphinx and
         # introspection anchor them under torch.compiler, not the private module).
@@ -1604,19 +1902,29 @@ class TestPrecompile(TestCase):
 
     @parametrize("backend", ("inductor", "eager"))
     def test_renamed_buffer_structural_mismatch_rejected(self, backend):
+        # [FUNCTION DOC] Parametrized by backend (inductor or eager). Traces a module with a
+        # named buffer then checks calling with the same module type whose buffer has a
+        # different name raises PrecompileError saying names do not match the traced model; the
+        # source records buffer names.
         # The BUFFER_NAMES half of the structural check (invariant 2): a runtime model
         # whose PARAM names match exactly but a BUFFER is renamed (same count and shape)
         # must be rejected, since the buffer name list is part of the baked structure.
         # The cached/inlined inductor driver and the eager driver each have their own
         # _check_structure, so cover both backends.
         class WithBuf(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer and a buffer registered under a
+            # caller-chosen name; forward adds that buffer to the layer output.
             def __init__(self, bufname):
+                # [FUNCTION DOC] HELPER: Creates the layer, registers a random buffer under the
+                # given name and remembers the name in a private attribute.
                 super().__init__()
                 self.lin = torch.nn.Linear(4, 3)
                 self.register_buffer(bufname, torch.randn(3))
                 self._bn = bufname
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the linear output plus the buffer looked up by
+                # its stored name.
                 return self.lin(x) + getattr(self, self._bn)
 
         m = WithBuf("buf").eval()
@@ -1631,6 +1939,9 @@ class TestPrecompile(TestCase):
             f_c(renamed, x)
 
     def test_example_input_inplace_mutation_not_restored(self):
+        # [FUNCTION DOC] Documents the contract that tracing executes the function once on the
+        # example inputs: an in-place add on an example tensor is left in place afterwards (only
+        # gradients are restored).
         # Capture EXECUTES fn once on the example inputs (invariant 3), so an in-place
         # mutation fn performs on its example user input happens at capture time and is
         # NOT restored -- only .grad is snapshotted/restored. Pin this surprising contract
@@ -1641,6 +1952,8 @@ class TestPrecompile(TestCase):
 
     @parametrize("path", ("cached", "inlined", "eager"))
     def test_wrong_dtype_rejected_across_all_paths(self, path):
+        # [FUNCTION DOC] Parametrized by path (cached, inlined or eager). Checks a double input
+        # where a float32 was traced raises PrecompileError mentioning dtype on each load path.
         # The same wrong-dtype input is rejected on ALL load paths -- cached (artifact),
         # inlined (artifact stripped), and eager -- each with its own driver copy of the
         # dtype check (invariant 6). Loading the SAME inductor artifact via cached and
@@ -1661,6 +1974,8 @@ class TestPrecompile(TestCase):
 
     @unittest.skipUnless(TEST_CUDA, "needs CUDA for a cpu-vs-cuda device mismatch")
     def test_eager_device_mismatch_rejected(self):
+        # [FUNCTION DOC] Needs CUDA. With the eager backend, a CUDA input to a CPU-traced
+        # artifact raises PrecompileError mentioning device.
         # The eager driver bakes each input's device (invariant 6): a cpu-traced eager
         # artifact rejects a cuda input up front, like the inductor backend.
         m = torch.nn.Linear(4, 3).eval()
@@ -1673,6 +1988,9 @@ class TestPrecompile(TestCase):
             f_c(m, x.cuda())
 
     def test_unserializable_in_spec_accepts_distinct_structures(self):
+        # [FUNCTION DOC] With an input spec that degraded to None, checks that both the original
+        # custom node and a plain list with the same two leaves are accepted and give the same
+        # result, showing the structure check is skipped as a best-effort limit.
         # When IN_SPEC degrades to None (the input pytree spec was not serializable) the
         # structural in_spec check is SKIPPED -- a documented best-effort limit. Two
         # SAME-leaf-count, same-per-leaf-shape but STRUCTURALLY DISTINCT runtime inputs
@@ -1695,6 +2013,9 @@ class TestPrecompile(TestCase):
 
     @parametrize("path", ("cached", "inlined"))
     def test_mark_unbacked_max_enforced_at_runtime(self, path):
+        # [FUNCTION DOC] Parametrized by path (cached or inlined). An unbacked dim marked with a
+        # max of sixteen: checks the source records the bounds, a size of 32 raises
+        # PrecompileError mentioning max, and a size of eight runs and matches eager.
         # The max-only mirror of test_mark_unbacked_min_enforced_at_runtime:
         # mark_unbacked(x, 0, max=16) records USER_INPUT_BOUNDS = [{0: (None, 16)}] and
         # the driver rejects an ABOVE-max runtime size on BOTH load paths (the capture-time
@@ -1719,6 +2040,10 @@ class TestPrecompile(TestCase):
 
     @unittest.skipUnless(TEST_CUDA, "functionalize_rng_ops seeds via CUDA rng state")
     def test_functionalized_rng_matches_eager_cpu(self):
+        # [FUNCTION DOC] Needs CUDA (the rng state helper requires it) though tensors are on
+        # CPU. With functionalized rng ops enabled, precompiles dropout, then seeds identically
+        # before the loaded run and before eager dropout; checks some elements are zeroed and
+        # the outputs are equal.
         # Under functionalized RNG the dropout draw is seeded from the global generator,
         # so seeding torch.manual_seed identically before the artifact run and before eager
         # makes both draw the SAME dropout mask: the artifact output is numerically EQUAL
@@ -1746,6 +2071,9 @@ class TestPrecompile(TestCase):
 
     @parametrize("backend", ("inductor", "eager"))
     def test_param_shape_mismatch_rejected(self, backend):
+        # [FUNCTION DOC] Parametrized by backend. Traces a linear and calls with a linear of the
+        # same parameter names but a different output size; for each default and inlined load
+        # path expects PrecompileError mentioning weight and shape.
         # The headline silent-wrong-result fix: the structural check (invariant 2) now
         # compares each runtime param's SHAPE against the baked example, not just its
         # name/count. A runtime model with the SAME param names but a different param
@@ -1767,6 +2095,8 @@ class TestPrecompile(TestCase):
 
     @parametrize("backend", ("inductor", "eager"))
     def test_param_dtype_mismatch_rejected(self, backend):
+        # [FUNCTION DOC] Parametrized by backend. Calls with a half precision copy of the traced
+        # linear and expects PrecompileError mentioning weight and dtype on each load path.
         # The dtype half of the structural shape/dtype check (invariant 2): a runtime
         # model with the SAME param names and shapes but a different param DTYPE (a
         # .half() copy of the traced float32 model) is rejected with a PrecompileError
@@ -1788,6 +2118,10 @@ class TestPrecompile(TestCase):
 
     @parametrize("backend", ("inductor", "eager"))
     def test_buffer_shape_dtype_mismatch_rejected(self, backend):
+        # [FUNCTION DOC] Parametrized by backend. Traces a module with a buffer read in forward,
+        # then calls with modules whose buffer of the same name has another shape or another
+        # dtype; expects PrecompileError naming the buffer with shape or dtype on every load
+        # path.
         # The BUFFER half of the structural SHAPE/DTYPE check (invariant 2): the
         # structural loop iterates PARAM_NAMES then BUFFER_NAMES, but only the param
         # branch was exercised elsewhere. A runtime model whose PARAMS match exactly but
@@ -1795,7 +2129,11 @@ class TestPrecompile(TestCase):
         # must be rejected naming that buffer. Cover both backends, and -- on inductor --
         # the cached AND inlined driver copies (each has its own _check_structure).
         class WithBuf(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer and a registered buffer b of
+            # configurable size and dtype; forward adds the buffer sum to the layer output.
             def __init__(self, size, dtype):
+                # [FUNCTION DOC] HELPER: Creates the layer and a random buffer b with the given
+                # size and dtype.
                 super().__init__()
                 self.lin = torch.nn.Linear(4, 3)
                 # A plain buffer the graph READS, so it is lifted to a graph input and
@@ -1803,6 +2141,7 @@ class TestPrecompile(TestCase):
                 self.register_buffer("b", torch.randn(size).to(dtype))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the linear output plus the sum of the buffer.
                 return self.lin(x) + self.b.sum()
 
         m = WithBuf(3, torch.float32).eval()
@@ -1823,6 +2162,10 @@ class TestPrecompile(TestCase):
                     f_c(bad_dtype, x)
 
     def test_param_layout_specialization_rejected_inductor(self):
+        # [FUNCTION DOC] Traces a linear with the inductor backend. A runtime copy whose weight
+        # has the same shape and dtype but a non-contiguous layout is rejected with
+        # PrecompileError mentioning memory format and parameter/buffer layout on cached and
+        # inlined paths; the eager backend accepts it and matches the layer output.
         # MAJOR2 (invariant 2 inductor caveat / invariant 6): the inductor backend bakes
         # each param/buffer's LAYOUT (memory format) too, since it emits assert_size_stride
         # on every weight the graph reads. A runtime model whose weight has the SAME
@@ -1834,6 +2177,9 @@ class TestPrecompile(TestCase):
         code, cache = torch.compiler.precompile(lambda model, t: model(t), m, x)
 
         def with_noncontig_weight():
+            # [FUNCTION DOC] HELPER: Builds a new linear with the traced module's state, then
+            # replaces its weight with a non-contiguous but equal-shaped parameter (asserting
+            # that); returns it.
             run = torch.nn.Linear(8, 5).eval()
             run.load_state_dict(m.state_dict())
             # A non-contiguous view of the same data: same shape+dtype, different layout.
@@ -1844,6 +2190,8 @@ class TestPrecompile(TestCase):
             return run
 
         def loaders():
+            # [FUNCTION DOC] HELPER: Generator yielding the cached loaded function and the
+            # artifact-stripped loaded function, each paired with a label.
             yield "cached", torch.compiler.precompile.load(code, cache)
             yield (
                 "inlined",
@@ -1864,6 +2212,11 @@ class TestPrecompile(TestCase):
         self.assertEqual(torch.compiler.precompile.load(ecode, ecache)(run, x), run(x))
 
     def test_unbacked_equality_shared_vs_independent_shape_id(self):
+        # [FUNCTION DOC] Compares dims marked with a shared shape id (equal sizes enforced, a
+        # mismatch raises PrecompileError mentioning shape or memory format) against
+        # independently marked dims (a mismatch is not rejected and the result takes the first
+        # input's size). The second part documents a known limitation rather than desired
+        # behavior.
         # MAJOR1 (invariant 3 DANGER note): two mark_unbacked dims that the graph requires
         # to be EQUAL behave differently depending on shape_id. (a) A SHARED shape_id binds
         # them to ONE symbol, so they are equal by construction AND a runtime size mismatch
@@ -1907,6 +2260,8 @@ class TestPrecompile(TestCase):
         self.assertEqual(tuple(out.shape), (10, 4))  # broadcasts to the first input
 
     def test_grad_identity_preserved_across_precompile(self):
+        # [FUNCTION DOC] After a warmup backward, precompiles a backward step on the same module
+        # and checks the weight gradient is still the same object (not a clone).
         # Capture snapshots and restores the example model's .grad by the SAME object (no
         # clone), so a caller holding a prior p.grad reference -- or optimizer state keyed
         # on grad identity -- is not invalidated. Warm up a backward to populate .grad,
@@ -1922,6 +2277,9 @@ class TestPrecompile(TestCase):
         self.assertIs(m.weight.grad, g)  # same object, not a clone
 
     def test_precompile_error_public_binding(self):
+        # [FUNCTION DOC] Checks the error class is the same object under both public locations,
+        # is a type, is in the compiler exports, and a real raised error (constant tensor guard)
+        # can be caught through the public alias.
         # PrecompileError is a single public type reachable two ways
         # (torch.compiler.PrecompileError and torch.compiler.precompile.PrecompileError),
         # is a real exception type, is advertised in torch.compiler.__all__, and a raised
@@ -1938,6 +2296,8 @@ class TestPrecompile(TestCase):
             torch.compiler.precompile(lambda x: x + captured, torch.randn(3))
 
     def test_single_trust_warning_on_inlined_load(self):
+        # [FUNCTION DOC] Loading an eager artifact with warnings captured must log exactly one
+        # message mentioning EXEC and at least one mentioning untrusted input.
         # On the inlined load path (an eager artifact has an empty cache, so there is
         # nothing to prime and load() just EXECs python_code) the untrusted-input / EXEC
         # warning must fire EXACTLY ONCE -- only _make_inlined_forward warns. Asserting
@@ -1956,17 +2316,27 @@ class TestPrecompile(TestCase):
         self.assertTrue(any("untrusted" in line.lower() for line in cm.output))
 
     def test_tied_weights_single_input_single_grad(self):
+        # [FUNCTION DOC] Traces a backward step on a module whose two layers share one weight:
+        # checks the source lists the tied parameter name once, and that the loaded function
+        # gives the same accumulated gradient as eager backward and the weights remain one
+        # tensor.
         # Invariants 1/2/5: a weight tied across two layers is interned by identity to a
         # SINGLE graph input (PARAM_NAMES lists the first name once) and accumulates ONE
         # grad -- the sum of both uses -- matching an eager backward, not one grad per name.
         class Tied(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module of two bias-free linear layers where the second layer
+            # weight is the same parameter as the first, applied in sequence.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates two layers and ties the second weight to the
+                # first.
                 super().__init__()
                 self.l1 = torch.nn.Linear(4, 4, bias=False)
                 self.l2 = torch.nn.Linear(4, 4, bias=False)
                 self.l2.weight = self.l1.weight  # tie: same tensor, two names
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the second layer applied to the first layer
+                # output.
                 return self.l2(self.l1(x))
 
         m = Tied()
@@ -1984,6 +2354,9 @@ class TestPrecompile(TestCase):
         self.assertIs(m.l1.weight, m.l2.weight)  # still one tensor at runtime
 
     def test_multiple_module_args_all_lifted(self):
+        # [FUNCTION DOC] Passes two different modules and an input; checks the source lists both
+        # module positions and prefixes parameter names per module, and that the loaded function
+        # matches the chained eager modules.
         # The multi=True naming branch: two DIFFERENT nn.Module args are BOTH lifted, their
         # positions recorded in MODULE_POSITIONS, and their params disambiguated as m0.* /
         # m1.* (per-module prefixes). Loaded artifact matches eager m2(m1(t)).
@@ -1999,11 +2372,18 @@ class TestPrecompile(TestCase):
         self.assertEqual(f_c(m1, m2, t), m2(m1(t)))
 
     def test_frozen_param_keeps_none_grad(self):
+        # [FUNCTION DOC] Traces a backward step on a module with a frozen and a trainable layer;
+        # after the loaded run the frozen parameters have no gradient and the trainable ones
+        # have gradients equal to a plain eager backward on a copy.
         # Invariant 5 with a mix: only params that received a gradient are harvested
         # (recorded in GRAD_PARAM_INDICES), so a frozen (requires_grad=False) param keeps
         # .grad is None while a trainable param gets a grad matching an eager backward.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a frozen linear layer (requires_grad off) followed
+            # by a trainable one.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two layers and freezes the first layer's
+                # parameters.
                 super().__init__()
                 self.frozen = torch.nn.Linear(4, 4)
                 self.trainable = torch.nn.Linear(4, 4)
@@ -2011,6 +2391,8 @@ class TestPrecompile(TestCase):
                     p.requires_grad_(False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the trainable layer applied to the frozen layer
+                # output.
                 return self.trainable(self.frozen(x))
 
         m = M()
@@ -2033,6 +2415,9 @@ class TestPrecompile(TestCase):
             self.assertEqual(p.grad, rp.grad, n)
 
     def test_requires_grad_flip_is_noop(self):
+        # [FUNCTION DOC] Traces a backward step while parameters require grad, then disables
+        # requires_grad on a runtime copy; checks the gradient is still produced and equals the
+        # eager gradient, showing which params get gradients is fixed at capture.
         # Which params get a scattered grad is fixed at CAPTURE time from the example
         # model's requires_grad (invariant 5); flipping a runtime param's requires_grad
         # does NOT change what the artifact computes. Capture with params requiring grad,
@@ -2058,11 +2443,18 @@ class TestPrecompile(TestCase):
 
 @skipIfTorchDynamo("precompile's make_fx capture is incompatible with dynamo wrapping")
 class TestPrecompileNumerics(TestCase):
+# [CLASS DOC] Numerics tests comparing precompile outputs and gradients to eager on the test
+# devices. Skipped under the dynamo wrapped test mode.
     # Numeric-correctness tests run device-generically so the same coverage
     # exercises the CUDA lowering, not just CPU.
 
     def test_plain_function(self, device):
+        # [FUNCTION DOC] Device-generic. Precompiles a function returning a sine of a matrix
+        # product and a sum on two random matrices; checks the returned python text and cache
+        # bytes types and that the loaded function outputs match the plain function.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns a pair of sine of the matrix product and the
+            # elementwise sum.
             return (x @ y).sin(), x + y
 
         a = make_tensor((4, 4), device=device, dtype=torch.float32)
@@ -2078,13 +2470,20 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(out[1], ref[1])
 
     def test_module_params_and_buffers_are_lifted(self, device):
+        # [FUNCTION DOC] Device-generic. Precompiles a module with a linear layer and a buffer
+        # passed as an argument and checks the loaded function matches the module output.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer and a registered buffer; forward is
+            # relu of the layer output plus the buffer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear layer and registers a random buffer
+                # b2.
                 super().__init__()
                 self.lin = torch.nn.Linear(4, 3)
                 self.register_buffer("b2", torch.randn(3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns relu of the linear output plus the buffer.
                 return torch.relu(self.lin(x)) + self.b2
 
         m = M().to(device).eval()
@@ -2094,6 +2493,9 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(f_c(m, x), m(x))
 
     def test_multiple_module_args(self, device):
+        # [FUNCTION DOC] Two module arguments: checks the source lists parameter names prefixed
+        # per module (first and second module) and the loaded function matches the chained eager
+        # result.
         # More than one nn.Module arg: each module's params are lifted with
         # m{i}.-prefixed names. Both modules are passed again at runtime.
         a = torch.nn.Linear(4, 4).to(device).eval()
@@ -2112,6 +2514,8 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(f_c(a, b, x), ref)
 
     def test_inplace_on_intermediate_is_allowed(self, device):
+        # [FUNCTION DOC] A sequential with an in-place relu on an intermediate is accepted by
+        # precompile (not treated as input mutation) and the loaded function matches eager.
         # In-place ops on intermediates (e.g. nn.ReLU(inplace=True)) are fine -- they
         # do not touch any input -- and must NOT be rejected as input mutation.
         m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.ReLU(inplace=True))
@@ -2122,6 +2526,9 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(f_c(m, x), m(x))
 
     def test_training_backward_harvest_matches_eager(self, device):
+        # [FUNCTION DOC] Precompiles a training step calling backward on a loss. The loaded
+        # function returns None and sets parameter gradients equal to eager; a second call
+        # doubles them (accumulation); a short SGD loop with zeroing reduces the loss.
         # A training step that calls loss.backward(): precompile scatters the
         # parameter grads onto the runtime model's .grad fields (mirroring eager
         # .backward()) and returns fn's own result (None here).
@@ -2140,6 +2547,8 @@ class TestPrecompileNumerics(TestCase):
         ref_grads = [p.grad.clone() for p in ref.parameters()]
 
         def train_step(model, x, target):
+            # [FUNCTION DOC] HELPER: Computes mean squared error of the model output and calls
+            # backward.
             loss_fn(model(x), target).backward()
 
         code, cache = torch.compiler.precompile(train_step, model, x, target)
@@ -2168,6 +2577,9 @@ class TestPrecompileNumerics(TestCase):
         self.assertLess(losses[-1], losses[0])
 
     def test_frozen_params_grad_matches_eager(self, device):
+        # [FUNCTION DOC] With the first linear layer frozen, runs a loaded training step and
+        # checks each parameter gradient is None where the eager reference has None and equal
+        # otherwise.
         # Params that do not receive a gradient -- a frozen (requires_grad=False)
         # backbone, or a param that does not contribute to the loss -- must keep
         # .grad = None after the step, exactly like eager .backward(). precompile must
@@ -2186,6 +2598,8 @@ class TestPrecompileNumerics(TestCase):
         loss_fn(ref(x), target).backward()
 
         def train_step(model, x, target):
+            # [FUNCTION DOC] HELPER: Computes mean squared error of the model output and calls
+            # backward.
             loss_fn(model(x), target).backward()
 
         code, cache = torch.compiler.precompile(train_step, model, x, target)
@@ -2198,6 +2612,9 @@ class TestPrecompileNumerics(TestCase):
                 self.assertEqual(p.grad, rp.grad)
 
     def test_multiple_modules_backward_grad_scatter(self, device):
+        # [FUNCTION DOC] Two modules with one frozen bias and a backward step: checks gradients
+        # scatter onto the right module parameters (None for the frozen bias, equal to eager
+        # elsewhere).
         # Two distinct module args + a backward: grads must scatter onto the correct
         # module's params via the cross-module GRAD_PARAM_INDICES mapping. One module
         # is partly frozen so the test also pins the index shift across modules.
@@ -2213,6 +2630,8 @@ class TestPrecompileNumerics(TestCase):
         loss_fn(ref_b(torch.relu(ref_a(x))), target).backward()
 
         def train_step(ma, mb, x, target):
+            # [FUNCTION DOC] HELPER: Runs the two modules in sequence with a relu between,
+            # computes mean squared error against the target and calls backward.
             loss_fn(mb(torch.relu(ma(x))), target).backward()
 
         code, cache = torch.compiler.precompile(train_step, a, b, x, target)
@@ -2227,17 +2646,26 @@ class TestPrecompileNumerics(TestCase):
             self.assertEqual(p.grad, rp.grad, f"b.{n}")
 
     def test_tied_weights_lifted_once(self, device):
+        # [FUNCTION DOC] Checks a weight tied across two layers is lifted once (the source lists
+        # a single parameter name), forward matches eager, and a backward step produces one
+        # gradient equal to the eager one that is shared by both layers.
         # A tied weight (same tensor under multiple names) must become a single
         # lifted input: otherwise it is double-counted (double optimizer step) and
         # gradients are split rather than accumulated.
         class Tied(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module of two bias-free linear layers with the second weight
+            # tied to the first; forward applies a relu between them.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two layers and ties the second weight to
+                # the first.
                 super().__init__()
                 self.a = torch.nn.Linear(4, 4, bias=False)
                 self.b = torch.nn.Linear(4, 4, bias=False)
                 self.b.weight = self.a.weight  # tie
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns second layer applied to relu of the first layer
+                # output.
                 return self.b(torch.relu(self.a(x)))
 
         torch.manual_seed(0)
@@ -2266,8 +2694,12 @@ class TestPrecompileNumerics(TestCase):
         self.assertIs(m.a.weight.grad, m.b.weight.grad)
 
     def test_backend_eager_plain_function(self, device):
+        # [FUNCTION DOC] Eager backend with a plain two-output function; the loaded outputs
+        # match the function applied directly.
         # backend="eager" runs the captured graph as-is and matches eager.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns a pair of sine of the matrix product and the
+            # elementwise sum.
             return (x @ y).sin(), x + y
 
         a = make_tensor((4, 4), device=device, dtype=torch.float32)
@@ -2280,6 +2712,8 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(out[1], ref[1])
 
     def test_backend_eager_module(self, device):
+        # [FUNCTION DOC] Eager backend with a linear plus relu module passed at runtime; the
+        # loaded function matches the module.
         m = torch.nn.Sequential(torch.nn.Linear(4, 3), torch.nn.ReLU())
         m.to(device).eval()
         x = make_tensor((5, 4), device=device, dtype=torch.float32)
@@ -2290,6 +2724,8 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(f_c(m, x), m(x))
 
     def test_backend_eager_training_harvest(self, device):
+        # [FUNCTION DOC] Eager backend training step: the loaded function returns None and sets
+        # parameter gradients equal to a plain eager backward.
         # The backward-harvest contract holds for the eager backend too.
         torch.manual_seed(0)
         model = torch.nn.Sequential(
@@ -2304,6 +2740,8 @@ class TestPrecompileNumerics(TestCase):
         ref_grads = [p.grad.clone() for p in ref.parameters()]
 
         def train_step(model, x, target):
+            # [FUNCTION DOC] HELPER: Computes mean squared error of the model output and calls
+            # backward.
             loss_fn(model(x), target).backward()
 
         code, cache = torch.compiler.precompile(
@@ -2316,11 +2754,16 @@ class TestPrecompileNumerics(TestCase):
             self.assertEqual(p.grad, rg)
 
     def test_backend_eager_batchnorm(self, device):
+        # [FUNCTION DOC] Eager backend with a batch norm model in training mode. Checks the
+        # standalone source works (needs the graph's device constant) and that output and the
+        # running mean update match an identically seeded eager copy.
         # The captured graph bakes a ``device`` constant (BatchNorm's
         # num_batches_tracked path), one of fx's custom builtins. The eager
         # standalone source must inject the full custom-builtin set, else this
         # raises NameError: name 'device' is not defined.
         def fresh():
+            # [FUNCTION DOC] HELPER: Seeds the generator, builds a linear plus batch norm
+            # sequential in train mode on the test device and returns it.
             torch.manual_seed(0)
             m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.BatchNorm1d(4))
             m.train()
@@ -2340,9 +2783,14 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(run[1].running_mean, ref_rm)
 
     def test_backend_eager_inf_constant(self, device):
+        # [FUNCTION DOC] Eager backend where a masked fill to negative infinity puts an infinity
+        # token in the generated graph source; checks the loaded function matches the plain
+        # function.
         # masked_fill to -inf bakes a bare ``inf`` token into gm.code (another fx
         # custom builtin); the eager standalone source must provide it.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns relu of the input with negative positions replaced
+            # by negative infinity.
             return torch.relu(x).masked_fill(x < 0, float("-inf"))
 
         x = make_tensor((8,), device=device, dtype=torch.float32)
@@ -2351,10 +2799,15 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(f_c(x), f(x))
 
     def test_batchnorm_train_with_backward(self, device):
+        # [FUNCTION DOC] Inductor training step on a model with batch norm in train mode. Checks
+        # the gradients and the updated running mean match an identically seeded eager reference
+        # within tolerance.
         # Training a model containing BatchNorm exercises buffer mutation (running
         # stats) and grad harvest together; grads and running stats must match eager.
         # Inductor fuses the BN backward, so rely on assertEqual's tolerance.
         def fresh():
+            # [FUNCTION DOC] HELPER: Seeds the generator, builds a linear, batch norm, linear
+            # sequential in train mode on the test device and returns it.
             torch.manual_seed(0)
             m = torch.nn.Sequential(
                 torch.nn.Linear(4, 8), torch.nn.BatchNorm1d(8), torch.nn.Linear(8, 3)
@@ -2374,6 +2827,8 @@ class TestPrecompileNumerics(TestCase):
         ref_rm = ref[1].running_mean.clone()
 
         def train_step(model, x, target):
+            # [FUNCTION DOC] HELPER: Computes mean squared error of the model output and calls
+            # backward.
             loss_fn(model(x), target).backward()
 
         code, cache = torch.compiler.precompile(train_step, fresh(), x, target)
@@ -2385,6 +2840,8 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(run[1].running_mean, ref_rm)
 
     def test_output_alias_supported(self, device):
+        # [FUNCTION DOC] Checks a function returning a transposed view of its input (output
+        # aliasing) precompiles and the loaded function returns the transpose.
         # An output that is a view of an input goes through AOTAutograd's output-
         # alias epilogue; precompile reproduces it.
         x = make_tensor((2, 3), device=device, dtype=torch.float32)
@@ -2393,6 +2850,8 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(f_c(x), x.t())
 
     def test_input_mutation_supported(self, device):
+        # [FUNCTION DOC] Precompiles a function that adds one in place to its input; the loaded
+        # function mutates the passed tensor (zeros become ones) and also returns ones.
         # In-place input mutation is reflected on the passed tensor (and matches
         # eager), via AOTAutograd's mutation handling composed into the artifact.
         scratch = make_tensor((4,), device=device, dtype=torch.float32)
@@ -2405,6 +2864,9 @@ class TestPrecompileNumerics(TestCase):
 
     @unittest.skipUnless(TEST_CUDA, "functionalize_rng_ops seeds via CUDA rng state")
     def test_functionalized_rng_supported(self, device):
+        # [FUNCTION DOC] Needs CUDA (rng state helper). With functionalized rng ops enabled,
+        # precompiles dropout and checks the loaded function output has the input's shape and
+        # some zeroed elements.
         # Functionalized RNG (dropout) threads seed/offset; the AOT backend composes
         # the RNG wrapper in. The artifact runs and produces a valid dropout mask. Even
         # for a CPU tensor the wrapper seeds from CUDARngStateHelper.get_torch_state_as_tuple,
@@ -2423,10 +2885,15 @@ class TestPrecompileNumerics(TestCase):
         self.assertTrue((out == 0).any())
 
     def test_batchnorm_train_buffer_mutation(self, device):
+        # [FUNCTION DOC] Traces a linear plus batch norm in train mode; the loaded function on a
+        # fresh copy gives the same output and the same running mean, running variance and batch
+        # counter as an identically seeded eager copy.
         # A stateful module (BatchNorm in training mode) mutates its running stats.
         # precompile reflects that onto the runtime model's buffers and matches eager
         # -- the mutation handling comes from AOTAutograd's codegen.
         def fresh():
+            # [FUNCTION DOC] HELPER: Seeds the generator, builds a linear plus batch norm
+            # sequential in train mode on the test device and returns it.
             torch.manual_seed(0)
             m = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.BatchNorm1d(4))
             m.train()
@@ -2450,6 +2917,9 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(run[1].num_batches_tracked, ref_nbt)
 
     def test_mutated_duplicate_input(self, device):
+        # [FUNCTION DOC] Precompiles a function that mutates its first argument and adds the
+        # second, with the same tensor passed for both. Running the loaded function with one
+        # cloned tensor passed twice gives the same output as eager on a clone.
         # The same tensor passed twice with a mutation: make_fx resolves the aliasing
         # at trace time (the graph mutates one input and reuses the result), so the
         # artifact reproduces eager when run with the same aliasing. Storage-aliased
@@ -2467,6 +2937,9 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(out, ref_out)
 
     def test_dynamic_shapes_runs_across_sizes(self, device):
+        # [FUNCTION DOC] With the batch dim marked unbacked, checks the source records an
+        # unknown first dim, then runs the cached load and an artifact-stripped load over batch
+        # sizes 8, 16 and 1, comparing to eager.
         # An UNBACKED-dynamic batch dim (opted in via mark_unbacked on the input): one
         # artifact runs on many runtime batch sizes (cached AND inlined paths), matching
         # eager. Device-generic so the CUDA unbacked-symint lowering is exercised.
@@ -2490,6 +2963,9 @@ class TestPrecompileNumerics(TestCase):
             self.assertEqual(f_i(m, xt), m(xt))  # inlined path
 
     def test_dynamic_shapes_training_across_sizes(self, device):
+        # [FUNCTION DOC] With a batch dim marked unbacked, precompiles a backward step; for
+        # batch sizes 8, 16 and 5 the loaded function on a fresh copy gives a weight gradient
+        # equal to eager.
         # Training (backward) with a dynamic batch; harvested grads match eager across
         # sizes (loss is output.sum() so no cross-input dim-equality guard is needed).
         # Device-generic so the CUDA unbacked-symint backward lowering is exercised.
@@ -2512,6 +2988,8 @@ class TestPrecompileNumerics(TestCase):
             self.assertEqual(run.weight.grad, ref.weight.grad)
 
     def test_dynamic_shapes_shared_shape_id(self, device):
+        # [FUNCTION DOC] Two inputs share a shape id on the batch dim and are added after a
+        # linear; the single artifact runs and matches eager for batch sizes 8, 16 and 3.
         # Two inputs whose batch dims share a shape_id reuse ONE unbacked symbol, so a
         # cross-input matched-batch op (here an add) traces with no dim-equality guard and
         # runs across sizes. Device-generic so the CUDA lowering is exercised.
@@ -2528,6 +3006,9 @@ class TestPrecompileNumerics(TestCase):
             self.assertEqual(f_c(m, xt, yt), m(xt) + yt)
 
     def test_mark_unbacked_strict_honored(self, device):
+        # [FUNCTION DOC] Checks an unbacked mark with the strict flag is honored: the source
+        # records an unknown first dim and the artifact matches eager for batch sizes 8, 16 and
+        # 2.
         # mark_unbacked(x, 0, strict=True) is HONORED: the dim is captured as an unbacked
         # symint, so USER_INPUT_SHAPES records None for it and the single artifact runs
         # across runtime sizes, matching eager (device-generic for CUDA coverage).
@@ -2542,6 +3023,8 @@ class TestPrecompileNumerics(TestCase):
             self.assertEqual(f_c(m, xt), m(xt))
 
     def test_unbacked_zero_batch_runs(self, device):
+        # [FUNCTION DOC] Checks an unbacked dim accepts a runtime batch size of zero and matches
+        # eager.
         # bs=0 on an unbacked dynamic dim is a valid runtime size (the symbol is >= 0);
         # the artifact runs on an empty batch and matches eager.
         m = torch.nn.Linear(4, 3).to(device).eval()
@@ -2553,6 +3036,9 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(f_c(m, xt), m(xt))
 
     def test_channels_last_marked_input_roundtrips(self, device):
+        # [FUNCTION DOC] Marks a channels last four dimensional input unbacked on its batch dim;
+        # the loaded pointwise function accepts a channels last input of another batch size and
+        # matches eager.
         # A channels_last-marked dynamic input round-trips at the SAME layout for a
         # LAYOUT-PRESERVING (pointwise) op: _detect_memory_format records channels_last so
         # the refaked leaf preserves it, and the artifact accepts a channels_last runtime
@@ -2570,6 +3056,9 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(out, torch.relu(xt) * 2.0)
 
     def test_marked_exotic_layout_rejected(self, device):
+        # [FUNCTION DOC] An unbacked-marked input that is a transposed (non-contiguous, not
+        # channels last) tensor makes precompile raise PrecompileError mentioning memory format
+        # at capture.
         # _detect_memory_format cannot preserve a layout that is neither contiguous nor
         # channels_last(_3d) through the refake, so a mark_unbacked input in such a layout
         # (here a transposed, non-contiguous 2D tensor) is rejected LOUDLY at capture rather
@@ -2582,6 +3071,8 @@ class TestPrecompileNumerics(TestCase):
             torch.compiler.precompile(lambda t: t.contiguous() * 2.0, x)
 
     def test_eager_backend_input_mutation(self, device):
+        # [FUNCTION DOC] Eager backend counterpart of the input mutation test: the loaded
+        # function mutates the passed tensor and returns it, both becoming ones.
         # The eager backend replays the raw ATen graph, so input mutation is reflected on
         # the passed tensor and matches eager, like the inductor backend.
         scratch = make_tensor((4,), device=device, dtype=torch.float32)
@@ -2595,6 +3086,8 @@ class TestPrecompileNumerics(TestCase):
         self.assertEqual(out, torch.ones(4, device=device))
 
     def test_eager_backend_output_alias(self, device):
+        # [FUNCTION DOC] Eager backend: a function returning a transposed view of its input
+        # produces the transpose when loaded.
         # The eager backend reproduces an output that aliases an input (a view), matching
         # eager, via the raw ATen replay.
         x = make_tensor((2, 3), device=device, dtype=torch.float32)

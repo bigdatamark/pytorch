@@ -1,4 +1,10 @@
 # Owner(s): ["module: decompositions"]
+# [MODULE DOC] Tests for the primitive operators (torch._prims) and reference
+# implementations (torch._refs). Defines device-generic test classes for prims
+# (broadcast, sum, cbrt, collapse, var, memory format strides, philox and functional
+# rng wrappers), basic prim behavior, refs corner cases and a decomposition varargs
+# check over OpInfo entries. Imports scipy only when available; two device-type test
+# classes are instantiated at import time.
 
 from functools import partial
 from itertools import product
@@ -35,10 +41,19 @@ NVPRIM_ATEN_FALLBACK_WARNING = "fallback to aten executor"
 GET_ISOLATED_GRAPHMODULE_ERROR = "get_isolated_graphmodule failed on decomposition"
 
 class TestPrims(TestCase):
+    # [CLASS DOC] Device-generic tests for prims. Several tests are CUDA only and compare
+    # traced execution through the aten executor against eager results; others check
+    # shapes, views, strides and rng state handling on any device.
     @onlyCUDA
     @dtypes(torch.float32)
     def test_broadcast_in_dim(self, device, dtype):
+        # [FUNCTION DOC] CUDA only. Traces a wrapper around the broadcast_in_dim prim with the
+        # aten executor and checks outputs for same-shape, added outer dimensions, expansion
+        # and unsqueeze cases against the equivalent tensor ops. Checks reordering the dims
+        # raises an error.
         def _wrapper(a, b, broadcast_dimensions):
+            # [FUNCTION DOC] HELPER: Calls the broadcast_in_dim prim to broadcast the first tensor
+            # to the shape of the second using the given mapping of dimensions.
             return prims.broadcast_in_dim(a, b.shape, broadcast_dimensions)
 
         traced = make_traced(_wrapper)
@@ -87,7 +102,12 @@ class TestPrims(TestCase):
     @onlyCUDA
     @dtypes(torch.float32)
     def test_broadcast_in_dim_sum(self, device, dtype):
+        # [FUNCTION DOC] CUDA only. Traces a sum over both dims followed by a broadcast to a
+        # scalar shape with the aten executor, and checks the result is zero-dimensional and
+        # equals eager execution.
         def _wrapper(a):
+            # [FUNCTION DOC] HELPER: Sums the input over dims zero and one with the sum prim, then
+            # broadcasts the result to an empty shape; returns it.
             a_sum = prims.sum(a, [0, 1])
             a_bc = prims.broadcast_in_dim(a_sum, [], [])
             return a_bc
@@ -108,6 +128,10 @@ class TestPrims(TestCase):
     @unittest.skipIf(not TEST_SCIPY, "SciPy not found")
     @dtypes(torch.float64, torch.long)
     def test_cbrt_prim(self, device, dtype):
+        # [FUNCTION DOC] Skipped without SciPy. For float64 and long dtypes and many
+        # batch/shape combos (including empty), compares the cbrt prim against scipy cube root
+        # computed on the CPU copy, under a double default dtype. Device is not compared
+        # strictly.
         make_arg = partial(make_tensor, device=device, dtype=dtype)
         batches = [(), (1,), (2,), (0, 1), (1, 1), (2, 2)]
         shapes = [(), (0,), (1,), (5,)]
@@ -126,6 +150,10 @@ class TestPrims(TestCase):
 
     @dtypes(torch.float32)
     def test_collapse(self, device, dtype):
+        # [FUNCTION DOC] Checks collapse (copy) and collapse_view (view) over several dim
+        # ranges against reshape with the expected shapes. Checks a view of a transposed
+        # tensor raises RuntimeError, the copy form still works, and invalid dim ranges raise
+        # AssertionError for both prims.
         t = torch.rand(2, 2, 2)
         dim_ranges = [(0, 0), (0, 1), (1, 2), (0, 2)]
         expected_shapes = [(2, 2, 2), (4, 2), (2, 4), (8,)]
@@ -156,6 +184,9 @@ class TestPrims(TestCase):
 
 
     def test_aten_overload_to_prims(self, device):
+        # [FUNCTION DOC] Under the refs mode context, traces a function of sigmoid and digamma
+        # aten calls with make_fx and checks every call_function node targets an op in the
+        # prims namespace.
         # This test is to ensure that the torch.ops.aten calls are replaced with refs
         from torch.fx.experimental.proxy_tensor import make_fx
         from torch._prims.context import TorchRefsMode
@@ -163,6 +194,8 @@ class TestPrims(TestCase):
         a = torch.randn(3, 3, device=device)
 
         def func(a):
+            # [FUNCTION DOC] HELPER: Applies aten digamma then aten sigmoid to the input and
+            # returns it.
             return torch.ops.aten.sigmoid.default(torch.ops.aten.digamma.default(a))
 
         with TorchRefsMode():
@@ -179,7 +212,12 @@ class TestPrims(TestCase):
     @dtypes(torch.float32)
     @parametrize("correction", [0, 1])
     def test_var(self, device, dtype, correction):
+        # [FUNCTION DOC] CUDA only. Parametrized by correction (0 or 1). Traces a wrapper
+        # around the var prim over both dims with the aten executor and checks a scalar result
+        # equal to eager.
         def _wrapper(a):
+            # [FUNCTION DOC] HELPER: Computes the var prim over dims zero and one with the closed-
+            # over correction value and returns it.
             return prims.var(a, [0, 1], correction=correction)
 
         traced = make_traced(_wrapper)
@@ -197,6 +235,13 @@ class TestPrims(TestCase):
 
     @dtypes(torch.float32)
     def test_memory_format_strides(self, device, dtype):
+        # [FUNCTION DOC] For many shapes and the contiguous, channels last and channels last
+        # 3d formats, checks the refs empty strides equal torch empty strides, and checks
+        # contiguous strides match the eager method on a noncontiguous input. The clone check
+        # compares torch clone to itself (both sides use the torch function), so it cannot
+        # fail.
+        # KNOWN ISSUE: the clone portion compares torch clone with torch clone, not the refs
+        #   version.
         shapes = (
             (),
             (0,),
@@ -260,6 +305,9 @@ class TestPrims(TestCase):
 
     @dtypes(torch.float32)
     def test_reshape_view_method(self, device, dtype):
+        # [FUNCTION DOC] Checks refs reshape and refs view give the same result as the tensor
+        # reshape and view methods for a five by five input and a new shape with extra size
+        # one dims.
         make_arg = partial(make_tensor, device=device, dtype=dtype)
         a = make_arg((5, 5))
         new_shape = 1, 5, 1, 5
@@ -275,6 +323,9 @@ class TestPrims(TestCase):
     @onlyCUDA
     @dtypes(torch.float32)
     def test_philox_rand(self, device, dtype):
+        # [FUNCTION DOC] CUDA only. For two sizes, records the CUDA rng state and a reference
+        # rand result per repeat, reseeds, then calls the philox_rand rngprim with the saved
+        # seed and offset and checks each result equals the reference.
         sizes = (1000, 1000000)  # offsets of 4 and 8
         repeats = 2  # Checks multiple rand calls results with multiple philox_rand calls
         for size in sizes:
@@ -303,6 +354,9 @@ class TestPrims(TestCase):
 
     @dtypes(torch.float32)
     def test_functional_rng_wrappers(self, device, dtype):
+        # [FUNCTION DOC] Checks the run_and_save_rng_state and run_with_rng_state wrappers:
+        # two saved runs after seeding reproduce two plain rand outputs, and replaying each
+        # saved state reproduces the same values.
 
         torch.manual_seed(123)
         ref1 = torch.rand(10, device=device, dtype=dtype)
@@ -322,6 +376,9 @@ class TestPrims(TestCase):
         self.assertEqual(ref2, res4)
 
     def test_functional_rng_wrapper_with_positional_device(self):
+        # [FUNCTION DOC] Calls run_and_save_rng_state on the inductor seeds prim passing the
+        # device as a positional argument, and checks the returned state and result are on CPU
+        # and the result has shape of one element.
         import torch._inductor.inductor_prims
 
         rng_state, result = torch._prims.rng_prims.run_and_save_rng_state(
@@ -333,7 +390,12 @@ class TestPrims(TestCase):
         self.assertEqual(result.shape, (1,))
 
 class TestPrimsBasic(TestCase):
+    # [CLASS DOC] Device-independent tests of basic prim behaviors: dispatch logging,
+    # complex inputs and meta clone stride handling.
     def test_torch_ops(self):
+        # [FUNCTION DOC] Checks the prims namespace sin matches torch sin, then logs the
+        # dispatch of the prim on a logging tensor and compares the captured log text with an
+        # expected string.
         r = make_tensor((2,), device='cpu', dtype=torch.float)
         self.assertEqual(torch.ops.prims.sin(r), torch.sin(r))
 
@@ -346,24 +408,34 @@ $0: f32[2] = input('input')
 $1: f32[2] = torch._ops.prims.sin.default($0)""")
 
     def test_mul_complex(self):
+        # [FUNCTION DOC] Smoke test: multiplies a random tensor by a complex Python scalar
+        # with the mul prim; only checks it does not raise.
         prims.mul(torch.randn(2), 1 + 1j)
 
     def test_clone_complex(self):
+        # [FUNCTION DOC] Smoke test: with the python dispatcher on, adds a scalar to a
+        # conjugated complex meta tensor; only checks it does not raise.
         with torch._dispatch.python.enable_python_dispatcher():
             x = torch.randn(4, dtype=torch.complex64, device='meta').conj()
             x + 1
 
     def test_clone_meta_stride_preservation_dense(self):
+        # [FUNCTION DOC] Checks the meta clone function under preserve format keeps the
+        # strides of a transposed (non-contiguous but dense) tensor.
         tensor = torch.randn(1, 5).t()
         meta_clone = prims._clone_meta(tensor, memory_format=torch.preserve_format)
         self.assertEqual(tensor.stride(), meta_clone.stride())
 
     def test_clone_meta_stride_preservation_sparse(self):
+        # [FUNCTION DOC] Checks the meta clone function under preserve format on a strided
+        # slice of a tensor gives the strides of the contiguous version.
         tensor = torch.arange(12).float().view(3, 4)[1:, ::2]
         meta_clone = prims._clone_meta(tensor, memory_format=torch.preserve_format)
         self.assertEqual(tensor.contiguous().stride(), meta_clone.stride())
 
     def test_check_deprecation_warning(self):
+        # [FUNCTION DOC] Checks the common check helper emits a FutureWarning stating it will
+        # be removed in the future, when called with a true condition.
         with self.assertWarnsRegex(FutureWarning, 'will be removed in the future'):
             torch._prims_common.check(True, lambda: 'message')
 
@@ -372,8 +444,12 @@ instantiate_device_type_tests(TestPrims, globals())
 
 
 class TestRefs(TestCase):
+    # [CLASS DOC] Device-generic tests for reference implementations (torch._refs).
     @dtypes(torch.float32)
     def test_constant_pad_nd_memory_format(self, device, dtype):
+        # [FUNCTION DOC] Checks refs constant_pad_nd preserves channels last or contiguous
+        # format for unambiguous cases, and for two ambiguous stride layouts compares strides
+        # with the torch version and checks the expected channels last or contiguous result.
         # Test memory format is preserved in unambiguous cases
         for mf, ndim in (
                 (torch.channels_last, 4),
@@ -407,6 +483,9 @@ class TestRefs(TestCase):
         self.assertTrue(actual.is_contiguous())
 
     def test_unbind(self):
+        # [FUNCTION DOC] Checks refs unbind on an empty-dim tensor returns the same as torch
+        # unbind. Kept here as it would break assumptions in the backward tests if added to
+        # OpInfo.
         # If unbind returns empty tuple, it breaks some assumptions in some backward tests in test_ops.py.
         # So can't put this test into common_methods_invocations.py.
         a = torch.rand([3, 0, 4])
@@ -415,23 +494,30 @@ class TestRefs(TestCase):
         self.assertEqual(actual, expect)
 
     def test_logspace_with_complex_input(self):
+        # [FUNCTION DOC] Compares refs logspace with torch logspace for a complex end value.
         actual = refs.logspace(2, 10 + 5j, steps=5)
         expect = torch.logspace(2, 10 + 5j, steps=5)
         self.assertEqual(actual, expect)
 
     def test_linspace_with_complex_input(self):
+        # [FUNCTION DOC] Compares refs linspace with torch linspace for a complex end value.
         actual = refs.linspace(2, 10 + 5j, steps=5)
         expect = torch.linspace(2, 10 + 5j, steps=5)
         self.assertEqual(actual, expect)
 
     # From https://github.com/pytorch/pytorch/issues/109558
     def test_infinite_loop_from_py_dispatcher(self):
+        # [FUNCTION DOC] Regression test for an infinite loop in the python dispatcher: with
+        # it enabled, moves a tensor to the meta device; passes if it terminates without
+        # error.
         # enables prim decomps
         with torch._dispatch.python.enable_python_dispatcher():
             x = torch.ones(4)
             x.to(device="meta")
 
     def test_inferred_tags(self):
+        # [FUNCTION DOC] Checks the tags on the normal prim default overload are the
+        # nondeterministic seeded tag and the pt2 compliant tag.
         self.assertEqual(torch.ops.prims.normal.default.tags, (torch.Tag.nondeterministic_seeded, torch.Tag.pt2_compliant_tag))
 
 
@@ -440,8 +526,14 @@ instantiate_device_type_tests(TestRefs, globals())
 
 
 class TestDecomp(TestCase):
+    # [CLASS DOC] Tests that decompositions via the refs mode work for method variants
+    # taking varargs.
     @ops([op for op in op_db if op.supports_varargs], dtypes=OpDTypes.any_one)
     def test_decomposition_method_vararg(self, device, dtype, op):
+        # [FUNCTION DOC] For OpInfo entries that support varargs, takes the first sample whose
+        # last argument is a non-empty sequence, traces the factory or method variant under
+        # the refs mode with that sequence expanded as varargs, then reruns the traced graph
+        # and the original under the same seed and compares results.
         # some ops have vararg variants for the methods. this tests it.
         # we don't have tests for varargs in OpInfo, so we need to
         # improvise this a bit.
