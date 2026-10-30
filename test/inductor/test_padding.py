@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Inductor tests for comprehensive padding of tensor strides and matmul shapes.
+# Defines env-flag driven switches (perf, accuracy, stack, cudagraphs), an optional
+# transformers import check, helper models and stride helpers, a GPU test base class, perf-
+# only test classes and the PaddingTest class. Runs tests only when a GPU is available.
 import copy
 import functools
 import os
@@ -36,11 +40,18 @@ except ImportError:
 
 
 def get_optim(m):
+    # [FUNCTION DOC] HELPER: Builds an Adam optimizer over the model parameters with
+    # learning rate 0.01, capturable and foreach enabled.
     return torch.optim.Adam(m.parameters(), lr=0.01, capturable=True, foreach=True)
 
 
 def gen_transformer_inputs(vocab_size, bs, seq_length):
+    # [FUNCTION DOC] HELPER: Returns a dict with input_ids and labels, each a random int64
+    # tensor of shape batch size by sequence length with values below vocab_size, using the
+    # nested generator for both.
     def geninp():
+        # [FUNCTION DOC] HELPER: Generates one random int64 token tensor without gradient,
+        # using the enclosing vocab size, batch size and sequence length.
         return torch.randint(
             0, vocab_size, (bs, seq_length), dtype=torch.int64, requires_grad=False
         )
@@ -50,6 +61,10 @@ def gen_transformer_inputs(vocab_size, bs, seq_length):
 
 
 def get_padded_stride(shape, alignment_bytes, pad_output, itemsize):
+    # [FUNCTION DOC] HELPER: Computes the expected strides of a contiguous tensor of the
+    # given shape. The alignment in elements is the byte alignment divided by item size;
+    # going from the innermost dimension outward, each stride is rounded up to a multiple of
+    # that alignment when pad_output is true. Returns a tuple.
     align = alignment_bytes // itemsize
     new_strides = [0 for _ in range(len(shape))]
     new_strides[len(shape) - 1] = 1
@@ -62,6 +77,9 @@ def get_padded_stride(shape, alignment_bytes, pad_output, itemsize):
 
 
 class LinearAndSoftmax(nn.Module):
+    # [CLASS DOC] HELPER: Toy model of a linear layer feeding a cross entropy loss,
+    # mimicking the vocabulary projection plus softmax of transformers. Holds the vocab
+    # size, a 768-to-vocab linear layer, and a loss module.
     """
     It's very common that a transformer model will do a matmul and then
     softmax/log_softmax in the end.
@@ -71,6 +89,8 @@ class LinearAndSoftmax(nn.Module):
     """
 
     def __init__(self, vocab_size=30523, bias=True):
+        # [FUNCTION DOC] HELPER: Stores the vocab size and creates the linear layer
+        # (optional bias) and the cross entropy loss module.
         """
         The default vocab size for BertForMaskedLM is 30522.
         We run a few test cases with good or bad vocab_size around Bert's
@@ -82,16 +102,22 @@ class LinearAndSoftmax(nn.Module):
         self.ce = nn.CrossEntropyLoss()
 
     def forward(self, x, label):
+        # [FUNCTION DOC] HELPER: Applies the linear layer to x, flattens logits to rows of
+        # vocab size and labels to a flat vector, and returns the cross entropy loss.
         x = self.linear(x)
         return self.ce(x.view(-1, self.vocab_size), label.view(-1))
 
     def get_example_inputs(self, batch_size=16):
+        # [FUNCTION DOC] HELPER: Returns a pair of random inputs: a float tensor of batch by
+        # 512 by 768 and random integer labels in the vocab range of shape batch by 512.
         return torch.randn(batch_size, 512, 768), torch.randint(
             0, self.vocab_size, (batch_size, 512)
         )
 
 
 def forward_and_backward_pass(m, inputs):
+    # [FUNCTION DOC] HELPER: Runs the model on the inputs, sums the output and runs
+    # backward.
     m(*inputs).sum().backward()
 
 
@@ -104,8 +130,15 @@ def forward_and_backward_pass(m, inputs):
 )
 @requires_gpu()
 class TestCaseBase(TestCase):
+    # [CLASS DOC] HELPER: Base class for the padding tests. Patched with kernel
+    # benchmarking, unique kernel names and cudagraphs per the USE_CUDA_GRAPHS env flag, and
+    # requires a GPU. Provides class-level precision and default-device setup, a closeness
+    # check, a compiled-vs-eager numeric check and a profiling helper.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: When a GPU exists, saves the current float32 matmul
+        # precision and default device on the class, sets precision to highest on ROCm and
+        # high otherwise, and makes the GPU the default device.
         if HAS_GPU:
             cls.prior_float32_matmul_precision = torch.get_float32_matmul_precision()
             cls.prior_default_device = torch.get_default_device()
@@ -117,6 +150,8 @@ class TestCaseBase(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] HELPER: When a GPU exists, restores the saved matmul precision and
+        # default device, then clears the saved class attributes.
         if HAS_GPU:
             torch.set_float32_matmul_precision(cls.prior_float32_matmul_precision)
             torch.set_default_device(cls.prior_default_device)
@@ -125,6 +160,10 @@ class TestCaseBase(TestCase):
             cls.prior_default_device = None
 
     def check_close(self, ref, act, tol=1e-3):
+        # [FUNCTION DOC] HELPER: Asserts two results are close with the given absolute and
+        # relative tolerance. For Longformer masked LM outputs it compares the loss fields,
+        # for sequence classifier outputs the logits, and for dicts containing a loss entry
+        # the loss values. The failure message includes both values.
         if type(ref).__name__ == "LongformerMaskedLMOutput":
             ref = ref.loss
             act = act.loss
@@ -140,6 +179,9 @@ class TestCaseBase(TestCase):
         )
 
     def common_numeric_check(self, f, *args, tol=1e-3, **kwargs):
+        # [FUNCTION DOC] HELPER: Runs the function eagerly, compiles it and runs the
+        # compiled version with the same arguments, then asserts the results are close using
+        # the given tolerance.
         ref = f(*args, **kwargs)
         opt_f = torch.compile(f)
         act = opt_f(*args, **kwargs)
@@ -154,6 +196,10 @@ class TestCaseBase(TestCase):
         args=(),
         kwargs=None,
     ):
+        # [FUNCTION DOC] HELPER: Profiles two callables with the torch profiler: after a
+        # device synchronize, runs three iterations of each, labeled by the tags, passing
+        # the args and kwargs, synchronizes, and writes a chrome trace to a fixed file under
+        # the tmp directory, printing its path.
         if kwargs is None:
             kwargs = {}
         device_interface = get_interface_for_device(GPU_TYPE)
@@ -174,12 +220,19 @@ class TestCaseBase(TestCase):
 
 
 class PerfTestBetweenGoodAndBadShape(TestCaseBase):
+    # [CLASS DOC] Perf-only tests comparing good (aligned) and bad (unaligned) vocab sizes.
     @unittest.skipIf(not DO_PERF_TEST, "Perf test not enabled")
     def test_nobias_LinearAndSoftmax_both_shapes(self):
+        # [FUNCTION DOC] Perf test: skipped unless the DO_PERF_TEST environment flag is on.
+        # Runs the shared body test with bias disabled.
         self.test_LinearAndSoftmax_both_shapes(bias=False)
 
     @unittest.skipIf(not DO_PERF_TEST, "Perf test not enabled")
     def test_LinearAndSoftmax_both_shapes(self, bias=True):
+        # [FUNCTION DOC] Perf test: skipped unless the DO_PERF_TEST environment flag is on.
+        # Compiles the toy linear and softmax model with a bad vocab size and a good vocab
+        # size, benchmarks forward plus backward of each on the GPU, and prints the
+        # latencies. No assertions.
         """
         Compare the perf with good and bad shape.
         """
@@ -203,6 +256,10 @@ class PerfTestBetweenGoodAndBadShape(TestCaseBase):
 
     @unittest.skipIf(not DO_PERF_TEST or not HAS_TRANSFORMER, "Perf test not enabled")
     def test_BertForMaskedLM(self, num_layers=1):
+        # [FUNCTION DOC] Perf test: skipped unless the DO_PERF_TEST environment flag is on.
+        # Also needs the transformers package. Builds compiled Bert masked LM training steps
+        # for vocab sizes 30528 (aligned) and 30522 (not), benchmarks both, prints latencies
+        # and writes a profile. No assertions.
         """
         Compare the perf between doing padding and good shape.
         """
@@ -213,6 +270,9 @@ class PerfTestBetweenGoodAndBadShape(TestCaseBase):
         seq_length = 512
 
         def create_model(vocab_size):
+            # [FUNCTION DOC] HELPER: Builds a Bert masked LM config with the given vocab
+            # size and layer count, creates random inputs and the model and an optimizer,
+            # and returns the compiled train step with its inputs.
             config = config_cls()
             config.num_hidden_layers = num_layers
             config.vocab_size = vocab_size
@@ -222,6 +282,9 @@ class PerfTestBetweenGoodAndBadShape(TestCaseBase):
             optim = get_optim(model)
 
             def f(**inputs):
+                # [FUNCTION DOC] HELPER: One training step: clears gradients, runs the model
+                # under autocast, takes the first output as loss, runs backward and steps
+                # the optimizer.
                 optim.zero_grad(True)
                 with torch.autocast(GPU_TYPE):
                     pred = model(**inputs)
@@ -255,8 +318,15 @@ class PerfTestBetweenGoodAndBadShape(TestCaseBase):
 
 
 class PerfTestWithAndWithoutPadding(TestCaseBase):
+    # [CLASS DOC] Tests that run models with accuracy checks and, if enabled, perf
+    # comparison with and without comprehensive padding.
     @maybe_cprofile
     def run_acc_and_perf_test(self, model, inputs, perf_inputs=None, tol=1e-3):
+        # [FUNCTION DOC] Wrapped by the optional cprofile decorator. Runs an accuracy test
+        # (eval mode, compiled vs eager, unless the DO_ACC_TEST env flag disables it) and
+        # then, when DO_PERF_TEST is on, benchmarks training steps compiled with
+        # comprehensive padding on and off using deep copies of the model and fresh
+        # optimizers, prints latencies and profiles both. perf_inputs defaults to inputs.
         """
         Run accuracy test.
 
@@ -267,6 +337,10 @@ class PerfTestWithAndWithoutPadding(TestCaseBase):
             perf_inputs = inputs
 
         def _process_inputs(x):
+            # [FUNCTION DOC] HELPER: Splits an input into a positional argument list and
+            # keyword dict: a dict becomes keyword arguments, anything else is wrapped into
+            # a list unless the outer inputs value is already a tuple or list. Returns the
+            # pair.
             """
             return args and kwargs
             """
@@ -293,7 +367,12 @@ class PerfTestWithAndWithoutPadding(TestCaseBase):
             print("Do performance test")
 
             def get_f(m, optim):
+                # [FUNCTION DOC] HELPER: Returns a training-step function for the given
+                # model and optimizer.
                 def f(*args, **kwargs):
+                    # [FUNCTION DOC] HELPER: Training step: clears gradients, runs the model
+                    # under autocast, reduces output to a scalar loss, runs backward and
+                    # steps the optimizer.
                     optim.zero_grad(True)
                     with torch.autocast(GPU_TYPE):
                         pred = m(*args, **kwargs)
@@ -338,6 +417,9 @@ class PerfTestWithAndWithoutPadding(TestCaseBase):
             )
 
     def test_nvidia_deeprecommender(self):
+        # [FUNCTION DOC] Builds a deep-recommender style stack of linear and SELU layers
+        # (with a dropout after the third linear) on very wide layer sizes and runs the
+        # accuracy and perf helper with a small input and a larger perf input.
         """
         Compared the perf with and without comprehensive padding.
         """
@@ -345,7 +427,11 @@ class PerfTestWithAndWithoutPadding(TestCaseBase):
         x = torch.randn(4, layer_sizes[0])
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Sequential stack of linear and SELU layers built from the
+            # enclosing layer sizes list, with a dropout inserted after the third linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the module list of linear and SELU layers
+                # and wraps it in a sequential container.
                 super().__init__()
                 mod_list = []
                 for i in range(len(layer_sizes) - 1):
@@ -357,6 +443,7 @@ class PerfTestWithAndWithoutPadding(TestCaseBase):
                 self.seq = nn.Sequential(*mod_list)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the sequential stack on the input.
                 return self.seq(x)
 
         m = Model()
@@ -365,6 +452,10 @@ class PerfTestWithAndWithoutPadding(TestCaseBase):
 
     @unittest.skipIf(not DO_PERF_TEST or not HAS_TRANSFORMER, "Perf test not enabled")
     def test_longformer(self, bs=4):
+        # [FUNCTION DOC] Perf test: skipped unless the DO_PERF_TEST environment flag is on.
+        # Also needs the transformers package and downloads the Longformer base
+        # configuration. Builds a masked LM from that config and runs the accuracy and perf
+        # helper on random token inputs of length 1024.
         from transformers import AutoConfig, AutoModelForMaskedLM
 
         config = AutoConfig.from_pretrained("allenai/longformer-base-4096")
@@ -378,6 +469,8 @@ class PerfTestWithAndWithoutPadding(TestCaseBase):
 
     @unittest.skipIf(not DO_PERF_TEST or not HAS_TRANSFORMER, "Perf test not enabled")
     def test_longformer_small_bs(self):
+        # [FUNCTION DOC] Perf test: skipped unless the DO_PERF_TEST environment flag is on.
+        # Also needs the transformers package. Runs the Longformer test with batch size 2.
         """
         The model exists in both HF and TB. In TB it uses a smaller batch size.
         """
@@ -386,16 +479,27 @@ class PerfTestWithAndWithoutPadding(TestCaseBase):
 
 @instantiate_parametrized_tests
 class PaddingTest(TestCaseBase):
+    # [CLASS DOC] Tests of comprehensive padding: stride padding, codegen alignment, output
+    # padding and dynamic shape handling. Inherits GPU setup from the base class.
     @unittest.skipIf(not DO_PERF_TEST, "Perf test not enabled")
     def test_mm_padding_perf(self):
+        # [FUNCTION DOC] Perf test: skipped unless the DO_PERF_TEST environment flag is on.
+        # Benchmarks plain mm and a padded mm for several bad and good shapes and prints the
+        # latencies. No assertions.
         def naive_mm(a, b):
+            # [FUNCTION DOC] HELPER: Returns the matrix product of the two inputs.
             return a @ b
 
         def _compute_padding(s, align):
+            # [FUNCTION DOC] HELPER: Returns how many elements must be added to a size to
+            # reach the next multiple of the alignment.
             return (s + align - 1) // align * align - s
 
         @torch.compile
         def pad_mm(a, b, align=16):
+            # [FUNCTION DOC] HELPER: Compiled function that computes padding amounts for M,
+            # K and N from the alignment and calls the pad_mm pass function. Only the
+            # described dimensions are padded to the alignment.
             """
             NOTE: this function only pad a single dimension which is good
             enough for testing.
@@ -419,6 +523,10 @@ class PaddingTest(TestCaseBase):
 
     @unittest.skipIf(not DO_PERF_TEST, "Perf test not enabled")
     def test_padmm(self):
+        # [FUNCTION DOC] Perf test: skipped unless the DO_PERF_TEST environment flag is on.
+        # Compares an unpadded half-precision matmul with a version that concatenates zero
+        # padding of 6 to the K dimension of both operands before an aten mm, benchmarks
+        # both, prints latencies and profiles. No assertions.
         """
         Latency between original matmul and padded matmul: 2.717 v.s. 2.356
         """
@@ -426,14 +534,19 @@ class PaddingTest(TestCaseBase):
         mat2_pad = torch.randn(30522, 768, dtype=torch.float16)
 
         def f():
+            # [FUNCTION DOC] HELPER: Returns the matrix product of the two captured tensors.
             return mat1_pad @ mat2_pad
 
         def pad_dim(x: Tensor, padded_length: int, dim: int) -> Tensor:
+            # [FUNCTION DOC] HELPER: Returns the tensor with zeros of the requested length
+            # concatenated on the given dimension.
             pad = x.new_zeros(*x.shape[:dim], padded_length, *x.shape[dim + 1 :])
             return torch.cat([x, pad], dim=dim)
 
         @torch.compile(fullgraph=True, options={"triton.cudagraphs": False})
         def g():
+            # [FUNCTION DOC] HELPER: Compiled function (full graph, no cudagraphs) padding
+            # both captured matrices on the K dimension and returning their aten mm.
             mat1 = mat1_pad
             mat2 = mat2_pad
             mat1 = pad_dim(mat1, 6, 1)
@@ -450,6 +563,9 @@ class PaddingTest(TestCaseBase):
 
     @unittest.skipIf(not DO_PERF_TEST, "Perf test not enabled")
     def test_matmul(self):
+        # [FUNCTION DOC] Perf test: skipped unless the DO_PERF_TEST environment flag is on.
+        # Compares compiled mm with out argument on aligned and unaligned shapes (the
+        # unaligned input is strided), prints latencies and profiles. No assertions.
         """
         Latency with good and bad shapes: 1.705 v.s. 2.625
         """
@@ -465,6 +581,8 @@ class PaddingTest(TestCaseBase):
         out_bad_shape = torch.randn(8192, 768, dtype=torch.float16)
 
         def f(x, weight, out):
+            # [FUNCTION DOC] HELPER: Runs mm writing into the given output tensor and
+            # returns that tensor.
             torch.mm(x, weight, out=out)
             return out
 
@@ -483,9 +601,15 @@ class PaddingTest(TestCaseBase):
 
     @serialTest()
     def test_nobias_LinearAndSoftmax_codegen(self):
+        # [FUNCTION DOC] Runs the shared codegen test with bias disabled. Marked serial.
         self.test_LinearAndSoftmax_codegen(bias=False)
 
     def test_LinearAndSoftmax_codegen(self, bias=True):
+        # [FUNCTION DOC] Compiles the linear and softmax model with an unaligned vocab size,
+        # runs forward plus backward capturing generated code, then compares the weight
+        # gradient with eager. Asserts there are two wrapper codes (forward, backward) and
+        # that the forward code loads softmax input with the row stride of the padded vocab
+        # size 30528. Optionally prints latency.
         m_bad_shape = LinearAndSoftmax(vocab_size=30523, bias=bias)
         inputs_bad_shape = m_bad_shape.get_example_inputs()
         m_bad_shape_opt = torch.compile(copy.deepcopy(m_bad_shape))
@@ -514,11 +638,18 @@ class PaddingTest(TestCaseBase):
 
     @config.patch(pattern_matcher=False)
     def test_attention(self):
+        # [FUNCTION DOC] With the pattern matcher off, builds a small attention module and
+        # checks compiled output matches eager.
         batch_size, seq_len, num_heads, hidden_size = 1, 4, 1, 16
         inv_scale = (num_heads / hidden_size) ** 0.5
 
         class Attention(nn.Module):
+            # [CLASS DOC] HELPER: Single-head-style attention block with query, key and
+            # value linear layers sized by the enclosing hidden size, using the enclosing
+            # batch, sequence and head counts.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates three linear projection layers for query,
+                # key and value.
                 super().__init__()
                 self.query = nn.Linear(hidden_size, hidden_size)
                 self.key = nn.Linear(hidden_size, hidden_size)
@@ -526,13 +657,22 @@ class PaddingTest(TestCaseBase):
 
             @staticmethod
             def reshape(x):
+                # [FUNCTION DOC] HELPER: Static method: views the input into batch,
+                # sequence, heads and per-head size, then permutes to put heads before
+                # sequence.
                 return x.view(batch_size, seq_len, num_heads, -1).permute(0, 2, 1, 3)
 
             @staticmethod
             def cancel_reshape(x):
+                # [FUNCTION DOC] HELPER: Static method: inverse of the reshape helper,
+                # permuting heads back after sequence and viewing as batch, sequence,
+                # hidden.
                 return x.permute(0, 2, 1, 3).view(batch_size, seq_len, hidden_size)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Projects the input, computes scaled attention
+                # weights with softmax over the last dimension, applies them to the values
+                # and returns the merged heads.
                 query, key, value = self.query(x), self.key(x), self.value(x)
                 weights = (
                     torch.matmul(
@@ -548,13 +688,19 @@ class PaddingTest(TestCaseBase):
         self.common_numeric_check(attn, x)
 
     def test_view(self):
+        # [FUNCTION DOC] Checks that a compiled view of a 2D tensor into a 3D shape matches
+        # eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Views the input as three by three by three.
             return x.view(3, 3, 3)
 
         x = torch.randn(3, 9)
         self.common_numeric_check(f, x)
 
     def test_pad_strides(self):
+        # [FUNCTION DOC] Checks the stride padding helper pads the inner stride to 2048 and
+        # consequently the outer one, given sizes 2, 16, 2047 and contiguous strides, for
+        # float32.
         """
         Note that dim0's stride is also padded even though its previous value
         is already multiple of 16. The reason is we padded dim1's stride.
@@ -571,6 +717,8 @@ class PaddingTest(TestCaseBase):
         )
 
     def test_pad_strides_skip(self):
+        # [FUNCTION DOC] Checks the stride padding helper leaves strides unchanged for sizes
+        # 2, 32, 127 with the contiguous strides, because padding would add too much memory.
         """
         The padding is skipped to avoid too much memory overhead.
         """
@@ -585,6 +733,9 @@ class PaddingTest(TestCaseBase):
         )
 
     def test_pad_3d_tensor(self):
+        # [FUNCTION DOC] Compiles a matmul, add, matmul chain on a 3D input (so intermediate
+        # strides can be padded), checks numerics with loose tolerance and that the
+        # comprehensive padding metric counter is positive.
         """
         Constructing this test case guided by the fact that we don't pad
         placeholder or user visible output's strides.
@@ -594,6 +745,8 @@ class PaddingTest(TestCaseBase):
         """
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Matrix-multiplies x by y, adds one, and multiplies by y
+            # again.
             x = torch.matmul(x, y)
             x = x + 1
             return torch.matmul(x, y)
@@ -604,6 +757,9 @@ class PaddingTest(TestCaseBase):
         self.assertTrue(metrics.num_comprehensive_padding > 0)
 
     def test_conv(self):
+        # [FUNCTION DOC] Runs a 3x3 convolution on a contiguous input and on a copy with
+        # padded strides and checks the results are close. With the perf flag on it also
+        # times both and profiles.
         """
         Padding the input for convolution may cause extra copy kernel being called.
         Check this example trace: https://gist.github.com/shunting314/ce45398f7d51a63ce05fc8d411faddb3
@@ -618,6 +774,8 @@ class PaddingTest(TestCaseBase):
         weight = torch.randn(64, 128, 3, 3)
 
         def fun(x, weight):
+            # [FUNCTION DOC] HELPER: Calls the convolution op with unit stride, padding and
+            # dilation, no groups and no bias.
             return torch.convolution(
                 x,
                 weight,
@@ -644,6 +802,10 @@ class PaddingTest(TestCaseBase):
 
     @unittest.skipIf(not DO_PERF_TEST, "Perf test not enabled")
     def test_cat(self):
+        # [FUNCTION DOC] Perf test: skipped unless the DO_PERF_TEST environment flag is on.
+        # Compares eager concatenation of a half-precision tensor with six zero columns
+        # against the compiled version with cudagraphs disabled, prints latencies and
+        # profiles. No assertions.
         """
         Compare the perf between aten cat and compiled cat.
 
@@ -654,6 +816,8 @@ class PaddingTest(TestCaseBase):
         x = torch.randn(8192, 30522, dtype=torch.float16)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Concatenates the input with a zero tensor of six
+            # columns on dimension 1.
             pad = x.new_zeros(x.size(0), 6)
             return torch.cat([x, pad], dim=1)
 
@@ -671,6 +835,8 @@ class PaddingTest(TestCaseBase):
         self.do_profiling(lambda: f(x), lambda: opt_f(x), "Eager Cat", "Compiled Cat")
 
     def test_pad_channels_last(self):
+        # [FUNCTION DOC] Checks the stride padding helper changes strides of a contiguous 4D
+        # tensor but leaves a channels-last tensor's strides unchanged.
         t = torch.randn(2, 3, 5, 1025)
         in_strides = t.stride()
         out_strides = ir.Layout._pad_strides(in_strides, t.shape, torch.float32)
@@ -687,6 +853,11 @@ class PaddingTest(TestCaseBase):
     def test_pad_outputs(
         self, dtype: torch.dtype, shape: tuple[int], alignment_bytes: int
     ):
+        # [FUNCTION DOC] Parametrized over alignment bytes, shape and dtype. Compiles an add
+        # under config enabling comprehensive padding and output padding, checks numerics,
+        # then computes the expected strides by rounding each slice size up to the alignment
+        # in elements and asserts the output is non-contiguous and has those strides. Also
+        # asserts the alignment is a multiple of and larger than the element size.
         """
         Tests padding output tensors to a specific alignment.
         This is enabled by a config flag.
@@ -738,12 +909,19 @@ class PaddingTest(TestCaseBase):
         ],
     )
     def test_noop_concat_output_padding(self, shape, alignment_bytes, pad_output):
+        # [FUNCTION DOC] Parametrized over shape, alignment and whether to pad. Compiles
+        # concatenation of twelve slightly padded input views on dimension 0 with a config
+        # suited to a no-op concat, and asserts the generated first code contains the
+        # expected output allocation line with the input's strides for buffer 12.
         """
         When we generate no-op concat kernel, alignment of the inputs
         and outputs should be honored based on padding_alignment_bytes.
         """
 
         def get_input(size: tuple[int], alignment_bytes: int) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Makes a float32 tensor whose last dimension is rounded
+            # up to the alignment (if padding is on) and returns a strided view with the
+            # requested size and the padded strides.
             size_padded = list(size)
             elem_size = 4  # float32
             pad_elems = alignment_bytes // elem_size
@@ -785,6 +963,10 @@ class PaddingTest(TestCaseBase):
 
     @requires_gpu()
     def test_concat_output_no_redundant_copy_with_padding(self):
+        # [FUNCTION DOC] Requires a GPU. With comprehensive padding and output padding,
+        # compiles a function whose concat output has padded strides and checks the result
+        # matches eager and that the generated code has exactly one buffer allocation (no
+        # redundant copy kernel).
         """
         When comprehensive_padding is enabled, ConcatKernel pads its output
         buffer strides. The graph output should accept the padded strides
@@ -792,6 +974,8 @@ class PaddingTest(TestCaseBase):
         """
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds one, multiplies that by two, and concatenates both
+            # on dimension 1; the first value has two consumers.
             a = x + 1
             # a has two consumers (mul and cat), which forces ConcatKernel
             # over pointwise_cat. Both inputs are Pointwise with
@@ -843,6 +1027,10 @@ class PaddingTest(TestCaseBase):
         ],
     )
     def test_outer_dynamic_shape_padding(self, shape, alignment_bytes, enable_pad):
+        # [FUNCTION DOC] Parametrized over shape, alignment and pad flag. Marks dimension 0
+        # of both inputs dynamic, compiles an add with the dynamic padding option on, and
+        # asserts the result strides equal the expected padded strides from the helper
+        # (padded only when the flag is on).
         """
         When only the outermost dim is dynamic shape, the output can still be padded up
         based on padding configuration.
@@ -887,12 +1075,17 @@ class PaddingTest(TestCaseBase):
     def test_perm_outer_dynamic_shape_padding(
         self, shape, perm, alignment_bytes, enable_pad
     ):
+        # [FUNCTION DOC] Parametrized over shape, permutation, alignment and pad flag. Marks
+        # the last dimension of a single input dynamic, compiles a permute plus contiguous
+        # function and asserts the result strides equal the expected padded strides.
         """
         When only the outermost dim is dynamic shape, the output can still be padded up
         based on padding configuration. Test when this occurs after a permute op.
         """
 
         def permute_contig(x):
+            # [FUNCTION DOC] HELPER: Permutes the input by the enclosing permutation and
+            # makes it contiguous.
             return torch.permute(x, perm).contiguous()
 
         num_inputs = 1
@@ -933,6 +1126,9 @@ class PaddingTest(TestCaseBase):
         ],
     )
     def test_dynamic_shape_padding(self, shape, alignment_bytes, enable_pad):
+        # [FUNCTION DOC] Parametrized over shape, alignment and pad flag. Compiles an add
+        # with dynamic shapes everywhere, with dynamic padding enabled only when the pad
+        # flag is on, and asserts result strides equal the expected strides.
         """
         When only the outermost dim is dynamic shape, the output can still be padded up
         based on padding configuration.
@@ -960,6 +1156,9 @@ class PaddingTest(TestCaseBase):
         self.assertEqual(result.stride(), expected_stride)
 
     def test_reduction_comprehensive_padding_stride(self):
+        # [FUNCTION DOC] Regression test for an issue with strides of user-visible
+        # reductions: with comprehensive padding on, a compiled adaptive average pool then
+        # flatten and sum must equal the eager result.
         """Comprehensive padding should not cause stride mismatches for
         user-visible reductions.
 
@@ -967,6 +1166,8 @@ class PaddingTest(TestCaseBase):
         """
 
         def program(x):
+            # [FUNCTION DOC] HELPER: Applies adaptive average pooling to 7 by 7, flattens
+            # from dimension 1 and sums over the last dimension.
             y = torch.nn.functional.adaptive_avg_pool2d(x, 7)
             return y.flatten(1).sum(dim=-1)
 
