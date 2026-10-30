@@ -1,5 +1,13 @@
 # Owner(s): ["module: cuda"]
 # run time cuda tests, but with the allocator using expandable segments
+# [MODULE DOC] Runner that re-executes the CUDA allocator tests from test_cuda with the caching
+# allocator in expandable-segments mode. Import-time side effects: temporarily sets the
+# allocator config environment variable before importing test_cuda (so the module-level
+# expandable-segments flag is true), restores the prior value afterwards, and adds then removes
+# the repository root on the import path to load the disabled-tests helper. Re-exports five
+# test classes so the test runner collects them here. When run as a script on a machine with
+# CUDA that is not Jetson or Windows, it fetches disabled-test data, switches the allocator
+# to expandable segments, and runs the tests.
 
 import os
 

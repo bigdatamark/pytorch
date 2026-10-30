@@ -1,4 +1,11 @@
 # Owner(s): ["module: cuda graphs"]
+# [MODULE DOC] Tests for CUDA graph utilities: kernel annotations (mark_kernels, mark_stream and
+# the remapping of annotation keys from capture ids to executable-graph ids), graph introspection
+# via get_graph_data, the global graph lifecycle hook registries (capture start and end,
+# instantiate, replay start and end, destroy), annotation removal, and trace annotation. Contains
+# helpers that build nested graph nodes through cuda.bindings (imported lazily, so the module
+# imports without it). Most capture tests are skipped on ROCm, without CUDA, without the Python
+# bindings, or when the tools-id query is unavailable; registry and keying tests are host-only.
 
 """Tests for CUDA graph utilities: kernel annotations and graph introspection."""
 
@@ -37,6 +44,10 @@ from torch.testing._internal.common_utils import (
 # below build them through cuda.bindings the way a library embedding one would.
 # cuda.bindings is imported lazily so this module still imports without it.
 def _memset_params(dst: torch.Tensor):
+    # [FUNCTION DOC] HELPER: Build a memset parameter object that zeroes the whole given CUDA
+    # tensor as 4-byte elements (width equals the element count, height one, no pitch, value
+    # zero), using the destination device pointer. Imports the runtime bindings lazily. Returns
+    # the parameters.
     from cuda.bindings import runtime as cuda_runtime
 
     params = cuda_runtime.cudaMemsetParams()
@@ -50,6 +61,10 @@ def _memset_params(dst: torch.Tensor):
 
 
 def _add_child_graph_node(graph, deps, dst):
+    # [FUNCTION DOC] HELPER: Create a separate body graph holding one memset node that zeroes the
+    # destination tensor, then add a child-graph node wrapping that body to the given graph with
+    # the given dependencies. Returns the new child-graph node. Errors from the bindings are
+    # checked.
     from cuda.bindings import runtime as cuda_runtime
 
     body = _check_cuda_bindings(cuda_runtime.cudaGraphCreate(0))
@@ -62,6 +77,9 @@ def _add_child_graph_node(graph, deps, dst):
 
 
 def _add_conditional_node(graph, deps, dst):
+    # [FUNCTION DOC] HELPER: Add a conditional (if-type) node to the given graph with the given
+    # dependencies. A conditional handle is created first; then a memset node zeroing the
+    # destination tensor is added into the conditional body graph. Returns the conditional node.
     from cuda.bindings import driver, runtime as cuda_runtime
 
     handle = _check_cuda_bindings(
@@ -99,16 +117,27 @@ _NESTED_NODE_ADDERS = {
     "cudaGraphNodeGetToolsId not available (needs cuda-compat >= 13.1)",
 )
 class TestMarkKernels(TestCase):
+    # [CLASS DOC] Tests for kernel annotation scopes and the annotation registry on real graph
+    # captures. setUp and tearDown clear the module-level annotation registry so each test starts
+    # and ends empty. Helpers count forward/backward annotations and compare the distinct resolved
+    # annotations (one per kernel group). Gated on NVIDIA CUDA, Python bindings and the tools-id
+    # query; parametrized tests are instantiated.
     def setUp(self):
+        # [FUNCTION DOC] Run the base setup and clear the global kernel annotation registry.
         super().setUp()
         # Annotations are enabled per-capture via torch.cuda.graph(..,
         # enable_annotations=True); there is no global toggle.
         clear_kernel_annotations()
 
     def tearDown(self):
+        # [FUNCTION DOC] Clear the global kernel annotation registry after each test. Does not
+        # call the base teardown.
         clear_kernel_annotations()
 
     def _count_phases(self, name):
+        # [FUNCTION DOC] HELPER: Walk all recorded annotation lists and count entries whose name
+        # equals the given name, separating those tagged with the backward autograd phase from the
+        # rest. Returns a pair of the forward count and the backward count.
         """Count (forward, backward) annotations recorded under ``name``."""
         fwd = bwd = 0
         for anns in get_kernel_annotations().values():
@@ -122,6 +151,10 @@ class TestMarkKernels(TestCase):
         return fwd, bwd
 
     def _distinct_annotations(self):
+        # [FUNCTION DOC] HELPER: Return the set of distinct resolved annotations, each as an
+        # immutable set of its items. Fails the test if any tools id maps to other than exactly
+        # one annotation dict, so the set is invariant to how many kernels an operation expands
+        # into.
         """The set of distinct resolved annotations, one per kernel group.
 
         Asserts every toolsId resolved to exactly one annotation dict, then
@@ -137,21 +170,30 @@ class TestMarkKernels(TestCase):
         return distinct
 
     def assertAnnotations(self, *expected):
+        # [FUNCTION DOC] HELPER: Assert the distinct resolved annotations equal exactly the given
+        # expected annotation dicts, compared as sets of item sets.
         """Assert the distinct resolved annotations equal ``expected`` dicts."""
         self.assertEqual(
             self._distinct_annotations(), {frozenset(e.items()) for e in expected}
         )
 
     def _bwd(self, ann):
+        # [FUNCTION DOC] HELPER: Return a copy of the given annotation dict with the autograd
+        # phase key set to backward.
         return {**ann, "autograd_phase": "backward"}
 
     def test_noop_outside_capture(self):
+        # [FUNCTION DOC] Using a mark scope in plain eager mode, with no capture, records nothing:
+        # the annotation registry stays empty.
         x = torch.randn(8, device="cuda")
         with mark_kernels("test"):
             _ = x + 1
         self.assertEqual(len(get_kernel_annotations()), 0)
 
     def test_event_nodes_are_annotatable(self):
+        # [FUNCTION DOC] Checks the set of annotatable graph node types returned by the library
+        # contains the event-record and event-wait driver node types, which are annotated so the
+        # profiler can place their spans on the intended stream lane.
         """Event record/wait nodes are annotatable so the profiler can place their
         spans on the intended stream lane (they are stream-ordered but do not
         occupy the device)."""
@@ -165,6 +207,8 @@ class TestMarkKernels(TestCase):
             self.assertIn(getattr(driver.CUgraphNodeType, name), annotatable)
 
     def test_host_nodes_are_annotatable(self):
+        # [FUNCTION DOC] Checks the annotatable node types include the host node type, for the
+        # same stream-lane placement reason as event nodes.
         """Host nodes are annotatable so the profiler can place their spans on the
         intended stream lane (they are stream-ordered but do not occupy the
         device)."""
@@ -175,6 +219,9 @@ class TestMarkKernels(TestCase):
         )
 
     def test_memset_nodes_are_annotated(self):
+        # [FUNCTION DOC] Captures a large sum inside a mark scope with the graph kept, finds
+        # memset nodes among the captured nodes through the runtime bindings, and checks at least
+        # one exists and that every such node's tools id is annotated with exactly the scope name.
         """Memset graph nodes get annotated, not just kernels and memcpys.
 
         A large reduction emits a ``cudaMemset`` node (zeroing the multi-block
@@ -220,6 +267,8 @@ class TestMarkKernels(TestCase):
             self.assertEqual(annotations[tools_id], [{"name": "reduction"}])
 
     def test_single_scope_at_capture_start_uses_root_fallback(self):
+        # [FUNCTION DOC] A scope that is the first captured work (empty entry frontier) still
+        # annotates its kernel, using the fall back to newly created graph roots.
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
 
@@ -233,6 +282,8 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "phase_a"})
 
     def test_multiple_scopes_no_overlap(self):
+        # [FUNCTION DOC] Two sequential scopes yield exactly their two annotations; the helper's
+        # one-annotation-per-tools-id check shows no kernel was claimed by both.
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
 
@@ -247,6 +298,7 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "scope_1"}, {"name": "scope_2"})
 
     def test_dict_annotation(self):
+        # [FUNCTION DOC] A scope given a dictionary annotation records exactly that dictionary.
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
 
@@ -258,6 +310,8 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(annotation)
 
     def test_clear_resets_state(self):
+        # [FUNCTION DOC] After an annotated capture, the registry is non-empty; clearing it leaves
+        # it empty.
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
 
@@ -270,10 +324,14 @@ class TestMarkKernels(TestCase):
         self.assertEqual(len(get_kernel_annotations()), 0)
 
     def test_resolve_without_scopes_is_noop(self):
+        # [FUNCTION DOC] Resolving pending annotations when no scope was opened is a no-op: the
+        # registry stays empty.
         resolve_pending_annotations()
         self.assertEqual(len(get_kernel_annotations()), 0)
 
     def test_scope_with_no_kernels(self):
+        # [FUNCTION DOC] A scope that contains no kernels records nothing, and kernels around it
+        # are not annotated.
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
 
@@ -286,6 +344,8 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations()
 
     def test_only_annotates_scope_kernels(self):
+        # [FUNCTION DOC] Of several captured operations, only the one inside the scope is
+        # annotated.
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
 
@@ -299,6 +359,8 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "tagged"})
 
     def test_nested_scopes_innermost_wins(self):
+        # [FUNCTION DOC] With nested string scopes, kernels in the inner scope carry the inner
+        # name and kernels only in the outer scope carry the outer name.
         """With nested string scopes, the innermost name wins."""
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
@@ -313,6 +375,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "outer"}, {"name": "inner"})
 
     def test_nested_dict_scopes_inner_wins_common_keys(self):
+        # [FUNCTION DOC] With nested dictionary scopes, the inner scope's keys win for keys in
+        # common; kernels only in the outer scope keep the outer dictionary. The expected result
+        # is the two dictionaries as given.
         """With truly nested dict scopes, inner wins for common keys,
         outer-only keys are preserved."""
         graph = torch.cuda.CUDAGraph()
@@ -339,6 +404,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(outer_ann, inner_ann)
 
     def test_same_range_scopes_inner_wins_common_keys(self):
+        # [FUNCTION DOC] When two scopes wrap exactly the same kernels, the inner scope's
+        # dictionary wins on common keys; since it covers all outer keys, only the inner
+        # annotation is recorded.
         """With same-range scopes (inner ctx exits first), inner wins
         for common keys, outer-only keys are preserved."""
         graph = torch.cuda.CUDAGraph()
@@ -363,6 +431,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(inner_ann)
 
     def test_string_scope_in_dict_scope_contends_for_name(self):
+        # [FUNCTION DOC] A string scope nested in a dictionary scope that has a name key competes
+        # for the name slot and wins; keys only in the outer dictionary survive in the merged
+        # annotation.
         """A string annotation wraps to {"name": ...}, so a string scope
         nested inside a dict scope with a "name" key contends for the same
         slot; the inner scope wins. This pins the wrapped-string format and
@@ -379,6 +450,8 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "inner", "dtype": "bfloat16"})
 
     def test_no_enable_records_nothing(self):
+        # [FUNCTION DOC] Without enabling annotations on the capture, a scope is a no-op and
+        # nothing is recorded.
         # Without enable_annotations=True the capture is un-annotated, so
         # mark_kernels is a no-op and nothing is recorded.
         graph = torch.cuda.CUDAGraph()
@@ -391,6 +464,8 @@ class TestMarkKernels(TestCase):
         self.assertEqual(len(get_kernel_annotations()), 0)
 
     def test_enable_annotations_kwarg(self):
+        # [FUNCTION DOC] Enabling annotations on the graph context manager records annotations and
+        # resolves them automatically on exit.
         """enable_annotations=True on torch.cuda.graph records and auto-resolves."""
         clear_kernel_annotations()
 
@@ -404,6 +479,8 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "auto"})
 
     def test_enable_annotations_does_not_clear(self):
+        # [FUNCTION DOC] Annotations from an earlier graph remain after a second annotated
+        # capture; the registry then holds both graphs' annotations.
         """Annotations from a previous graph survive a second capture."""
         clear_kernel_annotations()
 
@@ -425,6 +502,8 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "first"}, {"name": "second"})
 
     def test_enable_annotations_remaps_to_exec_graph(self):
+        # [FUNCTION DOC] After an annotated capture, every tools id in the registry has an upper
+        # 32 bits value equal to the executable graph's id, obtained through the runtime bindings.
         """enable_annotations=True must remap toolsIds to the exec graph ID."""
         from cuda.bindings import runtime as cuda_runtime
 
@@ -451,6 +530,10 @@ class TestMarkKernels(TestCase):
             )
 
     def test_mark_stream_snapshots_capture_before_switch(self):
+        # [FUNCTION DOC] Captures on a dedicated stream, forks an auxiliary stream via an event,
+        # and wraps work on the auxiliary stream in a stream mark scope. The recorded annotation
+        # carries the name and the auxiliary stream's id, taken as a snapshot before the stream
+        # switch.
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
         capture_stream = torch.cuda.Stream()
@@ -471,6 +554,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "aux", "stream": expected_stream_id})
 
     def test_mark_stream_annotates_target_already_capturing_when_synced(self):
+        # [FUNCTION DOC] Auxiliary stream already joined the capture by an earlier fork and
+        # unmarked work; a later stream mark scope on it annotates only its own kernel with the
+        # name and the stream id, and the earlier auxiliary work is not annotated.
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
         capture_stream = torch.cuda.Stream()
@@ -500,6 +586,8 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "aux_branch", "stream": expected_stream_id})
 
     def _exec_graph_id(self, graph):
+        # [FUNCTION DOC] HELPER: Return the executable graph id of the given graph, queried
+        # through the runtime bindings from the raw executable graph handle.
         from cuda.bindings import runtime as cuda_runtime
 
         _, exec_graph_id = cuda_runtime.cudaGraphExecGetId(graph.raw_cuda_graph_exec())
@@ -507,6 +595,10 @@ class TestMarkKernels(TestCase):
 
     @parametrize("keep_graph", [True, False])
     def test_multiple_graphs_in_sequence_each_remapped(self, keep_graph):
+        # [FUNCTION DOC] Captures two graphs in sequence with annotations, for both settings of
+        # keeping the graph template. When the template is kept, both are instantiated explicitly.
+        # Checks the two executable ids differ and each graph's annotations are keyed under its
+        # own id.
         """Several graphs captured in sequence must each be annotated and
         remapped to their own exec id -- not just the last one.
 
@@ -550,6 +642,8 @@ class TestMarkKernels(TestCase):
         self.assertEqual(graph_ids_by_name["graph_b"], {exec_b})
 
     def _assert_keyed_to(self, exec_graph_id):
+        # [FUNCTION DOC] HELPER: Assert the registry is non-empty and every tools id has an upper
+        # 32 bits value equal to the given executable graph id.
         annotations = get_kernel_annotations()
         self.assertGreater(len(annotations), 0)
         for tools_id in annotations:
@@ -557,6 +651,10 @@ class TestMarkKernels(TestCase):
 
     @parametrize("trigger", ["instantiate", "replay"])
     def test_keep_graph_true_remaps_on_first_instantiation(self, trigger):
+        # [FUNCTION DOC] With the graph template kept, the context exit must not fail before the
+        # executable graph exists. Annotations are recorded at once; after the parametrized
+        # trigger (explicit instantiate or first replay) they are keyed to the executable graph
+        # id.
         """With keep_graph=True the exec graph is not instantiated at
         capture_end, so the context exit must not error and the remap must be
         deferred until the graph is instantiated -- whether that happens via an
@@ -584,6 +682,9 @@ class TestMarkKernels(TestCase):
         self._assert_keyed_to(self._exec_graph_id(graph))
 
     def test_keep_graph_true_reinstantiate_rekeys_annotations(self):
+        # [FUNCTION DOC] With the graph kept, instantiate gives an executable id; replay keeps
+        # keys on it; a second instantiate yields a different id and the annotations are rekeyed
+        # to it.
         """keep_graph=True is meant for modifying the template and instantiating
         again. Each instantiate() produces a fresh exec id, so annotations must
         be rekeyed from the previous exec id to the new one on re-instantiation,
@@ -613,6 +714,9 @@ class TestMarkKernels(TestCase):
         self._assert_keyed_to(exec2)
 
     def test_resolve_and_remap_sequence(self):
+        # [FUNCTION DOC] Captures three default graphs with distinct scope names, then calls the
+        # resolve-and-remap helper once per graph (already done on exit, so it must be
+        # idempotent). Each name's keys end up under its own graph's executable id.
         """resolve_and_remap over a sequence keys each graph to its exec id.
 
         Uses default (keep_graph=False) graphs to show the capture id is
@@ -641,6 +745,9 @@ class TestMarkKernels(TestCase):
             self.assertEqual(graph_ids_by_name[f"graph_{i}"], {exec_id})
 
     def test_mark_kernels_skips_preexisting_dependents_on_entry_frontier(self):
+        # [FUNCTION DOC] A scope opened after another branch already depends on the same event
+        # must annotate only its own kernel: exactly one annotation exists, not the earlier
+        # dependent branch.
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda")
         capture_stream = torch.cuda.Stream()
@@ -671,6 +778,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations({"name": "tagged"})
 
     def test_backward_kernels_annotated(self):
+        # [FUNCTION DOC] Forward ops in a scope and the backward kernels of their autograd nodes
+        # (captured outside the scope) are annotated with the scope name, backward ones with the
+        # backward phase. Exactly two forward kernels are counted.
         """Backward kernels of ops run inside a scope carry its annotation."""
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda", requires_grad=True)
@@ -690,6 +800,9 @@ class TestMarkKernels(TestCase):
         self.assertEqual(self._count_phases("fwd_scope")[0], 2)
 
     def test_backward_direct_with_preallocated_grad(self):
+        # [FUNCTION DOC] Same as the basic backward test but through the tensor backward call with
+        # a gradient preallocated before capture, so accumulation is an in-place add that stays
+        # untagged.
         """Direct .backward() with .grad preallocated before capture, so the
         AccumulateGrad write is an in-place add on a stable buffer (the
         capture-safe idiom) rather than an allocation."""
@@ -707,6 +820,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(ann, self._bwd(ann))
 
     def test_backward_multi_use_leaf(self):
+        # [FUNCTION DOC] One leaf used in two scopes: each scope's forward and backward kernels
+        # carry only their own scope's annotation; shared add, sum and accumulate work carries
+        # neither.
         """A leaf used by two scopes: each scope's backward nodes carry their
         own scope's annotation."""
         graph = torch.cuda.CUDAGraph()
@@ -726,6 +842,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(ann_a, ann_b, self._bwd(ann_a), self._bwd(ann_b))
 
     def test_backward_false_annotates_forward_only(self):
+        # [FUNCTION DOC] Checks the mark function exposes a backward keyword in its signature (the
+        # documented probe for backward support). With backward disabled, only forward kernels are
+        # tagged (two counted) and no backward-phase annotation exists.
         """backward=False tags the two forward kernels and nothing from the
         backward pass. The keyword's presence in the signature is also the
         documented probe for native backward support, so pin both."""
@@ -747,6 +866,9 @@ class TestMarkKernels(TestCase):
         self.assertEqual(self._count_phases("fwd_only")[0], 2)
 
     def test_backward_false_outer_keys_inherited_via_inner_scope(self):
+        # [FUNCTION DOC] An outer scope with backward disabled still contributes its keys: a
+        # nested default scope creates the nodes, so the backward tags merge the inner name with
+        # the outer extra key.
         """A backward=False scope still contributes its annotation to the
         region, so nodes hooked by a nested backward=True scope freeze the
         outer keys into their backward tags."""
@@ -763,17 +885,26 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(merged, self._bwd(merged))
 
     def test_backward_scope_inside_custom_backward_wins(self):
+        # [FUNCTION DOC] A scope opened inside a custom autograd function's backward is
+        # dynamically inner, so it wins on common keys over the node's inherited forward
+        # annotation while keys unique to the inherited annotation are kept; those kernels are
+        # marked as backward work.
         """A mark_kernels opened inside a node's backward execution is
         dynamically inner, so it outranks the node's inherited annotation."""
 
         class Scoped(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd function computing sine of its input; its
+            # backward opens a mark scope around the gradient computation.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Save the input for backward and return its sine.
                 ctx.save_for_backward(x)
                 return x.sin()
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Inside a scope with its own dictionary annotation,
+                # multiply the incoming gradient by the cosine of the saved input and return it.
                 (x,) = ctx.saved_tensors
                 with mark_kernels({"name": "bwd_inner", "who": "inner"}):
                     return grad_out * x.cos()
@@ -795,6 +926,9 @@ class TestMarkKernels(TestCase):
         )
 
     def test_backward_scope_around_backward_call_merges(self):
+        # [FUNCTION DOC] A scope active around the gradient call merges into backward kernels:
+        # nodes with an inherited annotation keep their forward keys and win on common keys while
+        # wrapper-only keys survive; backward kernels of unmarked nodes get the wrapper tag alone.
         """A mark_kernels active around backward() merges into backward
         kernels, losing common keys to each node's inherited annotation."""
         graph = torch.cuda.CUDAGraph()
@@ -817,6 +951,10 @@ class TestMarkKernels(TestCase):
         )
 
     def test_backward_unmarked_nodes_not_tagged(self):
+        # [FUNCTION DOC] Runs the same capture with and without an extra unmarked operation after
+        # the scope, and checks the scope's forward and backward counts are identical, so backward
+        # kernels of nodes created outside any scope are not tagged. Forward count is one,
+        # backward at least one.
         """Backward kernels of nodes created outside any scope stay untagged:
         appending an unmarked op must not change the scope's tag counts."""
         counts = {}
@@ -842,6 +980,9 @@ class TestMarkKernels(TestCase):
         self.assertGreaterEqual(bwd, 1)
 
     def test_backward_clear_then_retained_backward(self):
+        # [FUNCTION DOC] After the registry is cleared, scopes opened before the clear lose their
+        # recording ability: a backward captured afterwards through a retained graph records
+        # nothing.
         """clear_kernel_annotations revokes recording from scopes opened
         before the clear: hooks on a retained graph become inert, so a
         backward captured after the clear records nothing."""
@@ -862,6 +1003,8 @@ class TestMarkKernels(TestCase):
         self.assertEqual(len(get_kernel_annotations()), 0)
 
     def test_backward_scope_after_clear_records(self):
+        # [FUNCTION DOC] A scope opened after a registry clear records normally, including the
+        # backward kernels of nodes created under it, with a fresh generation.
         """A scope opened after a clear records normally (fresh generation),
         including backward of nodes created under it."""
         graph1 = torch.cuda.CUDAGraph()
@@ -882,6 +1025,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(ann, self._bwd(ann))
 
     def test_backward_accumulate_grad_excluded(self):
+        # [FUNCTION DOC] For both the tensor backward call and the functional gradient call,
+        # counts tagged forward (two) and backward (at least two) kernels, and requires the
+        # backward counts to match, showing gradient accumulation is never tagged.
         """AccumulateGrad work is never tagged: a .backward() run (which
         executes AccumulateGrad) tags exactly as many backward kernels as an
         autograd.grad run (which has no AccumulateGrad) of the same graph."""
@@ -908,6 +1054,10 @@ class TestMarkKernels(TestCase):
         self.assertEqual(bwd_counts["backward"], bwd_counts["grad"])
 
     def test_backward_shared_nonleaf_multi_consumer(self):
+        # [FUNCTION DOC] A producer shared by two marked regions: with one and two consumers,
+        # region a's forward and backward counts must be equal, so the shared gradient aggregation
+        # is not attributed to a region. Region b gets two forward kernels and at least one
+        # backward.
         """A shared non-leaf feeding two marked regions: gradient
         aggregation for the shared producer (InputBuffer, outside any
         node's brackets) must not be attributed to either region, so each
@@ -937,18 +1087,27 @@ class TestMarkKernels(TestCase):
         self.assertGreaterEqual(bwd_b, 1)
 
     def test_backward_nested_backward_inside_custom_backward(self):
+        # [FUNCTION DOC] A custom backward that itself computes a gradient under its own scope:
+        # the distinct annotations are the outer forward tag, its backward-phase version, and the
+        # inner scope's name as backward work, since the inner scope owns the inner graph's work.
         """A custom backward that itself calls torch.autograd.grad: nodes
         of the inner graph built there are owned by the scope opened inside
         the custom backward."""
 
         class InnerGrad(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd function computing sine whose backward builds an
+            # inner graph under a scope with grad enabled and differentiates it.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Save the input for backward and return its sine.
                 ctx.save_for_backward(x)
                 return x.sin()
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Under a scope, recompute a detached copy of the input as
+                # a leaf, differentiate the cosine of triple of it, and return the incoming
+                # gradient times that result.
                 (x,) = ctx.saved_tensors
                 with mark_kernels("inner_bwd"):
                     with torch.enable_grad():
@@ -975,6 +1134,8 @@ class TestMarkKernels(TestCase):
         )
 
     def test_backward_mark_stream_differentiable(self):
+        # [FUNCTION DOC] A stream mark scope around differentiable work records the stream id in
+        # the forward annotation, and the same id appears in the backward-phase annotation.
         """mark_stream around differentiable work: the stream id recorded
         for forward lane assignment also propagates into backward tags."""
         graph = torch.cuda.CUDAGraph()
@@ -996,6 +1157,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(ann, self._bwd(ann))
 
     def test_backward_nested_dict_annotations_without_name(self):
+        # [FUNCTION DOC] Nested dictionary scopes without a name key: backward merging still lets
+        # the inner scope win common keys and unions the other keys, in both forward and backward
+        # tags.
         """Nested dict scopes need no "name" key; backward merge still
         applies inner-wins on common keys and unions the rest."""
         graph = torch.cuda.CUDAGraph()
@@ -1011,6 +1175,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(merged, self._bwd(merged))
 
     def test_backward_node_after_inner_scope_exit(self):
+        # [FUNCTION DOC] A node created after an inner scope exits but inside the outer scope
+        # inherits only the outer annotation; so the sine nodes are tagged inner and the multiply
+        # nodes outer, forward and backward.
         """A node created after an inner scope exits, while the outer is
         still open, inherits only the outer annotation."""
         graph = torch.cuda.CUDAGraph()
@@ -1033,6 +1200,8 @@ class TestMarkKernels(TestCase):
         )
 
     def test_backward_explicit_backward_entry_point(self):
+        # [FUNCTION DOC] Running the explicit backward entry point function (rather than the
+        # tensor method) also runs the annotation brackets, so backward kernels get tagged.
         """torch.autograd.backward(...) (not Tensor.backward) also runs the
         brackets."""
         graph = torch.cuda.CUDAGraph()
@@ -1048,6 +1217,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(ann, self._bwd(ann))
 
     def test_backward_create_graph_second_order_attributed(self):
+        # [FUNCTION DOC] Nodes created during a backward with graph creation inherit the forward
+        # scope, so second-order backward is attributed. The distinct set equals that of first
+        # order; the backward count must be at least four.
         """Nodes created during a create_graph backward inherit the forward
         scope's annotations, so a second-order backward is attributed too."""
         graph = torch.cuda.CUDAGraph()
@@ -1068,6 +1240,9 @@ class TestMarkKernels(TestCase):
         self.assertGreaterEqual(self._count_phases("L")[1], 4)
 
     def test_backward_second_order_through_uncaptured_first(self):
+        # [FUNCTION DOC] Only the second-order backward is captured; the first backward runs
+        # eagerly with graph creation. Ownership still propagates, so the forward and backward-
+        # phase annotations for the scope are recorded.
         """Ownership propagates even when the first backward runs eagerly:
         only the second-order backward is captured, and it is attributed."""
         x = torch.randn(8, device="cuda", requires_grad=True)
@@ -1086,10 +1261,15 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(ann, self._bwd(ann))
 
     def test_backward_checkpoint_recompute_attributed(self):
+        # [FUNCTION DOC] Checkpoint recomputation during backward builds fresh nodes. The scope
+        # inside the checkpointed function tags its original forward kernels plainly, and the
+        # recomputed forward and backward kernels with the backward phase.
         """Checkpoint recomputation during backward creates fresh nodes;
         scopes inside the recomputed forward still own the recompute work."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under checkpoint: inside a scope, return the sine of
+            # double the input.
             with mark_kernels("ckpt"):
                 return (x * 2).sin()
 
@@ -1106,16 +1286,25 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(ann, self._bwd(ann))
 
     def test_make_graphed_callables_annotations(self):
+        # [FUNCTION DOC] Builds graphed callables with annotations enabled for a module whose
+        # forward opens a scope. Runs the graphed module forward and backward, checks input and
+        # parameter gradients exist, and that forward and backward-phase annotations for the scope
+        # are recorded.
         """make_graphed_callables(enable_annotations=True) records marks from
         inside the module for both its forward and backward captures, and the
         graphed module still produces input and parameter gradients."""
 
         class Marked(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one linear layer whose forward applies it and a relu
+            # inside a scope named layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Create the module and its 8 by 8 linear layer.
                 super().__init__()
                 self.lin = torch.nn.Linear(8, 8)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Inside a scope named layer, apply the linear layer and
+                # relu, and return the result.
                 with mark_kernels("layer"):
                     return self.lin(x).relu()
 
@@ -1136,6 +1325,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(ann, self._bwd(ann))
 
     def test_backward_captured_in_separate_graph(self):
+        # [FUNCTION DOC] Forward captured in one graph with a scope, backward captured later in
+        # another graph via the gradient function with retained graph: both phases are still
+        # annotated.
         """Backward captured in its own graph (the make_graphed_callables
         pattern) still tags its kernels with the forward scope's annotation."""
         x = torch.randn(8, device="cuda", requires_grad=True)
@@ -1153,6 +1345,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(ann, self._bwd(ann))
 
     def test_backward_nested_scopes_inner_wins(self):
+        # [FUNCTION DOC] Nested scopes with a string inner and a dictionary outer: the forward and
+        # backward annotations are merged with the inner name winning and the outer extra key
+        # kept.
         """Backward kernels of nested scopes merge with the inner scope
         winning common keys, matching the forward merge order."""
         graph = torch.cuda.CUDAGraph()
@@ -1169,6 +1364,9 @@ class TestMarkKernels(TestCase):
         self.assertAnnotations(merged, self._bwd(merged))
 
     def test_backward_outside_capture_is_noop(self):
+        # [FUNCTION DOC] Hooks left by a captured forward do nothing during an eager backward:
+        # after running backward outside capture and resolving, the registry equals its earlier
+        # copy.
         """Hooks registered by a captured forward are inert in eager backward."""
         graph = torch.cuda.CUDAGraph()
         x = torch.randn(8, device="cuda", requires_grad=True)
@@ -1185,6 +1383,7 @@ class TestMarkKernels(TestCase):
         self.assertEqual(get_kernel_annotations(), before)
 
     def test_eager_forward_backward_noop(self):
+        # [FUNCTION DOC] Eager forward and backward under a scope with no capture record nothing.
         x = torch.randn(8, device="cuda", requires_grad=True)
         with mark_kernels("eager"):
             y = (x * 2).sum()
@@ -1193,6 +1392,9 @@ class TestMarkKernels(TestCase):
         self.assertEqual(len(get_kernel_annotations()), 0)
 
     def test_scope_inside_conditional_body_records_nothing(self):
+        # [FUNCTION DOC] A scope inside a conditional body capture warns about the conditional-
+        # node body and records nothing there. After instantiation, only the outer top-level scope
+        # is recorded and its keys match the executable graph id (querying the data also warns).
         """A scope inside a torch.cond body warns and records no annotations.
 
         begin_capture_to_if_node captures into a separate cudaGraph_t, so node ids
@@ -1227,6 +1429,10 @@ class TestMarkKernels(TestCase):
 
     @parametrize("kind", ["child_graph", "conditional"])
     def test_nested_graph_node_in_scope_warns(self, kind):
+        # [FUNCTION DOC] Parametrized by nested node kind (child graph or conditional). Adds a
+        # nested node of that kind in the middle of a scope using the node-adding helper; expects
+        # a warning that nested work is left unannotated, and that the two ordinary kernels are
+        # still annotated.
         """A scope containing a nested graph node warns; the rest is annotated.
 
         The dependent-edge walk stops at such a node, so the work in its body is
@@ -1271,7 +1477,14 @@ class TestMarkKernels(TestCase):
     "cudaGraphNodeGetToolsId not available (needs cuda-compat >= 13.1)",
 )
 class TestGetGraphData(TestCase):
+    # [CLASS DOC] Tests for the graph data introspection method of a kept and instantiated graph:
+    # structure, edges, hook export, caching during instantiation, nested nodes, and the error
+    # when the graph template was not kept. Gated like the annotation tests.
     def test_basic_structure(self):
+        # [FUNCTION DOC] After capturing and instantiating a kept graph, checks the returned
+        # mapping has an integer executable id and a non-empty node list. Each node has the
+        # expected keys, the graph id equals the executable id, and the tools id packs the graph
+        # id above the node id. Kernel nodes have a string kernel name.
         g = torch.cuda.CUDAGraph(keep_graph=True)
         x = torch.zeros([2000], device="cuda")
         y = torch.ones([2000], device="cuda")
@@ -1307,6 +1520,10 @@ class TestGetGraphData(TestCase):
             self.assertIsInstance(kn["kernel_name"], str)
 
     def test_export_graph_data_hook(self):
+        # [FUNCTION DOC] Registers an export hook writing graph data to a pickle file. For a kept
+        # graph, instantiate writes a non-empty file equal to the graph data. For a default graph
+        # the hook, registered before capture, still runs at capture end and the file has an id
+        # and nodes. Uses a temporary directory.
         import os
         import pickle
         import tempfile
@@ -1341,6 +1558,9 @@ class TestGetGraphData(TestCase):
             self.assertGreater(len(data["nodes"]), 0)
 
     def test_edges(self):
+        # [FUNCTION DOC] A chain of three ops yields nodes with dependencies and dependents, and
+        # the relations are symmetric: each node's index appears in the dependents of each of its
+        # dependencies, and the reverse.
         g = torch.cuda.CUDAGraph(keep_graph=True)
         x = torch.zeros([2000], device="cuda")
         y = torch.ones([2000], device="cuda")
@@ -1365,6 +1585,9 @@ class TestGetGraphData(TestCase):
                 self.assertIn(node["index"], nodes[dep_idx]["dependencies"])
 
     def test_cached_across_instantiate_hooks(self):
+        # [FUNCTION DOC] Two post-instantiate hooks each fetch the graph data during one
+        # instantiate; both get the same object. A later call returns a fresh equal but distinct
+        # object.
         # Within one instantiate(), every post-instantiate hook that calls
         # get_graph_data() shares a single query (same object); the cache is
         # dropped afterwards so a later call recomputes a fresh dict.
@@ -1387,6 +1610,9 @@ class TestGetGraphData(TestCase):
 
     @parametrize("kind", ["child_graph", "conditional"])
     def test_nested_graph_node_warns_but_reports_top_level(self, kind):
+        # [FUNCTION DOC] Adds a nested node of the parametrized kind directly to the kept raw
+        # graph before instantiation. Getting the data warns, mentioning the kind. Exactly one
+        # node of that kind is listed, its body memset is not, and tools ids remain well formed.
         """A nested cudaGraph_t warns; the top-level nodes are still reported.
 
         cudaGraphGetNodes does not descend into a child graph or a conditional
@@ -1415,6 +1641,8 @@ class TestGetGraphData(TestCase):
             self.assertEqual(node["tools_id"], (exec_graph_id << 32) | node["node_id"])
 
     def test_keep_graph_false_raises(self):
+        # [FUNCTION DOC] Asking for graph data on a graph captured without keeping the template
+        # raises a runtime error.
         g = torch.cuda.CUDAGraph(keep_graph=False)
         x = torch.zeros([2000], device="cuda")
         y = torch.ones([2000], device="cuda")
@@ -1429,11 +1657,17 @@ class TestGetGraphData(TestCase):
 # (TestMarkKernels skips unless cuda-bindings/driver >= 13.1). A toolsId packs
 # the graph id in the upper 32 bits and the node id in the lower 32.
 class TestRekeyAnnotations(TestCase):
+    # [CLASS DOC] Host-only tests of the function that rekeys annotation maps from the capture
+    # graph id to the executable graph id. A tools id has the graph id in its upper 32 bits and
+    # the node id in the lower 32 bits.
     @staticmethod
     def _tools_id(graph_id, node_id):
+        # [FUNCTION DOC] HELPER: Static method packing a graph id and node id into a tools id.
         return (graph_id << 32) | node_id
 
     def test_rekeys_matching_graph(self):
+        # [FUNCTION DOC] Entries whose graph id equals the capture id are rewritten to the
+        # executable id with the same node id.
         annotations = {self._tools_id(1, 10): ["a"], self._tools_id(1, 20): ["b"]}
         remapped = _rekey_annotations(annotations, capture_graph_id=1, exec_graph_id=2)
         self.assertEqual(
@@ -1442,6 +1676,8 @@ class TestRekeyAnnotations(TestCase):
         )
 
     def test_leaves_other_graphs_untouched(self):
+        # [FUNCTION DOC] Entries belonging to another graph id are kept unchanged while matching
+        # ones are rewritten.
         other = self._tools_id(9, 10)
         annotations = {self._tools_id(1, 10): ["a"], other: ["x"]}
         remapped = _rekey_annotations(annotations, capture_graph_id=1, exec_graph_id=2)
@@ -1451,11 +1687,13 @@ class TestRekeyAnnotations(TestCase):
         )
 
     def test_empty(self):
+        # [FUNCTION DOC] Rekeying an empty mapping returns an empty mapping.
         self.assertEqual(
             _rekey_annotations({}, capture_graph_id=1, exec_graph_id=2), {}
         )
 
     def test_does_not_mutate_input_lists(self):
+        # [FUNCTION DOC] Rekeying does not change the original list stored under the key.
         original = ["a"]
         annotations = {self._tools_id(1, 10): original}
         _rekey_annotations(annotations, capture_graph_id=1, exec_graph_id=2)
@@ -1465,7 +1703,10 @@ class TestRekeyAnnotations(TestCase):
 # Runs everywhere (no capture): the public probe must agree with the private
 # gate that mark_kernels no-ops on, whatever this machine supports.
 class TestIsAvailable(TestCase):
+    # [CLASS DOC] Host-only test that the public availability probe agrees with the private gate.
     def test_matches_private_gate(self):
+        # [FUNCTION DOC] The public probe equals the CUDA being available and the tools-id query
+        # being available.
         expected = torch.cuda.is_available() and not _is_tools_id_unavailable()
         self.assertEqual(is_available(), expected)
 
@@ -1474,7 +1715,10 @@ class TestIsAvailable(TestCase):
 # CUDAGraph fans out to at the end of instantiate(). The registry just passes the graph
 # through, so a sentinel stands in for it. No CUDA needed.
 class TestGraphInstantiateHooks(TestCase):
+    # [CLASS DOC] Host-only tests of the instantiate hook registry using a placeholder object in
+    # place of a graph. teardown empties the global registry.
     def tearDown(self):
+        # [FUNCTION DOC] Empty the global instantiate hook registry, then run the base teardown.
         import torch.cuda.graphs as cg
 
         cg._global_instantiate_hooks.clear()
@@ -1482,11 +1726,15 @@ class TestGraphInstantiateHooks(TestCase):
 
     @staticmethod
     def _run(graph):
+        # [FUNCTION DOC] HELPER: Static method invoking the registry's fan-out with the given
+        # graph.
         import torch.cuda.graphs as cg
 
         cg._run_global_hooks(cg._global_instantiate_hooks, graph)
 
     def test_register_run_unregister(self):
+        # [FUNCTION DOC] A registered hook receives the graph when run; after its handle is
+        # removed it is not called again.
         import torch.cuda.graphs as cg
 
         seen = []
@@ -1499,6 +1747,7 @@ class TestGraphInstantiateHooks(TestCase):
         self.assertEqual(seen, [graph])
 
     def test_multiple_hooks_all_run(self):
+        # [FUNCTION DOC] Two registered hooks both receive the graph.
         import torch.cuda.graphs as cg
 
         seen_a, seen_b = [], []
@@ -1509,11 +1758,13 @@ class TestGraphInstantiateHooks(TestCase):
         self.assertEqual((seen_a, seen_b), ([graph], [graph]))
 
     def test_run_swallows_hook_errors(self):
+        # [FUNCTION DOC] A hook that raises does not stop later hooks, and the error is swallowed.
         import torch.cuda.graphs as cg
 
         seen = []
 
         def boom(g):
+            # [FUNCTION DOC] HELPER: Hook that always raises a runtime error.
             raise RuntimeError("boom")
 
         cg.register_graph_instantiate_hook(boom)
@@ -1524,6 +1775,9 @@ class TestGraphInstantiateHooks(TestCase):
 
     @requires_cuda
     def test_fires_once_on_real_graph_instantiate(self):
+        # [FUNCTION DOC] Needs CUDA. Registers a hook, captures a default graph, and checks the
+        # hook fired once with that graph at capture end; replays do not fire it again. Cleanup
+        # removes the hook, and the graph is reset.
         import torch.cuda.graphs as cg
 
         seen = []
@@ -1549,13 +1803,19 @@ class TestGraphInstantiateHooks(TestCase):
 # cleanup hooks that a CUDAGraph invokes (gated on _graph_destroy_hooks_active) via
 # _run_graph_destroy_hooks when a CUDA graph is destroyed. No CUDA needed.
 class TestGraphDestroyHooks(TestCase):
+    # [CLASS DOC] Host-only tests of the graph destroy hook registry. Teardown empties the global
+    # registry.
     def tearDown(self):
+        # [FUNCTION DOC] Empty the global destroy hook registry, then run the base teardown.
         import torch.cuda.graphs as cg
 
         cg._global_destroy_hooks.clear()
         super().tearDown()
 
     def test_register_run_unregister(self):
+        # [FUNCTION DOC] Checks the active probe is false initially, true after registering, hooks
+        # receive the given id set when run, and after removal the probe is false and the hook is
+        # not called.
         import torch.cuda.graphs as cg
 
         seen = []
@@ -1570,6 +1830,7 @@ class TestGraphDestroyHooks(TestCase):
         self.assertEqual(seen, [{7}])
 
     def test_multiple_hooks_all_run(self):
+        # [FUNCTION DOC] Two registered destroy hooks both receive the id set.
         import torch.cuda.graphs as cg
 
         seen_a, seen_b = [], []
@@ -1579,11 +1840,13 @@ class TestGraphDestroyHooks(TestCase):
         self.assertEqual((seen_a, seen_b), ([{5}], [{5}]))
 
     def test_run_swallows_hook_errors(self):
+        # [FUNCTION DOC] A destroy hook that raises does not prevent later hooks from running.
         import torch.cuda.graphs as cg
 
         seen = []
 
         def boom(ids):
+            # [FUNCTION DOC] HELPER: Destroy hook that always raises a runtime error.
             raise RuntimeError("boom")
 
         cg.register_graph_destroy_hook(boom)
@@ -1593,6 +1856,9 @@ class TestGraphDestroyHooks(TestCase):
 
     @requires_cuda
     def test_fires_with_recorded_exec_ids_on_teardown(self):
+        # [FUNCTION DOC] Needs CUDA. An instantiate hook stamps a known executable id onto the
+        # graph's recorded ids; a destroy hook collects ids. Nothing is collected before reset;
+        # resetting the graph then passes the recorded id to the destroy hook.
         import torch.cuda.graphs as cg
 
         exec_id = 0xABCD
@@ -1626,17 +1892,23 @@ class TestGraphDestroyHooks(TestCase):
 # requested exec graph ids (tools_id >> 32). (The graph dependency map lives on the
 # profiler observer, not the module, and is exercised in the CUPTI monitor suite.)
 class TestRemoveKernelAnnotations(TestCase):
+    # [CLASS DOC] Host-only tests of the function removing annotations for given executable graph
+    # ids from the module-level registry. Teardown clears the registry.
     @staticmethod
     def _tools_id(graph_id, node_id):
+        # [FUNCTION DOC] HELPER: Static method packing a graph id and node id into a tools id.
         return (graph_id << 32) | node_id
 
     def tearDown(self):
+        # [FUNCTION DOC] Clear the module-level annotation registry, then run the base teardown.
         import torch.cuda._graph_annotations as ga
 
         ga.clear_kernel_annotations()
         super().tearDown()
 
     def test_removes_only_requested_exec_id(self):
+        # [FUNCTION DOC] Seeds the registry with entries for two executable ids, removes one id,
+        # and checks only the other id's entry remains.
         import torch.cuda._graph_annotations as ga
 
         exec_a, exec_b = 1, 2
@@ -1652,6 +1924,8 @@ class TestRemoveKernelAnnotations(TestCase):
         )
 
     def test_missing_and_empty_ids_are_noops(self):
+        # [FUNCTION DOC] Removing with an empty list or an unknown id leaves the registry
+        # unchanged.
         import torch.cuda._graph_annotations as ga
 
         ga.clear_kernel_annotations()
@@ -1666,8 +1940,12 @@ class TestRemoveKernelAnnotations(TestCase):
 # ("name") and reader tolerance for the two legacy pickle spellings: dicts
 # keyed "str" and bare unwrapped strings.
 class TestAnnotateTrace(TestCase):
+    # [CLASS DOC] Host-only tests of the trace annotation function: the canonical name key and the
+    # two legacy spellings (a dictionary keyed by str, and a bare string).
     @staticmethod
     def _trace_with_kernel(graph_node_id):
+        # [FUNCTION DOC] HELPER: Static method building a minimal trace mapping holding one kernel
+        # event with the given graph node id, stream 7 and fixed timing fields.
         return {
             "traceEvents": [
                 {
@@ -1684,6 +1962,9 @@ class TestAnnotateTrace(TestCase):
         }
 
     def _annotated_args(self, annotations):
+        # [FUNCTION DOC] HELPER: Annotate a trace with a kernel whose graph node id is 42 using
+        # the given annotation map, check exactly one event was annotated, and return that kernel
+        # event's args mapping.
         from torch.cuda._annotate_cuda_graph_trace import annotate_trace
 
         trace = self._trace_with_kernel(42)
@@ -1693,16 +1974,22 @@ class TestAnnotateTrace(TestCase):
         return event["args"]
 
     def test_canonical_name_key(self):
+        # [FUNCTION DOC] An annotation dictionary with name and dtype entries copies both into the
+        # event args.
         args = self._annotated_args({42: [{"name": "phase_a", "dtype": "bf16"}]})
         self.assertEqual(args["name"], "phase_a")
         self.assertEqual(args["dtype"], "bf16")
 
     def test_legacy_str_key_maps_to_name(self):
+        # [FUNCTION DOC] A legacy dictionary keyed by str becomes the name arg and no str arg
+        # remains.
         args = self._annotated_args({42: [{"str": "phase_a"}]})
         self.assertEqual(args["name"], "phase_a")
         self.assertNotIn("str", args)
 
     def test_legacy_bare_string_maps_to_name(self):
+        # [FUNCTION DOC] A legacy bare string annotation becomes the name arg and no annotation
+        # arg is created.
         args = self._annotated_args({42: ["phase_a"]})
         self.assertEqual(args["name"], "phase_a")
         self.assertNotIn("annotation", args)
@@ -1723,7 +2010,13 @@ GLOBAL_HOOK_REGISTRIES = [
 
 @instantiate_parametrized_tests
 class TestGraphGlobalLifecycleHooks(TestCase):
+    # [CLASS DOC] Parametrized tests run once per global lifecycle hook registry (capture start,
+    # capture end, instantiate, replay start, replay end): register, fan out, remove, swallow
+    # errors, public API surface, and the order and points at which hooks fire on a real graph.
+    # Teardown empties all of those registries.
     def tearDown(self):
+        # [FUNCTION DOC] Empty every registry named in the module-level list, then run the base
+        # teardown.
         import torch.cuda.graphs as cg
 
         for name in GLOBAL_HOOK_REGISTRIES:
@@ -1732,6 +2025,9 @@ class TestGraphGlobalLifecycleHooks(TestCase):
 
     @staticmethod
     def _api(name):
+        # [FUNCTION DOC] HELPER: Static method returning, for a registry name, the public
+        # registration function and a function that runs the registry's private fan-out on a given
+        # graph.
         # The fan-out is private -- only CUDAGraph calls it -- so drive it the way the graph
         # does, with the registry the register_* function writes to.
         import torch.cuda.graphs as cg
@@ -1744,6 +2040,8 @@ class TestGraphGlobalLifecycleHooks(TestCase):
 
     @parametrize("name", GLOBAL_HOOK_REGISTRIES)
     def test_register_run_unregister(self, name):
+        # [FUNCTION DOC] For the parametrized registry, a registered hook receives the placeholder
+        # graph untouched when run; once its handle is removed it is no longer called.
         register, run = self._api(name)
         seen = []
         graph = object()  # the registry passes the graph through untouched
@@ -1756,10 +2054,13 @@ class TestGraphGlobalLifecycleHooks(TestCase):
 
     @parametrize("name", GLOBAL_HOOK_REGISTRIES)
     def test_run_swallows_hook_errors(self, name):
+        # [FUNCTION DOC] For the parametrized registry, a hook that raises is swallowed and a
+        # later hook still runs.
         register, run = self._api(name)
         seen = []
 
         def boom(g):
+            # [FUNCTION DOC] HELPER: Hook that always raises a runtime error.
             raise RuntimeError("boom")
 
         register(boom)
@@ -1770,6 +2071,8 @@ class TestGraphGlobalLifecycleHooks(TestCase):
 
     @parametrize("name", GLOBAL_HOOK_REGISTRIES)
     def test_only_registration_is_public(self, name):
+        # [FUNCTION DOC] The registration function name is listed in the package's public names
+        # while no public function to run the hooks exists.
         import torch.cuda.graphs as cg
 
         self.assertIn(f"register_graph_{name}_hook", cg.__all__)
@@ -1777,6 +2080,10 @@ class TestGraphGlobalLifecycleHooks(TestCase):
 
     @requires_cuda
     def test_fire_points_over_a_real_graph(self):
+        # [FUNCTION DOC] Needs CUDA. Registers a hook per registry that appends its registry name;
+        # a default graph capture yields capture start, capture end, then instantiate, and each
+        # replay adds replay start and replay end. Cleanup removes the hooks and the graph is
+        # reset.
         # Each registry fires at its own point in one graph's life, for a graph the consumer
         # never built: capture start once, capture end once, instantiate once, and the replay
         # pair once per replay.
@@ -1806,6 +2113,8 @@ class TestGraphGlobalLifecycleHooks(TestCase):
 
     @requires_cuda
     def test_global_hooks_run_before_per_graph_hooks(self):
+        # [FUNCTION DOC] Needs CUDA. A global capture-start hook and a per-graph capture-start
+        # hook both fire in a capture; the global one fires first.
         # Ordering matches instantiate(): the global fan-out runs first, then the graph's own
         # hooks. A consumer registering both sees them in that order.
         import torch.cuda.graphs as cg
@@ -1824,6 +2133,8 @@ class TestGraphGlobalLifecycleHooks(TestCase):
 
     @requires_cuda
     def test_capture_start_hook_sees_live_capture(self):
+        # [FUNCTION DOC] Needs CUDA. A capture-start hook records whether the current stream is
+        # capturing; it must observe true, so the hook runs after capture has begun.
         # The hook fires with capture already under way -- that is what lets it read capture
         # state, and why its docs forbid issuing CUDA work.
         import torch.cuda.graphs as cg
@@ -1843,6 +2154,9 @@ class TestGraphGlobalLifecycleHooks(TestCase):
 
     @requires_cuda
     def test_replay_end_hook_fires_when_launch_raises(self):
+        # [FUNCTION DOC] Needs CUDA. With the underlying replay patched to raise a runtime error,
+        # the error still propagates from the replay call, and both replay start and replay end
+        # hooks fire.
         # The end hook is in a finally, so a start hook is always balanced by an end even if
         # the launch itself fails; the launch error still propagates.
         import torch.cuda.graphs as cg

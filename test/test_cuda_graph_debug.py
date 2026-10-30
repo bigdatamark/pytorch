@@ -1,5 +1,11 @@
 # Owner(s): ["module: cuda"]
 # ruff: noqa: F821, F841
+# [MODULE DOC] Tests for the input-liveness debugging option of CUDA graph capture. A graph
+# captured with the liveness check enabled tracks external input tensors and, on replay, raises
+# a runtime error if any of their storages died. Covers plain, view, nested, pinned, resized and
+# model-weight inputs, shared pools, streams, error tracebacks, and custom ops. When CUDA is
+# unavailable the module prints a notice to stderr and replaces the test base class with a
+# no-op class so nothing runs.
 
 import sys
 import warnings
@@ -21,6 +27,8 @@ if not TEST_CUDA:
 
 
 def _warmup_op(op, n=3):
+    # [FUNCTION DOC] HELPER: Run the given callable the given number of times (default three) on
+    # a fresh side stream, to warm up kernels before capture. Returns nothing.
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
         for _ in range(n):
@@ -28,6 +36,9 @@ def _warmup_op(op, n=3):
 
 
 def _capture_graph(op, **graph_kwargs):
+    # [FUNCTION DOC] HELPER: Warm up the callable, then capture it into a new CUDA graph with
+    # the input liveness check on by default (extra keyword arguments pass through to the graph
+    # context manager and may override it). Returns the graph and the callable's output.
     g = torch.cuda.CUDAGraph()
     _warmup_op(op)
     graph_kwargs.setdefault("check_input_liveness", True)
@@ -38,13 +49,20 @@ def _capture_graph(op, **graph_kwargs):
 
 @skipIfRocm(msg="input liveness checking is only supported on NVIDIA CUDA")
 class TestCUDAGraphDebugInputs(TestCase):
+    # [CLASS DOC] Tests that replaying a graph captured with the liveness check raises when an
+    # external input tensor (or its storage) has died, and does not raise for intermediates or
+    # inputs that are still alive. Skipped on ROCm.
     def test_nothing_dead_ok(self):
+        # [FUNCTION DOC] When all captured inputs are still alive, replay succeeds and the
+        # captured output equals the expected doubled input.
         x = torch.randn(100, device="cuda")
         g, y = _capture_graph(lambda: x * 2)
         g.replay()
         self.assertEqual(y, x * 2)
 
     def test_dead_input_tensor(self):
+        # [FUNCTION DOC] Deleting the only input tensor makes replay raise a runtime error that
+        # mentions a dead tensor.
         x = torch.randn(100, device="cuda")
         g, y = _capture_graph(lambda: x * 2)
         del x
@@ -52,6 +70,9 @@ class TestCUDAGraphDebugInputs(TestCase):
             g.replay()
 
     def test_dead_intermediate_tensors_ok(self):
+        # [FUNCTION DOC] Tensors created inside the capture (an intermediate and the output) are
+        # not tracked as inputs: replay works after deleting the intermediate and again after
+        # deleting the output.
         x = torch.randn(100, device="cuda")
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, check_input_liveness=True):
@@ -64,14 +85,23 @@ class TestCUDAGraphDebugInputs(TestCase):
         g.replay()
 
     def test_model_weight_dead(self):
+        # [FUNCTION DOC] Captures a small multilayer model on the GPU, replays it successfully and
+        # checks the output matches eager, then deletes one layer's weight and expects replay to
+        # raise a dead tensor error.
         class SimpleMLP(nn.Module):
+            # [CLASS DOC] HELPER: Tiny feed-forward network holding a list of linear layers of
+            # equal width; used as the captured model.
             def __init__(self, width, depth):
+                # [FUNCTION DOC] HELPER: Build the given number of linear layers of the given
+                # width and store them in a module list.
                 super().__init__()
                 self.layers = nn.ModuleList(
                     [nn.Linear(width, width) for _ in range(depth)]
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply each linear layer followed by a relu and return the
+                # result.
                 for layer in self.layers:
                     x = torch.relu(layer(x))
                 return x
@@ -89,6 +119,9 @@ class TestCUDAGraphDebugInputs(TestCase):
             g.replay()
 
     def test_model_training_weight_dead(self):
+        # [FUNCTION DOC] Captures forward and backward of a linear layer into a graph with the
+        # liveness check, replays it, then deletes the output and the weight parameter; replay is
+        # expected to raise a dead tensor error. Backward warmup runs with user warnings ignored.
         model = nn.Linear(32, 16).cuda()
         x = torch.randn(8, 32, device="cuda")
         static_grad = torch.randn(8, 16, device="cuda")
@@ -110,6 +143,9 @@ class TestCUDAGraphDebugInputs(TestCase):
             g.replay()
 
     def test_view_tensor(self):
+        # [FUNCTION DOC] Captured input is a slice view of a base tensor. Deleting the view alone
+        # keeps replay working because the storage lives; deleting the base then makes replay
+        # raise.
         base = torch.randn(100, device="cuda")
         view = base[10:50]
         g, y = _capture_graph(lambda: view * 2)
@@ -120,6 +156,8 @@ class TestCUDAGraphDebugInputs(TestCase):
             g.replay()
 
     def test_nested_structure_inputs(self):
+        # [FUNCTION DOC] Inputs are two lists of tensors passed to a foreach add; deleting one
+        # tensor from the second list makes replay raise a dead tensor error.
         xs = [torch.randn(10, device="cuda") for _ in range(3)]
         ys = [torch.randn(10, device="cuda") for _ in range(3)]
         g, result = _capture_graph(lambda: torch._foreach_add(xs, ys))
@@ -128,6 +166,8 @@ class TestCUDAGraphDebugInputs(TestCase):
             g.replay()
 
     def test_empty_tensor_not_tracked(self):
+        # [FUNCTION DOC] A zero-element tensor has a null data pointer, so it is not registered
+        # among the graph tracker's external inputs, and deleting it does not break replay.
         x = torch.randn(100, device="cuda")
         empty = torch.empty(0, device="cuda")
         g = torch.cuda.CUDAGraph()
@@ -140,6 +180,9 @@ class TestCUDAGraphDebugInputs(TestCase):
         g.replay()
 
     def test_non_capturing_stream_inputs_not_tracked(self):
+        # [FUNCTION DOC] Captures under one stream while also using a second stream inside the
+        # capture in relaxed error mode. Only the input used on the capturing stream is tracked;
+        # the input used on the other stream is not, so deleting it does not break replay.
         capture_stream = torch.cuda.Stream()
         other_stream = torch.cuda.Stream()
         x = torch.randn(100, device="cuda")
@@ -159,6 +202,10 @@ class TestCUDAGraphDebugInputs(TestCase):
         self.assertEqual(result, x * 2)
 
     def test_shared_pool_tensor_not_tracked(self):
+        # [FUNCTION DOC] Two graphs share a memory pool. Tensors allocated by the first capture
+        # and consumed by the second are not treated as external inputs, so deleting them (output
+        # and the other pool-allocated tensor) does not break replays; the second graph result is
+        # checked.
         pool = torch.cuda.graph_pool_handle()
         x = torch.randn(100, device="cuda")
         g1 = torch.cuda.CUDAGraph()
@@ -179,6 +226,9 @@ class TestCUDAGraphDebugInputs(TestCase):
         g2.replay()
 
     def test_alive_storage_dead_tensor_ok(self):
+        # [FUNCTION DOC] Two tensors share one storage. Deleting the captured tensor keeps replay
+        # working since the storage is alive through the other tensor; deleting the second tensor
+        # then makes replay raise.
         a = torch.randn(100, device="cuda")
         b = torch.empty(100, device="cuda")
         b.set_(a.untyped_storage())
@@ -191,6 +241,8 @@ class TestCUDAGraphDebugInputs(TestCase):
             g.replay()
 
     def test_dead_storage_raises(self):
+        # [FUNCTION DOC] Replacing the storage of the captured input tensor with a new one frees
+        # the original storage, so replay raises a dead tensor error.
         x = torch.randn(100, device="cuda")
         g, y = _capture_graph(lambda: x * 2)
         x.set_(torch.randn(100, device="cuda").untyped_storage())
@@ -198,6 +250,8 @@ class TestCUDAGraphDebugInputs(TestCase):
             g.replay()
 
     def test_resize_larger_detected(self):
+        # [FUNCTION DOC] Resizing the captured input to a much larger size in place (which
+        # reallocates storage) is detected, and replay raises a dead tensor error.
         x = torch.randn(100, device="cuda")
         g, y = _capture_graph(lambda: x * 2)
         x.resize_(100000)
@@ -205,11 +259,17 @@ class TestCUDAGraphDebugInputs(TestCase):
             g.replay()
 
     def test_pinned_memory_tensor_tracked(self):
+        # [FUNCTION DOC] A pinned host tensor copied into a GPU buffer during capture is tracked
+        # along with the GPU buffer as external inputs. Replay works while the pinned tensor lives
+        # and raises once it is deleted.
         pinned = torch.randn(100).pin_memory()
         cuda_dest = torch.empty(100, device="cuda")
         g = torch.cuda.CUDAGraph()
 
         def op():
+            # [FUNCTION DOC] HELPER: Unused capture body that copies the pinned tensor into the
+            # GPU buffer asynchronously and returns the doubled buffer; the test instead repeats
+            # these steps inline inside the capture context.
             cuda_dest.copy_(pinned, non_blocking=True)
             return cuda_dest * 2
 
@@ -226,6 +286,9 @@ class TestCUDAGraphDebugInputs(TestCase):
             g.replay()
 
     def test_recapture_without_clears_stale_state(self):
+        # [FUNCTION DOC] After a failed replay from a dead input, resetting the graph and
+        # capturing again with fresh input gives a graph whose replay succeeds, so stale tracking
+        # state is cleared by the reset.
         g = torch.cuda.CUDAGraph()
         x = torch.randn(32, device="cuda")
         with torch.cuda.graph(g, check_input_liveness=True):
@@ -240,9 +303,13 @@ class TestCUDAGraphDebugInputs(TestCase):
         g.replay()
 
     def test_higher_order_op_during_capture(self):
+        # [FUNCTION DOC] Captures a call through the higher-order wrap operator that doubles its
+        # input, and checks replay output equals the expected doubled input.
         from torch._higher_order_ops.wrap import wrap
 
         def inner_fn(x):
+            # [FUNCTION DOC] HELPER: Return the input multiplied by two; the body run through the
+            # higher-order wrap operator.
             return x * 2
 
         x = torch.randn(32, device="cuda")
@@ -253,7 +320,12 @@ class TestCUDAGraphDebugInputs(TestCase):
 
 @skipIfRocm(msg="input liveness checking is only supported on NVIDIA CUDA")
 class TestCUDAGraphDebugBacktraces(TestCase):
+    # [CLASS DOC] Tests the content of the error raised when a dead input is found at replay.
+    # Skipped on ROCm.
     def test_error_message_contains_all_tracebacks(self):
+        # [FUNCTION DOC] Deletes two captured inputs from a nested helper, replays, and checks the
+        # lowercased error message reports two dead tensors and includes Python and C++ creation
+        # tracebacks, a Python deletion traceback naming the helper, and a replay traceback.
         a = torch.randn(100, device="cuda")
         b = torch.randn(100, device="cuda")
         g = torch.cuda.CUDAGraph()
@@ -261,6 +333,8 @@ class TestCUDAGraphDebugBacktraces(TestCase):
             y = a + b
 
         def delete_tensors():
+            # [FUNCTION DOC] HELPER: Delete the two enclosing-scope input tensors so the deletion
+            # traceback will name this function.
             nonlocal a, b
             del a, b
 
@@ -278,17 +352,27 @@ class TestCUDAGraphDebugBacktraces(TestCase):
 
 @skipIfRocm(msg="input liveness checking is only supported on NVIDIA CUDA")
 class TestCUDAGraphDebugExternalOps(TestCase):
+    # [CLASS DOC] Tests liveness tracking when inputs reach the graph through external operator
+    # mechanisms (custom autograd function and a registered custom operator). Skipped on ROCm.
     def test_custom_autograd_function(self):
+        # [FUNCTION DOC] A custom autograd function saves its scale tensor argument during capture
+        # under no-grad. Deleting the scale tensor makes replay raise a dead tensor error.
         from torch.autograd import Function
 
         class ScaleOp(Function):
+            # [CLASS DOC] HELPER: Autograd function multiplying an input by a scale tensor, saving
+            # the scale for backward.
             @staticmethod
             def forward(ctx, x, scale):
+                # [FUNCTION DOC] HELPER: Save the scale tensor on the context and return the input
+                # times the scale.
                 ctx.save_for_backward(scale)
                 return x * scale
 
             @staticmethod
             def backward(ctx, grad):
+                # [FUNCTION DOC] HELPER: Return the gradient times the saved scale for the input
+                # and no gradient for the scale.
                 (scale,) = ctx.saved_tensors
                 return grad * scale, None
 
@@ -302,12 +386,19 @@ class TestCUDAGraphDebugExternalOps(TestCase):
             g.replay()
 
     def test_torch_library_custom_op(self):
+        # [FUNCTION DOC] Registers a custom operator that multiplies a tensor by a scale tensor,
+        # captures a call to it, deletes the scale tensor, and expects replay to raise a dead
+        # tensor error.
         @torch.library.custom_op("test_cuda_graph_debug::scale", mutates_args=())
         def scale_op(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom operator body returning the input times the scale
+            # tensor.
             return x * scale
 
         @scale_op.register_fake
         def _(x, scale):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor shaped like the
+            # input, for tracing.
             return torch.empty_like(x)
 
         x = torch.randn(100, device="cuda")
