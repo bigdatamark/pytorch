@@ -1,4 +1,10 @@
 # Owner(s): ["module: masked operators"]
+# [MODULE DOC] Tests for torch.masked MaskedTensor. Defines comparison helpers, sample data
+# generation, and test classes for construction and conversion (TestBasics), unary and binary
+# ufuncs (TestUnary, TestBinary), reductions and gradient behavior (TestReductions), and
+# OpInfo-driven equality checks against plain tensors for strided, sparse COO and sparse CSR
+# layouts (TestOperators). At import time builds the op lists and instantiates the device-type
+# classes for cpu and cuda and the parametrized classes.
 
 import torch
 from torch.testing._internal.common_utils import (
@@ -27,6 +33,11 @@ from torch.masked.maskedtensor.reductions import REDUCE_NAMES
 
 
 def _compare_mt_t(mt_result, t_result, rtol=1e-05, atol=1e-05):
+    # [FUNCTION DOC] HELPER: Checks a MaskedTensor result against a plain tensor result. Takes
+    # the mask and data of the masked result (densifying sparse COO or CSR ones), zeroes
+    # masked-out positions of detached views of both data and the tensor (this writes into the
+    # shared storage of the arguments), and compares with the given tolerances. Raises
+    # ValueError on mismatch.
     mask = mt_result.get_mask()
     mt_result_data = mt_result.get_data()
     if mask.layout in {torch.sparse_coo, torch.sparse_csr}:
@@ -39,6 +50,10 @@ def _compare_mt_t(mt_result, t_result, rtol=1e-05, atol=1e-05):
         raise ValueError("The data in MaskedTensor a and Tensor b do not match")
 
 def _compare_mts(mt1, mt2, rtol=1e-05, atol=1e-08):
+    # [FUNCTION DOC] HELPER: Checks two MaskedTensors for equality. Raises ValueError if data
+    # layouts differ, masks do not match, or mask layouts differ. Densifies sparse data and
+    # masks, zeroes masked-out positions of detached views (writing into shared storage), then
+    # compares the data within tolerances and raises ValueError if they differ.
     mt_data1 = mt1.get_data()
     mt_data2 = mt2.get_data()
     if mt_data1.layout != mt_data2.layout:
@@ -65,6 +80,10 @@ def _compare_mts(mt1, mt2, rtol=1e-05, atol=1e-08):
         raise ValueError("The data in MaskedTensor mt1 and MaskedTensor mt2 do not match")
 
 def _compare_forward_backward(data, mask, fn):
+    # [FUNCTION DOC] HELPER: Runs a function on a masked tensor with requires_grad and on a
+    # plain tensor whose masked-out entries are set to negative infinity, backpropagates the
+    # sum of each result, and compares both the results and the gradients (gradient tolerance
+    # 1e-6) using the masked-versus-tensor comparison helper.
     mt = masked_tensor(data, mask, requires_grad=True)
     masked_res = fn(mt)
     masked_res.sum().backward()
@@ -77,11 +96,18 @@ def _compare_forward_backward(data, mask, fn):
     _compare_mt_t(mt.grad, t.grad, atol=1e-06)
 
 def _create_random_mask(shape, device):
+    # [FUNCTION DOC] HELPER: Returns a random boolean mask of the given shape on the
+    # given device.
     return make_tensor(shape, device=device, dtype=torch.bool)
 
 def _generate_sample_data(
     device="cpu", dtype=torch.float, requires_grad=True, layout=torch.strided
 ):
+    # [FUNCTION DOC] HELPER: Builds a list of SampleInput objects for shapes: scalar, 1D,
+    # 2D and 4D, each with random data and a random mask given in the kwargs. For sparse
+    # COO the mask is coalesced and the data restricted to it; for sparse CSR non-2D shapes
+    # are skipped and the data is restricted to the mask. Raises AssertionError for any
+    # other layout.
     if layout not in {
         torch.strided,
         torch.sparse_coo,
@@ -110,13 +136,21 @@ def _generate_sample_data(
     return inputs
 
 def _fix_fn_name(fn_name):
+    # [FUNCTION DOC] HELPER: Removes a single trailing underscore from an op name, so an in-
+    # place variant maps to the name of its out-of-place op.
     if fn_name[-1] == "_":
         fn_name = fn_name[:-1]
     return fn_name
 
 
 class TestBasics(TestCase):
+    # [CLASS DOC] Device-generic tests for MaskedTensor construction validation (type,
+    # layout, dim and size errors, gradient warning), arithmetic, where, unfold/stack, device
+    # and dtype conversion, dense/sparse conversion with gradients, sparse index validation
+    # and contiguity.
     def test_invalid_tensor_inputs(self, device):
+        # [FUNCTION DOC] Checks that the constructor raises TypeError when data or mask is not
+        # a plain tensor (a masked tensor or a number).
         data = torch.randn((3, 4), device=device)
         mask = _create_random_mask((3, 4), device=device)
         mt = masked_tensor(data, mask)
@@ -131,24 +165,31 @@ class TestBasics(TestCase):
             masked_tensor(data, 0)
 
     def test_diff_layouts(self, device):
+        # [FUNCTION DOC] Checks that sparse COO data with a strided mask raises TypeError
+        # about the layouts.
         data = torch.randn((3, 4), device=device).to_sparse_coo()
         mask = _create_random_mask((3, 4), device=device)
         with self.assertRaisesRegex(TypeError, "data and mask must have the same layout"):
             masked_tensor(data, mask)
 
     def test_diff_dim(self, device):
+        # [FUNCTION DOC] Checks that data and mask with different number of dims
+        # raise ValueError.
         data = torch.randn((3, 4, 5), device=device)
         mask = _create_random_mask((3, 4), device=device)
         with self.assertRaisesRegex(ValueError, "data.dim\\(\\) must equal mask.dim\\(\\)"):
             masked_tensor(data, mask)
 
     def test_diff_sizes(self, device):
+        # [FUNCTION DOC] Checks that data and mask with different sizes raise ValueError.
         data = torch.randn((3, 4), device=device)
         mask = _create_random_mask((3, 3), device=device)
         with self.assertRaisesRegex(ValueError, "data.size\\(\\) must equal mask.size\\(\\)"):
             masked_tensor(data, mask)
 
     def test_grad_warning(self, device):
+        # [FUNCTION DOC] Checks that building a MaskedTensor from data that requires grad
+        # emits a UserWarning recommending against it.
         data = torch.randn((3, 4), device=device, requires_grad=True)
         mask = _create_random_mask((3, 4), device=device)
         msg = "It is not recommended to create a MaskedTensor with a tensor that requires_grad."
@@ -156,6 +197,9 @@ class TestBasics(TestCase):
             masked_tensor(data, mask)
 
     def test_add(self, device):
+        # [FUNCTION DOC] Checks that adding two masked tensors with different masks raises
+        # ValueError, and that adding a masked tensor to itself doubles the data under the
+        # same mask.
         data = torch.arange(5.0, device=device)
         mask = torch.tensor([True, True, False, True, False], device=device)
         m0 = masked_tensor(data, mask)
@@ -165,6 +209,8 @@ class TestBasics(TestCase):
         _compare_mts(m0 + m0, masked_tensor(torch.tensor([0., 2, 0, 6, 0], device=device), mask))
 
     def test_softmax(self, device):
+        # [FUNCTION DOC] Compares softmax over the last dim on a masked tensor with softmax on
+        # a tensor with masked-out entries set to negative infinity, forward and backward.
         data = torch.randn((3, 4), device=device) * 0.1
         mask = torch.tensor(
             [
@@ -178,6 +224,9 @@ class TestBasics(TestCase):
         _compare_forward_backward(data, mask, lambda t: torch.softmax(t, -1))
 
     def test_where(self, device):
+        # [FUNCTION DOC] Checks where with a masked tensor of exp values and a masked tensor
+        # of ones with the opposite mask, against plain tensors; compares results and
+        # gradients of both inputs.
         data = torch.tensor([-10.0, -5, 0, 5, 10, 50, 60, 70, 80, 90, 100], device=device)
         mask = data < 0
 
@@ -196,16 +245,22 @@ class TestBasics(TestCase):
         _compare_mt_t(my.grad, y.grad)
 
     def test_unfold(self, device):
+        # [FUNCTION DOC] Compares the unfold method along dim 1 on masked and plain tensors,
+        # forward and backward.
         data = torch.rand(5, 5, device=device)
         mask = torch.rand(5, 5, device=device) > 0.5
         _compare_forward_backward(data, mask, lambda t: t.unfold(1, 2, 2))
 
     def test_nn_unfold(self, device):
+        # [FUNCTION DOC] Compares torch.nn.functional.unfold with a (2, 3) kernel on masked
+        # and plain 4D tensors, forward and backward.
         data = torch.rand(2, 5, 3, 4, device=device)
         mask = torch.rand(2, 5, 3, 4, device=device) > 0.5
         _compare_forward_backward(data, mask, lambda t: torch.nn.functional.unfold(t, kernel_size=(2, 3)))
 
     def test_stack(self, device):
+        # [FUNCTION DOC] Stacks three masked tensors and three plain copies of their data,
+        # backpropagates the sums, and compares the stacked results and each input's gradient.
         masked_tensors = [
             masked_tensor(
                 torch.rand(2, 5, 3, 4, device=device),
@@ -225,6 +280,9 @@ class TestBasics(TestCase):
             _compare_mt_t(mt.grad, t.grad, atol=1e-06)
 
     def test_to_sparse(self, device):
+        # [FUNCTION DOC] For each sample, converts a masked tensor to sparse and the data
+        # to sparse then dense, backpropagates both and compares results and gradients with
+        # the data.
         for sample in _generate_sample_data(device=device):
             data = sample.input
             mask = sample.kwargs["mask"]
@@ -238,6 +296,9 @@ class TestBasics(TestCase):
             _compare_mt_t(mt.grad, data.grad)
 
     def test_to_device(self, device):
+        # [FUNCTION DOC] For each sample, moves the masked tensor to another device
+        # (accelerator if the test device is cpu and one exists, else cpu) and checks the
+        # tensor, its mask and its data all are on that device type.
         for sample in _generate_sample_data(device=device):
             data = sample.input
             mask = sample.kwargs["mask"]
@@ -258,6 +319,9 @@ class TestBasics(TestCase):
             self.assertEqual(mt_device.get_data().device.type, new_device.type)
 
     def test_to_dtype(self, device):
+        # [FUNCTION DOC] For each sample, converts the masked tensor to the other of float32
+        # and float64 and checks the tensor and its data have the new dtype while the mask
+        # stays boolean.
         for sample in _generate_sample_data(device=device):
             data = sample.input
             mask = sample.kwargs["mask"]
@@ -271,6 +335,9 @@ class TestBasics(TestCase):
             self.assertEqual(mt_dtype.get_data().dtype, new_dtype)
 
     def test_to_dense(self, device):
+        # [FUNCTION DOC] For sparse COO and CSR samples, converts the masked tensor to dense,
+        # backpropagates it and the densified data, and compares results and gradients (the
+        # gradient is densified).
         samples = _generate_sample_data(
             device=device,
             layout=torch.sparse_coo
@@ -289,6 +356,9 @@ class TestBasics(TestCase):
             _compare_mt_t(mt.grad.to_dense(), dense_data.grad)
 
     def test_to_dense_and_sparse_coo(self, device):
+        # [FUNCTION DOC] For each strided sample, compares converting a strided masked tensor
+        # to sparse COO then dense against a sparse COO masked tensor made to dense, results
+        # and gradients.
         for sample in _generate_sample_data(device=device, layout=torch.strided):
             data = sample.input
             mask = sample.kwargs["mask"]
@@ -307,6 +377,8 @@ class TestBasics(TestCase):
             _compare_mts(mt.grad, mts.grad.to_dense())
 
     def test_to_dense_and_sparse_csr(self, device):
+        # [FUNCTION DOC] Same as the COO round-trip test but for sparse CSR; non-2D samples
+        # are skipped.
         for sample in _generate_sample_data(device=device, layout=torch.strided):
             data = sample.input
             mask = sample.kwargs["mask"]
@@ -327,12 +399,16 @@ class TestBasics(TestCase):
             _compare_mts(mt.grad, mts.grad.to_dense())
 
     def test_invalid_sparse_layout(self, device):
+        # [FUNCTION DOC] Checks that data and mask with sparse CSC layout raise TypeError
+        # saying the layout is not supported.
         data = torch.randn((3, 4), device=device).to_sparse_csc()
         mask = _create_random_mask((3, 4), device=device).to_sparse_csc()
         with self.assertRaisesRegex(TypeError, "data layout of torch.sparse_csc is not supported"):
             masked_tensor(data, mask)
 
     def test_invalid_sparse_coo_values(self, device):
+        # [FUNCTION DOC] Checks that sparse COO data and mask with different indices
+        # raise ValueError.
         v = torch.tensor([3, 4, 5], dtype=torch.float32)
         i1 = torch.tensor([[0, 1, 1], [2, 0, 2]])
         i2 = torch.tensor([[0, 1, 1], [2, 1, 2]])
@@ -345,6 +421,8 @@ class TestBasics(TestCase):
             masked_tensor(t, mask)
 
     def test_invalid_sparse_csr_values(self, device):
+        # [FUNCTION DOC] Checks that sparse CSR data and mask with different crow indices, or
+        # with different col indices, raise ValueError.
         crow_indices1 = [0, 2, 3]
         crow_indices2 = [0, 1, 3]
         col_indices1 = [0, 1, 2]
@@ -387,6 +465,10 @@ class TestBasics(TestCase):
             masked_tensor(t2, mask2)
 
     def test_contiguous(self, device):
+        # [FUNCTION DOC] Checks contiguity queries: a contiguous and a strided non-contiguous
+        # masked tensor report correctly; sparse ones raise ValueError for both the query and
+        # making contiguous; making the strided one contiguous yields an equal masked tensor
+        # with contiguous data.
         data = torch.randn((3, 3), device=device)
 
         contiguous_data = data.clone()
@@ -426,7 +508,12 @@ class TestBasics(TestCase):
         self.assertEqual(now_contiguous_mt.is_contiguous(), True)
 
 class TestUnary(TestCase):
+    # [CLASS DOC] Tests unary ops on masked tensors against plain tensors for the native unary
+    # function lists, with per-op input domain fixing helpers. Parametrized per function.
     def _get_test_data(self, fn_name):
+        # [FUNCTION DOC] HELPER: Returns random 10x10 data and a random boolean mask. The data
+        # is adjusted to the valid domain of the named op (abs, clamp, offset, or integer
+        # conversion for bitwise_not).
         data = torch.randn(10, 10)
         mask = torch.rand(10, 10) > 0.5
         fn_name = _fix_fn_name(fn_name)
@@ -445,6 +532,8 @@ class TestUnary(TestCase):
         return data, mask
 
     def _get_sample_kwargs(self, fn_name):
+        # [FUNCTION DOC] HELPER: Returns keyword arguments for the op: min and max bounds for
+        # clamp and clip, otherwise an empty mapping.
         fn_name = _fix_fn_name(fn_name)
         kwargs = {}
         if fn_name in ["clamp", "clip"]:
@@ -453,6 +542,9 @@ class TestUnary(TestCase):
         return kwargs
 
     def _get_sample_args(self, fn_name, data, mask):
+        # [FUNCTION DOC] HELPER: Builds argument lists for the plain tensor call and the
+        # masked tensor call; for pow an extra exponent of two is appended to both. Returns
+        # the two lists.
         fn_name = _fix_fn_name(fn_name)
         mt = masked_tensor(data, mask)
         t_args = [data]
@@ -464,6 +556,8 @@ class TestUnary(TestCase):
 
     @parametrize("fn", NATIVE_UNARY_FNS)
     def test_unary(self, fn):
+        # [FUNCTION DOC] Seeds the RNG, runs each native unary function on masked and plain
+        # inputs and compares the results.
         torch.random.manual_seed(0)
         fn_name = fn.__name__
         data, mask = self._get_test_data(fn_name)
@@ -477,6 +571,8 @@ class TestUnary(TestCase):
 
     @parametrize("fn", NATIVE_INPLACE_UNARY_FNS)
     def test_inplace_unary(self, fn):
+        # [FUNCTION DOC] Seeds the RNG, runs each native in-place unary function on masked and
+        # plain inputs and compares the results.
         torch.random.manual_seed(0)
         fn_name = fn.__name__
         data, mask = self._get_test_data(fn_name)
@@ -489,7 +585,12 @@ class TestUnary(TestCase):
         _compare_mt_t(mt_result, t_result)
 
 class TestBinary(TestCase):
+    # [CLASS DOC] Tests binary ops on masked tensors against plain tensors for the native
+    # binary and in-place binary function lists, plus mask mismatch errors. Parametrized
+    # per function.
     def _get_test_data(self, fn_name):
+        # [FUNCTION DOC] HELPER: Returns two random 10x10 tensors and a random mask; integers
+        # for bitwise and/or/xor, non-negative int64 for shifts.
         fn_name = _fix_fn_name(fn_name)
         data0 = torch.randn(10, 10)
         data1 = torch.randn(10, 10)
@@ -503,11 +604,16 @@ class TestBinary(TestCase):
         return data0, data1, mask
 
     def _get_sample_kwargs(self, fn_name):
+        # [FUNCTION DOC] HELPER: Returns the keyword arguments for the op; always an
+        # empty mapping.
         fn_name = _fix_fn_name(fn_name)
         kwargs = {}
         return kwargs
 
     def _yield_sample_args(self, fn_name, data0, data1, mask):
+        # [FUNCTION DOC] HELPER: Generator yielding pairs of argument lists: plain tensors
+        # versus two masked tensors sharing a mask, then plain tensors versus a masked tensor
+        # and a plain tensor.
         """ Returns two sets of Tensor and MaskedTensor args for a binary function to compute.
             Tensor args are all the same (just the two provided data tensors),
             while the MaskedTensor args tests both (MaskedTensor, MaskedTensor) and (MaskedTensor, Tensor)
@@ -526,6 +632,8 @@ class TestBinary(TestCase):
 
     @parametrize("fn", NATIVE_BINARY_FNS)
     def test_binary(self, fn):
+        # [FUNCTION DOC] For each native binary function, compares masked results to plain
+        # results for both argument pairings.
         torch.random.manual_seed(0)
         fn_name = fn.__name__
         data0, data1, mask = self._get_test_data(fn_name)
@@ -538,6 +646,7 @@ class TestBinary(TestCase):
 
     @parametrize("fn", NATIVE_INPLACE_BINARY_FNS)
     def test_inplace_binary(self, fn):
+        # [FUNCTION DOC] Same as the binary test for in-place binary functions.
         torch.random.manual_seed(0)
         fn_name = fn.__name__
         data0, data1, mask = self._get_test_data(fn_name)
@@ -550,6 +659,10 @@ class TestBinary(TestCase):
 
     @parametrize("fn_name", ["add", "add_"])
     def test_masks_match(self, fn_name):
+        # [FUNCTION DOC] For the add op and its in-place form through the aten namespace,
+        # checks that masked tensors with different masks raise ValueError with the exact
+        # message about matching masks; raises AssertionError on a different message or when
+        # no error occurs.
         torch.random.manual_seed(0)
         fn = getattr(torch.ops.aten, fn_name)
         data0, data1, mask = self._get_test_data(fn_name)
@@ -565,7 +678,12 @@ class TestBinary(TestCase):
                 raise AssertionError(f"unexpected error message: {e}") from None
 
 class TestReductions(TestCase):
+    # [CLASS DOC] Tests reductions on masked tensors (sum, mean, amax, amin, prod, all, any-
+    # true) with values and gradients, the constructor differentiability cases for mean, and
+    # error cases.
     def test_max_not_implemented(self):
+        # [FUNCTION DOC] Checks that max is not implemented and raises TypeError naming the
+        # aten op.
         d = torch.tensor([[0, 1, 2], [3, 4, 5.0]])
         m = torch.tensor([[True, False, False], [False, True, False]])
         mt = masked_tensor(d, m)
@@ -573,6 +691,8 @@ class TestReductions(TestCase):
             mt.max()
 
     def test_sum(self):
+        # [FUNCTION DOC] Checks sum over all elements and along dim 0 considers only masked-
+        # in values.
         d = torch.tensor([[0, 1, 2, 6], [3, 4, 5.0, 7]])
         m = torch.tensor([[True, False, False, True], [False, True, False, True]])
         mt = masked_tensor(d, m)
@@ -586,6 +706,8 @@ class TestReductions(TestCase):
         )
 
     def test_sum_grad(self):
+        # [FUNCTION DOC] Checks the sum gradient is one at masked-in positions under the
+        # same mask.
         d = torch.tensor([[0, 1, 2], [3, 4, 5.0]])
         m = torch.tensor([[True, False, False], [False, True, False]])
         mt = masked_tensor(d, m, requires_grad=True)
@@ -593,6 +715,8 @@ class TestReductions(TestCase):
         _compare_mts(mt.grad, masked_tensor(torch.tensor(1.0).expand_as(m), m))
 
     def test_mean(self):
+        # [FUNCTION DOC] Checks mean over all elements and along dim 0 uses only masked-
+        # in values.
         d = torch.tensor([[0, 1, 3, 2], [3, 4, 1.0, 4]])
         m = torch.tensor([[True, False, False, True], [False, True, False, True]])
         mt = masked_tensor(d, m)
@@ -656,6 +780,9 @@ class TestReductions(TestCase):
             as expected.
     """
     def test_mean_grad_case_1a(self):
+        # [FUNCTION DOC] Case: data requires grad, masked tensor made with requires_grad true.
+        # Expects a warning, no gradient on the data, and masked gradient of mean (half at
+        # masked-in elements).
         """ values.requires_grad = True
             mt = masked_tensor(values, mask, requires_grad=True)
         """
@@ -668,6 +795,8 @@ class TestReductions(TestCase):
         _compare_mts(mt.grad, masked_tensor(torch.tensor([[0.5, 0, 0], [0, 0.5, 0]]), m))
 
     def test_mean_grad_case_1b(self):
+        # [FUNCTION DOC] Case: data without grad, masked tensor made with requires_grad true.
+        # Expects no gradient on the data and a correct masked gradient on the masked tensor.
         """ values.requires_grad = False
             mt = masked_tensor(values, mask, requires_grad=True)
         """
@@ -679,6 +808,11 @@ class TestReductions(TestCase):
         _compare_mts(mt.grad, masked_tensor(torch.tensor([[0.5, 0, 0], [0, 0.5, 0]]), m))
 
     def test_mean_grad_case_1c(self):
+        # [FUNCTION DOC] Case: data requires grad, masked tensor made with requires_grad
+        # false. Expects a warning on construction and RuntimeError on backward since no
+        # graph exists.
+        # KNOWN ISSUE: the stray string literal above this group of tests labels cases 1a,
+        # 1b, 2a/2b, 3a/3b, which do not match these test names 1a to 1f.
         """ values.requires_grad = True
             mt = masked_tensor(values, mask, requires_grad=False)
         """
@@ -693,6 +827,8 @@ class TestReductions(TestCase):
 
 
     def test_mean_grad_case_1d(self):
+        # [FUNCTION DOC] Case: data without grad, masked tensor made with requires_grad false.
+        # Expects RuntimeError on backward.
         """ values.requires_grad = False
             mt = masked_tensor(values, mask, requires_grad=False)
         """
@@ -705,6 +841,9 @@ class TestReductions(TestCase):
             result.backward()
 
     def test_mean_grad_case_1e(self):
+        # [FUNCTION DOC] Case: data requires grad, masked tensor via the differentiable
+        # constructor. The data gets the masked gradient; reading the gradient of the non-leaf
+        # masked tensor warns and returns none.
         """ values.requires_grad = True
             mt = as_masked_tensor(values, mask)
         """
@@ -718,6 +857,8 @@ class TestReductions(TestCase):
             self.assertIsNone(mt.grad)
 
     def test_mean_grad_case_1f(self):
+        # [FUNCTION DOC] Case: data without grad, masked tensor via the differentiable
+        # constructor. Expects RuntimeError on backward.
         """ values.requires_grad = False
             mt = as_masked_tensor(values, mask)
         """
@@ -730,6 +871,8 @@ class TestReductions(TestCase):
             result.backward()
 
     def test_mean_dim_grad(self):
+        # [FUNCTION DOC] Checks the gradient of the sum of the mean along dim 1 under
+        # the mask.
         d = torch.tensor([[0, 1, 2], [3, 4, 5.0]])
         m = torch.tensor([[True, True, False], [False, True, False]])
         mt = masked_tensor(d, m, requires_grad=True)
@@ -737,6 +880,8 @@ class TestReductions(TestCase):
         _compare_mts(mt.grad, masked_tensor(torch.tensor([[0.5, 0.5, 0], [0, 1, 0]]), m))
 
     def test_amax(self):
+        # [FUNCTION DOC] Checks amax over all elements and along dim 0 using only masked-
+        # in values.
         d = torch.tensor([[0, 1, 3, -3], [3, -4, 1.0, 3]])
         m = torch.tensor([[True, False, False, True], [False, True, False, True]])
         mt = masked_tensor(d, m)
@@ -750,6 +895,8 @@ class TestReductions(TestCase):
         )
 
     def test_amax_grad(self):
+        # [FUNCTION DOC] Checks the amax gradient is one at the maximum masked-in
+        # element only.
         d = torch.tensor([[0, 1, 2], [3, 4, 5.0]])
         m = torch.tensor([[True, False, False], [False, True, False]])
         mt = masked_tensor(d, m, requires_grad=True)
@@ -757,6 +904,8 @@ class TestReductions(TestCase):
         _compare_mts(mt.grad, masked_tensor(torch.tensor([[0.0, 0, 0], [0, 1, 0]]), m))
 
     def test_amin(self):
+        # [FUNCTION DOC] Checks amin over all elements and along dim 0 using only masked-
+        # in values.
         d = torch.tensor([[0, 1, 3, -3], [3, -4, 1.0, 3]])
         m = torch.tensor([[True, False, False, True], [False, True, False, True]])
         mt = masked_tensor(d, m)
@@ -770,6 +919,8 @@ class TestReductions(TestCase):
         )
 
     def test_amin_grad(self):
+        # [FUNCTION DOC] Checks the amin gradient is one at the minimum masked-in
+        # element only.
         d = torch.tensor([[0, 1, 2], [3, 4, 5.0]])
         m = torch.tensor([[True, False, False], [False, True, False]])
         mt = masked_tensor(d, m, requires_grad=True)
@@ -777,6 +928,8 @@ class TestReductions(TestCase):
         _compare_mts(mt.grad, masked_tensor(torch.tensor([[1.0, 0, 0], [0, 0, 0]]), m))
 
     def test_prod(self):
+        # [FUNCTION DOC] Checks prod over all elements and along dim 0, with a masked-out
+        # nan ignored.
         d = torch.tensor([[0, 1, 3, 0.0], [float("nan"), 4, 1.0, 5.0]])
         m = torch.tensor([[True, False, False, True], [False, True, False, True]])
         mt = masked_tensor(d, m)
@@ -790,6 +943,8 @@ class TestReductions(TestCase):
         )
 
     def test_prod_grad(self):
+        # [FUNCTION DOC] Checks the prod gradient at masked-in positions is the product of the
+        # others, with a masked-out nan ignored.
         d = torch.tensor([[2, float("nan"), 2], [3, 4, 5.0]])
         m = torch.tensor([[True, False, False], [False, True, False]])
         mt = masked_tensor(d, m, requires_grad=True)
@@ -797,6 +952,8 @@ class TestReductions(TestCase):
         _compare_mts(mt.grad, masked_tensor(torch.tensor([[4.0, 0, 0], [0, 2, 0]]), m))
 
     def test_all(self):
+        # [FUNCTION DOC] Checks all over all elements and along dim 0 for two different masks,
+        # using only masked-in values.
         d = torch.tensor([[True, True, False, False], [False, True, True, True]])
         m = torch.tensor([[True, False, False, True], [False, True, False, True]])
         mt = masked_tensor(d, m)
@@ -820,6 +977,8 @@ class TestReductions(TestCase):
         )
 
     def test_grad_dtype(self):
+        # [FUNCTION DOC] Checks that boolean data with requires_grad raises RuntimeError
+        # about dtypes.
         d = torch.tensor([[True, True, False], [False, True, True]])
         m = torch.tensor([[True, False, False], [False, True, False]])
         msg = "Only Tensors of floating point and complex dtype can require gradients"
@@ -827,6 +986,7 @@ class TestReductions(TestCase):
             masked_tensor(d, m, requires_grad=True)
 
     def test_any_true_dtype(self):
+        # [FUNCTION DOC] Checks the any-true check on non-boolean data raises ValueError.
         mt = torch.masked.MaskedTensor(
             torch.rand(2, 2),
             torch.rand(2, 2) > 0.5
@@ -836,6 +996,7 @@ class TestReductions(TestCase):
             mt._is_any_true()
 
     def test__is_any_true(self):
+        # [FUNCTION DOC] Checks the any-true check is true when some masked-in value is true.
         mt = torch.masked.MaskedTensor(
             torch.tensor([[True, True, False], [False, False, True]]),
             torch.tensor([[True, False, False], [False, True, False]]),
@@ -846,6 +1007,7 @@ class TestReductions(TestCase):
         )
 
     def test__is_any_true_false(self):
+        # [FUNCTION DOC] Checks the any-true check is false when every element is masked out.
         mt = torch.masked.MaskedTensor(
             torch.tensor([[True, True, False], [False, False, True]]),
             torch.tensor([[False, False, False], [False, False, False]]),
@@ -856,6 +1018,8 @@ class TestReductions(TestCase):
         )
 
     def test_backward(self):
+        # [FUNCTION DOC] Regression test for issue 128557: backward of sum on a
+        # masked tensor with grad must not trigger an error under anomaly detection.
         # See https://github.com/pytorch/pytorch/issues/128557
         with torch.autograd.detect_anomaly():
             mt = torch.masked.MaskedTensor(
@@ -867,12 +1031,16 @@ class TestReductions(TestCase):
 
 
 def is_unary(op):
+    # [FUNCTION DOC] HELPER: Returns whether the op name is in the masked unary op names.
     return op.name in UNARY_NAMES
 
 def is_binary(op):
+    # [FUNCTION DOC] HELPER: Returns whether the op name is in the masked binary op names.
     return op.name in BINARY_NAMES
 
 def is_reduction(op):
+    # [FUNCTION DOC] HELPER: Returns whether the op is a supported masked reduction name,
+    # excluding all, mean, std and var.
     return op.name in REDUCE_NAMES and op.name not in {"all", "mean", "std", "var"}
 
 mt_unary_ufuncs = [op for op in unary_ufuncs if is_unary(op)]
@@ -886,7 +1054,13 @@ MASKEDTENSOR_FLOAT_TYPES = {
 }
 
 class TestOperators(TestCase):
+    # [CLASS DOC] OpInfo-driven tests comparing masked tensor results with plain tensor
+    # results for unary ufuncs, binary ufuncs and reductions, on float16, float32 and
+    # float64 only.
     def _convert_mt_args(self, args, mask, layout):
+        # [FUNCTION DOC] HELPER: Converts every tensor in the argument list to a masked tensor
+        # with the mask (data restricted to the mask when the layout is not strided); other
+        # arguments pass through.
         return [
             masked_tensor(
                 arg.sparse_mask(mask) if layout != torch.strided else arg, mask
@@ -897,6 +1071,11 @@ class TestOperators(TestCase):
         ]
 
     def _test_unary_binary_equality(self, device, dtype, op, layout=torch.strided):
+        # [FUNCTION DOC] HELPER: For each requires-grad sample, takes the mask from the kwargs
+        # (removing it) or makes a random one, converts input and mask to the layout (CSR
+        # skips non-2D), skips binary samples whose shapes differ and drops kwargs for binary
+        # ops, then compares the masked result with the plain result. For strided binary ops
+        # also checks a masked-times-plain pairing.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
 
         for sample in samples:
@@ -939,6 +1118,10 @@ class TestOperators(TestCase):
                 _compare_mt_t(mt_result2, t_result)
 
     def _test_reduction_equality(self, device, dtype, op, layout=torch.strided):
+        # [FUNCTION DOC] HELPER: For each sample, skips zero-dim, empty and all-false-mask
+        # inputs, builds the reference by filling masked-out entries with the op identity,
+        # converts input and mask to the layout (CSR skips non-2D), applies the op with no
+        # extra args to the masked tensor and compares.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
 
         for sample in samples:
@@ -975,6 +1158,10 @@ class TestOperators(TestCase):
     @ops(mt_unary_ufuncs, allowed_dtypes=MASKEDTENSOR_FLOAT_TYPES)  # type: ignore[arg-type]
     @parametrize("layout", [torch.strided, torch.sparse_coo, torch.sparse_csr])
     def test_unary_core(self, device, dtype, op, layout):
+        # [FUNCTION DOC] Unary op test, parametrized by layout. Skips round variants that use
+        # keyword arguments.
+        # KNOWN ISSUE: the layout is not forwarded to the helper, so every layout runs the
+        # strided case.
         # Skip tests that don't have len(kwargs) == 0
         skip_variants = {
             "decimals_0",
@@ -988,11 +1175,15 @@ class TestOperators(TestCase):
     @ops(mt_binary_ufuncs, allowed_dtypes=MASKEDTENSOR_FLOAT_TYPES)  # type: ignore[arg-type]
     @parametrize("layout", [torch.strided, torch.sparse_coo, torch.sparse_csr])
     def test_binary_core(self, device, dtype, op, layout):
+        # [FUNCTION DOC] Binary op test for the given layout; delegates to the
+        # equality helper.
         self._test_unary_binary_equality(device, dtype, op, layout)
 
     @ops(mt_reduction_ufuncs, allowed_dtypes=MASKEDTENSOR_FLOAT_TYPES)  # type: ignore[arg-type]
     @parametrize("layout", [torch.strided, torch.sparse_coo, torch.sparse_csr])
     def test_reduction_all(self, device, dtype, op, layout):
+        # [FUNCTION DOC] Reduction op test for the given layout; returns early for arg min and
+        # arg max on sparse CSR, otherwise delegates to the reduction equality helper.
         # argmin and argmax are not currently supported for torch.sparse_csr
         if op.name in {"argmin", "argmax"} and layout == torch.sparse_csr:
             return

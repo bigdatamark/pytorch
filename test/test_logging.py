@@ -1,4 +1,7 @@
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Tests for torch._logging internals: backend autoload artifact registration,
+# trace_structured file output, LazyTraceHandler fork behavior, and the CI tlparse helper
+# script. Defines one TestCase class and runs it through run_tests when executed as a script.
 
 import glob
 import gzip
@@ -19,7 +22,16 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class LoggingTest(TestCase):
+    # [CLASS DOC] Test case covering logging setup (_init_logs), the structured trace handler
+    # (LOG_TRACE_HANDLER / LazyTraceHandler), API usage logging and the bash tlparse
+    # collection helper. Many tests mutate the TORCH_TRACE / TORCH_LOGS environment variables
+    # and module globals in torch._logging._internal and restore them in finally blocks.
     def test_backend_autoload_registers_torch_logs_before_env_parse(self):
+        # [FUNCTION DOC] Builds a temporary fake backend package with a torch.backends entry
+        # point that registers a log component and an artifact on import. Runs a subprocess
+        # with backend autoload enabled and TORCH_LOGS enabling both names, then asserts exit
+        # code zero and that both the component and artifact messages appear on stderr
+        # (registration precedes env parsing).
         with tempfile.TemporaryDirectory() as tmpdir:
             package_dir = os.path.join(tmpdir, "torch_issue173759_backend")
             dist_info_dir = os.path.join(
@@ -92,6 +104,10 @@ class LoggingTest(TestCase):
             self.assertIn("issue173759 artifact log", result.stderr)
 
     def testApiUsage(self):
+        # [FUNCTION DOC] Runs a subprocess helper twice: importing torch must emit a
+        # PYTORCH_API_USAGE line matching the import event, while only loading the torch C
+        # extension shared library via ctypes (static initialization) must not emit any API
+        # usage line.
         """
         This test verifies that api usage logging is not triggered via static
         initialization. Since it's triggered at first invocation only - we just
@@ -106,6 +122,11 @@ class LoggingTest(TestCase):
         self.assertNotRegex(s, "PYTORCH_API_USAGE")
 
     def test_trace_structured_with_logging_disable(self):
+        # [FUNCTION DOC] With global logging disabled at DEBUG level, points TORCH_TRACE at a
+        # temp dir, resets the trace handler and reinitializes logs, then checks trace_log has
+        # handlers and is enabled for DEBUG, emits one structured event and verifies a log
+        # file contains its name. Restores logging disable level, env var, handler global and
+        # reinitializes logs in finally.
         """trace_structured should work even when logging.disable(DEBUG) is active."""
         old_disable = logging.root.manager.disable
         old_env = os.environ.get("TORCH_TRACE")
@@ -147,6 +168,10 @@ class LoggingTest(TestCase):
             _init_logs()
 
     def test_init_logs_preserves_active_trace_handler_stream(self):
+        # [FUNCTION DOC] Verifies that calling _init_logs again keeps the same trace handler
+        # object and the same underlying stream path. Events written before and after the
+        # reinit must both land in the single log file in the temp trace dir. Restores env,
+        # handler global and logs in finally.
         old_env = os.environ.get("TORCH_TRACE")
         old_handler = log_internal.LOG_TRACE_HANDLER
         try:
@@ -194,12 +219,19 @@ class LoggingTest(TestCase):
             _init_logs()
 
     def test_init_logs_removes_marked_handlers_if_weak_registry_is_reset(self):
+        # [FUNCTION DOC] Sets logs to a dynamic setting with a log output file, replaces the
+        # log state, initializes logs, clears the module weak handler registry to simulate a
+        # reset, initializes again and asserts each registered logger ends with exactly two
+        # handlers (stream and file), i.e. previously marked handlers were removed rather than
+        # duplicated. Restores env and log state.
         old_logs = os.environ.get(log_internal.LOG_ENV_VAR)
         old_logs_out = os.environ.get(log_internal.LOG_OUT_ENV_VAR)
         old_log_state = log_internal._get_log_state()
         created_handlers = set()
 
         def close_created_handlers():
+            # [FUNCTION DOC] HELPER: Closes every handler collected in the enclosing test's
+            # set and empties it.
             for handler in created_handlers:
                 handler.close()
             created_handlers.clear()
@@ -242,9 +274,16 @@ class LoggingTest(TestCase):
             close_created_handlers()
 
     def test_trace_handler_close_stream_can_skip_flush(self):
+        # [FUNCTION DOC] Checks LazyTraceHandler stream closing. With flush disabled, buffered
+        # data is discarded (file stays empty) and the stream, pid and pending-version flag
+        # are reset; with the default flush the buffered text is written to the file. Temp
+        # files are removed in finally.
         paths: list[Path] = []
 
         def make_handler() -> tuple[log_internal.LazyTraceHandler, Path]:
+            # [FUNCTION DOC] HELPER: Creates a temp file and a LazyTraceHandler with no
+            # directory, attaches an open write stream, current pid and pending log version
+            # flag. Records the path for cleanup and returns the handler with its path.
             fd, path = tempfile.mkstemp()
             os.close(fd)
             paths.append(Path(path))
@@ -277,6 +316,11 @@ class LoggingTest(TestCase):
 
     @unittest.skipIf(not hasattr(os, "fork"), "requires os.fork")
     def test_trace_handler_close_after_fork_skips_flush(self):
+        # [FUNCTION DOC] Forks a child process (skipped without fork support) holding a
+        # handler with unflushed buffered data; the child closes the handler and must exit
+        # with status zero. The file must remain empty, showing a close after fork does not
+        # flush the inherited parent buffer. Reaps the child and closes the parent stream
+        # without flushing in finally.
         fd, path_str = tempfile.mkstemp()
         path = Path(path_str)
         child_pid = None
@@ -319,6 +363,11 @@ class LoggingTest(TestCase):
 
     @unittest.skipIf(not hasattr(os, "fork"), "requires os.fork")
     def test_trace_handler_reopens_after_fork(self):
+        # [FUNCTION DOC] Emits a trace event, forks, then emits events from both child and
+        # parent. Expects two log files in the trace dir: one with the child event only (no
+        # pre-fork or parent events) and one with the pre-fork and parent events but not the
+        # child event, so the handler reopens a new file after fork. The child must exit with
+        # status zero. Restores env and handler in finally.
         old_env = os.environ.get("TORCH_TRACE")
         old_handler = log_internal.LOG_TRACE_HANDLER
         child_pid = None
@@ -408,6 +457,11 @@ class LoggingTest(TestCase):
         sys.platform == "win32", "tests a bash CI helper with POSIX path semantics"
     )
     def test_collect_tlparse_output_preserves_multiple_trace_logs(self):
+        # [FUNCTION DOC] Skipped on Windows. Builds a fake tlparse executable that records its
+        # arguments and writes a source marker, then runs the collect_tlparse_output shell
+        # function from the CI torch_trace helper with two trace logs present. Asserts both
+        # logs are gzipped into a raw dir, that tlparse is called once on the trace directory
+        # (not on single logs), and that the parsed output refers to the trace directory.
         repo_root = Path(__file__).resolve().parent.parent
 
         with tempfile.TemporaryDirectory() as tmpdir:

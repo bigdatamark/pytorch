@@ -1,4 +1,9 @@
 # Owner(s): ["module: masked operators"]
+# [MODULE DOC] Tests for torch.masked operators. Builds reference implementations that apply
+# reductions and normalizations slice by slice over masked-in elements, collects the masked
+# ops from the op database, and checks strided results against references and sparse COO/CSR
+# layouts against strided results. Also tests the masked where for sparse inputs. Device-type
+# test classes are instantiated at import time for all devices except meta.
 
 """Tests for masked operations.
 """
@@ -20,6 +25,14 @@ from torch.testing._internal.common_device_type import \
 
 
 def apply_masked_reduction_along_dim(op, input, *args, **kwargs):
+    # [FUNCTION DOC] Reference implementation of a masked reduction. Pops the mask and the
+    # argument position of dim from the keyword arguments, locates dim in positional or keyword
+    # arguments, and replaces it with None before calling the op. Enumerates every elementary
+    # slice (all index combinations over non-reduced dims, full range over reduced dims), gathers
+    # only masked-in elements into a flat tensor and applies the op. Empty slices keep nan for
+    # floating dtype, else 0. Returns the result with reduced dims kept as size one, or dropped
+    # unless keepdim is requested. A zero-dim input is passed straight to the op and cast to the
+    # dtype. Raises AssertionError if dim is given both positionally and by keyword.
     """Applies reduction op along given dimension to strided x
     elements that are valid according to mask tensor.
 
@@ -137,6 +150,11 @@ def apply_masked_reduction_along_dim(op, input, *args, **kwargs):
 
 
 def apply_masked_normalization_along_dim(op, input, *args, **kwargs):
+    # [FUNCTION DOC] Reference implementation of a masked normalization such as softmax. Pops mask
+    # and dim position, returns the op result directly for zero-dim input, otherwise takes dim
+    # from the positional arguments, runs the op with dim replaced by zero on each 1D slice along
+    # dim restricted to its masked-in elements, and writes into a zeros tensor of the output dtype
+    # so masked-out positions stay zero. Returns the full-shape output.
     """Applies normalization op along given dimension to strided x
     elements that are valid according to mask tensor.
     """
@@ -178,6 +196,8 @@ masked_ops_with_non_strided_support = [op for op in masked_ops if op.supports_sp
 
 
 def _tensor_to_strided(obj):
+    # [FUNCTION DOC] HELPER: Returns a non-tensor object or an already strided tensor unchanged,
+    # and converts any other layout tensor to dense.
     # after gh-59958 is resolved, replace the usage of this function
     # with torch.Tensor.to_dense
     if torch.is_tensor(obj):
@@ -188,33 +208,53 @@ def _tensor_to_strided(obj):
 
 
 def to_strided(obj):
+    # [FUNCTION DOC] Maps the strided-conversion helper over every leaf of a nested structure and
+    # returns the structure with all tensors dense.
     """Convert the tensor content of object to strided tensor content.
     """
     return torch.utils._pytree.tree_map(_tensor_to_strided, obj)
 
 
 def to_sparse_coo(obj):
+    # [FUNCTION DOC] Maps the tensor to_sparse method over every leaf of a nested structure, so
+    # every leaf must be a tensor; returns the structure with sparse COO tensors.
     """Convert the tensor content of object to sparse coo tensor content.
     """
     return torch.utils._pytree.tree_map(torch.Tensor.to_sparse, obj)
 
 
 def to_sparse_csr(obj):
+    # [FUNCTION DOC] Maps the tensor to_sparse_csr method over every leaf of a nested structure,
+    # so every leaf must be a tensor; returns the structure with CSR tensors.
     """Convert the tensor content of object to sparse csr tensor content.
     """
     return torch.utils._pytree.tree_map(torch.Tensor.to_sparse_csr, obj)
 
 
 class mask_layouts(_TestParametrizer):
+    # [CLASS DOC] Parametrizer used as a test decorator. Each decorated test is generated
+    # three times, once per layout (strided, sparse COO, sparse CSR), and receives the layout
+    # plus a generator of sample inputs whose masks are provided in all layouts the op
+    # supports. Stateless.
     """Decorator class for parametrization of test function with an input
     layout argument and an extra argument of sample inputs generator.
     The sample_inputs generator provides samples with all supported
     layouts for the mask argument.
     """
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] Parametrizer hook. Defines a wrapper for the test and yields one
+        # entry per layout with the wrapper, a layout name derived from the layout string, the
+        # layout as a parameter and an empty decorator list.
 
         @wraps(test)
         def wrap(self, layout, device, dtype, op):
+            # [FUNCTION DOC] HELPER: Picks the sample input function for the layout (regular
+            # for strided, sparse variants otherwise), raising SkipTest when the op lacks
+            # support for that layout and NotImplementedError for any other layout. Calls the
+            # wrapped test with layout, device, dtype, op and a sample input generator.
+            # KNOWN ISSUE: the layout name is built with a character-set strip rather than a
+            # prefix removal; it gives the intended names only because the names start with a
+            # letter not in that set.
             layout_name = str(layout).lstrip('torch.')
             if layout == torch.strided:
                 # strided layouts are always supported
@@ -231,6 +271,12 @@ class mask_layouts(_TestParametrizer):
                 raise NotImplementedError(f'{layout}')
 
             def sample_inputs_generator():
+                # [FUNCTION DOC] HELPER: Generator over the op's samples. Samples without a
+                # mask are yielded as is. For masked samples it yields the original when its
+                # input layout matches, and copies with the mask converted to dense (non-
+                # strided layouts), to sparse COO (if the layout is not COO and the op
+                # supports sparse) or to CSR (if the layout is not CSR, supported and the
+                # input is 2D).
                 for sample_input in sample_inputs_func(device, dtype):
                     mask = sample_input.kwargs.get('mask')
                     if mask is None:
@@ -264,8 +310,13 @@ class mask_layouts(_TestParametrizer):
 
 
 class TestMasked(TestCase):
+    # [CLASS DOC] Device-generic tests for masked operators: comparison to slice-wise
+    # references, consistency across mask and input layouts, and sparse masked where.
+    # Instantiated per device type with meta excluded.
 
     def assertEqualMasked(self, actual, expected, mask):
+        # [FUNCTION DOC] HELPER: Densifies the actual result, zeroes both actual and expected
+        # outside the mask when a mask is given, then asserts equality (device ignored).
         strided = to_strided(actual)
         if mask is not None:
             strided = torch.where(mask, strided, strided.new_zeros([]))
@@ -277,6 +328,10 @@ class TestMasked(TestCase):
     @ops(masked_ops_with_references)
     @precisionOverride({torch.bfloat16: 5e-4, torch.float16: 5e-4})
     def test_reference_masked(self, device, dtype, op):
+        # [FUNCTION DOC] For each masked op that has a reference, runs the op and the
+        # reference on every sample input and compares them only at the output mask positions.
+        # Variance and std are skipped for integer inputs. Runs on native device types with
+        # warnings suppressed and loosened precision for half and bfloat16.
         op_name = op.name.rsplit('.', 1)[-1]
         ref_op = reference_functions[op_name]
         sample_inputs = op.sample_inputs(device, dtype)
@@ -299,6 +354,10 @@ class TestMasked(TestCase):
     @ops(masked_ops_with_non_strided_support)
     @precisionOverride({torch.bfloat16: 5e-3, torch.float16: 5e-3})
     def test_mask_layout(self, layout, device, dtype, op, sample_inputs):
+        # [FUNCTION DOC] For every sample, runs the masked op and requires the result layout
+        # to equal the tested layout (AssertionError otherwise). Then converts inputs to
+        # strided, runs the op again and compares at the output mask, checking sparse results
+        # agree with dense ones.
         for sample in sample_inputs:
             t_inp, t_args, t_kwargs = sample.input, sample.args, sample.kwargs
             actual = op.op(t_inp, *t_args, **t_kwargs)
@@ -323,31 +382,43 @@ class TestMasked(TestCase):
                                             ('csr', 0), ('csr', 123)],
                  name_fn=lambda sparse_kind, fill_value: f'{sparse_kind}_fill_value_{fill_value}')
     def test_where(self, sparse_kind, fill_value):
+        # [FUNCTION DOC] Tests the masked where on sparse COO, hybrid COO and CSR masks and
+        # inputs for two fill values. Builds a sparse mask and input with some explicitly
+        # stored masked-out or zero values, computes the expected sparse result with
+        # placeholder entries replaced by zero, and compares. Also checks the dense equivalent
+        # of the where over the output mask. Raises AssertionError for unknown sparse kind or
+        # layout. Skipped under Dynamo.
 
         is_hybrid = False
         if sparse_kind == 'coo':
 
             def to_sparse(dense):
+            # [FUNCTION DOC] HELPER: Converts a dense tensor to COO, two sparse dims.
                 return dense.to_sparse(2)
 
             def set_values(sparse, index, value):
+            # [FUNCTION DOC] HELPER: Overwrites the stored COO values at an index (mutates).
                 sparse._values()[index] = value
 
         elif sparse_kind == 'hybrid_coo':
             is_hybrid = True
 
             def to_sparse(dense):
+            # [FUNCTION DOC] HELPER: Converts a dense tensor to hybrid COO, one sparse dim.
                 return dense.to_sparse(1)
 
             def set_values(sparse, index, value):
+            # [FUNCTION DOC] HELPER: Overwrites the stored COO values at an index (mutates).
                 sparse._values()[index] = value
 
         elif sparse_kind == 'csr':
 
             def to_sparse(dense):
+            # [FUNCTION DOC] HELPER: Converts a dense tensor to CSR layout.
                 return dense.to_sparse_csr()
 
             def set_values(sparse, index, value):
+            # [FUNCTION DOC] HELPER: Overwrites the stored CSR values at an index (mutates).
                 sparse.values()[index] = value
 
         else:
