@@ -1,5 +1,14 @@
 # Owner(s): ["NNC"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for the NNC / TensorExpr (TE) fuser in TorchScript. Defines helper
+# context managers and graph-inspection utilities, the TestTEFuser suite (specialized into
+# static and dynamic shape variants), an OpInfo driven suite that compiles ops with
+# TensorExprKernel and compares against eager, and a loopnest randomization suite. Import
+# time side effects: forces the profiling executor and graph executor optimization on before
+# common_utils infers its executor setting, parses command line arguments when run as a
+# script, deletes the base TestTEFuser class so only subclasses run, and instantiates
+# device-generic test classes into the module globals. Running as a script calls the test
+# runner unless Python is 3.14 or newer.
 
 import contextlib
 import math
@@ -90,11 +99,17 @@ autograd_check_set = {
 
 
 def strip_profiling_nodes(nodes):
+    # [FUNCTION DOC] HELPER: Returns the nodes of the given sequence whose kind is not a
+    # profiling bailout marker (BailoutTemplate or BailOut). The input is not modified; a
+    # new list is returned.
     profiling_opcodes = {"prim::BailoutTemplate", "prim::BailOut"}
     return [n for n in nodes if n.kind() not in profiling_opcodes]
 
 
 def warmup_forward(f, *args, profiling_count=2):
+    # [FUNCTION DOC] HELPER: Calls the callable f with the given arguments profiling_count
+    # times (default 2) so the profiling executor can record shapes and optimize. Returns
+    # the result of the last call.
     for _ in range(profiling_count):
         results = f(*args)
 
@@ -103,6 +118,9 @@ def warmup_forward(f, *args, profiling_count=2):
 
 @contextlib.contextmanager
 def texpr_reductions_enabled():
+    # [FUNCTION DOC] HELPER: Context manager that enables TensorExpr reduction fusion for
+    # its body. Remembers the previous setting and restores it in a finally clause, even on
+    # error.
     old = torch._C._jit_set_texpr_reductions_enabled(True)
     try:
         yield
@@ -112,6 +130,9 @@ def texpr_reductions_enabled():
 
 @contextlib.contextmanager
 def texpr_enable_strategy(strategy):
+    # [FUNCTION DOC] HELPER: Context manager that sets the JIT fusion strategy (a list of
+    # kind/count pairs such as dynamic or static with a limit) for its body. Restores the
+    # previous strategy in a finally clause.
     old = torch._C._jit_set_fusion_strategy(strategy)
     try:
         yield
@@ -121,6 +142,8 @@ def texpr_enable_strategy(strategy):
 
 @contextlib.contextmanager
 def inline_fusion_groups():
+    # [FUNCTION DOC] HELPER: Context manager that turns on fusion group inlining (debug
+    # flag) for its body. Restores the previous flag in a finally clause.
     old_inlining = torch._C._debug_get_fusion_group_inlining()
     torch._C._debug_set_fusion_group_inlining(True)
     try:
@@ -130,7 +153,16 @@ def inline_fusion_groups():
 
 
 class TestTEFuser(JitTestCase):
+    # [CLASS DOC] Base suite of TE fuser tests, run only through its static and dynamic
+    # shape subclasses (the base is deleted from the module). Subclasses must define the
+    # dynamic_shapes attribute. setUp saves TensorExprTestOptions and the fusion strategy;
+    # helpers check that a graph is fully fused and find fusion groups. Tests script or
+    # trace small functions and assert fusion happens and results match eager.
     def setUp(self):
+        # [FUNCTION DOC] Prepares each test: applies TensorExprTestOptions, sets the fusion
+        # strategy to dynamic or static (limit 20) according to the dynamic_shapes class
+        # attribute and remembers the old one, and builds the lists of devices (cpu plus
+        # cuda if available) and of integer, floating point and combined dtypes.
         super().setUp()
         self.tensorexpr_options = TensorExprTestOptions()
 
@@ -157,11 +189,18 @@ class TestTEFuser(JitTestCase):
         self.dtypes = self.int_dtypes + self.fp_dtypes
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the TensorExpr test options and the saved fusion strategy,
+        # then calls the parent tearDown.
         self.tensorexpr_options.restore()
         torch._C._jit_set_fusion_strategy(self.old_fusion_strategy)
         super().tearDown()
 
     def assertAllFused(self, graph, except_for=None):
+        # [FUNCTION DOC] Asserts that every node of the top level block of the graph is a
+        # constant, a single guard, an allowed node kind from except_for (default empty), or
+        # an If node whose previous node is a guard. Guards are type checks, requires-grad
+        # checks, dynamic guards or autodiff all-nonzero/all-zero checks. Fails on any other
+        # node kind and fails unless exactly one guard was found.
         except_for = except_for if except_for is not None else set()
         # TODO - upstream
         guards = (
@@ -172,6 +211,9 @@ class TestTEFuser(JitTestCase):
         guard_found = False
 
         def autodiff_guard(node):
+            # [FUNCTION DOC] HELPER: Returns True if the node is an all-reduction over a
+            # list construct that has an autodiff all-nonzero or all-zero input; this is how
+            # autodiff guards appear. Returns False otherwise.
             if node.kind() != "aten::all":
                 return False
             inps = list(node.inputs())
@@ -187,6 +229,8 @@ class TestTEFuser(JitTestCase):
             return False
 
         def is_guard(node):
+            # [FUNCTION DOC] HELPER: Returns True if the node is one of the known guard
+            # kinds or an autodiff guard.
             return node.kind() in guards or autodiff_guard(node)
 
         for node in graph.block().nodes():
@@ -206,9 +250,14 @@ class TestTEFuser(JitTestCase):
         self.assertTrue(guard_found)
 
     def assertLastGraphAllFused(self):
+        # [FUNCTION DOC] Asserts that the most recently executed optimized graph is fully
+        # fused, using assertAllFused with default exceptions.
         self.assertAllFused(torch.jit.last_executed_optimized_graph())
 
     def findFusionGroups(self, graph):
+        # [FUNCTION DOC] Recursively walks a graph (or block) and returns a list of the
+        # subgraphs of all TensorExprGroup nodes, descending into the blocks of other nodes
+        # such as If nodes. Fusion groups are not searched inside.
         result = []
         for n in graph.nodes():
             if n.kind() == FUSION_GROUP:
@@ -219,9 +268,14 @@ class TestTEFuser(JitTestCase):
         return result
 
     def test_typecheck(self):
+        # [FUNCTION DOC] Checks a fused add-multiply kernel is created for size one input
+        # and that a larger input afterwards triggers a type check failure and
+        # recompilation, so the scripted result still equals eager.
         a = torch.ones(1)
 
         def fused_kernel(a, b):
+            # [FUNCTION DOC] HELPER: Eager function adding two tensors and multiplying by
+            # two.
             return (a + b) * 2.0
 
         scripted = self.checkScript(fused_kernel, (a, a))
@@ -239,7 +293,10 @@ class TestTEFuser(JitTestCase):
         self.assertEqual(scripted(a, a), fused_kernel(a, a))
 
     def test_sum_simple(self):
+        # [FUNCTION DOC] Checks that a squared-sum reduction script function fuses
+        # completely when TE reductions are enabled.
         def func(x):
+            # [FUNCTION DOC] HELPER: Squares the input and returns the sum.
             x2 = x * x
             return x2.sum()
 
@@ -250,13 +307,18 @@ class TestTEFuser(JitTestCase):
             self.assertLastGraphAllFused()
 
     def test_nop(self):
+        # [FUNCTION DOC] Placeholder test that does nothing.
         pass
 
     def test_sum_dim(self):
+        # [FUNCTION DOC] Checks that sum over a positive dim and over a negative dim
+        # followed by a multiply are fully fused with reductions enabled.
         def func(x):
+            # [FUNCTION DOC] HELPER: Sums over dim zero then multiplies by two.
             return x.sum((0,)) * 2
 
         def func_neg(x):
+            # [FUNCTION DOC] HELPER: Sums over dim minus two then multiplies by two.
             return x.sum((-2,)) * 2
 
         with texpr_reductions_enabled():
@@ -268,7 +330,11 @@ class TestTEFuser(JitTestCase):
             self.assertLastGraphAllFused()
 
     def test_sum_keepdim_cast(self):
+        # [FUNCTION DOC] Checks that a sum with keepdim and a dtype cast to double followed
+        # by a multiply fuses fully with reductions enabled.
         def func(x):
+            # [FUNCTION DOC] HELPER: Sum over dim zero with keepdim and double dtype, times
+            # two.
             return x.sum((0,), keepdim=True, dtype=torch.double) * 2
 
         with texpr_reductions_enabled():
@@ -279,9 +345,12 @@ class TestTEFuser(JitTestCase):
             self.assertLastGraphAllFused()
 
     def test_abs(self):
+        # [FUNCTION DOC] On every device checks that absolute value times two is fully
+        # fused.
         for device in self.devices:
 
             def func(x):
+                # [FUNCTION DOC] HELPER: Returns absolute value of x times two.
                 return x.abs() * 2
 
             a = torch.randn(5, device=device)
@@ -289,9 +358,13 @@ class TestTEFuser(JitTestCase):
             self.assertLastGraphAllFused()
 
     def test_unsqueeze_size_calculation(self):
+        # [FUNCTION DOC] On every device checks that an unsqueeze followed by scale,
+        # broadcast add and divide fuses fully when one input requires grad.
         for device in self.devices:
 
             def foo(b, d):
+                # [FUNCTION DOC] HELPER: Unsqueezes d at dim one, multiplies by 42, adds b
+                # and divides by 42.
                 x = d.unsqueeze(1)
                 y = x * 42.0
                 z = b + y
@@ -306,9 +379,13 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(scripted.graph_for(*inputs))
 
     def test_zero_element_tensors(self):
+        # [FUNCTION DOC] On every device checks that a script function on zero-element
+        # tensors (atan2 of floats) runs and matches eager.
         for device in self.devices:
 
             def decode(sin_t, cos_t):
+                # [FUNCTION DOC] HELPER: Returns atan2 of the sine and cosine tensors
+                # converted to float.
                 theta = torch.atan2(sin_t.float(), cos_t.float())
                 return theta
 
@@ -318,6 +395,9 @@ class TestTEFuser(JitTestCase):
             ge = self.checkScript(decode, inputs)
 
     def test_arg_configurations_smoke(self):
+        # [FUNCTION DOC] Smoke test that a traced function with a chunk gives the same
+        # results for contiguous and non-contiguous (transposed) arguments, so one kernel is
+        # not reused wrongly. Skipped for dynamic shapes.
         if self.dynamic_shapes:
             self.skipTest("TODO: chunk dynamic shapes")
 
@@ -328,6 +408,8 @@ class TestTEFuser(JitTestCase):
         for device in self.devices:
 
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Adds two tensors, chunks into two along dim one and
+                # multiplies the halves.
                 z1, z2 = (x + y).chunk(2, dim=1)
                 return z1 * z2
 
@@ -337,9 +419,12 @@ class TestTEFuser(JitTestCase):
             self.assertEqual(traced_f(x.t().contiguous(), y), traced_f(x.t(), y))
 
     def test_broadcast(self):
+        # [FUNCTION DOC] On every device checks that scale-and-shift with broadcast operands
+        # of different rank is scripted correctly.
         for device in self.devices:
 
             def scaleshift(x, scale, shift):
+                # [FUNCTION DOC] HELPER: Returns x times scale plus shift.
                 return x * scale + shift
 
             inputs = [
@@ -355,6 +440,10 @@ class TestTEFuser(JitTestCase):
         GRAPH_EXECUTOR != ProfilingMode.LEGACY, "no half support with profiling on"
     )
     def test_cuda_half(self):
+        # [FUNCTION DOC] CUDA-only test (skipped without CUDA, without half support, or
+        # unless the legacy executor is used) that compares half precision traced fusion
+        # outputs and gradients against float32 eager for comparison, relu and exp
+        # functions.
         x = torch.randn(4, 4, dtype=torch.half, device="cuda")
         y = torch.randn(4, 4, dtype=torch.half, device="cuda")
 
@@ -392,6 +481,10 @@ class TestTEFuser(JitTestCase):
                 self.assertEqual(grads_half, fusion_grads)
 
     def test_checks_cat_inputs(self):
+        # [FUNCTION DOC] With fusion group inlining enabled, checks on each device that a
+        # concatenation of two fused expressions with a broadcastable second input yields
+        # output shape three by four (inputs are not treated as broadcasting) and is fully
+        # fused.
         # single fusion node causes error
         with set_fusion_group_inlining(True):
             for device in self.devices:
@@ -399,6 +492,8 @@ class TestTEFuser(JitTestCase):
                 # need to be checked for having the same map size, before we can
                 # run the kernel.
                 def f(x, y):
+                    # [FUNCTION DOC] HELPER: Concatenates two separately computed polynomial
+                    # expressions of x and y along dim zero.
                     return torch.cat([x + 2 * x + x**2, y + 4 * y + y**3], dim=0)
 
                 # NOTE: y is broadcastable to x, but output of f(x, y) should have
@@ -411,12 +506,16 @@ class TestTEFuser(JitTestCase):
                 self.assertAllFused(scripted.graph_for(x, y))
 
     def test_chunk(self):
+        # [FUNCTION DOC] On each device checks a three-way chunk along dim one followed by
+        # arithmetic is scripted correctly and fully fused. Skipped for dynamic shapes.
         if self.dynamic_shapes:
             self.skipTest("TODO: chunk dynamic shapes")
 
         for device in self.devices:
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Chunks x in three along dim one and returns a times
+                # b plus c.
                 a, b, c = x.chunk(3, 1)
                 return a * b + c
 
@@ -426,20 +525,26 @@ class TestTEFuser(JitTestCase):
             self.assertLastGraphAllFused()
 
     def test_chunk_correctness(self):
+        # [FUNCTION DOC] Checks chunk results and full fusion for four-way chunks along the
+        # first, middle and last dim over a split-size-one tensor, a contiguous tensor and a
+        # transposed tensor. Skipped for dynamic shapes.
         if self.dynamic_shapes:
             self.skipTest("TODO: chunk dynamic shapes")
 
         for device in self.devices:
 
             def chunk_4_0(x):
+                # [FUNCTION DOC] HELPER: Sums the four chunks of x along dim zero.
                 x0, x1, x2, x3 = x.chunk(4, 0)
                 return x0 + x1 + x2 + x3
 
             def chunk_4_1(x):
+                # [FUNCTION DOC] HELPER: Sums the four chunks of x along dim one.
                 x0, x1, x2, x3 = x.chunk(4, 1)
                 return x0 + x1 + x2 + x3
 
             def chunk_4_last(x):
+                # [FUNCTION DOC] HELPER: Sums the four chunks of x along dim two.
                 x0, x1, x2, x3 = x.chunk(4, 2)
                 return x0 + x1 + x2 + x3
 
@@ -461,6 +566,9 @@ class TestTEFuser(JitTestCase):
                     self.assertLastGraphAllFused()
 
     def test_chunk_distributes(self):
+        # [FUNCTION DOC] Traces a function that chunks a sum and multiplies the halves, then
+        # checks the printed fusion graph has exactly one ConstantChunk inside a fusion
+        # group. Skipped for dynamic shapes (the duplicate skip check is redundant).
         if self.dynamic_shapes:
             self.skipTest("TODO: chunk dynamic shapes")
 
@@ -470,6 +578,8 @@ class TestTEFuser(JitTestCase):
         for device in self.devices:
 
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Adds x and y, chunks in two along dim one and
+                # multiplies the halves.
                 z1, z2 = (x + y).chunk(2, dim=1)
                 return z1 * z2
 
@@ -486,17 +596,21 @@ class TestTEFuser(JitTestCase):
             ).run(str(graph))
 
     def test_chunk_motion_deduplicates_inputs(self):
+        # [FUNCTION DOC] Checks that chunks of an intermediate tensor, used with duplicate
+        # inputs, still fuse fully for two functions. Skipped for dynamic shapes.
         if self.dynamic_shapes:
             self.skipTest("TODO: chunk dynamic shapes")
 
         for device in self.devices:
 
             def func1(x):
+                # [FUNCTION DOC] HELPER: Squares x, chunks in two and multiplies the halves.
                 z = x * x
                 z0, z1 = z.chunk(2)
                 return z0 * z1
 
             def func2(x):
+                # [FUNCTION DOC] HELPER: Cubes x, chunks in two and multiplies the halves.
                 z = x * x * x
                 z0, z1 = z.chunk(2)
                 return z0 * z1
@@ -507,6 +621,9 @@ class TestTEFuser(JitTestCase):
                 self.assertLastGraphAllFused()
 
     def test_chunk_multiple(self):
+        # [FUNCTION DOC] Checks fusion with several chunked inputs whose arguments are
+        # intentionally out of order, with different chunk counts and dims. Skipped for
+        # dynamic shapes.
         if self.dynamic_shapes:
             self.skipTest("TODO: chunk dynamic shapes")
 
@@ -514,6 +631,8 @@ class TestTEFuser(JitTestCase):
             # The arguments are intentionally used out of order as a test to see
             # if the fusion compiler adds extra args in the correct order
             def fn(s, x, y, z):
+                # [FUNCTION DOC] HELPER: Chunks z, x and y along different dims and sums all
+                # pieces with s.
                 z1, z2 = z.chunk(2, 2)
                 x1, x2, x3 = x.chunk(3, 1)
                 y1, y2 = y.chunk(2, 0)
@@ -530,12 +649,16 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(ge.graph_for(*inputs))
 
     def test_minmax(self):
+        # [FUNCTION DOC] Checks that elementwise max and min of two tensors, including with
+        # a NaN scalar tensor operand, are fully fused on each device.
         for device in self.devices:
 
             def tmax(a, b):
+                # [FUNCTION DOC] HELPER: Returns the maximum of twice a and b.
                 return torch.max(2 * a, b)
 
             def tmin(a, b):
+                # [FUNCTION DOC] HELPER: Returns the minimum of twice a and b.
                 return torch.min(2 * a, b)
 
             a = torch.randn(4, 4, dtype=torch.float)
@@ -550,21 +673,29 @@ class TestTEFuser(JitTestCase):
                 self.assertAllFused(s.graph_for(*inputs))
 
     def test_clamp(self):
+        # [FUNCTION DOC] Checks clamp variants (finite bounds, infinite bounds, optional min
+        # or max) with normal and NaN inputs are fused in forward and in the backward graph,
+        # using profiling mode. The first input requires grad.
         for device in self.devices:
 
             def func2(a, b):
+                # [FUNCTION DOC] HELPER: Clamps the sum to the range zero to two.
                 return torch.clamp(a + b, min=0, max=2)
 
             def funcInf(a, b):
+                # [FUNCTION DOC] HELPER: Clamps the sum from zero to positive infinity.
                 return torch.clamp(a + b, min=0, max=float("inf"))
 
             def funcNegInf(a, b):
+                # [FUNCTION DOC] HELPER: Clamps the sum from negative infinity to zero.
                 return torch.clamp(a + b, min=float("-inf"), max=0)
 
             def funcOptMin(a, b):
+                # [FUNCTION DOC] HELPER: Clamps the sum with only an upper bound of two.
                 return torch.clamp(a + b, max=2)
 
             def funcOptMax(a, b):
+                # [FUNCTION DOC] HELPER: Clamps the sum with only a lower bound of zero.
                 return torch.clamp(a + b, min=0)
 
             a = torch.randn(4, 4, dtype=torch.float, device=device, requires_grad=True)
@@ -591,9 +722,13 @@ class TestTEFuser(JitTestCase):
                 )
 
     def test_clamp_double(self):
+        # [FUNCTION DOC] Checks a double-precision clamp with float scalar bounds is fused
+        # (except the final subtraction) with tight tolerance.
         for device in self.devices:
 
             def clamp_double(x, eta: float):
+                # [FUNCTION DOC] HELPER: Returns one minus x clamped to eta and one minus
+                # eta.
                 return 1 - x.clamp(eta, 1 - eta)
 
             x = torch.tensor([1.0, 1.0], dtype=torch.double, device=device)
@@ -608,9 +743,12 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(s.graph_for(x, eta), except_for={"aten::sub"})
 
     def test_clamp_int(self):
+        # [FUNCTION DOC] Checks clamp of an integer tensor with a very large integer bound
+        # (above 32 bits) is fused.
         for device in self.devices:
 
             def clamp_int(x, eta: int):
+                # [FUNCTION DOC] HELPER: Clamps x between zero and the integer eta.
                 return x.clamp(0, eta)
 
             x = torch.tensor([1, 1], device=device)
@@ -619,10 +757,13 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(s.graph_for(x, eta))
 
     def test_add_bool(self):
+        # [FUNCTION DOC] Traces boolean tensor addition of three operands over several sizes
+        # and devices and checks full fusion.
         sizes = [(1,), (2,), (4, 4)]
         for device, size in product(self.devices, sizes):
 
             def f(x, y, z):
+                # [FUNCTION DOC] HELPER: Adds three tensors.
                 return x + y + z
 
             x = torch.randint(0, 2, size, dtype=torch.bool, device=device)
@@ -632,9 +773,12 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(ge.graph_for(x, y, z))
 
     def test_mul_bool(self):
+        # [FUNCTION DOC] Traces boolean tensor multiplication of three operands on each
+        # device and checks full fusion.
         for device in self.devices:
 
             def f(x, y, z):
+                # [FUNCTION DOC] HELPER: Multiplies three tensors.
                 return x * y * z
 
             x = torch.randint(0, 2, (4, 4), dtype=torch.bool, device=device)
@@ -645,9 +789,12 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(ge.graph_for(x, y, z))
 
     def test_div_bool(self):
+        # [FUNCTION DOC] Traces division of a boolean sum by an all-true boolean tensor on
+        # each device and checks full fusion.
         for device in self.devices:
 
             def f(x, y, z):
+                # [FUNCTION DOC] HELPER: Returns the sum of x and y divided by z.
                 return (x + y) / z
 
             x = torch.randint(0, 2, (4, 4), dtype=torch.bool, device=device)
@@ -658,7 +805,13 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(ge.graph_for(x, y, z))
 
     def test_bitwise_ops(self):
+        # [FUNCTION DOC] For every integer dtype, bitwise operator and device, builds data,
+        # skips combinations eager rejects, traces a two-step application and checks
+        # equality and full fusion; failures are re-raised as a RuntimeError naming dtype,
+        # operator and device.
         def apply(fn):
+            # [FUNCTION DOC] HELPER: Returns a function applying a binary function twice on
+            # three inputs.
             return lambda x, y, z: fn(fn(x, y), z)
 
         binary_ops = [
@@ -691,7 +844,12 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_minmax_int_ops(self):
+        # [FUNCTION DOC] Like the bitwise test but for integer min and max over all integer
+        # dtypes and devices: compares traced results with eager and checks full fusion,
+        # raising RuntimeError with details on failure.
         def apply(fn):
+            # [FUNCTION DOC] HELPER: Returns a function applying a binary function twice on
+            # three inputs.
             return lambda x, y, z: fn(fn(x, y), z)
 
         binary_ops = [torch.min, torch.max]
@@ -718,9 +876,13 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_comparison_eq_ne(self):
+        # [FUNCTION DOC] Traces equality and inequality masks used to blend tensors on each
+        # device and checks full fusion.
         for device in self.devices:
 
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Builds masks from x equal to zero and not equal to
+                # zero and blends them with y.
                 mask = (x == 0).type_as(x)
                 z = x * mask + y
                 mask = (x != 0).type_as(x)
@@ -735,6 +897,8 @@ class TestTEFuser(JitTestCase):
 
     @staticmethod
     def fn_test_comparison_gt_lt(x, y):
+        # [FUNCTION DOC] HELPER: Static function shared by tests; blends x and y using
+        # greater-than and less-than masks of x and returns the result.
         mask = (x > 0).type_as(x)
         z = x * mask + y
         mask = (x < 0).type_as(x)
@@ -742,6 +906,8 @@ class TestTEFuser(JitTestCase):
         return z
 
     def test_comparison_gt_lt(self):
+        # [FUNCTION DOC] Traces the shared greater-than/less-than function on each device
+        # and checks full fusion.
         for device in self.devices:
             x = torch.randn(4, 4, dtype=torch.float, device=device)
             y = torch.randn(4, 4, dtype=torch.float, device=device)
@@ -750,9 +916,14 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(ge.graph_for(x, y))
 
     def test_comparison_ge_le(self):
+        # [FUNCTION DOC] Traces a greater-or-equal / less-or-equal blending function on each
+        # device, checks full fusion, then marks inputs as requiring grad and checks fusion
+        # again allowing size related nodes.
         for device in self.devices:
 
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Blends x and y using masks of x at least zero and
+                # at most zero.
                 mask = (x >= 0).type_as(x)
                 z = x * mask + y
                 mask = (x <= 0).type_as(x)
@@ -776,12 +947,16 @@ class TestTEFuser(JitTestCase):
             )
 
     def test_addcmul(self):
+        # [FUNCTION DOC] Checks a traced addcmul with broadcast inputs yields exactly one
+        # fusion group containing an add and an addcmul.
         for device in self.devices:
             t = torch.randn(1, 4, dtype=torch.float, device=device)
             t1 = torch.randn(4, 1, dtype=torch.float, device=device)
             t2 = torch.randn(1, 4, dtype=torch.float, device=device)
 
             def foo(t, t1, t2):
+                # [FUNCTION DOC] HELPER: Calls addcmul on t with t plus one and t2, value
+                # 0.1.
                 return t.addcmul(t + 1, t2, value=0.1)
 
             ge = self.checkTrace(foo, (t, t1, t2), allow_unused=True)
@@ -799,6 +974,8 @@ class TestTEFuser(JitTestCase):
     # If this is a real problem, we'll need to revisit Torchscript Function
     # lifetimes in Python.
     def test_lerp(self):
+        # [FUNCTION DOC] On each device checks lerp with a scalar weight is traced and fully
+        # fused. The tensor weight variant is disabled.
         for device in self.devices:
             start = torch.randn(4, 1, dtype=torch.float, device=device)
             end = torch.randn(1, 4, dtype=torch.float, device=device)
@@ -806,10 +983,14 @@ class TestTEFuser(JitTestCase):
 
             # scalar weight overload
             def foo_weight_scalar(start, end):
+                # [FUNCTION DOC] HELPER: Lerp of start plus one toward end with scalar
+                # weight 0.5.
                 return torch.lerp(start + 1, end, 0.5)
 
             # tensor weight overload
             def foo_weight_tensor(start, end):
+                # [FUNCTION DOC] HELPER: Lerp of start plus one toward end with the captured
+                # tensor weight; defined but not used because the check is commented out.
                 return torch.lerp(start + 1, end, weight)
 
             ge_weight_scalar = self.checkTrace(foo_weight_scalar, (start, end))
@@ -822,6 +1003,8 @@ class TestTEFuser(JitTestCase):
             # self.assertAllFused(graph)
 
     def test_concat(self):
+        # [FUNCTION DOC] With inlining of fusion groups enabled, checks a concatenation of a
+        # sum and a product is fully fused on each device.
         # disabling concat causes error with single concat node
         with set_fusion_group_inlining(True):
             for device in self.devices:
@@ -829,6 +1012,8 @@ class TestTEFuser(JitTestCase):
                 cx = torch.randn(3, 20, dtype=torch.float, device=device)
 
                 def foo(hx, cx):
+                    # [FUNCTION DOC] HELPER: Concatenates the sum and the product of hx and
+                    # cx.
                     return torch.cat((hx + cx, hx * cx))
 
                 ge = self.checkTrace(foo, (hx, cx))
@@ -838,9 +1023,13 @@ class TestTEFuser(JitTestCase):
                 # FileCheck().check("FusedConcat").check_next("return").run(str(graph))
 
     def test_remove_output_used_only_in_size(self):
+        # [FUNCTION DOC] Scripts a function, warms it up three times, then checks the
+        # differentiable graph subgraph has one If node whose outputs (and so the fusion
+        # group inside) number one, meaning an output used only for sizes was removed.
         for device in self.devices:
 
             def test_fuse(a, b):
+                # [FUNCTION DOC] HELPER: Returns the add of a, b and b again.
                 c = a + b
                 d = c + b
                 return d
@@ -860,10 +1049,13 @@ class TestTEFuser(JitTestCase):
             self.assertEqual(len(list(if_nodes[0].outputs())), 1)
 
     def test_concat_invariant(self):
+        # [FUNCTION DOC] Checks concat followed by an add is fused except an add, covering
+        # the invariant that a concat output is not consumed inside its own group.
         for device in self.devices:
             # Invariant: the output of prim::FusedConcat may
             # not be an input to any node inside the FusionGroup.
             def fn(x, y, z):
+                # [FUNCTION DOC] HELPER: Concatenates x plus y with x minus y and adds z.
                 x1 = x + y
                 y1 = x - y
                 w = torch.cat([x1, y1])
@@ -880,9 +1072,13 @@ class TestTEFuser(JitTestCase):
 
     @staticmethod
     def fn_test_exp(x, y):
+        # [FUNCTION DOC] HELPER: Static function shared by tests returning the exponential
+        # of x plus half of y.
         return (x + 0.5 * y).exp()
 
     def test_exp(self):
+        # [FUNCTION DOC] Traces the shared exp function on each device and checks full
+        # fusion.
         for device in self.devices:
             x = torch.randn(4, 4, dtype=torch.float, device=device)
             y = torch.randn(4, 4, dtype=torch.float, device=device)
@@ -891,9 +1087,13 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(ge.graph_for(x, y))
 
     def test_threshold(self):
+        # [FUNCTION DOC] Scripts a threshold plus additions function on each device and
+        # checks it is fully fused.
         for device in self.devices:
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Thresholds x at zero with value minus ten and adds
+                # x three times.
                 return torch.threshold(x, 0, -10) + x + x + x
 
             x = torch.tensor([-1, -0.5, 0, 1, 2, 3], device=device)
@@ -901,9 +1101,13 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(scripted.graph_for(x))
 
     def test_scalar_arg(self):
+        # [FUNCTION DOC] Checks scripted functions with a float scalar argument (an integer
+        # is passed) are fused, both without and with a requires-grad input (using a second
+        # function to avoid bailouts).
         for device in self.devices:
 
             def fn_test_scalar_arg(x: torch.Tensor, p: float) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Returns p times the sum of x squared and x.
                 return p * (x * x + x)
 
             x = torch.randn(4, 4, dtype=torch.float, device=device)
@@ -918,6 +1122,9 @@ class TestTEFuser(JitTestCase):
             def fn_test_scalar_arg_requires_grad(
                 x: torch.Tensor, p: float
             ) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Same computation as the scalar-argument function,
+                # defined separately so the requires-grad case does not reuse a bailed-out
+                # profile.
                 return p * (x * x + x)
 
             scripted = torch.jit.script(fn_test_scalar_arg_requires_grad)
@@ -936,7 +1143,11 @@ class TestTEFuser(JitTestCase):
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     @unittest.skipIf(not RUN_CUDA_MULTI_GPU, "needs non-zero device")
     def test_fusion_reuse_multi_gpu(self):
+        # [FUNCTION DOC] CUDA multi-GPU test checking that a scripted function first run on
+        # CPU and then on two different cuda devices does not crash and uses different
+        # kernels.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns x times y times x times y.
             return x * y * x * y
 
         inputs_cpu = [
@@ -957,10 +1168,16 @@ class TestTEFuser(JitTestCase):
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     @unittest.skipIf(not RUN_CUDA_MULTI_GPU, "needs non-zero device")
     def test_kernel_cache_multi_gpu(self):
+        # [FUNCTION DOC] CUDA multi-GPU test that three identical fusion groups on cpu and
+        # two cuda devices exist; the kernel cache size assertion is commented out. A TODO
+        # notes device is not checked when forming groups.
         def not_fusible(x):
+            # [FUNCTION DOC] HELPER: Identity function that blocks fusion between outputs.
             return x
 
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Computes fifth powers by repeated multiplication of
+            # three inputs and returns them through the identity helper.
             x_out = x * x * x * x * x  # fusion: lambda x. x * x * x * x * x
             y_out = y * y * y * y * y
             z_out = z * z * z * z * z
@@ -985,17 +1202,22 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA_MULTI_GPU, "needs non-zero device")
     def test_nonzero_device_cuda(self):
+        # [FUNCTION DOC] Checks fusion on cuda device index one for a traced sigmoid-tanh
+        # function. Skipped without multiple GPUs.
         device = "cuda:" + str(1)
         x = torch.tensor([0.4], dtype=torch.float, device=device)
         y = torch.tensor([0.7], dtype=torch.float, device=device)
 
         def doit(x, y):
+            # [FUNCTION DOC] HELPER: Sigmoid of tanh of x times the sum of x and y plus x.
             return torch.sigmoid(torch.tanh(x * (x + y) + x))
 
         ge = self.checkTrace(doit, (x, y))
         self.assertAllFused(ge.graph_for(x, y))
 
     def test_lstm(self):
+        # [FUNCTION DOC] On each device scripts the scripted LSTM cell with training inputs
+        # and checks it is fully fused except tuple construction.
         for device in self.devices:
             inputs = get_lstm_inputs(device, training=True)
             module = self.checkScript(LSTMCellS, inputs)
@@ -1004,6 +1226,9 @@ class TestTEFuser(JitTestCase):
             )
 
     def test_lstm_concat(self):
+        # [FUNCTION DOC] With inlining enabled, traces the LSTM cell with concat on each
+        # device and checks full fusion allowing tuple construction and linear, and extra
+        # nodes under dynamic shapes.
         # single fusion node causes error
         with set_fusion_group_inlining(True):
             for device in self.devices:
@@ -1021,6 +1246,10 @@ class TestTEFuser(JitTestCase):
                 # FileCheck().check("FusedConcat").check_next("return").run(str(graph))
 
     def test_lstm_gates_permutations(self):
+        # [FUNCTION DOC] For each permutation of the four LSTM gate terms builds source for
+        # a cell function, evaluates it in Python and as a TorchScript compilation unit,
+        # compares outputs and checks the forward graph has the expected number of fusion
+        # groups (two for dynamic shapes, else one).
         for device in self.devices:
             # lstm has gates = x.mm(w_ih.t()) + hx.mm(w_hh.t()) + b_ih + b_hh.
             # Test that any permutation of this will still result in one FusionGroup.
@@ -1048,6 +1277,9 @@ class TestTEFuser(JitTestCase):
 
     # TODO: Fuser doesn't work at all when inputs require grad. Fix that
     def test_lstm_traced(self):
+        # [FUNCTION DOC] Traces the LSTM cell on each device and checks the expected count
+        # of fusion groups and that the relevant group contains sigmoid and tanh (and chunk
+        # when static).
         for device in self.devices:
             inputs = get_lstm_inputs(device)
             ge = self.checkTrace(LSTMCellF, inputs)
@@ -1064,6 +1296,8 @@ class TestTEFuser(JitTestCase):
             )
 
     def test_milstm(self):
+        # [FUNCTION DOC] Scripts the multiplicative LSTM cell, checks the fusion group
+        # count, graph structure and runs a backward pass. Skipped for dynamic shapes.
         if self.dynamic_shapes:
             self.skipTest("don't run conv with dynamic shapes")
 
@@ -1085,15 +1319,23 @@ class TestTEFuser(JitTestCase):
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     @unittest.skip("rand_like is not supported yet")
     def test_rand_cuda(self):
+        # [FUNCTION DOC] Skipped (rand_like unsupported) CUDA test intended to show random
+        # output differs between calls, lies in the range zero to one and is fused.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a constant cuda device attribute used
+            # in a skipped test.
             __constants__ = ["d"]
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the parent initializer and stores a cuda
+                # device attribute.
                 super().__init__()
                 self.d = torch.device("cuda")
 
             @torch.jit.script_method
             def create(self, x):
+                # [FUNCTION DOC] HELPER: Script method returning x squared plus x plus
+                # random numbers shaped like x.
                 return x * x + x + torch.rand_like(x)
 
         x = torch.zeros([3, 4, 5], dtype=torch.float, device="cuda")
@@ -1109,9 +1351,13 @@ class TestTEFuser(JitTestCase):
 
     @staticmethod
     def fn_test_relu(x, y):
+        # [FUNCTION DOC] HELPER: Static function shared by tests returning relu of x plus
+        # half of y.
         return F.relu(x + 0.5 * y)
 
     def test_relu(self):
+        # [FUNCTION DOC] Traces the shared relu function on each device and checks full
+        # fusion.
         for device in self.devices:
             x = torch.randn(4, 4, dtype=torch.float, device=device)
             y = torch.randn(4, 4, dtype=torch.float, device=device)
@@ -1120,12 +1366,16 @@ class TestTEFuser(JitTestCase):
             self.assertAllFused(ge.graph_for(x, y))
 
     def test_erf(self):
+        # [FUNCTION DOC] On cuda devices only (cpu skipped) checks erf minus erfc then relu
+        # is fused with profiling, and again with a requires-grad input allowing size
+        # related nodes.
         for device in self.devices:
             # only enabled on gpu
             if device == "cpu":
                 continue
 
             def fn_test_erf(x):
+                # [FUNCTION DOC] HELPER: Relu of erf minus erfc of x.
                 return F.relu(torch.erf(x) - torch.erfc(x))
 
             x = torch.randn(4, 4, dtype=torch.float, device=device)
@@ -1145,13 +1395,20 @@ class TestTEFuser(JitTestCase):
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     @unittest.skip("rand_like is not supported yet")
     def test_rand_broadcast_cuda(self):
+        # [FUNCTION DOC] Skipped CUDA test for random numbers broadcast in a fused script
+        # function, checking fusion and that broadcasted random values are consistent across
+        # rows.
         def fn_test_rand(x, y):
+            # [FUNCTION DOC] HELPER: Multiplies a random tensor shaped like y by x and adds
+            # x.
             r = torch.rand_like(y)
             return r * x + x
 
         # If using profiling, a different function is needed to test different
         # shapes, or we'll use a cached script.
         def fn_test_rand2(x, y):
+            # [FUNCTION DOC] HELPER: Variant of the random function with x squared, defined
+            # separately to avoid a cached script.
             r = torch.rand_like(y)
             return r * x * x
 
@@ -1183,7 +1440,11 @@ class TestTEFuser(JitTestCase):
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     @unittest.skip("rand_like is not supported yet")
     def test_rand_diamond(self):
+        # [FUNCTION DOC] Skipped CUDA test checking a random value used on two branches of a
+        # diamond cancels so the output equals x plus y.
         def fn_test_diamond(x, y):
+            # [FUNCTION DOC] HELPER: Adds a random tensor to x, subtracts it from y and
+            # returns the sum of both.
             r = torch.rand_like(y)
             a = x + r
             b = y - r
@@ -1197,7 +1458,10 @@ class TestTEFuser(JitTestCase):
         self.assertEqual(out, x + y)
 
     def test_scalar(self):
+        # [FUNCTION DOC] Checks a function mixing a zero-dim scalar tensor operand is
+        # scripted correctly and fully fused on cpu.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns two times x plus y.
             return 2 * x + y
 
         x = torch.tensor(0.1, dtype=torch.float, device="cpu")
@@ -1207,8 +1471,12 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skip("https://github.com/pytorch/pytorch/issues/156438")
     def test_inlined_optimized_graph(self):
+        # [FUNCTION DOC] Skipped test (linked issue) that runs a scripted relu function with
+        # three different input ranks, then checks the last optimized graph has one If and
+        # TensorExpr groups, repeated after inlining.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Scripted function returning relu of x plus x.
             return torch.relu(x + x)
 
         for _ in range(3):
@@ -1232,9 +1500,13 @@ class TestTEFuser(JitTestCase):
         f.run(g)
 
     def test_small_constant(self):
+        # [FUNCTION DOC] On each device checks tiny and huge float constants in a traced
+        # expression are fused.
         for device in self.devices:
 
             def fn_test_small_constant(x, y):
+                # [FUNCTION DOC] HELPER: Combines x and y with tiny constants and scales up
+                # by one hundred million.
                 return (1e-8 * x + 5e-9 * y) * 1e8
 
             x = torch.randn(4, 4, dtype=torch.float, device=device)
@@ -1250,14 +1522,20 @@ class TestTEFuser(JitTestCase):
     # be more careful at how we rewrite its users.
     # TODO: fix that and reenable the test.
     def test_tensor_scalar_ops(self):
+        # [FUNCTION DOC] Checks that a constant scalar is fused with surrounding ops, and a
+        # non-constant scalar input is also fused, with correct results when the scalar
+        # value changes.
         for device in self.devices:
 
             def should_fuse(x):
+                # [FUNCTION DOC] HELPER: Adds a constant to x and multiplies by x.
                 z = 3.0
                 y = x + z
                 return x * y
 
             def should_fuse_scalar(x, z):
+                # [FUNCTION DOC] HELPER: Adds an integer made from the scalar z to x and
+                # multiplies by x.
                 y = x + int(z)
                 return x * y
 
@@ -1286,9 +1564,13 @@ class TestTEFuser(JitTestCase):
             )
 
     def test_where_and_typing(self):
+        # [FUNCTION DOC] On each device checks that a function returning a boolean mask and
+        # a where result is fully fused except tuple construction.
         for device in self.devices:
 
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Returns mask x greater than y and where(mask, x,
+                # y).
                 mask = x > y
                 res = torch.where(mask, x, y)
                 return mask, res
@@ -1302,10 +1584,14 @@ class TestTEFuser(JitTestCase):
             )
 
     def test_disabled(self):
+        # [FUNCTION DOC] Disables CPU fusion, scripts a small function and checks no fusion
+        # groups exist, then restores the previous CPU fusion state (restore is skipped if
+        # an assertion fails).
         old_cpu_fuser_state = torch._C._jit_can_fuse_on_cpu()
         torch._C._jit_override_can_fuse_on_cpu(False)
 
         def fn(a):
+            # [FUNCTION DOC] HELPER: Returns a squared plus a.
             return a**2 + a
 
         x = torch.randn(4, dtype=torch.float, device="cpu")
@@ -1316,6 +1602,10 @@ class TestTEFuser(JitTestCase):
         torch._C._jit_override_can_fuse_on_cpu(old_cpu_fuser_state)
 
     def data_for(self, dtype, device="cuda", size=None):
+        # [FUNCTION DOC] HELPER: Builds test data. With no size makes a two-element float
+        # tensor of one and two, otherwise a random tensor of the given size. Converts to
+        # boolean by comparing with two, quantizes for quantized dtypes (scale 0.1, zero
+        # point 1), otherwise casts to the dtype.
         if size is None:
             v = torch.arange(1, 3, dtype=torch.float, device=device)
         else:
@@ -1329,9 +1619,14 @@ class TestTEFuser(JitTestCase):
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/121876")
     def test_torch_to(self):
+        # [FUNCTION DOC] Checks the fuser handles type conversion: no-op, non-constant
+        # dtype, pinned memory and cross-device conversions are not fused, while after
+        # freezing a module with constant target dtype all supported dtype pairs are fused
+        # (float16 on cpu skipped). Skipped for TorchDynamo.
         # test no op
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Scripted conversion to float, a no-op.
             return x.to(torch.float)
 
         foo(torch.tensor([3.0], dtype=torch.float))
@@ -1343,6 +1638,7 @@ class TestTEFuser(JitTestCase):
         # test not fusing non-const inputs
         @torch.jit.script
         def foo(x, dtype: int):
+            # [FUNCTION DOC] HELPER: Scripted conversion with a non-constant dtype.
             return x.to(dtype)
 
         foo(torch.tensor([3.0], dtype=torch.float), torch.int)
@@ -1354,6 +1650,7 @@ class TestTEFuser(JitTestCase):
         # test not fusing to_pinned inputs
         @torch.jit.script
         def foo(x, dtype: int):
+            # [FUNCTION DOC] HELPER: Scripted conversion requesting pinned memory.
             return x.to(pin_memory=True)
 
         foo(torch.tensor([3.0], dtype=torch.float), torch.int)
@@ -1367,6 +1664,7 @@ class TestTEFuser(JitTestCase):
 
             @torch.jit.script
             def foo(x):
+                # [FUNCTION DOC] HELPER: Scripted conversion to cuda device.
                 return x.to(device="cuda")
 
             foo(torch.tensor([3.0], dtype=torch.float))
@@ -1386,11 +1684,15 @@ class TestTEFuser(JitTestCase):
         ]
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that converts its input to a stored dtype.
             def __init__(self, dtype):
+                # [FUNCTION DOC] HELPER: Stores the target dtype after calling the parent
+                # initializer.
                 super().__init__()
                 self.dtype = dtype
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x converted to the stored dtype.
                 return x.to(self.dtype)
 
         bad_dtypes = []
@@ -1414,6 +1716,10 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skip("Temporarily disabled")
     def test_masked_fill(self):
+        # [FUNCTION DOC] Skipped test of masked_fill over integer, float and bool dtypes,
+        # devices, scalar values and sizes, tracing and checking close and fusion.
+        # KNOWN ISSUE: the failure message builder uses a name op that is not defined in
+        # this scope (a noqa hides the lint error), so the error path would raise NameError.
         dtypes = [
             torch.int8,
             torch.int16,
@@ -1433,6 +1739,8 @@ class TestTEFuser(JitTestCase):
             mask = self.data_for(torch.bool, device, size=size)
 
             def fn(input_v, mask):
+                # [FUNCTION DOC] HELPER: Fills input where mask is set with the captured
+                # scalar value.
                 return torch.masked_fill(input_v, mask, scalar_val)
 
             ref = fn(input_v, mask)
@@ -1454,6 +1762,9 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_isnan(self):
+        # [FUNCTION DOC] Traces an isnan lambda over inputs containing NaN, all device and
+        # many dtypes (half on cpu skipped), warms up and checks results equal eager and the
+        # graph is fully fused; failures raise RuntimeError naming dtype and device.
         x = torch.rand([4])
         x[0] = float("nan")
         inputs = [x, torch.tensor([float("nan"), 0.5])]
@@ -1484,7 +1795,12 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_gelu(self):
+        # [FUNCTION DOC] Checks traced GELU with a boolean approximate flag over dtypes,
+        # devices and sizes against eager, skipping combinations eager rejects, and checks
+        # full fusion. Raises RuntimeError on failure.
         def apply(fn):
+            # [FUNCTION DOC] HELPER: Returns a function calling the given op with x and
+            # approximate.
             return lambda x, approximate: fn(x, approximate)
 
         unary_ops = [
@@ -1517,9 +1833,14 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_unary_ops(self):
+        # [FUNCTION DOC] Large sweep of unary ops (math and activation functions) over
+        # dtypes, devices and sizes: records eager result, skips combos eager rejects and
+        # gpu-only ops on cpu, traces, compares closeness and checks full fusion; failures
+        # re-raised as RuntimeError. Runs with emit hooks disabled.
         with torch._jit_internal._disable_emit_hooks():
 
             def apply(fn):
+                # [FUNCTION DOC] HELPER: Returns a function applying the unary op.
                 return lambda x: fn(x)
 
             unary_ops = [
@@ -1605,7 +1926,11 @@ class TestTEFuser(JitTestCase):
                     ) from e
 
     def test_binary_ops(self):
+        # [FUNCTION DOC] Sweep of binary ops over dtypes and devices: compares traced to
+        # eager and checks full fusion (float-only ops are checked only for floating
+        # dtypes). Combos that fail in eager are skipped; other failures raise RuntimeError.
         def apply(fn):
+            # [FUNCTION DOC] HELPER: Returns a function applying the binary op to x and y.
             return lambda x, y: fn(x, y)
 
         binary_ops = [
@@ -1658,7 +1983,13 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_binary_scalar_ops(self):
+        # [FUNCTION DOC] Builds IR text for each binary scalar op with int, float and bool
+        # operand types, interprets it, then compiles with TensorExprKernel and compares
+        # kernel results with the interpreter. Skips IR that cannot be interpreted; raises
+        # RuntimeError if compile or run fails.
         def apply(fn):
+            # [FUNCTION DOC] HELPER: Returns a function applying the binary op; unused in
+            # the body.
             return lambda x, y: fn(x, y)
 
         ir_template = """
@@ -1715,10 +2046,14 @@ class TestTEFuser(JitTestCase):
                     ) from e
 
     def test_matmul(self):
+        # [FUNCTION DOC] Checks matmul traced for many shape pairs on cpu against eager;
+        # only the two-dimensional case is checked for fusion, others only for correctness.
+        # Skipped for dynamic shapes.
         if self.dynamic_shapes:
             self.skipTest("don't run conv with dynamic shapes")
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns the matrix product of x and y.
             return torch.matmul(x, y)
 
         devices = ["cpu"]  # No cuda support for ext calls yet
@@ -1771,9 +2106,15 @@ class TestTEFuser(JitTestCase):
                 raise RuntimeError(" ".join(["Failed:", str(dtype), device])) from e
 
     def test_binary_tensor_scalar_ops(self):
+        # [FUNCTION DOC] Sweep of binary tensor-scalar ops over dtypes, devices and scalars:
+        # compares traced to eager and checks full fusion, with emit hooks disabled.
+        # KNOWN ISSUE: tracing passes the bare tensor in parentheses rather than a tuple, so
+        # the input is not wrapped in a one-element tuple.
         with torch._jit_internal._disable_emit_hooks():
 
             def apply_with_scalar(fn, scalar):
+                # [FUNCTION DOC] HELPER: Returns a function applying the op to x and a
+                # captured scalar.
                 return lambda x: fn(x, scalar)
 
             # FIXME: Fails in IR Eval: torch.int64 and_ cpu
@@ -1818,7 +2159,11 @@ class TestTEFuser(JitTestCase):
                     ) from e
 
     def test_binary_div_ops(self):
+        # [FUNCTION DOC] Like the tensor-scalar sweep for div, remainder and fmod with
+        # nonzero scalars: checks traced output equals eager but does not check fusion.
         def apply_with_scalar(fn, scalar):
+            # [FUNCTION DOC] HELPER: Returns a function applying the op to x and a captured
+            # scalar.
             return lambda x: fn(x, scalar)
 
         binary_ops = [
@@ -1853,7 +2198,11 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_binary_pow(self):
+        # [FUNCTION DOC] Checks pow with scalar exponents for float32 and float64 on each
+        # device: traced results equal eager and graph is fully fused.
         def apply_with_scalar(fn, scalar):
+            # [FUNCTION DOC] HELPER: Returns a function applying the op to x and a captured
+            # scalar.
             return lambda x: fn(x, scalar)
 
         dtypes = [
@@ -1893,7 +2242,10 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_ternary_ops(self):
+        # [FUNCTION DOC] Sweep of lerp and addcmul over dtypes and devices: compares traced
+        # with eager and checks full fusion; failures raise RuntimeError.
         def apply(fn):
+            # [FUNCTION DOC] HELPER: Returns a function applying a ternary op to x, y and z.
             return lambda x, y, z: fn(x, y, z)
 
         ternary_ops = [
@@ -1925,7 +2277,11 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_ternary_norm_ops(self):
+        # [FUNCTION DOC] Sweep of batch_norm called with positional tensors over dtypes and
+        # devices: compares traced with eager and checks full fusion; failures raise
+        # RuntimeError.
         def apply(fn):
+            # [FUNCTION DOC] HELPER: Returns a function applying a ternary op to x, y and z.
             return lambda x, y, z: fn(x, y, z)
 
         ternary_ops = [
@@ -1959,7 +2315,11 @@ class TestTEFuser(JitTestCase):
         "FIXME: fuser doesn't include ListConstruct nodes to the group causing a failure"
     )
     def test_list_ops(self):
+        # [FUNCTION DOC] Skipped test (fuser does not pull list construction into groups) of
+        # concatenating squares of three inputs over dtypes and devices.
         def apply(fn):
+            # [FUNCTION DOC] HELPER: Returns a function concatenating squares of its three
+            # inputs with the given op.
             return lambda x, y, z: fn([x * x, y * y, z * z])
 
         devices = self.devices
@@ -1990,7 +2350,12 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_where_ops(self):
+        # [FUNCTION DOC] Sweep of where variants (tensor, scalar float and scalar int
+        # branches) over dtypes and devices with a boolean condition: compares traced to
+        # eager and checks full fusion.
         def apply(fn):
+            # [FUNCTION DOC] HELPER: Returns a function applying the op to a condition and
+            # two tensors.
             return lambda cond, x, y: fn(cond, x, y)
 
         ops = [
@@ -2023,9 +2388,13 @@ class TestTEFuser(JitTestCase):
                 ) from e
 
     def test_unsupported_dtypes(self):
+        # [FUNCTION DOC] For unsupported dtypes (unsigned byte, complex, quantized) checks
+        # traced output equals eager and no fusion groups exist; skips dtypes eager cannot
+        # make.
         for device in self.devices:
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Returns x squared plus x.
                 return x * x + x
 
             unsupported_dtypes = [
@@ -2051,6 +2420,9 @@ class TestTEFuser(JitTestCase):
                 self.assertEqual(len(self.findFusionGroups(t.graph_for(x))), 0)
 
     def test_superslomo(self):
+        # [FUNCTION DOC] Super-SloMo derived test with strided mixed-size inputs and mixed-
+        # shape outputs; scripts a function, runs it four times, compares to eager and
+        # checks full fusion. The cpu device is removed when LLVM is not available.
         devices = self.devices.copy()
         if not LLVM_ENABLED:
             devices.remove("cpu")
@@ -2061,6 +2433,8 @@ class TestTEFuser(JitTestCase):
             # expose a memory corruption bug due to not properly guarding the
             # outputs.
             def eager(t0, t1, t2, t3, t4):
+                # [FUNCTION DOC] HELPER: Multiplies and adds five input tensors, returning a
+                # tuple of four results.
                 t5 = torch.mul(t0, t4)
                 t6 = torch.mul(t2, t3)
                 t7 = torch.mul(t6, t1)
@@ -2086,9 +2460,14 @@ class TestTEFuser(JitTestCase):
                     )
 
     def test_sub_gt_and(self):
+        # [FUNCTION DOC] Checks a function whose boolean mask is used in a never-executed
+        # branch still gives correct scripted results on each device.
         for device in self.devices:
 
             def eager(t1, t2, t3, t4, t: float):
+                # [FUNCTION DOC] HELPER: Builds a boolean mask from two thresholded
+                # differences, verifies its dtype, returns k plus one if t is large else w.
+                # Raises AssertionError if the mask dtype is not bool.
                 w = t1 - t2
                 h = t3 - t4
                 k = (w > t) & (h > t)
@@ -2107,12 +2486,16 @@ class TestTEFuser(JitTestCase):
 
     @skipIfTorchDynamo("too slow")
     def test_chunk_mul_one(self):
+        # [FUNCTION DOC] Checks chunking a large tensor and scaling one piece scripts
+        # correctly on each device. Skipped for dynamic shapes and for TorchDynamo.
         if self.dynamic_shapes:
             self.skipTest("TODO: chunk dynamic shapes")
 
         for device in self.devices:
 
             def eager(x):
+                # [FUNCTION DOC] HELPER: Chunks x in three along the last dim and returns
+                # the first piece times three plus the other two.
                 z, y, w = torch.chunk(x, 3, -1)
                 return z * 3, y, w
 
@@ -2121,9 +2504,13 @@ class TestTEFuser(JitTestCase):
             script = self.checkScript(eager, (x,))
 
     def test_eq_unsqueeze_type_as(self):
+        # [FUNCTION DOC] Checks equality mask, unsqueeze and type_as scripts correctly on
+        # each device.
         for device in self.devices:
 
             def eager(a, b):
+                # [FUNCTION DOC] HELPER: Returns the mask b equal one unsqueezed and
+                # converted to a's type, plus the mask.
                 mask = b == 1
                 mask = torch.unsqueeze(mask, -1)
                 x = mask.type_as(a)
@@ -2134,13 +2521,18 @@ class TestTEFuser(JitTestCase):
             script = self.checkScript(eager, (a, b))
 
     def test_neg_pow(self):
+        # [FUNCTION DOC] Checks negated pow for tensor-tensor, tensor-scalar and scalar-
+        # tensor operands scripts correctly; fusion checks are commented out.
         def eager_tt(a: torch.Tensor, b: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Negated power of two tensors.
             return torch.neg(torch.pow(a, b))
 
         def eager_ts(a: torch.Tensor, b: float):
+            # [FUNCTION DOC] HELPER: Negated power of a tensor and a float.
             return torch.neg(torch.pow(a, b))
 
         def eager_st(a: float, b: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Negated power of a float and a tensor.
             return torch.neg(torch.pow(a, b))
 
         a = torch.rand(1, dtype=torch.float)
@@ -2156,10 +2548,14 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skipIf(not LLVM_ENABLED, "Too slow to run with the TE interpreter")
     def test_conv2d_depthwise(self):
+        # [FUNCTION DOC] Depthwise 2D convolution scripted and checked for full fusion.
+        # Skipped unless LLVM is enabled and for dynamic shapes.
         if self.dynamic_shapes:
             self.skipTest("don't run conv with dynamic shapes")
 
         def eager(input, weight, bias):
+            # [FUNCTION DOC] HELPER: Depthwise conv2d with stride one, padding one and 72
+            # groups.
             return torch.conv2d(input, weight, bias, stride=1, padding=1, groups=72)
 
         input = torch.rand((1, 72, 56, 56), dtype=torch.float)
@@ -2170,10 +2566,13 @@ class TestTEFuser(JitTestCase):
         self.assertAllFused(script.graph_for(input, weight, bias))
 
     def test_conv2d(self):
+        # [FUNCTION DOC] Checks a regular 2D convolution scripts correctly and is not fused
+        # into TensorExpr. Skipped for dynamic shapes.
         if self.dynamic_shapes:
             self.skipTest("don't run conv with dynamic shapes")
 
         def eager(input, weight, bias):
+            # [FUNCTION DOC] HELPER: conv2d with stride one, padding one and one group.
             return torch.conv2d(input, weight, bias, stride=1, padding=1, groups=1)
 
         input = torch.rand((1, 64, 56, 56), dtype=torch.float)
@@ -2186,9 +2585,14 @@ class TestTEFuser(JitTestCase):
         )
 
     def test_type_as_cat(self):
+        # [FUNCTION DOC] With inlined fusion groups, traces concat of x with a type_as
+        # converted tensor over dtype pairs (excluding half types) and checks results and
+        # full fusion.
         with inline_fusion_groups():
 
             def eager(x, y):
+                # [FUNCTION DOC] HELPER: Concatenates x with y converted to x type along dim
+                # one.
                 return torch.cat((x, y.type_as(x)), dim=1)
 
             dtypes = self.dtypes.copy()
@@ -2206,7 +2610,10 @@ class TestTEFuser(JitTestCase):
                 self.assertAllFused(script.graph_for(x, one))
 
     def test_to_device(self):
+        # [FUNCTION DOC] Checks conversion to the cpu device followed by relu is scripted
+        # and fully fused.
         def eager(x):
+            # [FUNCTION DOC] HELPER: Converts to cpu and applies relu.
             return x.to(device="cpu").relu()
 
         x = torch.rand(8)
@@ -2214,7 +2621,10 @@ class TestTEFuser(JitTestCase):
         self.assertAllFused(script.graph_for(x))
 
     def test_dims(self):
+        # [FUNCTION DOC] Checks division of a strided three-dimensional tensor by a one
+        # element tensor sum is fully fused.
         def eager(x, y):
+            # [FUNCTION DOC] HELPER: Divides x by y plus a small epsilon.
             return x / (y + 0.0001)
 
         x = torch.linspace(-1, 1, 768, dtype=torch.float32).as_strided(
@@ -2226,7 +2636,11 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     def test_channels_last_dims_dynamic(self):
+        # [FUNCTION DOC] CUDA test: for each subset of dims set to size one in a channels-
+        # last input, with dynamic strategy, traces an add and checks output equals eager,
+        # remains channels-last and contains TensorExpr.
         def eager(x, y):
+            # [FUNCTION DOC] HELPER: Adds x to y plus a small epsilon.
             return x + (y + 0.0001)
 
         indices = [0, 1, 2, 3]
@@ -2251,10 +2665,14 @@ class TestTEFuser(JitTestCase):
                 FileCheck().check("TensorExpr").run(g)
 
     def test_exhaust_specializations(self):
+        # [FUNCTION DOC] With a static strategy limited to one specialization, runs a
+        # scripted function with two shapes and checks the inlined graph has exactly two
+        # TensorExpr nodes.
         with texpr_enable_strategy([("STATIC", 1)]):
 
             @torch.jit.script
             def foo(x):
+                # [FUNCTION DOC] HELPER: Scripted function returning x three times added.
                 return x + x + x
 
             for _ in range(3):
@@ -2269,7 +2687,10 @@ class TestTEFuser(JitTestCase):
             FileCheck().check_count("TensorExpr", 2, exactly=True).run(g)
 
     def test_unsqueeze_var_dim(self):
+        # [FUNCTION DOC] Checks unsqueeze with a non-constant dimension argument on a
+        # permuted input scripts correctly.
         def eager(x, y, z: int):
+            # [FUNCTION DOC] HELPER: Multiplies x by y unsqueezed at integer dim z.
             return x * torch.unsqueeze(y, dim=z)
 
         x = torch.rand(4, 4, 64).permute(1, 0, 2)
@@ -2278,6 +2699,9 @@ class TestTEFuser(JitTestCase):
         script = self.checkScript(eager, (x, y, z))
 
     def _test_fwd_bwd(self, fn):
+        # [FUNCTION DOC] HELPER: Trains a function eagerly and scripted for 11 steps with
+        # gradient descent on arange inputs, using the same random upstream gradient, then
+        # asserts final outputs are close.
         x = torch.arange(-10, 10, dtype=torch.float32, requires_grad=True)
         xs = torch.arange(-10, 10, dtype=torch.float32, requires_grad=True)
         script = torch.jit.script(fn)
@@ -2297,25 +2721,34 @@ class TestTEFuser(JitTestCase):
         torch.testing.assert_close(y, ys)
 
     def test_relu_fwd_bwd(self):
+        # [FUNCTION DOC] Runs forward/backward comparison for scaled relu.
         def eager(x):
+            # [FUNCTION DOC] HELPER: Relu of x times 1.01.
             return torch.relu(x * 1.01)
 
         self._test_fwd_bwd(eager)
 
     def test_hardswish_fwd_bwd(self):
+        # [FUNCTION DOC] Runs forward/backward comparison for scaled hardswish.
         def eager(x):
+            # [FUNCTION DOC] HELPER: Hardswish of x times 1.01.
             return F.hardswish(x) * 1.01
 
         self._test_fwd_bwd(eager)
 
     def test_hardsigmoid_fwd_bwd(self):
+        # [FUNCTION DOC] Runs forward/backward comparison for scaled hardsigmoid.
         def eager(x):
+            # [FUNCTION DOC] HELPER: Hardsigmoid of x times 1.01.
             return F.hardsigmoid(x) * 1.01
 
         self._test_fwd_bwd(eager)
 
     def test_cat_graph_opt(self):
+        # [FUNCTION DOC] Checks log of a concatenation of three tensors is scripted
+        # correctly and the last graph is fully fused.
         def foo(x, y, z):
+            # [FUNCTION DOC] HELPER: Log of the concatenation of three tensors.
             return torch.log(torch.cat([x, y, z]))
 
         self.checkScript(
@@ -2325,12 +2758,17 @@ class TestTEFuser(JitTestCase):
         self.assertLastGraphAllFused()
 
     def test_dynamic_cat(self):
+        # [FUNCTION DOC] With inlined fusion groups, runs a scripted function that
+        # concatenates nested concatenations in a loop over lists of varying-sized tensors
+        # three times; passes if it does not fail.
         with inline_fusion_groups():
 
             @torch.jit.script
             def repro(
                 xs: list[torch.Tensor], ys: list[torch.Tensor], zs: list[torch.Tensor]
             ):
+                # [FUNCTION DOC] HELPER: Scripted list comprehension concatenating x with
+                # the concatenation of y and z.
                 return [
                     torch.cat([x, torch.cat([y, z], dim=-1)], dim=-1)
                     for x, y, z in zip(xs, ys, zs)
@@ -2346,16 +2784,23 @@ class TestTEFuser(JitTestCase):
                 repro(xs, ys, zs)
 
     def test_scalar_only_inputs(self):
+        # [FUNCTION DOC] Checks a function whose only input is a float scalar scripts
+        # correctly.
         def eager(b: float):
+            # [FUNCTION DOC] HELPER: Returns a one element ones tensor times b.
             a = torch.ones(1)
             return a * b
 
         script = self.checkScript(eager, (1.0,))
 
     def test_cat_2k_args(self):
+        # [FUNCTION DOC] With inlined groups, checks a concat of 2000 copies of a tensor
+        # followed by relu is traced correctly and creates no fusion groups (too many
+        # arguments).
         with inline_fusion_groups():
 
             def eager(x):
+                # [FUNCTION DOC] HELPER: Relu of the concatenation of 2000 copies of x.
                 return torch.relu(torch.cat([x for _ in range(2000)]))
 
             x = torch.randn(1)
@@ -2364,14 +2809,18 @@ class TestTEFuser(JitTestCase):
             self.assertEqual(len(fusion_groups), 0)
 
     def test_adaptive_avg_pool2d(self):
+        # [FUNCTION DOC] Compiles traced adaptive average pooling with tuple and int output
+        # sizes with TensorExprKernel and compares with the traced output.
         # TODO: once the adaptive_avg_pool2d is available in OpInfo DB, this
         # test should be moved there
         with inline_fusion_groups():
 
             def foo1(x):
+                # [FUNCTION DOC] HELPER: Adaptive average pool to 2 by 2.
                 return torch.nn.functional.adaptive_avg_pool2d(x, (2, 2))
 
             def foo2(x):
+                # [FUNCTION DOC] HELPER: Adaptive average pool to size 2.
                 return torch.nn.functional.adaptive_avg_pool2d(x, (2))
 
             x = torch.randn(4, 4, 4)
@@ -2382,9 +2831,14 @@ class TestTEFuser(JitTestCase):
                 self.assertEqual(kernel.run((x,)), correct_val)
 
     def test_unrolled_cat(self):
+        # [FUNCTION DOC] Checks a loop of concatenations over x rows: after warming up with
+        # a size-one input the profile is baked in, and a longer input must still give the
+        # eager result.
         with inline_fusion_groups():
 
             def eager(x):
+                # [FUNCTION DOC] HELPER: Builds a tensor by looping over rows of x and
+                # appending relu of each row.
                 ret = torch.empty(0)
                 for i in range(x.shape[0]):
                     ret = torch.cat([ret, x[i].relu()])
@@ -2409,21 +2863,29 @@ class TestTEFuser(JitTestCase):
     @skipIfTorchDynamo("too slow")
     @unittest.skipIf(TEST_WITH_ASAN, "takes 10+ minutes on asan")
     def test_batch_norm(self):
+        # [FUNCTION DOC] Checks batch_norm variants (with/without weight and bias) are fully
+        # fused and close to eager on each device. Skipped for TorchDynamo and under ASAN.
         def test(fn, args):
+            # [FUNCTION DOC] HELPER: Traces fn with args, asserts full fusion and closeness
+            # to eager treating NaN as equal.
             trace = torch.jit.trace(fn, args)
             self.assertAllFused(trace.graph_for(*args))
             torch.testing.assert_close(fn(*args), trace(*args), equal_nan=True)
 
         def bn(i, x, rv):
+            # [FUNCTION DOC] HELPER: Batch norm with weight and bias then relu.
             return torch.batch_norm(i, x, x, x, rv, False, 0.1, 1e-4, False).relu()
 
         def bn_no_weight(i, x, rv):
+            # [FUNCTION DOC] HELPER: Batch norm without weight, then relu.
             return torch.batch_norm(i, None, x, x, rv, False, 0.1, 1e-4, False).relu()
 
         def bn_no_bias(i, x, rv):
+            # [FUNCTION DOC] HELPER: Batch norm without bias, then relu.
             return torch.batch_norm(i, x, None, x, rv, False, 0.1, 1e-4, False).relu()
 
         def bn_neither(i, x, rv):
+            # [FUNCTION DOC] HELPER: Batch norm without weight and bias, then relu.
             return torch.batch_norm(
                 i, None, None, x, rv, False, 0.1, 1e-4, False
             ).relu()
@@ -2438,8 +2900,11 @@ class TestTEFuser(JitTestCase):
                 test(fn, (i, x, rv))
 
     def test_profiler(self):
+        # [FUNCTION DOC] Runs a scripted function three times under the autograd profiler
+        # and asserts the profile table includes a fused_mul_add entry.
         @torch.jit.script
         def test(x, y, z):
+            # [FUNCTION DOC] HELPER: Scripted function returning x times y plus z.
             return x * y + z
 
         args = [torch.randn(4) for _ in range(3)]
@@ -2450,8 +2915,12 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/156436")
     def test_skip_grad_in_check(self):
+        # [FUNCTION DOC] Skipped on Linux (linked issue). Runs a scripted function with
+        # requires-grad input under inference mode and checks the inlined graph keeps
+        # exactly one If node.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Scripted function returning x plus two divided by two.
             return (x + 2) / 2
 
         inp = torch.rand([4, 4])
@@ -2468,6 +2937,10 @@ class TestTEFuser(JitTestCase):
         FileCheck().check_count("prim::If", 1, exactly=True).run(g)
 
     def test_dynamic_shapes(self):
+        # [FUNCTION DOC] With a dynamic strategy, traces unary/binary/ternary functions over
+        # differently shaped tensors (including transposed and channels last) and checks
+        # exactly one dynamic guard in the optimized graph, then checks one guard per
+        # generator for repeated shapes.
         from functools import partial
 
         n = 10
@@ -2484,16 +2957,20 @@ class TestTEFuser(JitTestCase):
         with texpr_enable_strategy([("DYNAMIC", 20)]):
 
             def foo(x, y, z):
+                # [FUNCTION DOC] HELPER: Sigmoid of tanh of x; function caching is disabled
+                # on it.
                 return torch.sigmoid(torch.tanh(x))
 
             foo.__disable_jit_function_caching__ = True
 
             def fi(x, y, z):
+                # [FUNCTION DOC] HELPER: Tanh of x plus y; function caching disabled.
                 return torch.tanh(x + y)
 
             fi.__disable_jit_function_caching__ = True
 
             def fum(x, y, z):
+                # [FUNCTION DOC] HELPER: Tanh of x plus y plus z; function caching disabled.
                 return torch.tanh(x + y) + z
 
             fum.__disable_jit_function_caching__ = True
@@ -2546,7 +3023,11 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA, "half-precision NNC fusion requires CUDA")
     def test_autocast_up(self):
+        # [FUNCTION DOC] CUDA test checking a script function that converts half to full
+        # precision then exps is fused.
         def f(x):
+            # [FUNCTION DOC] HELPER: Converts x to full precision and returns its
+            # exponential.
             y = x._autocast_to_full_precision(True, True)
             z = torch.exp(y)
             return z
@@ -2559,7 +3040,10 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA, "half-precision NNC fusion requires CUDA")
     def test_autocast_down(self):
+        # [FUNCTION DOC] CUDA test checking sigmoid followed by conversion to half precision
+        # is fused.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sigmoid of x then conversion to reduced precision half.
             y = torch.sigmoid(x)
             z = y._autocast_to_reduced_precision(True, True, torch.half, torch.half)
             return z
@@ -2572,7 +3056,12 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skipIf(not LLVM_ENABLED, "Compiles with TensorExprKernel")
     def test_to_dtype(self):
+        # [FUNCTION DOC] Checks a chain of precision conversions on float and bfloat16
+        # traced inputs: float32 case is fully fused, bfloat16 case yields two groups;
+        # values match within tolerance. Requires LLVM.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sigmoid, conversions to half-reduced, full precision,
+            # then to bfloat16 and float32.
             y = torch.sigmoid(x)
             z = y._autocast_to_reduced_precision(True, True, torch.half, torch.bfloat16)
             h = z._autocast_to_full_precision(True, True)
@@ -2597,6 +3086,14 @@ class TestTEFuser(JitTestCase):
         self.assertEqual(f(bf_x), bf_scr(bf_x), atol=4e-3, rtol=4e-3)
 
     def test_with_strict_fusion(self):
+        # [FUNCTION DOC] Tests the strict_fusion context: a pure arithmetic function
+        # succeeds and fuses; an unfusible random op raises with unfused operators text;
+        # calling in eager warns; autodiff and multiple separate fusions also raise errors.
+        # KNOWN ISSUE: the error assertions quote source text from scripted nested
+        # functions, so their doc blocks are placed above the def lines to leave quoted text
+        # unchanged.
+        # [FUNCTION DOC] HELPER: Scripted function adding x three times within a strict
+        # fusion region.
         def success(x):
             with torch.jit.strict_fusion():
                 return x + x + x
@@ -2605,6 +3102,8 @@ class TestTEFuser(JitTestCase):
         g = torch.jit.last_executed_optimized_graph()
         FileCheck().check_not("aten::add").check("prim::TensorExprGroup").run(g)
 
+        # [FUNCTION DOC] HELPER: Strict fusion region with an unfusible random tensor
+        # addition; scripting it should fail with source quoted unfused operators.
         def foo(x):
             with torch.jit.strict_fusion():
                 return x + x + torch.rand([4]) + 3
@@ -2623,6 +3122,8 @@ class TestTEFuser(JitTestCase):
 
         FileCheck().check("Only works in script mode").run(str(warns[0]))
 
+        # [FUNCTION DOC] HELPER: Strict fusion region with random tensor plus x three times
+        # for the autodiff failure case.
         def test_autodiff(x):
             with torch.jit.strict_fusion():
                 return torch.rand([4]) + x + x + x
@@ -2635,6 +3136,8 @@ class TestTEFuser(JitTestCase):
         f = FileCheck().check("unfused operators").check("aten::rand")
         f.run(str(error_out.exception))
 
+        # [FUNCTION DOC] HELPER: Two separate strict fusion regions in one return, expected
+        # to raise a multiple fusions error.
         def test_separate_fusions(x, y):
             with torch.jit.strict_fusion():
                 return x + x + x, y + y + y
@@ -2649,6 +3152,10 @@ class TestTEFuser(JitTestCase):
         f.run(str(error_out.exception))
 
     def test_constant_chunk_shapes(self):
+        # [FUNCTION DOC] Regression test that building shape expressions for a ConstantChunk
+        # whose input is built from unsupported constants does not fail: traces the
+        # function, checks one ConstantChunk in the group and runs it four times matching
+        # eager. Skipped for dynamic shapes.
         # We had an issue where buildShapeExpressions would fail as show below:
         #
         # %1 : Tensor = Constant[..]  # not supported, we don't build this shape
@@ -2661,6 +3168,8 @@ class TestTEFuser(JitTestCase):
         for device in self.devices:
 
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Adds x, y and a constant tensor then chunks and
+                # multiplies the halves.
                 r = torch.tensor(4)
                 z1, z2 = (x + y + r).chunk(2, dim=1)
                 return z1 * z2
@@ -2686,8 +3195,11 @@ class TestTEFuser(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA_HALF, "half-precision NNC fusion requires CUDA")
     def test_pow_multiple_dtype(self):
+        # [FUNCTION DOC] CUDA half test: a scripted sigmoid then power with float exponent
+        # on half input runs four times and matches eager.
         # https://github.com/pytorch/pytorch/issues/75476
         def fn(p: torch.Tensor, gamma: float = 2.0) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Sigmoid then power with gamma.
             p = torch.sigmoid(p)
             result = p**gamma
             return result
@@ -2704,10 +3216,14 @@ class TestTEFuser(JitTestCase):
 
 
 class TestTEFuserStatic(TestTEFuser):
+    # [CLASS DOC] Runs all TestTEFuser tests with static shapes (class attribute
+    # dynamic_shapes is False).
     dynamic_shapes = False
 
 
 class TestTEFuserDynamic(TestTEFuser):
+    # [CLASS DOC] Runs all TestTEFuser tests with dynamic shapes (class attribute
+    # dynamic_shapes is True).
     dynamic_shapes = True
 
 
@@ -2835,6 +3351,8 @@ skip_ops = ["conj"]
 
 
 def get_name(op):
+    # [FUNCTION DOC] HELPER: Returns the OpInfo name, joined with the variant test name by a
+    # dot when that variant name is non-empty.
     l = [op.name]
     if op.variant_test_name != "":
         l.append(op.variant_test_name)
@@ -2846,19 +3364,34 @@ def get_name(op):
 # super(TestNNCOpInfo, self) fails because TestNNCOpInfo gets deleted from global scope.
 # super(JitCommonTestCase, self).fn() would skip JitCommonTestCase.fn() implementation
 class TestNNCOpInfoParent(JitCommonTestCase):
+    # [CLASS DOC] HELPER: Empty parent class allowing explicit super calls from
+    # TestNNCOpInfo, which cannot use zero-argument super because of device-type
+    # instantiation.
     pass
 
 
 class TestNNCOpInfo(TestNNCOpInfoParent):
+    # [CLASS DOC] OpInfo-driven tests (instantiated per device type, cpu and cuda unless
+    # FBCODE) that compile op traces with TensorExprKernel and compare run and fallback
+    # results with eager, plus a slow correctness test of traced variants. Uses the module
+    # lists of working ops, known failures and skipped ops.
     def setUp(self):
+        # [FUNCTION DOC] Calls the grandparent setUp and applies the TensorExpr test
+        # options.
         super(TestNNCOpInfoParent, self).setUp()
         self.tensorexpr_options = TensorExprTestOptions()
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the TensorExpr test options and calls the grandparent
+        # tearDown.
         self.tensorexpr_options.restore()
         super(TestNNCOpInfoParent, self).tearDown()
 
     def te_compile(self, device, dtype, op):
+        # [FUNCTION DOC] HELPER: For all sample inputs of the op (skipping ops listed in
+        # skip_ops), generates function source taking tensor arguments, executes it to
+        # define a function calling the op, traces it, builds a TensorExprKernel and asserts
+        # its run and fallback outputs equal eager. Mutates the function module name.
         if op.name in skip_ops:
             return
         sample_inputs_itr = op.sample_inputs(device, dtype, requires_grad=False)
@@ -2906,6 +3439,8 @@ def f({", ".join(param_names)}):
         allowed_dtypes=(torch.float,),
     )
     def test_working(self, device, dtype, op):
+        # [FUNCTION DOC] Compiles and checks every OpInfo whose name is in the works list
+        # (cpu only, requires LLVM).
         self.te_compile(device, dtype, op)
 
     @onlyCPU
@@ -2915,6 +3450,8 @@ def f({", ".join(param_names)}):
         allowed_dtypes=(torch.float,),
     )
     def test_failures(self, device, dtype, op):
+        # [FUNCTION DOC] For ops listed as known failures, expects compilation to raise;
+        # raises RuntimeError if it unexpectedly succeeds.
         try:
             self.te_compile(device, dtype, op)
         except Exception as e:
@@ -2931,6 +3468,11 @@ def f({", ".join(param_names)}):
         allowed_dtypes=(torch.float,),
     )
     def test_unsupported(self, device, dtype, op):
+        # [FUNCTION DOC] For ops in neither list, expects compilation to raise (tracer
+        # warnings ignored) and raises RuntimeError if it works, prompting a move to the
+        # works list. Ops in the skip list return early.
+        # KNOWN ISSUE: the tracer warning class referenced is not imported here, a noqa
+        # hides the lint error.
         if get_name(op) in skip_ops:
             return
         try:
@@ -2951,6 +3493,10 @@ def f({", ".join(param_names)}):
         dtypes=OpDTypes.supported,
     )
     def test_nnc_correctness(self, device, dtype, op):
+        # [FUNCTION DOC] Slow test comparing traced variants of each supported op with eager
+        # results over sample inputs (looser tolerance for bfloat16), then drops all
+        # functions of the global compilation unit to limit memory. Skips ops without
+        # tracing support.
         if not op.supports_tracing:
             self.skipTest("Requires tracing support")
 
@@ -2986,11 +3532,20 @@ instantiate_device_type_tests(TestNNCOpInfo, globals(), only_for=only_for)
 
 # Purpose of this class is to allow super() calls. (See TestNNCOpInfoParent)
 class TestLoopnestRandomizationParent(JitTestCase):
+    # [CLASS DOC] HELPER: Empty parent class allowing explicit super calls from
+    # TestLoopnestRandomization.
     pass
 
 
 class TestLoopnestRandomization(TestLoopnestRandomizationParent):
+    # [CLASS DOC] Tests running the TE fuser with loopnest random transformation seed
+    # enabled via environment variable; setUp saves and overrides fuser flags, tearDown
+    # restores them.
     def setUp(self):
+        # [FUNCTION DOC] Saves current CPU/GPU fuser, LLVM, profiling, inlining and texpr
+        # fuser states and then enables CPU and GPU fusion, profiling executor, no inlining,
+        # texpr fuser, disables forced LLVM, and sets the random transform seed environment
+        # variable to one.
         super(TestLoopnestRandomizationParent, self).setUp()
         self.old_cpu_fuser_state = torch._C._jit_can_fuse_on_cpu()
         self.old_must_use_cpu_state = torch._C._jit_get_te_must_use_llvm_cpu()
@@ -3018,6 +3573,8 @@ class TestLoopnestRandomization(TestLoopnestRandomizationParent):
         os.environ["PYTORCH_TENSOREXPR_RANDOM_TRANSFORM_SEED"] = "1"
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores all saved fuser and executor states, resets the random
+        # transform seed environment variable to zero and calls the grandparent tearDown.
         torch._C._jit_set_profiling_executor(self.old_profiling_executor)
         torch._C._get_graph_executor_optimize(self.old_profiling_mode)
 
@@ -3036,7 +3593,10 @@ class TestLoopnestRandomization(TestLoopnestRandomizationParent):
     @onlyCPU
     @unittest.skipIf(not LLVM_ENABLED, "Compiles with TensorExprKernel")
     def test_relu(self, device):
+        # [FUNCTION DOC] CPU-only test (requires LLVM) tracing a relu expression and raising
+        # AssertionError if the traced result is not close to eager.
         def fn_test_relu(x, y):
+            # [FUNCTION DOC] HELPER: Relu of x plus half of y.
             return F.relu(x + 0.5 * y)
 
         x = torch.randn(4, 4, dtype=torch.float, device=device)

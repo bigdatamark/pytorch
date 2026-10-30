@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Runs the whole test_jit suite under the legacy JIT graph executor. At import it
+# appends the legacy executor flag to the command line arguments, then (when run as a script)
+# parses the command line so the executor setting is known before test classes are created.
+# It star-imports every test from test_jit, so those tests are collected here too. When run as
+# a script it calls the test runner, except on Python 3.14 or newer where nothing is run.
 
 import sys
 sys.argv.append("--jit-executor=legacy")
