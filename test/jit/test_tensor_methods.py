@@ -1,4 +1,6 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] TorchScript tests for calling tensor methods by name, here the getitem special
+# method. Importing the module appends the test directory to the system path.
 
 import os
 import sys
@@ -15,8 +17,14 @@ from torch.testing._internal.jit_utils import JitTestCase
 
 
 class TestTensorMethods(JitTestCase):
+    # [CLASS DOC] JitTestCase suite for tensor method calls in TorchScript, covering valid and
+    # invalid getitem calls.
     def test_getitem(self):
+        # [FUNCTION DOC] Checks that calling getitem on a tensor with an index tensor matches
+        # eager results and that the scripted graph contains an aten index node.
         def tensor_getitem(inp: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Builds a long tensor of indices zero and two and returns
+            # the input indexed by it.
             indices = torch.tensor([0, 2], dtype=torch.long)
             return inp.__getitem__(indices)
 
@@ -27,7 +35,12 @@ class TestTensorMethods(JitTestCase):
         FileCheck().check("aten::index").run(scripted.graph)
 
     def test_getitem_invalid(self):
+        # [FUNCTION DOC] Checks that scripting a call of getitem with no arguments raises a
+        # RuntimeError saying exactly one argument is expected, with the method access
+        # highlighted.
         def tensor_getitem_invalid(inp: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Calls getitem on the input without arguments; never
+            # successfully compiled.
             return inp.__getitem__()
 
         with self.assertRaisesRegexWithHighlight(
