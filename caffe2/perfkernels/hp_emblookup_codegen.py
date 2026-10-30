@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Script that generates a C++ source file of AVX2 and FMA embedding lookup kernels
+# (sum or weighted sum over bags of rows, with optional length normalization) for int32 and int64
+# indices and float, half, bfloat16 and uint8 input data. Command line options choose the output
+# file name, whether rows are the fused 8-bit rowwise layout (scale and bias stored in the row)
+# and whether bags are described by an offsets array instead of a lengths array. Import-time side
+# effects: the whole script runs on import - it parses sys.argv, builds the code and writes the
+# output file, then prints a Created message. It defines the helpers unroll (fixed block sizes)
+# and generic (any block size).
 
 
 import argparse
@@ -9,7 +17,22 @@ sizeof = {"float": 4, "at::Half": 2, "at::BFloat16": 2, "uint8_t": 1}
 
 
 def unroll(uf, IndexType, InType, OutType, use_weights, isa, fused, use_offsets):
+    # [FUNCTION DOC] Return a list of C++ source lines for the bag loop of a kernel
+    # specialised for block sizes of 8 times uf floats: uf AVX registers hold the
+    # accumulators, there is one unrolled fused multiply-add per register per index, indices
+    # are bounds-checked (generated code returns false on failure) and the sum is optionally
+    # divided by the bag length. The bag length comes from the offsets array when use_offsets
+    # is set, else the lengths array. fused selects the scale and bias stored inside each
+    # uint8 row. Arguments use_weights and isa are not used.
+    # KNOWN ISSUE: for uint8 input without fused rows the emitted C++ assigns the bio
+    # variable without declaring it (the generic variant declares it), and both branches of
+    # the use_offsets check that emit the range loop header are identical.
     def compute(regid, InType, use_weights, isa, prefetch):
+        # [FUNCTION DOC] HELPER: Return C++ lines performing the multiply-add for the
+        # register numbered regid, converting float, half, bfloat16 or uint8 input to
+        # float32 first (uint8 adds the bias vector). Emits a T0 prefetch of the next row
+        # when prefetch is true, else only a comment. Raises AssertionError for an
+        # unsupported InType. use_weights and isa are unused.
         code = []
 
         if InType == "float":
@@ -198,7 +221,19 @@ def unroll(uf, IndexType, InType, OutType, use_weights, isa, fused, use_offsets)
 
 
 def generic(IndexType, InType, OutType, use_weights, isa, fused, use_offsets):
+    # [FUNCTION DOC] Return a list of C++ source lines for the bag loop used for any block
+    # size: zeroes the output row, then for each index in the bag does a vectorised multiply-
+    # add over groups of 8 floats and a scalar fused multiply-add loop for the remaining
+    # tail, with bounds checks that return false, prefetch of the next row, and optional
+    # normalisation by the bag length. use_offsets and fused have the same meaning as in
+    # unroll. use_weights and isa are unused. Raises AssertionError for an unsupported InType
+    # in the tail code.
     def compute(InType, use_weights, isa):
+        # [FUNCTION DOC] HELPER: Return C++ lines for the 8-wide vector multiply- add of
+        # the current group of floats (at the running offset) into the output, converting
+        # float, half, bfloat16 or uint8 input to float32 (uint8 adds the bias), followed
+        # by a T0 prefetch. Raises AssertionError for an unsupported InType. use_weights
+        # and isa are unused.
         code = []
         if InType == "float":
             code.append(

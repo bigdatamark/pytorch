@@ -1,3 +1,9 @@
+# [MODULE DOC] Benchmark script comparing torch.nn.MultiheadAttention against a composite
+# implementation (fused input projection, scaled_dot_product_attention, output projection) on
+# CUDA, eager and torch.compile, for dense and padded (nested tensor) inputs. Defines the frozen
+# dataclasses for configs and results, CompositeMHA, input generation, timing and reporting
+# helpers. Import-time side effect: all Python warnings are ignored. Run as a script with an
+# optional save path to print a table and write it as CSV.
 import argparse
 import itertools
 import random
@@ -20,6 +26,11 @@ warnings.filterwarnings("ignore")
 
 @dataclass(frozen=True)
 class ExperimentConfig:
+    # [CLASS DOC] Immutable description of one experiment: batch size, head count, maximum
+    # sequence length, embedding size, dtype, optional padding fraction (None means dense
+    # input) and four flags selecting which scaled dot product attention backends are enabled
+    # (math, flash, memory efficient, cudnn). Provides the field values and names as table
+    # columns.
     batch_size: int
     num_heads: int
     max_sequence_len: int
@@ -32,6 +43,8 @@ class ExperimentConfig:
     enable_cudnn: bool
 
     def get_entries(self) -> list:
+        # [FUNCTION DOC] Return the field values in declaration order as a list, matching
+        # the order of get_entry_names.
         return [
             self.batch_size,
             self.num_heads,
@@ -47,6 +60,8 @@ class ExperimentConfig:
 
     @classmethod
     def get_entry_names(cls) -> list[str]:
+        # [FUNCTION DOC] Return the list of field names in declaration order, used as
+        # table column headers.
         return [
             "batch_size",
             "num_heads",
@@ -63,12 +78,18 @@ class ExperimentConfig:
 
 @dataclass(frozen=True)
 class ExperimentResults:
+    # [CLASS DOC] Immutable timings in microseconds for one experiment: eager
+    # nn.MultiheadAttention, its compiled version (None if not measured), the composite
+    # implementation, and its compiled version (None if not measured).
     nn_mha_time: float
     compiled_nn_mha_time: float | None
     composite_mha_time: float
     compiled_composite_mha_time: float | None
 
     def get_entries(self) -> list:
+        # [FUNCTION DOC] Return the four timings formatted as strings for table rows. The
+        # compiled entries become None when the value is missing or zero; otherwise
+        # values are formatted as floating point text.
         return [
             f"{self.nn_mha_time:2f}",
             f"{self.compiled_nn_mha_time:2f}" if self.compiled_nn_mha_time else None,
@@ -80,6 +101,8 @@ class ExperimentResults:
 
     @classmethod
     def get_entry_names(cls) -> list[str]:
+        # [FUNCTION DOC] Return the four column header strings for the timings, each
+        # labelled with the microsecond unit.
         return [
             "nn_mha_time (\u00b5s)",
             "compiled_nn_mha_time (\u00b5s)",
@@ -90,15 +113,26 @@ class ExperimentResults:
 
 @dataclass(frozen=True)
 class Experiment:
+    # [CLASS DOC] Immutable pairing of an ExperimentConfig and its ExperimentResults.
     config: ExperimentConfig
     results: ExperimentResults
 
     def get_entries(self) -> list:
+        # [FUNCTION DOC] Return the config entries followed by the results entries as one
+        # table row.
         return self.config.get_entries() + self.results.get_entries()
 
 
 class CompositeMHA(torch.nn.Module):
+    # [CLASS DOC] Minimal multi-head self attention module built from the weights of an
+    # existing torch.nn.MultiheadAttention. Holds the packed input projection weight and
+    # bias, the output projection module and the head count, and uses
+    # scaled_dot_product_attention for the core. Its call signature and return value (output,
+    # None) mimic the nn module.
     def __init__(self, num_heads, in_proj_weight, in_proj_bias, out_proj):
+        # [FUNCTION DOC] Store the head count, the packed query/key/value projection
+        # weight and bias, and the output projection module as attributes (the tensors
+        # are shared, not copied).
         super().__init__()
         self.in_proj_weight = in_proj_weight
         self.in_proj_bias = in_proj_bias
@@ -106,6 +140,13 @@ class CompositeMHA(torch.nn.Module):
         self.num_heads = num_heads
 
     def forward(self, query, key, value, mask):
+        # [FUNCTION DOC] Self attention forward pass. Requires query, key and value to be
+        # the very same tensor object and mask to be None, otherwise raises
+        # NotImplementedError. Projects the input with the packed weight, splits the
+        # result into three chunks along the last dim, reshapes each to batch, heads,
+        # sequence, head dim, runs scaled dot product attention without mask, dropout or
+        # causality, merges the heads, applies the output projection and returns (output,
+        # None).
         if not (query is key and key is value):
             raise NotImplementedError(
                 "query, key and value must be the same Tensor for now."
@@ -143,6 +184,10 @@ class CompositeMHA(torch.nn.Module):
 
 
 def build_composite_mha_from_nn_mha(pt):
+    # [FUNCTION DOC] Create a CompositeMHA that shares the weights of the given
+    # torch.nn.MultiheadAttention. Raises AssertionError unless the module uses one embedding
+    # dimension for query, key and value, has a packed input projection weight, and was
+    # created with batch_first set.
     if not pt._qkv_same_embed_dim:
         raise AssertionError("pt._qkv_same_embed_dim must be True")
     in_proj_weight = pt.in_proj_weight
@@ -161,6 +206,12 @@ def generate_rand_batch(
     dtype=torch.float16,
     device="cuda",
 ):
+    # [FUNCTION DOC] Create a random input batch. With no padding fraction, return a pair of
+    # one dense normally distributed tensor of shape batch, sequence, embedding and None.
+    # Otherwise draw a per-sample length from a gaussian around the padding fraction, force
+    # one random sample to the maximum length, and return a nested tensor of per-sample
+    # random tensors plus the list of lengths. Uses the global random state and the given
+    # dtype and device.
     if not pad_percentage:
         return (
             torch.randn(
@@ -192,6 +243,9 @@ def generate_rand_batch(
 
 
 def benchmark_torch_function_in_microseconds(f, *args, **kwargs):
+    # [FUNCTION DOC] Time a callable with torch.utils.benchmark blocked autorange and return
+    # the mean run time in microseconds. Extra positional and keyword arguments are forwarded
+    # to it.
     t0 = benchmark.Timer(
         stmt="f(*args, **kwargs)", globals={"args": args, "kwargs": kwargs, "f": f}
     )
@@ -199,6 +253,10 @@ def benchmark_torch_function_in_microseconds(f, *args, **kwargs):
 
 
 def assert_close_tensors(tensor_a, tensor_b):
+    # [FUNCTION DOC] Rough correctness check of two tensors. If both are nested, compares
+    # each unbound component with absolute and relative tolerance of 1e-2; otherwise compares
+    # the tensors with tolerance 1e-3. Raises AssertionError reporting the maximum difference
+    # when values are not close.
     # First order sanity check. Not a replacement for rigorous tests.
     if tensor_a.is_nested and tensor_b.is_nested:
         for a, b in zip(tensor_a.unbind(), tensor_b.unbind()):
@@ -214,6 +272,13 @@ def assert_close_tensors(tensor_a, tensor_b):
 
 
 def run_single_experiment(config: ExperimentConfig) -> ExperimentResults:
+    # [FUNCTION DOC] Run one experiment on CUDA inside the sdp_kernel context built from the
+    # config flags: build an nn MultiheadAttention (eval mode, config dtype, no dropout) and
+    # its composite counterpart, generate an input, check that outputs are close, time both
+    # eagerly and, only when there is no padding (nested tensors cannot be compiled), also
+    # with torch.compile. Returns an Experiment holding the config and timings.
+    # KNOWN ISSUE: the return annotation says ExperimentResults but the function returns an
+    # Experiment that wraps the config and the results.
     with sdp_kernel(
         enable_math=config.enable_math,
         enable_flash=config.enable_flash,
@@ -284,6 +349,10 @@ def run_single_experiment(config: ExperimentConfig) -> ExperimentResults:
 def generate_experiments(
     batch_sizes, num_heads, max_seq_lens, embed_dims, dtypes, pad_percentages
 ) -> list[ExperimentConfig]:
+    # [FUNCTION DOC] Build the list of ExperimentConfig objects for the cartesian product of
+    # the given batch sizes, head counts, maximum sequence lengths, embedding sizes, dtypes
+    # and padding fractions. Every config enables the flash, memory efficient and cudnn
+    # backends and disables the math backend.
     configs = []
     for bsz, n_heads, seq_len, embed_dim, dtype, padding in itertools.product(
         batch_sizes, num_heads, max_seq_lens, embed_dims, dtypes, pad_percentages
@@ -306,6 +375,11 @@ def generate_experiments(
 
 
 def main(save_path: Path | None):
+    # [FUNCTION DOC] Entry point. Seeds numpy and torch (123), runs and prints one fixed
+    # experiment, then runs a grid of experiments (batch 256, 32 heads, sequence 256,
+    # embedding 512, three dtypes, with and without padding) with a progress bar, prints them
+    # in a PrettyTable and, when save_path is not None, writes the table as CSV text to that
+    # path.
     seed = 123
     np.random.seed(seed)
     torch.manual_seed(seed)

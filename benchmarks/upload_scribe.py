@@ -1,3 +1,8 @@
+# [MODULE DOC] Uploader that converts pytest-benchmark JSON results into Scribe log messages.
+# Defines a base ScribeUploader (schema-checked message formatting plus upload through either the
+# scribe_cat command line tool or the Facebook graph HTTP endpoint) and the concrete
+# PytorchBenchmarkUploader with the perfpipe_pytorch_benchmarks schema. Run as a script with a
+# pytest-benchmark JSON file to upload it. No import-time side effects.
 """Scribe Uploader for Pytorch Benchmark Data
 
 Currently supports data in pytest-benchmark format but can be extended.
@@ -17,10 +22,20 @@ import requests
 
 
 class ScribeUploader:
+    # [CLASS DOC] Base uploader bound to one Scribe category name (stored as category).
+    # Subclasses must set a schema attribute: a mapping with the keys normal, int and float,
+    # each holding the list of permitted field names of that type. Provides message
+    # formatting and upload; the schema attribute is not defined on this class itself.
     def __init__(self, category):
+        # [FUNCTION DOC] Store the Scribe category name used for all later uploads.
         self.category = category
 
     def format_message(self, field_dict):
+        # [FUNCTION DOC] Convert a flat mapping of field name to value into a nested
+        # message mapping keyed by type (normal as strings, int as integers, float as
+        # floats) using self.schema. Raises AssertionError if the field named time is
+        # absent, and ValueError for any field not listed in any schema group. Returns
+        # the resulting defaultdict of dicts.
         if "time" not in field_dict:
             raise AssertionError("Missing required Scribe field 'time'")
         message = defaultdict(dict)
@@ -38,12 +53,20 @@ class ScribeUploader:
         return message
 
     def _upload_intern(self, messages):
+        # [FUNCTION DOC] HELPER: Upload each message by running the scribe_cat command
+        # line tool with the category and the message serialized as JSON. Return codes of
+        # the subprocess are ignored.
         for m in messages:
             json_str = json.dumps(m)
             cmd = ["scribe_cat", self.category, json_str]
             subprocess.run(cmd)
 
     def upload(self, messages):
+        # [FUNCTION DOC] Send a list of formatted messages to Scribe. If the
+        # SCRIBE_INTERN environment variable is set, delegate to the scribe_cat path.
+        # Otherwise require SCRIBE_GRAPHQL_ACCESS_TOKEN (raises ValueError if missing)
+        # and POST all messages in one request to the graph.facebook.com scribe_logs
+        # endpoint, print the response body, and raise on an HTTP error status.
         if os.environ.get("SCRIBE_INTERN"):
             return self._upload_intern(messages)
         access_token = os.environ.get("SCRIBE_GRAPHQL_ACCESS_TOKEN")
@@ -71,7 +94,13 @@ class ScribeUploader:
 
 
 class PytorchBenchmarkUploader(ScribeUploader):
+    # [CLASS DOC] Uploader for the perfpipe_pytorch_benchmarks category. Its schema lists the
+    # int fields (time, rounds), the string fields describing the benchmark, PyTorch commit,
+    # machine and CircleCI build, and the float timing statistics (stddev, min, median, max).
     def __init__(self):
+        # [FUNCTION DOC] Initialize the base uploader with the benchmarks category and
+        # set the field schema mapping (int, normal, float groups) used to validate and
+        # type messages.
         super().__init__("perfpipe_pytorch_benchmarks")
         self.schema = {
             "int": [
@@ -106,6 +135,12 @@ class PytorchBenchmarkUploader(ScribeUploader):
         }
 
     def post_pytest_benchmarks(self, pytest_json):
+        # [FUNCTION DOC] Convert a parsed pytest-benchmark JSON mapping into Scribe
+        # messages and upload them in one batch. For each benchmark entry it builds a
+        # name from the test name and the net_name parameter, reads executor and fuser
+        # parameters, commit and machine info and the timing stats, and takes CircleCI
+        # build info from environment variables (may be absent). The pytorch_version
+        # field is always None. Missing JSON keys raise KeyError.
         machine_info = pytest_json["machine_info"]
         commit_info = pytest_json["commit_info"]
         upload_time = int(time.time())

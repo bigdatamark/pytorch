@@ -1,11 +1,29 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Code generator that writes a C++ source file with ARM SVE implementations of the
+# embedding lookup kernels (sum or weighted sum over bags of rows, with optional length
+# normalization) for int32 and int64 indices and float, half, bfloat16 and uint8 input data.
+# Output is a C++ text file whose name comes from a command line option. Running the module as a
+# script calls main; nothing runs at import time.
 import argparse
 import sys
 
 
 # Unroll loops when block_size is a multiple of vector length.
 def unroll(num_unrolls, IndexType, InType, OutType):
+    # [FUNCTION DOC] Return a list of C++ source lines implementing one unrolled stage of the
+    # index loop: a main loop handling num_unrolls bag entries at once (or a single guarded
+    # tail step when num_unrolls is 1). Each entry is bounds-checked against data_size
+    # (generated code returns false on failure), weights and uint8 scale/bias are applied,
+    # and the row is accumulated into the output with SVE vector loads, a full-width main
+    # loop and a predicated tail. IndexType is accepted but unused here; OutType is the
+    # accumulator type name.
     def compute_output(num_unrolls, InType, is_main):
+        # [FUNCTION DOC] HELPER: Return C++ lines that load the num_unrolls input rows at
+        # the current block offset, convert them to float32 (direct for float, widen for
+        # half, shift for bfloat16, integer widen for uint8 with an extra bias add) and
+        # fuse-multiply-add them into the accumulator using the full predicate when
+        # is_main is true, else the tail predicate. Raises ValueError for an unsupported
+        # InType.
         code = []
 
         pred = "svAll" if is_main else "pg"
@@ -105,6 +123,11 @@ def unroll(num_unrolls, IndexType, InType, OutType):
     return code
 
 def main():
+    # [FUNCTION DOC] Parse the optional filename option (default
+    # embedding_lookup_idx_sve.cc), generate the full C++ file for all eight index and data
+    # type combinations (a templated kernel on weight positioning plus false and true
+    # wrappers each), write it to that file and print a Created message. Side effect: writes
+    # the file in the current directory.
     parser = argparse.ArgumentParser()
     parser.add_argument("-f", "--filename", help="file name")
     opts = parser.parse_args()

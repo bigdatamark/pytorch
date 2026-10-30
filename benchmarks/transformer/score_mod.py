@@ -1,3 +1,11 @@
+# [MODULE DOC] Benchmark driver comparing compiled flex_attention (with score_mod and block mask
+# variants such as causal, alibi, sliding window, document mask, prefix LM and softcap) against
+# eager scaled_dot_product_attention backends and flash attention libraries on CUDA. Contains
+# input and mask generators, per backend runners that check numerical agreement and time forward
+# and optionally backward passes, speedup, bandwidth and TFLOPS helpers, result table, CSV and
+# dashboard JSON writers, and a command line main that can merge a config file. Import-time side
+# effects: sets torch dynamo config (automatic dynamic shapes off, recompile limit 1000). Needs
+# the sibling config_utils module and the external attn_gym package at run time.
 import argparse
 import csv
 import gc
@@ -38,6 +46,8 @@ from torch._inductor.runtime.benchmarking import benchmarker
 
 
 def cleanup_memory():
+    # [FUNCTION DOC] Free cached GPU memory: empties the CUDA allocator cache, runs the
+    # Python garbage collector and, when CUDA is available, synchronizes the device.
     """Aggressively free GPU memory"""
     torch.cuda.empty_cache()
     gc.collect()
@@ -46,6 +56,14 @@ def cleanup_memory():
 
 
 def safe_backend(backend_name=None, return_dict=False):
+    # [FUNCTION DOC] Decorator factory for benchmark runner functions. The returned decorator
+    # wraps a function whose first argument is an ExperimentConfig so that out-of-memory
+    # errors, runtime errors and any other exception are caught, a SKIP message is printed
+    # (error text truncated to 100 characters) and a NaN result is returned instead.
+    # backend_name is only used in messages (default is the wrapped function name). With
+    # return_dict set, the NaN result is a mapping of every configured backend plus the flex
+    # entry to NaN results; otherwise it is a single ExperimentResults with NaN times
+    # (backward time None when not requested). Memory is cleaned up after OOM conditions.
     """Decorator that wraps backend functions with error handling
 
     Args:
@@ -55,8 +73,16 @@ def safe_backend(backend_name=None, return_dict=False):
     """
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Decorator that wraps the given function in the error
+        # handling wrapper and preserves its metadata.
         @wraps(func)
         def wrapper(config, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Call the wrapped function with the config and
+            # other arguments. On torch.OutOfMemoryError, a RuntimeError that
+            # mentions Triton resource or out of memory, no valid Triton configs, any
+            # other RuntimeError, or any other Exception it prints a SKIP line
+            # (cleaning up GPU memory for the OOM cases) and falls through to return
+            # the NaN placeholder result described in safe_backend.
             try:
                 return func(config, *args, **kwargs)
             except torch.OutOfMemoryError:
@@ -139,6 +165,10 @@ backend_to_operator_name = {
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
+    # [FUNCTION DOC] Time a callable on the GPU. Calls it five times as warmup, then uses the
+    # inductor benchmarker GPU timing helper and returns the result converted from
+    # milliseconds to microseconds. Positional and keyword arguments are forwarded on every
+    # call.
     # warmup
     for _ in range(5):
         func(*args, **kwargs)
@@ -147,6 +177,11 @@ def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) ->
 
 @dataclass(frozen=True)
 class ExperimentConfig:
+    # [CLASS DOC] Immutable description of one experiment: shape as six integers (batch,
+    # query heads, query length, kv heads, kv length, head dim), attention variant name,
+    # dtype, flags for whether to time backward and compute bandwidth, the list of backend
+    # names to compare against flex attention, and the max-autotune flag. Invariant: the
+    # shape has exactly six entries.
     shape: tuple[int, ...]  # [B, Hq, M, Hkv, N, D]
     attn_type: str
     dtype: torch.dtype
@@ -156,12 +191,17 @@ class ExperimentConfig:
     max_autotune: bool
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validation hook run after construction: raises AssertionError if
+        # the shape does not contain exactly six entries.
         if len(self.shape) != 6:
             raise AssertionError(
                 f"Shape must be of length 6 [B, Hq, M, Hkv, N, D], got {len(self.shape)}"
             )
 
     def asdict(self):
+        # [FUNCTION DOC] Return the config as a dict for table display. The
+        # backward-time, bandwidth, backends and max-autotune entries are removed and the
+        # shape entry is renamed to a column label that lists the dimension names.
         # Convert the dataclass instance to a dictionary
         d = asdict(self)
         # Remove the 'calculate_bwd_time' and `cal_bandwidth` key
@@ -175,12 +215,17 @@ class ExperimentConfig:
 
 @dataclass(frozen=True)
 class Times:
+    # [CLASS DOC] Immutable pair of eager and compiled times. Not used elsewhere in this
+    # file.
     eager_time: float
     compiled_time: float
 
 
 @dataclass(frozen=True)
 class ExperimentResults:
+    # [CLASS DOC] Immutable timing result for one backend: forward time and backward time
+    # (None if backward was not measured), both in microseconds, plus an optional sparsity
+    # fraction that is only filled for the flex attention entry.
     fwd_time: float
     bwd_time: float | None
     sparsity: float | None = None
@@ -188,10 +233,14 @@ class ExperimentResults:
 
 @dataclass(frozen=True)
 class Experiment:
+    # [CLASS DOC] Immutable pairing of an ExperimentConfig with a mapping from backend name
+    # (and the key flex) to its ExperimentResults.
     config: ExperimentConfig
     results: dict[str, ExperimentResults]  # backend -> ExperimentResults
 
     def asdict(self):
+        # [FUNCTION DOC] Return one flat dict merging the displayable config entries and
+        # the per backend result objects keyed by backend name.
         dict1 = self.config.asdict()
         dict2 = self.results
         return {**dict1, **dict2}
@@ -209,6 +258,12 @@ def generate_inputs(
     requires_grad: bool,
     nested_tensors: bool = False,
 ):
+    # [FUNCTION DOC] Create query, key and value tensors with uniform random values (the
+    # torch seed is reset to 0 on every call). They are built as batch by length by hidden
+    # size, viewed as heads and head dim, and transposed to batch, heads, length, head dim.
+    # With nested_tensors set (document mask) the batch is folded into one long sequence of
+    # batch times length with batch size 1 instead. Raises AssertionError if the query head
+    # count is not a multiple of the kv head count. Returns the (query, key, value) tuple.
     torch.manual_seed(0)
     q_shape = (batch_size, q_sequence_length, q_heads * head_dim)
     kv_shape = (batch_size, kv_sequence_length, kv_heads * head_dim)
@@ -267,11 +322,19 @@ def generate_jagged_inputs(
     value: torch.Tensor,
     offsets: torch.Tensor,
 ):
+    # [FUNCTION DOC] Convert dense query, key and value tensors laid out as one packed
+    # sequence into jagged nested tensors, one component per document. The packed tokens are
+    # split using the offsets tensor (document boundaries), each piece is cloned, detached
+    # and kept in the original dtype and device. The shape argument is unpacked but otherwise
+    # unused. Returns the nested (q, k, v) tensors.
     B, Hq, M, Hkv, N, D = shape
 
     def offsets_to_lengths(
         offsets: torch.Tensor, device: str | torch.device
     ) -> torch.tensor:
+        # [FUNCTION DOC] HELPER: Return the lengths of consecutive documents as
+        # differences of adjacent offsets. The device argument is unused. Unused by the
+        # caller in this function.
         """Converts a list of offsets to a list of lengths. Reverse op of attn_gym.masks.document_mask.length_to_offsets
 
         Args:
@@ -311,6 +374,8 @@ def query_key_value_clones(
     value: torch.Tensor,
     dtype: torch.dtype = None,
 ):
+    # [FUNCTION DOC] Return detached copies of query, key and value, cast to the given dtype
+    # (default: the query dtype), with requires_grad copied from each original tensor.
     """Clones the query, key, and value tensors and moves them to the specified dtype."""
     if dtype is None:
         dtype = query.dtype
@@ -332,6 +397,16 @@ def run_single_backend_sdpa(
     mask_kwargs,
     backend: str,
 ) -> ExperimentResults:
+    # [FUNCTION DOC] Run and time the eager scaled_dot_product_attention reference for one
+    # SDPA backend (selected through get_backend_context) and compare it against the compiled
+    # flex output out_compile. Builds the eager callable from the attention type, block mask
+    # and score mod; document mask inputs are converted to jagged tensors. If the eager call
+    # raises RuntimeError a SKIP message is printed and NaN times are returned. Checks
+    # closeness with tolerance 1e-2 (skipped for rel and alibi with 16 bit dtypes, where
+    # accuracy is known to be poor). Returns forward time in microseconds (NaN if no eager
+    # implementation exists) and backward time (NaN for document mask or missing
+    # implementation, None if backward not requested). Errors are handled by safe_backend,
+    # which returns NaN results.
     backend_context = get_backend_context(backend)
     with backend_context:
         _device = torch.device("cuda")
@@ -415,6 +490,14 @@ def run_single_backend_FA(
     mask_kwargs,
     backend: str,
 ) -> ExperimentResults:
+    # [FUNCTION DOC] Run and time a flash attention library kernel (backend fav3 or fakv) for
+    # the given inputs and compare with the compiled flex output out_compile within tolerance
+    # 1e-2 (skipped for rel and alibi with 16 bit dtypes). Raises AssertionError for any
+    # other backend, which safe_backend turns into a NaN result. When no callable exists for
+    # the attention type or dtype, times are NaN. Inputs are transposed to the library
+    # layout, and flattened for document mask. Returns an ExperimentResults with forward time
+    # and backward time (None if not requested). score_mod and block_mask arguments are not
+    # used.
     if backend not in ["fav3", "fakv"]:
         raise AssertionError(f"backend must be 'fav3' or 'fakv', got {backend}")
     # Generate callable for specific backend.
@@ -474,6 +557,14 @@ def run_single_experiment(
     config: ExperimentConfig,
     dynamic=False,
 ) -> dict[str, ExperimentResults]:
+    # [FUNCTION DOC] Benchmark one config. Generates inputs, score mod, block mask and kernel
+    # options, compiles flex_attention (max-autotune without cudagraphs if requested),
+    # computes the compiled output and times the compiled forward pass. Then runs every
+    # configured backend through the flash attention runner (fav3, fakv) or the SDPA runner
+    # and, if requested, times the compiled backward pass. Sparsity comes from the block mask
+    # (fixed at 0.5 for document mask). Returns a mapping from backend name to
+    # ExperimentResults, with the flex entry added. Wrapped by safe_backend so failures
+    # produce NaN results for all backends.
     device = torch.device("cuda")
     batch_size, q_heads, q_seq_len, kv_heads, kv_seq_len, head_dim = config.shape
     query, key, value = generate_inputs(
@@ -567,6 +658,9 @@ def run_single_experiment(
 def calculate_speedup(
     results: ExperimentResults, baseline_results: ExperimentResults, type: str
 ) -> float:
+    # [FUNCTION DOC] Return the speedup of results over the baseline: baseline time divided
+    # by the measured time, for the forward or backward pass depending on type. Raises
+    # AssertionError if the backward time is missing and ValueError for any other type value.
     if type == "fwd":
         return baseline_results.fwd_time / results.fwd_time
     elif type == "bwd":
@@ -580,6 +674,14 @@ def calculate_speedup(
 def calculate_bandwidth(
     config: ExperimentConfig, results: ExperimentResults, type: str
 ) -> float:
+    # [FUNCTION DOC] Estimate achieved forward memory bandwidth in TB/s. Counts bytes of
+    # query read, key and value read (scaled by one minus sparsity, which is taken from the
+    # results only for decoding where the query length is 1, else zero) and output written,
+    # from element size of the config dtype, then divides by the forward time in microseconds
+    # converted to seconds. Raises ValueError for any type other than forward.
+    # KNOWN ISSUE: for decoding configs the sparsity of non-flex backend results is None, so
+    # calling this for them raises a TypeError; the dashboard writer does call it for every
+    # backend.
     B, Hq, M, Hkv, N, D = config.shape
     sparsity = results.sparsity if M == 1 else 0.0
     if type == "fwd":
@@ -612,6 +714,11 @@ def calculate_bandwidth(
 
 
 def calculate_tflops(config: ExperimentConfig, results: ExperimentResults) -> float:
+    # [FUNCTION DOC] Estimate forward TFLOPS from the config shape and the forward time in
+    # microseconds. Counts two matmul terms and a softmax term per query and key pair,
+    # multiplies by batch and query heads and by one minus the sparsity (zero if unset). Does
+    # not account for online softmax or split-k overhead. Uses query and key lengths of the
+    # config.
     (B, Hq, M, Hkv, N, D) = config.shape
     qk_flops = M * N * D * 2
     softmax_flops = M * N * 2  # Not counting online softmax overhead
@@ -623,6 +730,11 @@ def calculate_tflops(config: ExperimentConfig, results: ExperimentResults) -> fl
 
 
 def get_average_speedups(results: list[Experiment], type: str, backend: str):
+    # [FUNCTION DOC] Compute speedups of flex attention over the given backend for every
+    # experiment and return three table rows as dicts: the average speedup (ignoring NaN,
+    # with empty config columns), and the maximum and minimum speedup together with the
+    # config of the experiment that produced each. The type selects forward or backward
+    # speedup. Raises ValueError if all speedups are NaN.
     # Calculate speedups
     speedups = [
         calculate_speedup(r.results["flex"], r.results[backend], type) for r in results
@@ -651,6 +763,13 @@ def get_average_speedups(results: list[Experiment], type: str, backend: str):
 
 
 def print_results(results: list[Experiment], save_path: str | None = None):
+    # [FUNCTION DOC] Print benchmark results and optionally save them. Builds a table with
+    # config columns, forward and backward times per backend (falsy times are skipped),
+    # speedup columns for flex over each backend, and when bandwidth was requested the memory
+    # bandwidth and TFLOPS of flex. Prints it in GitHub table format, then for each backend
+    # that has non-NaN speedups prints average, max and min speedup tables (backward too when
+    # measured). When save_path is given, writes the table as CSV and prints the path. Relies
+    # on the first result for the configuration.
     table_data = defaultdict(list)
     for experiment in results:
         backends = experiment.config.backends + ["flex"]
@@ -727,14 +846,23 @@ dropout_p = 0.0
 
 
 def generate_score_mod(attn_type: str, shape: tuple[int, ...]) -> Callable | None:
+    # [FUNCTION DOC] Return the score modification callable for an attention type, or None if
+    # the type needs no score mod (it uses only a mask or nothing). Supports relative
+    # position bias, head bias, alibi (from attn_gym) and tanh softcap (approximate form only
+    # on CUDA, not ROCm). For decoding (query length 1) the callable is wrapped to shift the
+    # query index by half the kv length, held in a CUDA tensor. Imports attn_gym lazily.
+    # Unknown type raises KeyError.
     B, Hq, M, Hkv, N, D = shape
     is_decoding = M == 1
     from attn_gym.mods import generate_alibi_bias, generate_tanh_softcap
 
     def relative_bias(score, b, h, m, n):
+        # [FUNCTION DOC] HELPER: Score modifier adding the query minus key position to
+        # the score.
         return score + (m - n)
 
     def head_bias(score, b, h, m, n):
+        # [FUNCTION DOC] HELPER: Score modifier adding twice the head index to the score.
         return score + 2 * h
 
     on_cuda = torch.cuda.is_available() and torch.version.hip is None
@@ -758,6 +886,9 @@ def generate_score_mod(attn_type: str, shape: tuple[int, ...]) -> Callable | Non
         offset = torch.tensor(N // 2).to("cuda")
 
         def score_mod_w_offset(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Call the wrapped score modifier with the query
+            # index shifted by the captured offset tensor (half of the kv length),
+            # used for decoding steps.
             return score_mod(score, b, h, m + offset, n)
 
         new_score_mod = score_mod_w_offset
@@ -772,14 +903,30 @@ prefix_length = 512
 
 
 def generate_block_mask(attn_type: str, shape: tuple[int, ...]):
+    # [FUNCTION DOC] Build the flex attention block mask for an attention type and return it
+    # with a mapping of extra keyword arguments. The mapping is empty except for document
+    # mask, where it holds document start offsets generated from random document lengths
+    # (random seed 0, one document per batch element, total length kv length times batch).
+    # Document mask in decoding mode raises AssertionError. Mask functions come from local
+    # causal definitions or attn_gym (sliding window, prefix LM, document mask); types with
+    # no mask use the no-op mask. In decoding mode the query index is shifted by half the kv
+    # length. The mask is created with a compiled block mask builder on CUDA for a single
+    # batch and head (batch folded for document mask).
     B, Hq, M, Hkv, N, D = shape
     is_decoding = M == 1
 
     def causal(b, h, m, n):
+        # [FUNCTION DOC] HELPER: Causal mask function; true when the query index is at
+        # least the key index.
         return m >= n
 
     def gen_offset(off):
+        # [FUNCTION DOC] HELPER: Return a mask function that is causal after shifting the
+        # query index by the given offset.
         def offset(b, h, m, n):
+            # [FUNCTION DOC] HELPER: Mask function true when the query index plus the
+            # captured offset is at least the key index. Not used elsewhere in this
+            # file.
             return m + off >= n
 
         return offset
@@ -792,6 +939,10 @@ def generate_block_mask(attn_type: str, shape: tuple[int, ...]):
     from attn_gym.masks.document_mask import length_to_offsets
 
     def generate_random_lengths(total_length, num_documents):
+        # [FUNCTION DOC] HELPER: Return a list of num_documents positive integer lengths
+        # summing to total_length: each starts at 1 and the remaining tokens are assigned
+        # to randomly chosen documents using the global random generator. Assumes
+        # total_length is at least num_documents.
         # Initialize all lengths to 1 to ensure each document has at least one token
         lengths = [1] * num_documents
         remaining_length = total_length - num_documents
@@ -834,6 +985,9 @@ def generate_block_mask(attn_type: str, shape: tuple[int, ...]):
         cached_seq_len = torch.tensor(N // 2).to("cuda")
 
         def decoding_w_cached_seq_len(b, h, m, n):
+            # [FUNCTION DOC] HELPER: Call the wrapped mask function with the query
+            # index shifted by the cached sequence length tensor (half of the kv
+            # length), for decoding.
             return mask_mod(b, h, m + cached_seq_len, n)
 
         new_mask_mod = decoding_w_cached_seq_len
@@ -850,6 +1004,12 @@ def generate_block_mask(attn_type: str, shape: tuple[int, ...]):
 
 
 def get_kernel_options(attn_type: str, shape: tuple[int, ...]):
+    # [FUNCTION DOC] Return the flex attention kernel options mapping for the attention type
+    # and shape, or None. For training and prefill only document mask has options (fixed
+    # block sizes, warps and stages) and only when the CUDA device capability is at least 8.0
+    # and head dim is at most 128. For decoding (query length 1) causal, alibi and softcap
+    # get a split-kv setting equal to twice a heuristic split count. Queries the CUDA device.
+    # Unknown type raises KeyError.
     B, Hq, M, Hkv, N, D = shape
     is_decoding = M == 1
     kernel_opt_training_dict = {
@@ -876,6 +1036,9 @@ def get_kernel_options(attn_type: str, shape: tuple[int, ...]):
     }
 
     def get_default_split_k(B: int, H: int, Mk: int) -> int:
+        # [FUNCTION DOC] HELPER: Heuristic number of kv splits borrowed from xformers:
+        # streaming multiprocessor count of the CUDA device divided (integer division) by
+        # max of batch times heads and 1, times 2, with a minimum of 1. Mk is unused.
         num_SM = torch.cuda.get_device_properties("cuda").multi_processor_count
         """Heuristic for the number of splits from xformer"""
         bh = max(B * H, 1)  # NOTE: Handle B*h=0 case
@@ -907,6 +1070,10 @@ def get_kernel_options(attn_type: str, shape: tuple[int, ...]):
 
 
 def get_backend_context(backend: str):
+    # [FUNCTION DOC] Return the context manager that selects the given backend: SDPA kernel
+    # restriction for fav2, cudnn, math and efficient, and a no-op context for fav3, fakv and
+    # og-eager. Raises ValueError listing the valid names for an unknown backend (including
+    # flex).
     """
     Returns a context manager for the specified backend.
     Args:
@@ -938,6 +1105,14 @@ def get_backend_context(backend: str):
 def generate_FA_callable(
     attn_type: str, shape: tuple[int, ...], dtype: torch.dtype, backend: str, **kwargs
 ) -> Callable | None:
+    # [FUNCTION DOC] Return a flash attention 3 callable for the attention type, or None.
+    # Returns None for dtypes other than float16 and bfloat16, for unsupported attention
+    # types (rel, head bias, prefix LM) and for backends other than fav3 (after printing a
+    # message). For fav3 it imports flash_attn (printing a hint and re-raising the
+    # ImportError if missing) and returns a partial of the dense function, with causal,
+    # window, alibi slopes or softcap settings, or the variable length function for document
+    # mask using int32 cumulative offsets from the keyword arguments and the maximum document
+    # length. Unknown attention type raises KeyError.
     if dtype not in [torch.float16, torch.bfloat16]:
         return None
     if backend == "fav3":
@@ -969,6 +1144,8 @@ def generate_FA_callable(
         def offsets_to_lengths(
             offsets: torch.Tensor, device: str | torch.device
         ) -> torch.tensor:
+            # [FUNCTION DOC] HELPER: Return the lengths of consecutive documents as
+            # differences of adjacent offsets. The device argument is unused.
             lengths = offsets[1:] - offsets[:-1]
             return lengths
 
@@ -997,6 +1174,13 @@ def generate_FA_callable(
 def generate_FD_callable(
     attn_type: str, shape: tuple[int, ...], dtype: torch.dtype
 ) -> Callable | None:
+    # [FUNCTION DOC] Return a flash attention kv-cache (flash decoding) callable for the
+    # attention type, or None for dtypes other than float16 and bfloat16 and unsupported
+    # types (rel, head bias, document mask, prefix LM). Imports flash_attn, printing a hint
+    # and re-raising if missing. Raises AssertionError unless the query length is 1. The
+    # returned partial sets cache length to half the kv length for causal style types and
+    # adds alibi slopes, window size or softcap as required. Unknown attention type raises
+    # KeyError.
     if dtype not in [torch.float16, torch.bfloat16]:
         return None
     try:
@@ -1013,6 +1197,8 @@ def generate_FD_callable(
         raise AssertionError(f"M must be 1 for FD callable, got {M}")
 
     def flash_attn_with_kvcache_renamed(q, k, v, **kwargs):
+        # [FUNCTION DOC] HELPER: Adapter calling the flash kv-cache function with key and
+        # value passed under its cache argument names.
         return flash_attn_with_kvcache(q, k_cache=k, v_cache=v, **kwargs)
 
     FA_kwargs = {}
@@ -1048,6 +1234,12 @@ def generate_attn_mask_linear_score_mod(
     score_mod: Callable,
     dtype: torch.dtype,
 ):
+    # [FUNCTION DOC] Build a dense additive attention mask for score modifiers that cannot be
+    # expressed as a plain mask. shape is the four values batch, heads, query length, kv
+    # length. Returns None if both block mask and score mod are None. Otherwise evaluates the
+    # score mod on zero scores with broadcast index tensors on CUDA, sets positions
+    # disallowed by the block mask function to negative infinity and returns the result in
+    # the given dtype. Requires a block mask whenever a score mod is given.
     B, Hq, M, N = shape
     if block_mask is None and score_mod is None:
         return None
@@ -1077,6 +1269,13 @@ def generate_eager_sdpa(
     score_mod: Callable | None = None,
     **kwargs,
 ) -> Callable | None:
+    # [FUNCTION DOC] Return a callable running eager scaled_dot_product_attention for the
+    # attention type with the matching dense mask or causal flag, or None if no eager
+    # equivalent exists (softcap, and document mask when query and kv head counts differ).
+    # Masks are created on CUDA: from the block mask for sliding window, prefix LM and
+    # decoding causal; from the score mod for rel and alibi; as a head bias tensor for
+    # head_bias. Grouped query attention is enabled when head counts differ. Extra keyword
+    # arguments are ignored. Unknown type raises KeyError.
     B, Hq, M, Hkv, N, D = shape
     is_decoding = M == 1
     if attn_type == "sliding_window" or attn_type == "prefix_lm":
@@ -1152,6 +1351,12 @@ def generate_experiment_configs(
     backends: list[str],
     max_autotune: bool,
 ) -> list[ExperimentConfig]:
+    # [FUNCTION DOC] Build the list of ExperimentConfig objects for the cross product of
+    # batch sizes (or, when kv_cache_size in MiB is given, batch sizes derived from it and
+    # skipped if below one), head pairs, sequence lengths, head dims and attention types for
+    # one dtype. Sequence pairs are query equals kv length, or query length 1 for decoding.
+    # Raises AssertionError if backward is requested with decoding or if query heads are not
+    # a multiple of kv heads.
     if calculate_bwd and decoding:
         raise AssertionError("Decoding does not support backward")
 
@@ -1210,6 +1415,16 @@ def _output_json_for_dashboard(
     output_file,
     benchmark_name="PyTorch operator microbenchmark",
 ):
+    # [FUNCTION DOC] HELPER: Write experiment results to a JSON file in the PyTorch OSS
+    # benchmark dashboard record format. Returns without writing when the experiment list is
+    # empty. For each backend result with a non-NaN forward time it appends records for
+    # forward latency, and when bandwidth was requested also memory bandwidth and TFLOPS, and
+    # when backward was measured (not None, not NaN) backward latency; each record names
+    # benchmark, model and metric with device cuda. Writes the full list of records as
+    # indented JSON.
+    # KNOWN ISSUE: the bandwidth call can raise TypeError for non-flex backends in decoding
+    # mode (see calculate_bandwidth), and the dataclasses are redefined on every loop
+    # iteration.
     """
     Write the result into JSON format for PyTorch OSS dashboard.
     The JSON format is defined at
@@ -1271,6 +1486,8 @@ def _output_json_for_dashboard(
             # Create dataclasses for JSON structure
             @dataclass
             class BenchmarkInfo:
+                # [CLASS DOC] HELPER: Dashboard record part describing the
+                # benchmark: name, mode, dtype and an extra info mapping.
                 name: str
                 mode: str | None
                 dtype: str
@@ -1278,6 +1495,8 @@ def _output_json_for_dashboard(
 
             @dataclass
             class ModelInfo:
+                # [CLASS DOC] HELPER: Dashboard record part describing the model:
+                # name, type, origins and an extra info mapping.
                 name: str
                 type: str
                 origins: list[str]
@@ -1285,6 +1504,9 @@ def _output_json_for_dashboard(
 
             @dataclass
             class MetricInfo:
+                # [CLASS DOC] HELPER: Dashboard record part describing one
+                # metric: name, unit, list of measured values and an optional
+                # target value.
                 name: str
                 unit: str
                 benchmark_values: list[float]
@@ -1292,6 +1514,9 @@ def _output_json_for_dashboard(
 
             @dataclass
             class BenchmarkRecord:
+                # [CLASS DOC] HELPER: One dashboard record combining benchmark
+                # info, model info and metric info, converted to a plain dict
+                # before being written.
                 benchmark: BenchmarkInfo
                 model: ModelInfo
                 metric: MetricInfo
@@ -1439,6 +1664,14 @@ def main(
     output_json_for_dashboard: str | None = None,
     benchmark_name: str = "PyTorch operator microbenchmark",
 ) -> None:
+    # [FUNCTION DOC] Run the whole sweep. Converts the dtype name to a torch dtype, forces
+    # throughput on (the argument is ignored), prints the backends, seeds numpy and torch
+    # with 123, generates the configs, runs every config through run_single_experiment with a
+    # progress bar and cleans GPU memory every 50 experiments. Then prints the results
+    # (writing CSV when save_path is given) and writes dashboard JSON when
+    # output_json_for_dashboard is set. Parameters correspond to the command line options;
+    # batch sizes, heads, sequence lengths, head dims, modifiers and backends must be
+    # provided as lists. Returns None.
     """Run sweep over sizes and score mods for flex attention.
 
     Usage Examples:
