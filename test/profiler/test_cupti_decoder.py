@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Test of the CUPTI activity decode worker. IMPORT-TIME SIDE EFFECT: when CUPTI
+# is available (TEST_CUPTI), imports the pylibcupti wrapper from the profiler cupti_python
+# module. Defines one test class; the single test needs a loaded CUPTI of version 13.3 or
+# newer and a CUDA context. Runs the tests via run_tests when executed as a script.
 
 import time
 import unittest
@@ -16,9 +20,20 @@ if TEST_CUPTI:
 
 
 class TestCuptiDecoder(TestCase):
+    # [CLASS DOC] Test case for the native CUPTI decoder that accumulates activity records
+    # into columns grouped by kind and record layout. Holds no state of its own.
     @unittest.skipIf(not TEST_CUPTI_V13_3, "requires a loaded libcupti >= 13.3")
     @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA context")
     def test_decoder_groups_distinct_layouts(self):
+        # [FUNCTION DOC] Drives the native decode worker through the CUPTI v2 user-defined
+        # record API with two different field selections for the concurrent kernel activity
+        # kind, running a small GPU workload after each. Subscribes (skipping the test if the
+        # subscription is unavailable on this driver), arms the records and starts the
+        # decoder, then drains the decoded groups. Asserts that exactly two groups exist for
+        # the kind, with the expected sorted field id sets for each selection, and within each
+        # group every column holds the same positive record count. The finally block stops the
+        # decoder, disarms (ignoring CUPTI errors) and unsubscribes. Skipped unless CUPTI 13.3
+        # or newer is loaded and CUDA is available.
         # The native decode worker keys accumulated columns by (kind, layout) -- the
         # sorted (field_id, size) set of the captured record layout. When a kind's
         # field selection changes mid-session its records get a different layout, so
@@ -44,6 +59,11 @@ class TestCuptiDecoder(TestCase):
             self.skipTest(f"v2 subscribe unavailable on this driver/cupti: {e}")
 
         def run_and_flush():
+            # [FUNCTION DOC] HELPER: Runs a repeated matrix multiply and relu workload on the
+            # GPU, forces a synchronize and flushes all CUPTI activity buffers, then waits up
+            # to about five seconds (polling until no buffers are pending) for the decode
+            # worker thread to drain, and sleeps a further 0.1 seconds so the last buffer
+            # finishes decoding.
             x = torch.randn(256, 256, device="cuda")
             for _ in range(3):
                 x = torch.relu(x @ x)

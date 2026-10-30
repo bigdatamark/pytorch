@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: package/deploy"]
+# [MODULE DOC] Miscellaneous tests for torch.package: Directory file-structure views, custom
+# importer loaders, python version metadata, exporter content lists, is_from_package, source
+# inspection of packaged classes and the torch_package module attribute. Imports the test
+# helper PackageTestCase from the sibling common module, or from a top-level import when the
+# file is run directly. Runs the tests via run_tests when executed as a script.
 
 import inspect
 import os
@@ -27,9 +32,16 @@ except ImportError:
 
 
 class TestMisc(PackageTestCase):
+    # [CLASS DOC] Grab-bag test case deriving from PackageTestCase for one-off package
+    # behaviors that do not fit the other package test modules. Holds no state of its own.
     """Tests for one-off or random functionality. Try not to add to this!"""
 
     def test_file_structure(self):
+        # [FUNCTION DOC] Exports a module, a package, a pickled object and a text file into an
+        # in-memory buffer, then checks the importer file_structure Directory. The printed
+        # tree (minus its first line, which varies by platform) must match expected text for
+        # no filter, for an include filter of subpackage and pickle files, and for an exclude
+        # filter.
         """
         Tests package's Directory structure representation of a zip file. Ensures
         that the returned Directory prints what is expected and filters
@@ -116,12 +128,23 @@ class TestMisc(PackageTestCase):
         )
 
     def test_loaders_that_remap_files_work_ok(self):
+        # [FUNCTION DOC] Checks that a source loader whose reported filename is remapped still
+        # lets a module be packaged. Installs a custom meta path finder at the front of the
+        # finder list, drops module_a from the module cache, exports it, and asserts the
+        # packaged source came from the remapped path. The finally block removes the module
+        # and the finder to avoid affecting other tests.
         from importlib.abc import MetaPathFinder
         from importlib.machinery import SourceFileLoader
         from importlib.util import spec_from_loader
 
         class LoaderThatRemapsModuleA(SourceFileLoader):
+            # [CLASS DOC] HELPER: Source file loader that reports a different filename for
+            # module_a (same directory, file named module_a_remapped_path) and defers to the
+            # normal behavior for all other module names.
             def get_filename(self, name):
+                # [FUNCTION DOC] HELPER: Returns the normal filename from the base loader, except
+                # for module_a, where it returns a path in the same directory ending in the
+                # remapped file name.
                 result = super().get_filename(name)
                 if name == "module_a":
                     return os.path.join(
@@ -131,7 +154,15 @@ class TestMisc(PackageTestCase):
                     return result
 
         class FinderThatRemapsModuleA(MetaPathFinder):
+            # [CLASS DOC] HELPER: Meta path finder that handles only module_a. It locates the real
+            # spec by asking the other finders on the path, then swaps its loader for the
+            # remapping loader.
             def find_spec(self, fullname, path, target):
+                # [FUNCTION DOC] HELPER: Returns None for any name other than module_a. Otherwise
+                # walks the other meta path finders (using find_spec, or building a spec from the
+                # loader for old-style finders) until one yields a spec. Raises AssertionError if
+                # no spec was found or its loader is not a source file loader. Replaces the spec
+                # loader with the remapping loader and returns the spec.
                 """Try to find the original spec for module_a using all the
                 remaining meta_path finders."""
                 if fullname != "module_a":
@@ -176,6 +207,8 @@ class TestMisc(PackageTestCase):
             sys.meta_path.pop(0)
 
     def test_python_version(self):
+        # [FUNCTION DOC] Exports a simple object, reloads the package and checks that the importer
+        # reports the same python version string as the running interpreter.
         """
         Tests that the current python version is stored in the package and is available
         via PackageImporter's python_version() method.
@@ -199,6 +232,9 @@ class TestMisc(PackageTestCase):
         "Tests that use temporary files are disabled in fbcode",
     )
     def test_load_python_version_from_package(self):
+        # [FUNCTION DOC] Loads a prebuilt package file from the package_e test data directory and
+        # checks its recorded python version is 3.9.7. Skipped in fbcode and sandcastle because it
+        # reads a file.
         """Tests loading a package with a python version embedded"""
         importer1 = PackageImporter(
             f"{Path(__file__).parent}/package_e/test_nn_module.pt"
@@ -206,6 +242,8 @@ class TestMisc(PackageTestCase):
         self.assertEqual(importer1.python_version(), "3.9.7")
 
     def test_file_structure_has_file(self):
+        # [FUNCTION DOC] Exports a pickled object and checks Directory has_file: true for a real
+        # file path inside the package and false for a directory path.
         """
         Test Directory's has_file() method.
         """
@@ -225,6 +263,10 @@ class TestMisc(PackageTestCase):
         self.assertFalse(file_structure.has_file("package_a/subpackage"))
 
     def test_exporter_content_lists(self):
+        # [FUNCTION DOC] Checks the exporter lists of extern, mock, intern and deny modules and
+        # the reverse dependency query. In the first export, the extern/mock/intern lists and the
+        # reverse dependencies of the mocked module are asserted. In the second, denying package_b
+        # makes saving the pickle raise PackagingError, which is expected.
         """
         Test content list API for PackageExporter's contained modules.
         """
@@ -253,6 +295,8 @@ class TestMisc(PackageTestCase):
                 self.assertEqual(he.denied_modules(), ["package_b"])
 
     def test_is_from_package(self):
+        # [FUNCTION DOC] Verifies is_from_package is false for the regular module and a regular
+        # object and true for a module imported from, and an object loaded from, a package.
         """is_from_package should work for objects and modules"""
         import package_a.subpackage
 
@@ -275,6 +319,8 @@ class TestMisc(PackageTestCase):
         self.assertTrue(is_from_package(loaded_obj))
 
     def test_inspect_class(self):
+        # [FUNCTION DOC] Verifies that source line retrieval for a class imported from a package
+        # returns the same result as for the original class.
         """Should be able to retrieve source for a packaged class."""
         import package_a.subpackage
 
@@ -297,6 +343,8 @@ class TestMisc(PackageTestCase):
         self.assertEqual(packaged_src, regular_src)
 
     def test_dunder_package_present(self):
+        # [FUNCTION DOC] Verifies a module imported through PackageImporter has the torch_package
+        # attribute.
         """
         The attribute '__torch_package__' should be populated on imported modules.
         """
@@ -315,6 +363,9 @@ class TestMisc(PackageTestCase):
         self.assertTrue(hasattr(mod, "__torch_package__"))
 
     def test_dunder_package_works_from_package(self):
+        # [FUNCTION DOC] Verifies packaged code can see it is packaged: a helper in the
+        # use_dunder_package module returns true when imported from a package and false in the
+        # normal import.
         """
         The attribute '__torch_package__' should be accessible from within
         the module itself, so that packaged code can detect whether it's
@@ -336,6 +387,10 @@ class TestMisc(PackageTestCase):
 
     @skipIfTorchDynamo("Not a suitable test for TorchDynamo")
     def test_std_lib_sys_hackery_checks(self):
+        # [FUNCTION DOC] Regression test for modules that reassign entries in the module table (as
+        # the standard library does). Picks the module variant by python version (3.13 or later
+        # uses a separate file), pickles an instance, loads it from the package and calls it.
+        # Skipped under Dynamo.
         """
         The standard library performs sys.module assignment hackery which
         causes modules who do this hackery to fail on import. See

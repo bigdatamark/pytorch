@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: package/deploy"]
+# [MODULE DOC] Tests for resource access in torch.package: the importlib resource reader API,
+# reading resources from packaged modules via the standard resources API, and the text and
+# binary loaders available to packaged code through the importer module. Uses PackageTestCase
+# from the sibling common module (or a top-level import when run directly).
 
 from io import BytesIO
 from sys import version_info
@@ -17,9 +21,16 @@ except ImportError:
 
 
 class TestResources(PackageTestCase):
+    # [CLASS DOC] Test case deriving from PackageTestCase for packaged resource access. No
+    # state.
     """Tests for access APIs for packaged resources."""
 
     def test_resource_reader(self):
+        # [FUNCTION DOC] Saves text resources into several packages (one, one.three, two) and
+        # checks the importer resource reader: resource_path raises FileNotFoundError,
+        # is_resource is true for files and false for a subpackage, open_resource returns the
+        # stored bytes, contents lists the files plus the subpackage name, and an unknown
+        # package yields no reader (None).
         """Test compliance with the get_resource_reader importlib API."""
         buffer = BytesIO()
         with PackageExporter(buffer) as pe:
@@ -78,6 +89,10 @@ class TestResources(PackageTestCase):
 
     @skipIf(version_info >= (3, 13), "https://github.com/python/cpython/issues/127012")
     def test_package_resource_access(self):
+        # [FUNCTION DOC] Saves a source module that reads a text resource with the standard
+        # resources API along with the resource itself, and checks the imported module returns
+        # the stored text. Skipped on python 3.13 or later because of an upstream CPython
+        # issue.
         """Packaged modules should be able to use the importlib.resources API to access
         resources saved in the package.
         """
@@ -102,6 +117,9 @@ class TestResources(PackageTestCase):
         )
 
     def test_importer_access(self):
+        # [FUNCTION DOC] Saves text and binary resources and a package source that loads both
+        # through the importer module available to packaged code, then imports it and checks
+        # the loaded text and bytes match what was saved.
         buffer = BytesIO()
         with PackageExporter(buffer) as he:
             he.save_text("main", "main", "my string")
@@ -123,6 +141,9 @@ class TestResources(PackageTestCase):
         self.assertEqual(m.b, b"my string")
 
     def test_resource_access_by_path(self):
+        # [FUNCTION DOC] Saves a binary resource and a package source that opens the resource
+        # through the resources path API and reads it as text, then imports the package and
+        # checks the string read equals the stored content.
         """
         Tests that packaged code can used importlib.resources.path.
         """

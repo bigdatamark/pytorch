@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: package/deploy"]
+# [MODULE DOC] Core tests for the torch.package save and load API: saving sources from files
+# and strings, saving modules, pickles including long names and protocol 4, mismatched code
+# detection on re-export, re-saving imported modules, and float8 tensors. Defines at import
+# time a module-level path to the directory containing this test file, used to find fixture
+# modules. Uses PackageTestCase from the sibling common module (or a top-level import).
 
 import pickle
 from io import BytesIO
@@ -24,9 +29,14 @@ packaging_directory = Path(__file__).parent
 
 
 class TestSaveLoad(PackageTestCase):
+    # [CLASS DOC] Test case deriving from PackageTestCase covering exporter save methods and
+    # importer load methods. Holds no state.
     """Core save_* and loading API tests."""
 
     def test_saving_source(self):
+        # [FUNCTION DOC] Saves a source file and a source directory from the test data folder
+        # under chosen module names, imports them back and checks each exposes its expected
+        # result string.
         buffer = BytesIO()
         with PackageExporter(buffer) as he:
             he.save_source_file("foo", str(packaging_directory / "module_a.py"))
@@ -39,6 +49,9 @@ class TestSaveLoad(PackageTestCase):
         self.assertEqual(s.result, "package_a.subpackage")
 
     def test_saving_string(self):
+        # [FUNCTION DOC] Saves a source string that imports the math module, then checks the
+        # importer returns the real standard library math module and that the saved module
+        # refers to the same object.
         buffer = BytesIO()
         with PackageExporter(buffer) as he:
             src = dedent(
@@ -58,6 +71,8 @@ class TestSaveLoad(PackageTestCase):
         self.assertIs(my_mod.math, math)
 
     def test_save_module(self):
+        # [FUNCTION DOC] Saves a module and a package by name into a buffer, imports them and
+        # checks each exposes its result string and is a different object than the original.
         buffer = BytesIO()
         with PackageExporter(buffer) as he:
             import module_a
@@ -75,6 +90,10 @@ class TestSaveLoad(PackageTestCase):
         self.assertIsNot(package_a_i, package_a)
 
     def test_dunder_imports(self):
+        # [FUNCTION DOC] Pickles a class from package_b with all modules interned, loads it,
+        # then imports several modules by name (a package, a standard library module, a nested
+        # standard library module, and three package_b subpackages) and checks their name or
+        # result attributes.
         buffer = BytesIO()
         with PackageExporter(buffer) as he:
             import package_b
@@ -106,6 +125,8 @@ class TestSaveLoad(PackageTestCase):
         self.assertEqual(subsubpackage_0.result, "subsubpackage_0")
 
     def test_bad_dunder_imports(self):
+        # [FUNCTION DOC] Saves a source string whose import call cannot be resolved and passes
+        # if exporting finishes without raising; nothing is asserted.
         """Test to ensure bad __imports__ don't cause PackageExporter to fail."""
         buffer = BytesIO()
         with PackageExporter(buffer) as e:
@@ -115,6 +136,9 @@ class TestSaveLoad(PackageTestCase):
             )
 
     def test_save_module_binary(self):
+        # [FUNCTION DOC] Same checks as the buffer save module test, using a differently named
+        # buffer variable: a module and a package are saved, imported, and compared for result
+        # strings and object identity.
         f = BytesIO()
         with PackageExporter(f) as he:
             import module_a
@@ -132,6 +156,10 @@ class TestSaveLoad(PackageTestCase):
         self.assertIsNot(package_a_i, package_a)
 
     def test_pickle(self):
+        # [FUNCTION DOC] Pickles an object with a nested object, loads it, checks dependencies
+        # were saved (the subpackage imports) and unrelated modules were not (importing
+        # module_a raises ImportError), and that loaded object types differ from the originals
+        # but are instances of the packaged class.
         import package_a.subpackage
 
         obj = package_a.subpackage.PackageASubpackageObject()
@@ -158,6 +186,9 @@ class TestSaveLoad(PackageTestCase):
         )
 
     def test_pickle_long_name_with_protocol_4(self):
+        # [FUNCTION DOC] Builds a container holding a function with a very long qualified
+        # name, pickles it with protocol 4, loads it back and checks the container is a new
+        # object with one function returning the same value.
         import package_a.long_name
 
         container = []
@@ -181,6 +212,11 @@ class TestSaveLoad(PackageTestCase):
         self.assertEqual(container[0](), unpickled_container[0]())
 
     def test_exporting_mismatched_code(self):
+        # [FUNCTION DOC] Loads the same package twice through two importers and then
+        # re-exports with an ordered importer list. Saving the original object succeeds
+        # through the system importer fallback, saving the object loaded by the second
+        # importer raises a pickling error, and saving the object loaded by the first importer
+        # succeeds.
         """
         If an object with the same qualified name is loaded from different
         packages, the user should get an error if they try to re-save the
@@ -205,6 +241,8 @@ class TestSaveLoad(PackageTestCase):
         loaded2 = importer2.load_pickle("obj", "obj.pkl")
 
         def make_exporter():
+            # [FUNCTION DOC] HELPER: Returns a new exporter writing to a fresh buffer whose
+            # importers are the first package importer followed by the system importer.
             pe = PackageExporter(BytesIO(), importer=[importer1, sys_importer])
             # Ensure that the importer finds the 'PackageAObject' defined in 'importer1' first.
             return pe
@@ -226,6 +264,9 @@ class TestSaveLoad(PackageTestCase):
         pe.save_pickle("obj", "obj.pkl", loaded1)
 
     def test_save_imported_module(self):
+        # [FUNCTION DOC] Pickles an object, loads it, then exports the loaded object's module
+        # through a second exporter given the first importer and the system importer. Passes
+        # if it does not raise.
         """Saving a module that came from another PackageImporter should work."""
         import package_a.subpackage
 
@@ -250,6 +291,9 @@ class TestSaveLoad(PackageTestCase):
             exporter.save_module(imported_obj2_module)
 
     def test_save_imported_module_using_package_importer(self):
+        # [FUNCTION DOC] Saves a module that uses the torch package importer helper, loads the
+        # package, and re-saves that module through an exporter with the importer chain.
+        # Passes if no error.
         """Exercise a corner case: re-packaging a module that uses `torch_package_importer`"""
         import package_a.use_torch_package_importer  # noqa: F401
 
@@ -270,6 +314,8 @@ class TestSaveLoad(PackageTestCase):
 
     @skipIf(version_info >= (3, 13), "https://github.com/pytorch/pytorch/issues/142170")
     def test_save_load_fp8(self):
+        # [FUNCTION DOC] Pickles a float8 tensor, loads it, and checks equality with the
+        # original. Skipped on python 3.13 or later (upstream issue).
         tensor = torch.rand(20, 20).to(torch.float8_e4m3fn)
 
         buffer = BytesIO()

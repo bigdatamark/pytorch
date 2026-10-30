@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: package/deploy"]
+# [MODULE DOC] End-to-end tests for packaging whole torchvision models with torch.package.
+# Tries to import resnet18 from torchvision at import time and records availability in a flag;
+# defines a skip decorator used when torchvision is missing. The test class is additionally
+# skipped unconditionally because it does not work with recent torchvision. Uses the
+# PackageTestCase helper from the sibling common module (or a top-level import when run
+# directly).
 
 from io import BytesIO
 from textwrap import dedent
@@ -30,6 +36,10 @@ except ImportError:
 )
 @skipIfNoTorchVision
 class ModelTest(PackageTestCase):
+    # [CLASS DOC] Test case that packages a resnet18 model in several ways and checks the
+    # reloaded models produce the same outputs. The whole class is skipped unconditionally
+    # (known upstream incompatibility with recent torchvision) and also when torchvision is
+    # not installed.
     """End-to-end tests packaging an entire model."""
 
     @skipIf(
@@ -37,6 +47,11 @@ class ModelTest(PackageTestCase):
         "Tests that use temporary files are disabled in fbcode",
     )
     def test_resnet(self):
+        # [FUNCTION DOC] Pickles a resnet18 into a temporary-file package with all modules
+        # interned, loads it back, and compares outputs on a random input. Then re-exports the
+        # loaded model into an in-memory buffer using the first package importer plus the
+        # system importer so that class names resolve, reloads that, and compares outputs
+        # again. Skipped in fbcode and sandcastle because it uses temporary files.
         resnet = resnet18()
 
         f1 = self.temp()
@@ -92,6 +107,10 @@ class ModelTest(PackageTestCase):
 
     @skipIfNoTorchVision
     def test_model_save(self):
+        # [FUNCTION DOC] Builds two packages of the same resnet18: one pickling the whole
+        # model and one pickling only its state dict, each with a small generated source
+        # module named model that exposes a load function. Imports each package, calls its
+        # load function, runs a random input and asserts both packages produce equal outputs.
         # This example shows how you might package a model
         # so that the creator of the model has flexibility about
         # how they want to save it but the 'server' can always
@@ -169,6 +188,9 @@ class ModelTest(PackageTestCase):
 
     @skipIfNoTorchVision
     def test_script_resnet(self):
+        # [FUNCTION DOC] Packages a resnet18, loads it from the package, scripts it with
+        # TorchScript, saves and loads the scripted module via a buffer, and asserts the
+        # loaded module output equals the original model output on a random input.
         resnet = resnet18()
 
         f1 = BytesIO()

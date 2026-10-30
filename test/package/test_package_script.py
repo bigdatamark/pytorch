@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: package/deploy"]
+# [MODULE DOC] Tests for torch.package compatibility with TorchScript: packaging scripted
+# interfaces, script classes and script modules, sharing of script modules and tensors across
+# pickles and repackaging, and mixing inline and packaged modules. At import time tries to
+# import resnet18 from torchvision and defines a skip decorator used when it is unavailable.
+# Uses PackageTestCase from the sibling common module (or a top-level import when run
+# directly).
 
 from io import BytesIO
 from textwrap import dedent
@@ -30,9 +36,16 @@ skipIfNoTorchVision = skipIf(not HAS_TORCHVISION, "no torchvision")
 
 
 class TestPackageScript(PackageTestCase):
+    # [CLASS DOC] Test case deriving from PackageTestCase that exercises scripted modules,
+    # interfaces and script classes through PackageExporter and PackageImporter. Holds no
+    # state.
     """Tests for compatibility with TorchScript."""
 
     def test_package_interface(self):
+        # [FUNCTION DOC] Scripts a module that uses a TorchScript interface, attaches a
+        # scripted alternative implementation as its proxy submodule, packages the unscripted
+        # module, loads and scripts it, attaches the same alternative implementation, and
+        # checks both give equal output for a scalar tensor input.
         """Packaging an interface class should work correctly."""
 
         import package_a.fake_interface as fake
@@ -58,6 +71,10 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(scripted(input), scripted_loaded(input))
 
     def test_different_package_interface(self):
+        # [FUNCTION DOC] Writes a package whose source string defines an interface with the
+        # same module name as the fake_interface module in the loading environment but
+        # different content, imports it from the package, and checks the differing version can
+        # be scripted without a name clash.
         """Test a case where the interface defined in the package is
         different than the one defined in the loading environment, to make
         sure TorchScript can distinguish between the two.
@@ -105,6 +122,9 @@ class TestPackageScript(PackageTestCase):
         torch.jit.script(diff_fake.UsesInterface())
 
     def test_package_script_class(self):
+        # [FUNCTION DOC] Packages the fake_script_class module as a module, imports it back,
+        # and checks a function using a script class gives allclose results in the original
+        # and packaged versions.
         import package_a.fake_script_class as fake
 
         buffer = BytesIO()
@@ -123,6 +143,10 @@ class TestPackageScript(PackageTestCase):
         )
 
     def test_package_script_class_referencing_self(self):
+        # [FUNCTION DOC] Scripts an object first to fill the compilation cache, packages and
+        # loads it, scripts the loaded object (checking there is no false sharing with the
+        # outer cached types), and checks the scripted result can be saved to a buffer and
+        # loaded again without error.
         import package_a.fake_script_class as fake
 
         obj = fake.UsesIdListFeature()
@@ -146,6 +170,10 @@ class TestPackageScript(PackageTestCase):
         torch.jit.load(BytesIO(buffer2))
 
     def test_different_package_script_class(self):
+        # [FUNCTION DOC] Packages a source string that defines a script class with attribute
+        # bar where the original class uses foo. Imports the packaged module, builds instances
+        # of both classes from the same tensor and checks the packaged bar attribute equals
+        # the original foo attribute.
         """Test a case where the script class defined in the package is
         different than the one defined in the loading environment, to make
         sure TorchScript can distinguish between the two.
@@ -179,6 +207,9 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(loaded_script_class.bar, orig_script_class.foo)
 
     def test_save_scriptmodule(self):
+        # [FUNCTION DOC] Scripts a module holding a tensor, saves it with save_pickle into a
+        # buffer, loads it with a cpu map location, and checks outputs match on a random
+        # input.
         """
         Test basic saving of ScriptModule.
         """
@@ -201,6 +232,8 @@ class TestPackageScript(PackageTestCase):
         "Tests that use temporary files are disabled in fbcode",
     )
     def test_save_scriptmodule_file(self):
+        # [FUNCTION DOC] Same as the buffer-based script module save test but uses a temporary
+        # file path for both export and import. Skipped in fbcode and sandcastle.
         """
         Test basic saving of ScriptModule in file.
         """
@@ -218,6 +251,8 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(loaded_mod(input), scripted_mod(input))
 
     def test_save_scriptmodule_with_submods(self):
+        # [FUNCTION DOC] Scripts a module that wraps another module with a tensor, saves it to
+        # a buffer, reloads it with a cpu map location and checks outputs match.
         """
         Test basic saving of ScriptModule with submodule.
         """
@@ -238,6 +273,11 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(loaded_mod(input), scripted_mod(input))
 
     def test_save_scriptmodules_submod_redefinition(self):
+        # [FUNCTION DOC] Defines a submodule class and a top module that calls it, scripts the
+        # top module, then redefines the submodule class with different behavior and scripts
+        # the top module again. Saves both scripted modules in one package, reloads them and
+        # checks each reproduces its own scripted output and that the two loaded outputs
+        # differ, proving both concrete types were kept.
         """
         Test to verify saving multiple ScriptModules with same top module
         but different submodules works. Submodule is redefined to between
@@ -246,16 +286,24 @@ class TestPackageScript(PackageTestCase):
         """
 
         class Submod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Submodule whose forward appends a fixed suffix to a string
+            # input.
             def forward(self, input: str):
+                # [FUNCTION DOC] HELPER: Returns the input string with the suffix appended.
                 input = input + "_submod"
                 return input
 
         class TopMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Top module holding a single Submod instance as modB.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only builds the base module and registers a Submod as
+                # modB.
                 super().__init__()
                 self.modB = Submod()
 
             def forward(self, input: str):
+                # [FUNCTION DOC] HELPER: Returns the result of calling the submodule on the
+                # input string.
                 return self.modB(input)
 
         scripted_mod_0 = torch.jit.script(TopMod())
@@ -263,7 +311,12 @@ class TestPackageScript(PackageTestCase):
         # redefinition is intentional, change single inner string
         # string attribute, should trigger new module type
         class Submod(torch.nn.Module):  # noqa: F811
+            # [CLASS DOC] HELPER: Redefinition of Submod (same name) whose forward appends a
+            # different suffix, so the top module scripted afterwards has a distinct concrete
+            # type.
             def forward(self, input: str):
+                # [FUNCTION DOC] HELPER: Returns the input string with the changed suffix
+                # appended.
                 input = input + "_submod(changed)"
                 return input
 
@@ -283,6 +336,9 @@ class TestPackageScript(PackageTestCase):
         self.assertNotEqual(loaded_mod_0("input"), loaded_mod_1("input"))
 
     def test_save_independent_scriptmodules(self):
+        # [FUNCTION DOC] Scripts two unrelated modules, saves both into one package, reloads
+        # both and checks each loaded module output matches its scripted original on a random
+        # input.
         """
         Test to verify saving multiple ScriptModules with completely
         separate code works.
@@ -306,6 +362,9 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(loaded_mod_1(input), scripted_mod_1(input))
 
     def test_save_repeat_scriptmodules(self):
+        # [FUNCTION DOC] Scripts three module kinds and saves five pickles, two of which
+        # repeat an already saved scripted module. Loads one of each kind and checks outputs
+        # match, verifying repeated saves do not break later loads.
         """
         Test to verify saving multiple different modules and
         repeats of same scriptmodule in package works. Also tests that
@@ -345,6 +404,10 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(loaded_mod_2(input), scripted_mod_2(input))
 
     def test_scriptmodules_repeat_save(self):
+        # [FUNCTION DOC] Saves a scripted module in a first package, loads it, then saves the
+        # loaded module together with another scripted module in a second package. Checks that
+        # the first loaded, second loaded and re-loaded modules all reproduce the original
+        # outputs.
         """
         Test to verify saving and loading same ScriptModule object works
         across multiple packages.
@@ -383,6 +446,10 @@ class TestPackageScript(PackageTestCase):
 
     @skipIfNoTorchVision
     def test_save_scriptmodule_only_necessary_code(self):
+        # [FUNCTION DOC] Scripts a module holding a torchvision model and a plain tensor
+        # module and saves each in a separate package. Checks the file listing of the first
+        # package mentions torchvision and that of the second does not. Skipped without
+        # torchvision.
         """
         Test to verify when saving multiple packages with same CU
         that packages don't include unnecessary torchscript code files.
@@ -392,11 +459,16 @@ class TestPackageScript(PackageTestCase):
         from package_a.test_module import ModWithTensor
 
         class ModWithTorchVision(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a torchvision resnet child whose forward
+            # multiplies the input by four.
             def __init__(self, name: str):
+                # [FUNCTION DOC] HELPER: Builds the base module and stores a resnet18 as
+                # tvmod; the name argument is not used.
                 super().__init__()
                 self.tvmod = resnet18()
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by four.
                 return input * 4
 
         scripted_mod_0 = torch.jit.script(ModWithTorchVision("foo"))
@@ -420,6 +492,9 @@ class TestPackageScript(PackageTestCase):
         self.assertFalse("torchvision" in str(importer_1.file_structure()))
 
     def test_save_scriptmodules_in_container(self):
+        # [FUNCTION DOC] Saves a list containing a scripted module and a scripted module that
+        # wraps the first, loads the list and checks the outputs of both elements match their
+        # originals.
         """
         Test saving of ScriptModules inside of container. Checks that relations
         between shared modules are upheld.
@@ -444,6 +519,9 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(loaded_mod_list[1](input), scripted_mod_b(input))
 
     def test_save_eager_mods_sharing_scriptmodule(self):
+        # [FUNCTION DOC] Builds two eager modules sharing one scripted submodule, saves both
+        # pickles, and checks the package contains the scripted code file for index zero but
+        # not index one, so the shared script module was written once.
         """
         Test saving of single ScriptModule shared by multiple
         eager modules (ScriptModule should be saved just once
@@ -469,6 +547,9 @@ class TestPackageScript(PackageTestCase):
         self.assertFalse(file_structure.has_file(".data/ts_code/1"))
 
     def test_load_shared_scriptmodules(self):
+        # [FUNCTION DOC] Builds a parent module with two eager children sharing one scripted
+        # module, saves and loads it, and checks the two children refer to the same loaded
+        # script module object.
         """
         Test loading of single ScriptModule shared by multiple eager
         modules in single pickle (ScriptModule objects should be the same).
@@ -501,6 +582,9 @@ class TestPackageScript(PackageTestCase):
 
     @skipIfTorchDynamo("unexplained 3.13 failure: Can't pickle Tensor object")
     def test_save_shared_tensors(self):
+        # [FUNCTION DOC] Shares a tensor between a scripted module and two eager modules,
+        # saves the tensor and both modules, then checks the package holds exactly one storage
+        # file and the loaded module output equals the original. Skipped under Dynamo.
         """
         Test tensors shared across eager and ScriptModules are serialized once.
         """
@@ -531,6 +615,10 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(loaded_mod_1(input), mod1(input))
 
     def test_load_shared_tensors(self):
+        # [FUNCTION DOC] Builds a module sharing one tensor with two scripted children, first
+        # checking the storage identity before saving. After a save and load, checks the
+        # loaded tensor and both children tensors still share storage, and that an in-place
+        # add on the parent tensor is visible in both children.
         """
         Test tensors shared across eager and ScriptModules on load
         are the same.
@@ -581,6 +669,10 @@ class TestPackageScript(PackageTestCase):
         )
 
     def test_load_shared_tensors_repackaged(self):
+        # [FUNCTION DOC] Same as the loaded shared tensor test but saves the loaded module
+        # into a second package using the first importer, then checks shared storage and that
+        # an in-place update on the parent tensor shows up in both child tensors after the
+        # second load.
         """
         Test tensors shared across eager and ScriptModules on load
         are the same across multiple package saves and loads. This is
@@ -637,6 +729,9 @@ class TestPackageScript(PackageTestCase):
         )
 
     def test_saving_and_scripting_packaged_mod(self):
+        # [FUNCTION DOC] Packages an eager module, loads it, checks equal output, scripts the
+        # loaded module, saves the scripted module in a second package using the first
+        # importer, loads it and checks the output still matches the original eager module.
         """
         Test scripting a module loaded from a package
         and saving it in a new package as a script object.
@@ -671,18 +766,27 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(loaded_mod_scripted(input), orig_mod(input))
 
     def test_mixing_packaged_and_inline_modules(self):
+        # [FUNCTION DOC] Scripts a module defined inline in the test and a module from
+        # package_a, saves both into one package, loads both and checks each gives the same
+        # output as its original.
         """
         Test saving inline and imported modules in same package with
         independent code.
         """
 
         class InlineMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module storing a name string and a random tensor; forward
+            # appends the name to a string input and returns it with the tensor times four.
             def __init__(self, name: str):
+                # [FUNCTION DOC] HELPER: Stores the name and a random tensor attribute after
+                # the base setup.
                 super().__init__()
                 self.name = name
                 self.tensor = torch.rand(1, 2, 3)
 
             def forward(self, input: str):
+                # [FUNCTION DOC] HELPER: Returns the input string with a fixed marker and the
+                # name appended, paired with the stored tensor times four.
                 input = input + "_modInline:" + self.name
                 return input, (self.tensor * 4)
 
@@ -710,21 +814,32 @@ class TestPackageScript(PackageTestCase):
 
     @skipIfNoTorchVision
     def test_mixing_packaged_and_inline_modules_shared_code(self):
+        # [FUNCTION DOC] Like the mixed inline and packaged test, but both modules share code:
+        # a locally defined module with a torchvision child and a helper function, and a
+        # module from package_c. Scripts both, saves them in one package, loads them and
+        # checks outputs match. Skipped without torchvision.
         """
         Test saving inline and imported modules in same package that
         share code.
         """
 
         class TorchVisionTestInline(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a torchvision resnet child whose forward calls a
+            # helper function on the input twice and applies relu to the result plus 3.0.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the base module and stores a resnet18 as
+                # tvmod.
                 super().__init__()
                 self.tvmod = resnet18()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Passes the input as both arguments of the helper
+                # function, then returns relu of that plus 3.0.
                 x = a_non_torch_leaf(x, x)
                 return torch.relu(x + 3.0)
 
         def a_non_torch_leaf(a, b):
+            # [FUNCTION DOC] HELPER: Returns the sum of its two arguments.
             return a + b
 
         inline_mod = TorchVisionTestInline()
@@ -750,16 +865,24 @@ class TestPackageScript(PackageTestCase):
         self.assertEqual(loaded_inline(input), inline_mod(input))
 
     def test_tensor_sharing_pickle(self):
+        # [FUNCTION DOC] Saves a scripted module holding a tensor and, separately, a plain
+        # tensor in the same package, then loads both and checks the loaded values equal the
+        # originals.
         """Test that saving a ScriptModule and a separately saving a tensor
         object causes no issues.
         """
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a tensor attribute of ones whose forward
+            # returns it.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the base module and stores a 2 by 3 tensor of
+                # ones as foo.
                 super().__init__()
                 self.foo = torch.ones(2, 3)
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns the stored tensor foo.
                 return self.foo
 
         scripted_m = torch.jit.script(M())
