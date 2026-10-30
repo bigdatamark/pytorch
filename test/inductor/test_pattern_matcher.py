@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the Inductor pattern matcher and the FX graph passes built on it (post-
+# grad addmm/mm fusion and unfusion, mixed-dtype mm, cat/split rewrites, scaled softmax,
+# mutation-region tracking, register_replacement and register_graph_pattern behavior, pattern
+# pretty printing). Defines the opaque test class OpaqueScaleFactor (registered as a hoisted
+# constant custom class at import time) and the TestPatternMatcher suite, plus further suites
+# later in the file. Most tests compile small functions with torch.compile and check counters or
+# generated code. Running the file as a script calls run_tests.
 import copy
 import os
 import types
@@ -59,16 +66,27 @@ aten = torch.ops.aten
 
 
 class OpaqueScaleFactor(CustomClassBase):
+    # [CLASS DOC] HELPER: Test-only opaque value class holding one scalar, used as a constant
+    # opaque object in compiled graphs. Equality and hash are by the wrapped value; the FX repr
+    # hook returns a constructor string plus the namespace needed to rebuild it. Registered
+    # right after the definition as a constant, hoisted custom class.
     def __init__(self, val):
+        # [FUNCTION DOC] HELPER: Stores the wrapped value in the val attribute.
         self.val = val
 
     def __eq__(self, other):
+        # [FUNCTION DOC] HELPER: Equal only to another OpaqueScaleFactor holding an equal val;
+        # returns False for any other type.
         return isinstance(other, OpaqueScaleFactor) and self.val == other.val
 
     def __hash__(self):
+        # [FUNCTION DOC] HELPER: Hashes by the wrapped val so equal instances hash alike.
         return hash(self.val)
 
     def __fx_repr__(self):
+        # [FUNCTION DOC] HELPER: Returns a pair: a repr string that reconstructs the instance
+        # from val, and a mapping from the class name to the class so generated FX code can
+        # resolve it.
         return (
             f"OpaqueScaleFactor({self.val!r})",
             {"OpaqueScaleFactor": OpaqueScaleFactor},
@@ -80,6 +98,11 @@ register_custom_class(OpaqueScaleFactor, typ="constant", hoist=True)
 
 @instantiate_parametrized_tests
 class TestPatternMatcher(TestCase):
+    # [CLASS DOC] Main pattern matcher test suite, run on the GPU device type (GPU_TYPE). Tests
+    # compile functions and check pattern_matcher counters, generated code (via FileCheck) and
+    # numerics against eager. Decorated with instantiate_parametrized_tests so parametrize
+    # decorators expand into per-case tests. Holds shared helpers common,
+    # _test_fused_int_mm_mul_impl and _test_mixed_impl.
     device_type = GPU_TYPE
 
     def common(
@@ -91,6 +114,13 @@ class TestPatternMatcher(TestCase):
         additional_check=lambda code: None,
         reference_in_float=False,
     ):
+        # [FUNCTION DOC] HELPER: Shared checker. Clears counters, seeds the RNG, optionally
+        # upcasts tensor args to float32 for the eager reference, compiles fn with torch.compile
+        # and runs it capturing generated code, then asserts closeness to the reference (dtype
+        # checked only when no float reference is used). Asserts the pattern_matcher_count and
+        # pattern_matcher_nodes inductor counters equal expected_matches and expected_nodes,
+        # then calls additional_check with the code (a single code string if only one was
+        # produced) and clears counters again.
         counters.clear()
         torch.manual_seed(42)
         if reference_in_float:
@@ -115,7 +145,12 @@ class TestPatternMatcher(TestCase):
 
     @inductor_config.patch(max_autotune_gemm=True)
     def test_mm_plus_mm(self):
+        # [FUNCTION DOC] Checks mm+mm fusion with max autotune gemm enabled. For shapes where
+        # the output dims of both mms agree, the mm_plus_mm pattern fuses (expected 1 match, 3
+        # nodes). For the unfusable shapes (issue 100670) only the add-of-mm pattern matches (1
+        # match, 2 nodes).
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Adds the results of two matrix multiplications.
             return torch.add(torch.mm(a, b), torch.mm(c, d))
 
         # when m1 == n1 and m2 == n2, mm_plus_mm can be matched to fused op
@@ -156,6 +191,11 @@ class TestPatternMatcher(TestCase):
             self.common(fn, args, 1, 2)
 
     def _test_fused_int_mm_mul_impl(self, fn, args, fused_int_mm_mul_expected=True):
+        # [FUNCTION DOC] HELPER: Compiles fn in max-autotune mode with fresh dynamo
+        # state and cleared counters, and checks whether the generated code contains the
+        # fused int mm template kernel according to fused_int_mm_mul_expected. When a
+        # fusion is expected, compares the non-inf entries of the compiled result
+        # against eager and checks dtype too.
         torch._dynamo.reset()
         counters.clear()
         ref = fn(*args)
@@ -177,10 +217,17 @@ class TestPatternMatcher(TestCase):
     )
     @unittest.skipIf(not IS_BIG_GPU, "templates require big gpu")
     def test_fused_int_mm_mul(self):
+        # [FUNCTION DOC] Checks that an int8 matmul (through out_dtype to int32) multiplied by a
+        # scale tensor is fused into a Triton template, for float16, bfloat16 and float32 scale
+        # inputs, with and without a trailing cast to bfloat16. Requires SM80, a big GPU and
+        # Triton gemm backend settings.
         def fn1(a, b, c):
+            # [FUNCTION DOC] HELPER: Int8 mm accumulated to int32 then multiplied by c.
             return out_dtype(torch.ops.aten.mm.default, torch.int32, a, b) * c
 
         def fn2(a, b, c):
+            # [FUNCTION DOC] HELPER: Same as the first variant but the product is
+            # converted to bfloat16.
             return (out_dtype(torch.ops.aten.mm.default, torch.int32, a, b) * c).to(
                 torch.bfloat16
             )
@@ -208,6 +255,10 @@ class TestPatternMatcher(TestCase):
             self._test_fused_int_mm_mul_impl(fn2, args, True)
 
     def test_duplicate_search(self):
+        # [FUNCTION DOC] Registers two independent replacements (add one to subtract one, add
+        # two to subtract two) in one pass and applies the pass through a custom post grad pass
+        # in a custom backend. A compiled function containing both patterns must be rewritten
+        # and match the manually rewritten function, and the pass must report two replacements.
         from collections.abc import Callable, Iterable
 
         import torch
@@ -218,15 +269,19 @@ class TestPatternMatcher(TestCase):
         )
 
         def pattern1(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Pattern: x plus one.
             return x + 1
 
         def replacement1(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Replacement: x minus one.
             return x - 1
 
         def pattern2(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Pattern: x plus two.
             return x + 2
 
         def replacement2(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Replacement: x minus two.
             return x - 2
 
         patterns = PatternMatcherPass()
@@ -237,12 +292,16 @@ class TestPatternMatcher(TestCase):
         count = 0
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that stores the number of replacements
+            # applied by the patterns into the enclosing count variable.
             nonlocal count
             count = patterns.apply(graph)
 
         def custom_backend(
             graph: torch.fx.GraphModule, example_inputs: Iterable[torch.Tensor]
         ) -> Callable:
+            # [FUNCTION DOC] HELPER: Backend that copies the inductor config, installs the
+            # custom post grad pass and compiles with compile_fx; returns the compiled callable.
             from torch._inductor import config
 
             current_config = config.shallow_copy_dict()
@@ -253,11 +312,14 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile(backend=custom_backend)
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Compiled function: relu of x plus one, plus two.
             y = x + 1
             y2 = y.relu() + 2
             return y2
 
         def f_replaced(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Reference for the expected rewritten computation: relu of x
+            # minus one, minus two.
             y = x - 1
             y2 = y.relu() - 2
             return y2
@@ -278,12 +340,18 @@ class TestPatternMatcher(TestCase):
     @inductor_config.patch(force_fuse_int_mm_with_mul=True)
     @inductor_config.patch("test_configs.runtime_triton_dtype_assert", True)
     def test_fused_int_mm_mul_epilogue(self):
+        # [FUNCTION DOC] Like test_fused_int_mm_mul but with a multiply-by-half and relu
+        # epilogue after the scaled int mm, with force_fuse_int_mm_with_mul and runtime triton
+        # dtype asserts enabled. Expects the fused template in all cases.
         def fn1(a, b, c):
+            # [FUNCTION DOC] HELPER: Int8 mm to int32, times c, times 0.5, then relu.
             return (
                 (out_dtype(torch.ops.aten.mm.default, torch.int32, a, b) * c) * 0.5
             ).relu()
 
         def fn2(a, b, c):
+            # [FUNCTION DOC] HELPER: Same as the first variant but with a cast to bfloat16
+            # between the scale multiply and the 0.5 multiply.
             return (
                 (out_dtype(torch.ops.aten.mm.default, torch.int32, a, b) * c).to(
                     torch.bfloat16
@@ -323,7 +391,10 @@ class TestPatternMatcher(TestCase):
     )
     @unittest.skipIf(not IS_BIG_GPU, "templates require big gpu")
     def test_fused_int_mm_mul_gating(self):
+        # [FUNCTION DOC] Gating test: a scale tensor of shape eight (a one dimensional bias-like
+        # scale) still allows the fused int mm mul template to be generated.
         def fn1(a, b, c):
+            # [FUNCTION DOC] HELPER: Int8 mm accumulated to int32 then multiplied by c.
             return out_dtype(torch.ops.aten.mm.default, torch.int32, a, b) * c
 
         args1 = (
@@ -342,6 +413,12 @@ class TestPatternMatcher(TestCase):
         rtol=None,
         atol=None,
     ):
+        # [FUNCTION DOC] HELPER: Compiles fn with fresh dynamo state, compares against eager
+        # with optional rtol and atol, then inspects the generated code. If mixed_mm_expected,
+        # the kernel must show the k index loop with a dtype cast before the dot; otherwise (and
+        # when no extern mm is used) no cast may appear before the dot. If
+        # fallback_mixed_mm_expected, the code must call a run entry point of either a triton
+        # template or the extern mm kernel.
         torch._dynamo.reset()
         counters.clear()
         ref = fn(*args)
@@ -371,7 +448,11 @@ class TestPatternMatcher(TestCase):
     )
     @unittest.skipIf(not IS_BIG_GPU, "templates require big gpu")
     def test_mixed_mm(self):
+        # [FUNCTION DOC] Checks that a matmul whose right operand is cast to the left operand's
+        # dtype is turned into a mixed-dtype mm template, for several dtype combinations (int8,
+        # uint8, bfloat16 with float32), under max autotune gemm.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: mm of a with b cast to a's dtype.
             return torch.mm(a, b.to(a.dtype))
 
         args_list = [
@@ -409,7 +490,11 @@ class TestPatternMatcher(TestCase):
     @parametrize("dtype_left", (torch.float16, torch.float32, torch.bfloat16))
     @parametrize("dtype_right", (torch.int8, torch.uint8))
     def test_mixed_mm_exhaustive(self, dtype_left, dtype_right):
+        # [FUNCTION DOC] Parametrized over left dtype (float16, float32, bfloat16) and right
+        # dtype (int8, uint8): builds 256x256 operands in the integer range of the right dtype
+        # and checks the mixed mm template is used, with loose tolerance (rtol 0.16).
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: mm of a with b cast to a's dtype.
             return torch.mm(a, b.to(a.dtype))
 
         dtype_ranges = {torch.uint8: (0, 255), torch.int8: (-128, 127)}
@@ -431,7 +516,11 @@ class TestPatternMatcher(TestCase):
     )
     @unittest.skipIf(not IS_BIG_GPU, "templates require big gpu")
     def test_mixed_mm_bad_cases(self):
+        # [FUNCTION DOC] Mixed mm with transposed and strided (every other column)
+        # integer right operands in float16 and bfloat16 left operands; still expects
+        # the mixed mm template path.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: mm of a with b cast to a's dtype.
             return torch.mm(a, b.to(a.dtype))
 
         args_list = [
@@ -463,7 +552,11 @@ class TestPatternMatcher(TestCase):
     )
     @unittest.skipIf(not IS_BIG_GPU, "templates require big gpu")
     def test_mixed_mm_epi_works(self):
+        # [FUNCTION DOC] Mixed mm followed by a multiply and add of vectors (epilogue); checks
+        # the template path is still used for int8 and uint8 right operands across dtypes.
         def fn(a, b, c, d):
+            # [FUNCTION DOC] HELPER: mm of a with b cast to a's dtype, scaled by c and
+            # offset by d.
             return torch.mm(a, b.to(a.dtype)) * c + d
 
         args_list = [
@@ -493,7 +586,11 @@ class TestPatternMatcher(TestCase):
     @skipCUDAIf(not SM80OrLater, "need sm_80")
     @unittest.skipIf(not IS_BIG_GPU, "templates require big gpu")
     def test_mixed_mm_gating(self):
+        # [FUNCTION DOC] Without max autotune the mixed mm template is not generated (a fallback
+        # path is expected); with max autotune and Triton backend settings patched in, the mixed
+        # mm template is expected.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: mm of a with b cast to a's dtype.
             return torch.mm(a, b.to(a.dtype))
 
         args = (
@@ -514,7 +611,10 @@ class TestPatternMatcher(TestCase):
             self._test_mixed_impl(fn, args, True, False)
 
     def test_mixed_mm_cpu(self):
+        # [FUNCTION DOC] CPU variant: mixed mm on CPU tensors must give correct results and
+        # generate neither the mixed mm template nor the fallback expectation.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: mm of a with b cast to a's dtype.
             return torch.mm(a, b.to(a.dtype))
 
         args = (
@@ -531,9 +631,15 @@ class TestPatternMatcher(TestCase):
         ],
     )
     def test_unsuccessful_partial_reuse(self, case):
+        # [FUNCTION DOC] Parametrized by a static shape (4, 8) or dynamic shape: computes a
+        # partial amax along dim zero (keepdim) and a full amax; since the full reduction cannot
+        # reuse the partial one in these cases, partial_reduction_reuse stays at zero and the
+        # output matches eager.
         shape, device = case
 
         def test_fn(x):
+            # [FUNCTION DOC] HELPER: Returns a partial amax over dim zero with keepdim and a
+            # full amax of x.
             partial = torch.amax(x, [0], True)
             full = torch.amax(x)
             return partial, full
@@ -558,9 +664,15 @@ class TestPatternMatcher(TestCase):
         ],
     )
     def test_successful_partial_reuse(self, case):
+        # [FUNCTION DOC] Parametrized over shape and a pair of (partial reduction, full
+        # reduction) functions such as amax/amax, amin/min, amax/max: the full reduction is
+        # rewritten to reuse the partial one, so partial_reduction_reuse is one and results
+        # match eager.
         shape, (partial_fn, full_fn) = case
 
         def test_fn(x):
+            # [FUNCTION DOC] HELPER: Applies the partial reduction function over dim zero with
+            # keepdim and the full reduction function to x, returning both.
             partial = partial_fn(x, [0], True)
             full = full_fn(x)
             return partial, full
@@ -573,7 +685,13 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(counters["inductor"]["partial_reduction_reuse"], 1)
 
     def test_addmm(self):
+        # [FUNCTION DOC] Checks addmm fusion of add(a, mm(b, c)) and the reversed order on
+        # several operand shapes: broadcastable bias shapes fuse (2 matches, 4 nodes) while a
+        # mismatching batch shape or a python scalar bias do not (0, 0). Resets dynamo and
+        # counters per case and compares with eager.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Returns add of a with mm(b, c) and mm(b, c) plus a,
+            # as a pair.
             return torch.add(a, torch.mm(b, c)), torch.mm(b, c) + a
 
         args_list = [
@@ -621,7 +739,11 @@ class TestPatternMatcher(TestCase):
             self.assertEqual(counters["inductor"]["pattern_matcher_nodes"], nodes)
 
     def test_addmm_symbolic_scalar(self):
+        # [FUNCTION DOC] With dynamic shapes, an mm plus a symbolic size scalar bias must not be
+        # fused: output matches eager and pattern_matcher_count stays zero.
         def fn(m1, m2):
+            # [FUNCTION DOC] HELPER: Adds the symbolic first dimension size of m1 to the product
+            # of m1 and m2, in both operand orders.
             bias = m1.size(0)
             return torch.add(bias, torch.mm(m1, m2)), torch.mm(m1, m2) + bias
 
@@ -635,14 +757,21 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(counters["inductor"]["pattern_matcher_count"], 0)
 
     def test_addmm_broadcasting_bias(self):
+        # [FUNCTION DOC] A linear layer with a bias of shape (1, 4) and a 3-D input must still
+        # compile and match eager results (broadcasting bias must not break addmm handling).
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying the functional linear with fixed random weight
+            # and a (1, 4) bias on the GPU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores the functional linear, a random 4x4 weight and a
+                # random (1, 4) bias on the GPU device.
                 super().__init__()
                 self.linear = torch.nn.functional.linear
                 self.linear_weight = torch.randn(4, 4).to(GPU_TYPE)
                 self.bias = torch.randn(1, 4).to(GPU_TYPE)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear to x with the stored weight and bias.
                 x = self.linear(x, self.linear_weight, self.bias)
                 return x
 
@@ -662,7 +791,12 @@ class TestPatternMatcher(TestCase):
         }
     )
     def test_bmm_to_mm(self):
+        # [FUNCTION DOC] With the ATEN gemm backend, a batch-1 bmm is converted to mm (checked
+        # on GPU through the generated code containing the extern mm and no extern bmm), while a
+        # batch-3 bmm stays an extern bmm. Results are compared against eager in both cases. On
+        # non-GPU builds the first check is only constructed, not run.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Batched matmul of a and b.
             return torch.bmm(a, b)
 
         a = torch.randn(1, 16, 8, device=GPU_TYPE)
@@ -695,7 +829,11 @@ class TestPatternMatcher(TestCase):
         FileCheck().check("extern_kernels.bmm(").run(code_multi)
 
     def test_cat_mm(self):
+        # [FUNCTION DOC] Concatenation of three mm results along dim one is compiled; asserts
+        # the output equals eager and that the generated call function contains no triton run
+        # (all work is done by one extern call).
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Concatenates mm of a,b; b,c; a,c along dim one.
             return torch.cat(
                 [
                     torch.mm(a, b),
@@ -715,7 +853,12 @@ class TestPatternMatcher(TestCase):
         FileCheck().check("call").check_not(".run").run(code[0])
 
     def test_cat_addmm(self):
+        # [FUNCTION DOC] Same as test_cat_mm but with addmm operands rotated across
+        # three inputs; checks equality with eager and that no kernel run appears in the
+        # call function.
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Concatenates three addmm results with rotated operands
+            # along dim one.
             return torch.cat(
                 [
                     torch.addmm(a, b, c),
@@ -735,7 +878,14 @@ class TestPatternMatcher(TestCase):
         FileCheck().check("call").check_not(".run").run(code[0])
 
     def test_cat_slice_cat_cuda(self):
+        # [FUNCTION DOC] Cat followed by slice-slice and a second cat is optimized (1 match, 3
+        # nodes) for a slice end of 19; for another shape compiled directly the counters are
+        # checked only when dynamic shapes are not assumed by default; with a negative slice end
+        # the optimized path is not used but a match of 1 and 3 nodes is still expected by the
+        # helper. Aliased as the xpu test below for the cpp wrapper test.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Cat of a and b along dim one, slices of it with end 19,
+            # then cat of the full cat and the slice.
             cat_1 = torch.ops.aten.cat.default([a, b], 1)
             slice_1 = torch.ops.aten.slice.Tensor(cat_1, 0, 0, 9223372036854775807)
             slice_2 = torch.ops.aten.slice.Tensor(slice_1, 1, 0, 19)
@@ -763,6 +913,8 @@ class TestPatternMatcher(TestCase):
 
         # Verify we fallback to non-optimal path for negative `end`.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Same structure as the first variant but the inner slice end
+            # is negative one.
             cat_1 = torch.ops.aten.cat.default([a, b], 1)
             slice_1 = torch.ops.aten.slice.Tensor(cat_1, 0, 0, 9223372036854775807)
             slice_2 = torch.ops.aten.slice.Tensor(slice_1, 1, 0, -1)
@@ -778,7 +930,13 @@ class TestPatternMatcher(TestCase):
     test_cat_slice_cat_xpu = test_cat_slice_cat_cuda
 
     def test_pointless_view_pair(self):
+        # [FUNCTION DOC] Pointless pair of view ops: two successive views are traced with
+        # make_fx and joint_graph_passes must remove both (zero calls remain). If the
+        # intermediate view is also returned the pair is kept. A view with a negative one size
+        # is also collapsed.
         def f(x):
+            # [FUNCTION DOC] HELPER: Two successive views reshaping to a 3-D shape then
+            # to a 2-D one.
             x = aten.view.default(x, [3, 5, 7])
             x = aten.view.default(x, [15, 7])
             return x
@@ -790,6 +948,8 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(count_calls(gm.graph), 0)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Same pair of views, but returns both the intermediate and
+            # final views.
             x1 = aten.view.default(x, [3, 5, 7])
             x2 = aten.view.default(x1, [15, 7])
             return x1, x2
@@ -801,6 +961,7 @@ class TestPatternMatcher(TestCase):
 
         # handle negative 1 in size argument of view
         def f(x):
+            # [FUNCTION DOC] HELPER: Two views where the second uses a negative one size.
             x = aten.view.default(x, [3, 5, 7])
             x = aten.view.default(x, [-1, 7])
             return x
@@ -811,7 +972,12 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(count_calls(gm.graph), 0)
 
     def test_pointless_view_pair_dynamic_shapes(self):
+        # [FUNCTION DOC] With dynamic and unbacked shapes, a flatten then reshape back to the
+        # original symbolic dims is removed; the output equals the input and the
+        # removed_pointless_view_pair counter is one.
         def f(x):
+            # [FUNCTION DOC] HELPER: Flattens x with a view then views it back to its original
+            # two symbolic dims.
             s1, s2 = x.shape
             x = aten.view.default(x, [-1])
             x = aten.view.default(x, [s1, s2])
@@ -826,7 +992,11 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(counters["inductor"]["removed_pointless_view_pair"], 1)
 
     def test_pointless_permute_pair(self):
+        # [FUNCTION DOC] Two successive transposing permutes are removed by joint graph passes
+        # when the intermediate is unused elsewhere (zero calls left), and kept when the
+        # intermediate is also returned.
         def f(x):
+            # [FUNCTION DOC] HELPER: Applies the same two dim swap permute twice.
             x = aten.permute.default(x, [1, 0])
             x = aten.permute.default(x, [1, 0])
             return x
@@ -838,6 +1008,8 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(count_calls(gm.graph), 0)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Same double permute but returns the intermediate and the
+            # final result.
             x1 = aten.permute.default(x, [1, 0])
             x2 = aten.permute.default(x1, [1, 0])
             return x1, x2
@@ -848,7 +1020,11 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(count_calls(gm.graph), 2)
 
     def test_pointless_permute_pair_3d(self):
+        # [FUNCTION DOC] Three dimensional version of the pointless permute pair test
+        # using a permutation swapping the first two dims; removed when the intermediate
+        # is unused, kept otherwise.
         def f(x):
+            # [FUNCTION DOC] HELPER: Applies the same 3-D permute twice.
             x = aten.permute.default(x, [1, 0, 2])
             x = aten.permute.default(x, [1, 0, 2])
             return x
@@ -860,6 +1036,8 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(count_calls(gm.graph), 0)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Same double permute returning both intermediate and
+            # final value.
             x1 = aten.permute.default(x, [1, 0, 2])
             x2 = aten.permute.default(x1, [1, 0, 2])
             return x1, x2
@@ -882,7 +1060,14 @@ class TestPatternMatcher(TestCase):
     def test_pointless_convert(
         self, input_dtype, intermediate_dtype, emulate_precision_casts, expected_calls
     ):
+        # [FUNCTION DOC] Parametrized over input and intermediate dtype, emulate_precision_casts
+        # and the expected number of remaining calls: a round trip dtype conversion pair is
+        # removed only when the intermediate type preserves the input values (and not when
+        # precision casts are emulated for narrowing). A float to int32 to float round trip is
+        # never removed.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Converts x to the intermediate dtype then back to
+            # the input dtype.
             x = torch.ops.prims.convert_element_type.default(x, intermediate_dtype)
             x = torch.ops.prims.convert_element_type.default(x, input_dtype)
             return x
@@ -895,6 +1080,7 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(count_calls(gm.graph), expected_calls)
 
         def fn_int(x):
+            # [FUNCTION DOC] HELPER: Converts float32 to int32 and back to float32.
             x = torch.ops.prims.convert_element_type.default(x, torch.int32)
             x = torch.ops.prims.convert_element_type.default(x, torch.float32)
             return x
@@ -909,52 +1095,69 @@ class TestPatternMatcher(TestCase):
     # Turn it back on for test
     @inductor_config.patch(joint_graph_constant_folding=True)
     def test_pointless_cumsum(self):
+        # [FUNCTION DOC] With joint graph constant folding enabled, cumsum of constant tensors
+        # created with full is folded away: for each of eleven variants the compiled code has no
+        # cumsum, results equal eager, and at least one pattern match is counted.
         def fn1():
+            # [FUNCTION DOC] HELPER: Cumsum over dim one of ones converted to int64,
+            # times those ones.
             ones = torch.full(
                 [1, 128], 1, layout=torch.strided, dtype=torch.float32
             ).to(torch.int64)
             return torch.cumsum(ones, 1) * ones
 
         def fn2():
+            # [FUNCTION DOC] HELPER: Cumsum over dim one of ones of shape 55 by 10
+            # converted to int64.
             ones = torch.full(
                 [55, 10], 1, layout=torch.strided, dtype=torch.float32
             ).to(torch.int64)
             return torch.cumsum(ones, 1)
 
         def fn3():
+            # [FUNCTION DOC] HELPER: Cumsum over dim zero of a constant int64 tensor of twos.
             twos = torch.full([5, 4, 3], 2, dtype=torch.int64)
             return torch.cumsum(twos, 0)
 
         def fn4():
+            # [FUNCTION DOC] HELPER: Cumsum of a float tensor filled with 0.1.
             x = torch.full([100], 0.1, dtype=torch.float32)
             return torch.cumsum(x, 0)
 
         def fn5():
+            # [FUNCTION DOC] HELPER: Cumsum over a boolean tensor obtained from a filled tensor.
             t1 = torch.full([2, 4], 1)
             t2 = t1.to(dtype=torch.bool)
             return torch.cumsum(t2, 1)
 
         def fn6():
+            # [FUNCTION DOC] HELPER: Cumsum of an int32 tensor filled with True.
             x = torch.full([10, 10], True, dtype=torch.int32)
             return torch.cumsum(x, 1)
 
         def fn7():
+            # [FUNCTION DOC] HELPER: Cumsum of a boolean tensor with output dtype bfloat16.
             ones = torch.full([2, 4, 4], True, dtype=torch.bool)
             return torch.cumsum(ones, 1, dtype=torch.bfloat16)
 
         def fn8():
+            # [FUNCTION DOC] HELPER: Cumsum of an int32 tensor with output dtype float64.
             x = torch.full([10, 10], 2, dtype=torch.int32)
             return torch.cumsum(x, 1, dtype=torch.float64)
 
         def fn9():
+            # [FUNCTION DOC] HELPER: Cumsum of float32 0.1 values with output dtype float64.
             x = torch.full([100], 0.1, dtype=torch.float32)
             return torch.cumsum(x, 0, dtype=torch.float64)
 
         def fn10():
+            # [FUNCTION DOC] HELPER: Cumsum of float16 ones with output dtype float32
+            # over 5000 elements.
             x = torch.full([5000], 1.0, dtype=torch.float16)
             return torch.cumsum(x, 0, dtype=torch.float32)
 
         def fn11():
+            # [FUNCTION DOC] HELPER: Cumsum of float32 2.5 values with output dtype int64.
             x = torch.full([10], 2.5, dtype=torch.float32)
             return torch.cumsum(x, 0, dtype=torch.int64)
 
@@ -966,8 +1169,12 @@ class TestPatternMatcher(TestCase):
             counters.clear()
 
     def test_reciprocal_sqrt_to_rsqrt(self):
+        # [FUNCTION DOC] reciprocal of sqrt must be compiled into a single rsqrt: the
+        # code contains rsqrt, no plain sqrt call, matches eager and at least one
+        # pattern match is counted.
         # reciprocal(sqrt(x)) should fuse into a single rsqrt in the kernel.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Reciprocal of the square root of x.
             return torch.reciprocal(torch.sqrt(x))
 
         x = torch.rand(64) + 1.0
@@ -979,8 +1186,14 @@ class TestPatternMatcher(TestCase):
         self.assertGreaterEqual(counters["inductor"]["pattern_matcher_count"], 1)
 
     def test_splitwithsizes_cat(self):
+        # [FUNCTION DOC] Checks the split_with_sizes followed by cat rewrite: the good case (all
+        # splits concatenated in order on the same dim) matches once with 4 nodes; cases where
+        # not all getitems feed the cat, the cat dim differs, or the order is permuted (issue
+        # 99686) do not match.
         # Good case
         def fn(a):
+            # [FUNCTION DOC] HELPER: Splits into sizes 8 and 24 then concatenates the pieces in
+            # order and squares.
             split_with_sizes = torch.ops.aten.split_with_sizes.default(a, [8, 24], 1)
             getitem = split_with_sizes[0]
             getitem_1 = split_with_sizes[1]
@@ -994,6 +1207,8 @@ class TestPatternMatcher(TestCase):
 
         # Not all getitems are passed to cat
         def fn(a):
+            # [FUNCTION DOC] HELPER: Three-way split where only the first two pieces are
+            # concatenated and the third is added separately.
             split_with_sizes = torch.ops.aten.split_with_sizes.default(a, [8, 8, 16], 1)
             getitem = split_with_sizes[0]
             getitem_1 = split_with_sizes[1]
@@ -1008,6 +1223,8 @@ class TestPatternMatcher(TestCase):
 
         # Different dimensions  (TODO this case should be handled by replacing with a reshape)
         def fn(a):
+            # [FUNCTION DOC] HELPER: Split into four pieces then concatenation along a
+            # different dim.
             split_with_sizes = torch.ops.aten.split_with_sizes.default(
                 a, [8, 8, 8, 8], 1
             )
@@ -1021,6 +1238,8 @@ class TestPatternMatcher(TestCase):
 
         # https://github.com/pytorch/pytorch/issues/99686.
         def fn(a):
+            # [FUNCTION DOC] HELPER: Splits into three and concatenates the pieces in a
+            # permuted order.
             x = torch.ops.aten.split_with_sizes.default(a, [3, 2, 3], dim=1)
             cat = torch.ops.aten.cat.default([x[1], x[0], x[2]], dim=1)
             return cat
@@ -1031,8 +1250,14 @@ class TestPatternMatcher(TestCase):
         self.common(fn, args, 0, 0)
 
     def test_cat_splitwithsizes(self):
+        # [FUNCTION DOC] Checks cat followed by split_with_sizes elimination across five
+        # cases: the good case matches (1 match, 2 nodes); no match when cat has other
+        # users, when dims differ, when the number of splits differs, or when split
+        # sizes differ from cat input sizes.
         # good case
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Cat of three inputs on dim one, split by matching sizes,
+            # each piece squared.
             cat = torch.ops.aten.cat.default([a, b, c], 1)
             split_with_sizes = torch.ops.aten.split_with_sizes.default(
                 cat, [2, 3, 5], 1
@@ -1048,6 +1273,8 @@ class TestPatternMatcher(TestCase):
 
         # cat node has other users
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Same as the good case but also returns the cube of the cat
+            # result, giving it another user.
             cat = torch.ops.aten.cat.default([a, b, c], 1)
             split_with_sizes = torch.ops.aten.split_with_sizes.default(
                 cat, [2, 3, 5], 1
@@ -1063,6 +1290,7 @@ class TestPatternMatcher(TestCase):
 
         # cat and split dims are different
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Cat on dim one but split on dim zero.
             cat = torch.ops.aten.cat.default([a, b, c], 1)
             split_with_sizes = torch.ops.aten.split_with_sizes.default(
                 cat, [2, 3, 5], 0
@@ -1078,6 +1306,7 @@ class TestPatternMatcher(TestCase):
 
         # cat and split lengths are different
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Cat of three inputs, split into only two pieces.
             cat = torch.ops.aten.cat.default([a, b, c], 1)
             split_with_sizes = torch.ops.aten.split_with_sizes.default(cat, [5, 5], 1)
             return [s**2 for s in split_with_sizes]
@@ -1091,6 +1320,8 @@ class TestPatternMatcher(TestCase):
 
         # cat input sizes and split sizes are different
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Cat of three inputs, split with the same count but a
+            # different ordering of sizes.
             cat = torch.ops.aten.cat.default([a, b, c], 1)
             split_with_sizes = torch.ops.aten.split_with_sizes.default(
                 cat, [2, 5, 3], 1
@@ -1105,6 +1336,10 @@ class TestPatternMatcher(TestCase):
         self.common(fn, args, 0, 0)
 
     def test_symint_pattern_matching(self):
+        # [FUNCTION DOC] Registers a replacement with a custom post grad pass for dynamic
+        # shapes: replaces add with an expression involving a symbolic size. Checks the
+        # extra_check hook ran, compiled output equals eager, and the saved graph contains a
+        # symbolic size node with two users.
         import torch._inductor.config as config
         from torch._inductor.pattern_matcher import (
             fwd_only,
@@ -1115,10 +1350,15 @@ class TestPatternMatcher(TestCase):
         saved_graph = None
 
         class _CustomPass(PatternMatcherPass):
+            # [CLASS DOC] HELPER: PatternMatcherPass subclass used as the post grad custom pass;
+            # applies the patterns to the graph and saves the graph in an enclosing variable.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the parent constructor with no arguments.
                 super().__init__()
 
             def __call__(self, g: torch.fx.graph.Graph):
+                # [FUNCTION DOC] HELPER: Applies all registered patterns to graph g and stores g
+                # into the enclosing saved_graph variable.
                 self.apply(g)
                 nonlocal saved_graph
                 saved_graph = g
@@ -1132,10 +1372,14 @@ class TestPatternMatcher(TestCase):
         ):
 
             def add(x, y):
+                # [FUNCTION DOC] HELPER: Pattern function: sum of the two inputs.
                 return x + y
 
             # testing that
             def sym_minus(x, y):
+                # [FUNCTION DOC] HELPER: Replacement function that computes the sum through
+                # subtraction of negated terms plus a symbolic size of y, intended to trace to
+                # equivalent math with symbolic sizes.
                 return (x - (-y.size(0))) - (y * -1) - y.size(0)
 
             device = "cpu"
@@ -1147,6 +1391,8 @@ class TestPatternMatcher(TestCase):
             invoked = False
 
             def extra_check(match):
+                # [FUNCTION DOC] HELPER: Match filter that records it was invoked in an
+                # enclosing flag and always accepts.
                 nonlocal invoked
                 invoked = True
                 return True
@@ -1162,6 +1408,8 @@ class TestPatternMatcher(TestCase):
 
             @torch.compile(dynamic=True)
             def foo(x, y):
+                # [FUNCTION DOC] HELPER: Compiled function with dynamic shapes returning
+                # x plus y.
                 return x + y
 
             x = torch.rand([8, 1])
@@ -1177,6 +1425,10 @@ class TestPatternMatcher(TestCase):
 
     @inductor_config.patch(fx_graph_remote_cache=False)
     def test_match_with_mutation(self):
+        # [FUNCTION DOC] A graph pattern on add(x, sin(x)) registered in a private
+        # PatternMatcherPass is swapped into the pre grad patterns. It must match for the plain
+        # function and not match when a mutation (copy_, out= write, manual_seed, no_grad or
+        # autocast regions) lies between the sin and the add. Results are checked against eager.
         counter = 0
         test_pass = PatternMatcherPass(pass_name="test")
 
@@ -1187,39 +1439,51 @@ class TestPatternMatcher(TestCase):
             pass_dict=test_pass,
         )
         def _test(match, x):
+            # [FUNCTION DOC] HELPER: Handler that increments the enclosing match counter and
+            # does not rewrite anything.
             nonlocal counter
             counter += 1
 
         def fn0(x, y):
+            # [FUNCTION DOC] HELPER: sin then add with no side effects; expected to match.
             a = torch.sin(x)
             b = torch.add(x, a)
             return b
 
         def fn1(x, y):
+            # [FUNCTION DOC] HELPER: Mutates x in place with copy_ between the sin and the add;
+            # expected not to match.
             a = torch.sin(x)
             x.copy_(y)
             b = torch.add(x, a)
             return b
 
         def fn2(x, y):
+            # [FUNCTION DOC] HELPER: Adds under a no_grad context; expected not to match.
             a = torch.sin(x)
             with torch.no_grad():
                 b = torch.add(x, a)
             return b
 
         def fn3(x, y):
+            # [FUNCTION DOC] HELPER: Adds under an autocast context for the GPU;
+            # expected not to match.
             a = torch.sin(x)
             with torch.autocast(GPU_TYPE):
                 b = torch.add(x, a)
             return b
 
         def fn4(x, y):
+            # [FUNCTION DOC] HELPER: Seeds the global RNG between sin and add; expected
+            # not to match.
             a = torch.sin(x)
             torch.manual_seed(1234)
             b = torch.add(x, a)
             return b
 
         def fn5(x, y):
+            # [FUNCTION DOC] HELPER: Writes into x through an out= argument between sin and add;
+            # expected not to match.
             a = torch.sin(x)
             torch.add(y, 1, out=x)
             b = torch.add(x, a)
@@ -1253,6 +1517,10 @@ class TestPatternMatcher(TestCase):
                 torch.testing.assert_close(actual, expected)
 
     def test_mutation_region_ids_update_after_replacement_adds_mutation(self):
+        # [FUNCTION DOC] A graph pattern replaces sin with sin plus an in-place copy,
+        # introducing a mutation. After the pass, mutation_region_id metadata must be
+        # recomputed: sin has region zero, copy_ one and the following cos one, and a later pass
+        # whose pattern spans the sin to cos edge must find no match.
         insert_mutation_pass = PatternMatcherPass()
 
         @register_graph_pattern(
@@ -1260,7 +1528,12 @@ class TestPatternMatcher(TestCase):
             pass_dict=insert_mutation_pass,
         )
         def insert_mutation(match: Match, x):
+            # [FUNCTION DOC] HELPER: Replacement handler that rewrites a match using
+            # replace_by_example with a function doing sin and an in-place self copy, without
+            # running functional passes.
             def repl(a):
+                # [FUNCTION DOC] HELPER: Replacement body: computes sin of a, copies a onto
+                # itself in place, returns the sin result.
                 y = torch.sin(a)
                 a.copy_(a)
                 return y
@@ -1278,10 +1551,13 @@ class TestPatternMatcher(TestCase):
             pass_dict=later_pass,
         )
         def match_across_mutation(match: Match, x):
+            # [FUNCTION DOC] HELPER: Handler for the later pass that counts matches in an
+            # enclosing variable.
             nonlocal later_matches
             later_matches += 1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Cos of sin of x.
             y = torch.sin(x)
             return torch.cos(y)
 
@@ -1306,12 +1582,17 @@ class TestPatternMatcher(TestCase):
         )
 
     def test_pure_replacement_skips_mutation_region_refresh(self):
+        # [FUNCTION DOC] A register_replacement of sin by cos (pure) must not call the mutation
+        # region refresh function: that function is patched to raise on use, and the pass must
+        # still apply exactly one replacement.
         pure_replacement_pass = PatternMatcherPass()
 
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern: sin of x.
             return torch.sin(x)
 
         def replacement(x):
+            # [FUNCTION DOC] HELPER: Replacement: cos of x.
             return torch.cos(x)
 
         register_replacement(
@@ -1331,6 +1612,9 @@ class TestPatternMatcher(TestCase):
             self.assertEqual(pure_replacement_pass.apply(gm.graph), 1)
 
     def test_pure_graph_pattern_skips_mutation_region_refresh(self):
+        # [FUNCTION DOC] A pure graph pattern handler (does nothing) must not trigger
+        # recomputation of mutation region ids: compute_mutation_region_ids is called once
+        # beforehand, then patched to raise, and the pass still reports one match.
         pure_graph_pass = PatternMatcherPass()
 
         @register_graph_pattern(
@@ -1338,9 +1622,11 @@ class TestPatternMatcher(TestCase):
             pass_dict=pure_graph_pass,
         )
         def pure_graph_pattern(match: Match, x):
+            # [FUNCTION DOC] HELPER: Handler that does nothing.
             pass
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sin of x.
             return torch.sin(x)
 
         gm = make_fx(fn)(torch.randn(4))
@@ -1353,12 +1639,19 @@ class TestPatternMatcher(TestCase):
             self.assertEqual(pure_graph_pass.apply(gm.graph), 1)
 
     def test_mutating_register_replacement_refreshes_mutation_regions(self):
+        # [FUNCTION DOC] Like the mutation-introducing graph pattern test but via
+        # register_replacement with a mutating replacement; mutation regions must be
+        # refreshed afterward (sin zero, copy_ one, cos one) and the later pass must not
+        # match across the mutation.
         insert_mutation_pass = PatternMatcherPass()
 
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern: sin of x.
             return torch.sin(x)
 
         def replacement(x):
+            # [FUNCTION DOC] HELPER: Replacement: sin of x plus in-place self copy; returns the
+            # sin value.
             y = torch.sin(x)
             x.copy_(x)
             return y
@@ -1382,10 +1675,13 @@ class TestPatternMatcher(TestCase):
             pass_dict=later_pass,
         )
         def match_across_mutation(match: Match, x):
+            # [FUNCTION DOC] HELPER: Handler for the later pass that counts matches in an
+            # enclosing variable.
             nonlocal later_matches
             later_matches += 1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Cos of sin of x.
             y = torch.sin(x)
             return torch.cos(y)
 
@@ -1410,6 +1706,9 @@ class TestPatternMatcher(TestCase):
         )
 
     def test_graph_pattern_mutation_before_match_refreshes_full_graph(self):
+        # [FUNCTION DOC] A handler inserts an in-place copy_ before a matched node. After the
+        # pass the whole graph's mutation region ids are refreshed: sin region zero, copy_ one,
+        # cos, neg and relu one, and a later deep pattern spanning the mutation finds no match.
         insert_mutation_pass = PatternMatcherPass()
 
         @register_graph_pattern(
@@ -1420,6 +1719,8 @@ class TestPatternMatcher(TestCase):
             pass_dict=insert_mutation_pass,
         )
         def insert_mutation_before_match(match: Match, z):
+            # [FUNCTION DOC] HELPER: Handler that walks to the sin input via the argument chain
+            # of z and inserts a copy_ call before z in the match graph.
             sin_node = z.args[0]
             x = sin_node.args[0]
             with match.graph.inserting_before(z):
@@ -1442,10 +1743,13 @@ class TestPatternMatcher(TestCase):
             pass_dict=later_pass,
         )
         def match_across_mutation(match: Match, x):
+            # [FUNCTION DOC] HELPER: Handler for the later pass that counts matches in an
+            # enclosing variable.
             nonlocal later_matches
             later_matches += 1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Relu of neg of cos of sin of x.
             return torch.relu(torch.neg(torch.cos(torch.sin(x))))
 
         gm = make_fx(fn)(torch.randn(4))
@@ -1475,8 +1779,11 @@ class TestPatternMatcher(TestCase):
         )
 
     def test_remove_pointless_clones(self):
+        # [FUNCTION DOC] A clone after mm is removed: the compiled code returns buf0 directly
+        # and does not use the CPP async compile path.
         @torch.compile(fullgraph=True)
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Compiled function returning a clone of mm of a and b.
             return torch.mm(a, b).clone()
 
         _, (code) = run_and_get_code(fn, torch.randn(8, 8), torch.randn(8, 8))
@@ -1485,6 +1792,9 @@ class TestPatternMatcher(TestCase):
         self.assertNotIn("async_compile.cpp", code[0])
 
     def test_unfuse_bias_addmm(self):
+        # [FUNCTION DOC] Unfuse behavior of bias addmm: a plain addmm stays an extern addmm;
+        # addmm followed by gelu, or followed by unsqueeze and gelu (the view path), is unfused
+        # so no extern addmm remains.
         args = [
             torch.randn(20, device=GPU_TYPE),
             torch.randn(10, 15, device=GPU_TYPE),
@@ -1493,6 +1803,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn(inp, a, b):
+            # [FUNCTION DOC] HELPER: Compiled addmm of inp with a and b.
             return torch.ops.aten.addmm(inp, a, b)
 
         _, (code) = run_and_get_code(fn, args[0], args[1], args[2])
@@ -1500,6 +1811,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn2(inp, a, b):
+            # [FUNCTION DOC] HELPER: Compiled gelu of an addmm.
             return torch.nn.functional.gelu(torch.ops.aten.addmm(inp, a, b))
 
         _, (code) = run_and_get_code(fn2, args[0], args[1], args[2])
@@ -1507,6 +1819,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn2(inp, a, b):
+            # [FUNCTION DOC] HELPER: Compiled gelu of an addmm result after unsqueeze.
             return torch.nn.functional.gelu(
                 torch.ops.aten.addmm(inp, a, b).unsqueeze(0)
             )
@@ -1516,6 +1829,9 @@ class TestPatternMatcher(TestCase):
         FileCheck().check_not("extern_kernels.addmm(").run(code[0])
 
     def test_unfuse_broadcast_bias_baddbmm(self):
+        # [FUNCTION DOC] Broadcast bias baddbmm: plain baddbmm stays extern baddbmm; with gelu
+        # epilogue, or an explicitly expanded bias with zero stride and relu, it is unfused into
+        # extern bmm. Results are compared against eager baddbmm.
         args = [
             torch.randn(4, 1, 8, device=GPU_TYPE),
             torch.randn(4, 6, 5, device=GPU_TYPE),
@@ -1524,6 +1840,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn(inp, a, b):
+            # [FUNCTION DOC] HELPER: Compiled baddbmm.
             return torch.ops.aten.baddbmm(inp, a, b)
 
         actual, (code) = run_and_get_code(fn, args[0], args[1], args[2])
@@ -1532,6 +1849,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn2(inp, a, b):
+            # [FUNCTION DOC] HELPER: Compiled gelu of baddbmm.
             return torch.nn.functional.gelu(torch.ops.aten.baddbmm(inp, a, b))
 
         actual, (code) = run_and_get_code(fn2, args[0], args[1], args[2])
@@ -1542,6 +1860,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn3(inp, a, b):
+            # [FUNCTION DOC] HELPER: Expands the bias to 4 by 6 by 8 then baddbmm and relu.
             inp = inp.expand(4, 6, 8)
             return torch.ops.aten.baddbmm(inp, a, b).relu()
 
@@ -1554,6 +1873,8 @@ class TestPatternMatcher(TestCase):
         ).run(code[0])
 
     def test_unfuse_broadcast_bias_baddbmm_alpha_beta(self):
+        # [FUNCTION DOC] baddbmm with alpha 0.8 and beta 0.2 and a broadcast bias followed by
+        # relu is unfused into extern bmm (no extern baddbmm) and matches eager.
         args = [
             torch.randn(4, 1, 8, device=GPU_TYPE),
             torch.randn(4, 6, 5, device=GPU_TYPE),
@@ -1562,6 +1883,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn(inp, a, b):
+            # [FUNCTION DOC] HELPER: Relu of baddbmm with alpha and beta set.
             return torch.nn.functional.relu(
                 torch.ops.aten.baddbmm(inp, a, b, alpha=0.8, beta=0.2)
             )
@@ -1576,6 +1898,8 @@ class TestPatternMatcher(TestCase):
         ).run(code[0])
 
     def test_preserve_accumulator_addmm_with_pointwise(self):
+        # [FUNCTION DOC] When the bias has a pointwise op (sin) applied before an addmm and a
+        # gelu consumer, the addmm is kept as an extern addmm; result is compared with eager.
         args = [
             torch.randn(10, 20, device=GPU_TYPE),
             torch.randn(10, 15, device=GPU_TYPE),
@@ -1584,6 +1908,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn(inp, a, b):
+            # [FUNCTION DOC] HELPER: Applies sin to inp then gelu of addmm with it.
             inp = torch.sin(inp)
             return torch.nn.functional.gelu(torch.ops.aten.addmm(inp, a, b))
 
@@ -1594,12 +1919,17 @@ class TestPatternMatcher(TestCase):
         FileCheck().check("extern_kernels.addmm(").run(code[0])
 
     def test_unfuse_same_shape_leaf_bias_addmm(self):
+        # [FUNCTION DOC] A module that adds a same-shape parameter bias after mm then relu:
+        # compiled output equals eager and the add is not turned into an extern addmm.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 10 by 20 parameter bias on the GPU.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the random bias parameter.
                 super().__init__()
                 self.bias = torch.nn.Parameter(torch.randn(10, 20, device=GPU_TYPE))
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Returns relu of mm of a and b plus the bias.
                 return (torch.mm(a, b) + self.bias).relu()
 
         mod = Mod()
@@ -1613,6 +1943,10 @@ class TestPatternMatcher(TestCase):
         FileCheck().check_not("extern_kernels.addmm(").run(code[0])
 
     def test_addmm_fusion_extra_check_without_beta_kwarg(self):
+        # [FUNCTION DOC] Builds an FX graph by hand with mm followed by add (both operand
+        # orders) with fake tensors on an mps device and asserts that the post grad function
+        # should_prefer_unfused_addmm returns True for a match namespace with positional args
+        # and an inp keyword, even without a beta keyword.
         graph = torch.fx.Graph()
         inp = graph.placeholder("inp")
         mat1 = graph.placeholder("mat1")
@@ -1642,6 +1976,9 @@ class TestPatternMatcher(TestCase):
             )
 
     def test_unfuse_expanded_bias_addmm(self):
+        # [FUNCTION DOC] Bias expanded from a vector to the output shape (zero stride on dim
+        # zero) followed by relu: addmm is unfused, so no extern addmm appears; the result
+        # equals eager.
         args = [
             torch.randn(20, device=GPU_TYPE),
             torch.randn(10, 15, device=GPU_TYPE),
@@ -1650,6 +1987,8 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn(bias, a, b):
+            # [FUNCTION DOC] HELPER: Unsqueezes and expands bias to 10 by 20, then relu
+            # of addmm.
             bias = bias.unsqueeze(0).expand(10, 20)
             return torch.ops.aten.addmm(bias, a, b).relu()
 
@@ -1661,7 +2000,12 @@ class TestPatternMatcher(TestCase):
 
     @parametrize("inplace", [False, True])
     def test_accumulator_addmm_loop_does_not_delay_pointwise(self, inplace):
+        # [FUNCTION DOC] Parametrized by inplace: a loop of addmm (in-place or functional)
+        # followed by cos on an accumulator must keep each addmm as an extern call (three of
+        # them, no extern mm) and give eager-equal results.
         def fn(x, ws):
+            # [FUNCTION DOC] HELPER: Starts from zeros like x and, for each weight, accumulates
+            # addmm of the buffer with the weight used as both matrices, then applies cos.
             buf = torch.zeros_like(x)
             for w in ws:
                 if inplace:
@@ -1689,6 +2033,9 @@ class TestPatternMatcher(TestCase):
         }
     )
     def test_unfuse_bias_addmm_half_dtypes(self, dtype):
+        # [FUNCTION DOC] Parametrized over bfloat16 and float16 with
+        # keep_addmm_fused_for_half_dtypes on: addmm with a pointwise consumer is kept fused as
+        # an extern addmm to avoid extra truncation.
         args = [
             torch.randn(20, device=GPU_TYPE, dtype=dtype),
             torch.randn(10, 15, device=GPU_TYPE, dtype=dtype),
@@ -1699,6 +2046,7 @@ class TestPatternMatcher(TestCase):
         # to avoid precision loss from extra truncation at the mm output
         @torch.compile()
         def fn(inp, a, b):
+            # [FUNCTION DOC] HELPER: Compiled gelu of addmm.
             return torch.nn.functional.gelu(torch.ops.aten.addmm(inp, a, b))
 
         _, (code) = run_and_get_code(fn, args[0], args[1], args[2])
@@ -1712,6 +2060,8 @@ class TestPatternMatcher(TestCase):
         }
     )
     def test_unfuse_bias_addmm_half_dtypes_when_flag_disabled(self, dtype):
+        # [FUNCTION DOC] Same as the half dtype test but with keep_addmm_fused_for_half_dtypes
+        # off: the addmm is unfused and no extern addmm remains.
         args = [
             torch.randn(20, device=GPU_TYPE, dtype=dtype),
             torch.randn(10, 15, device=GPU_TYPE, dtype=dtype),
@@ -1720,6 +2070,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn(inp, a, b):
+            # [FUNCTION DOC] HELPER: Compiled gelu of addmm.
             return torch.nn.functional.gelu(torch.ops.aten.addmm(inp, a, b))
 
         _, (code) = run_and_get_code(fn, args[0], args[1], args[2])
@@ -1737,6 +2088,9 @@ class TestPatternMatcher(TestCase):
         "narrowing-cast unfuse is XPU-only; CUDA/ROCm keep addmm fused",
     )
     def test_unfuse_bias_addmm_half_dtypes_narrowing_cast(self, dtype):
+        # [FUNCTION DOC] Skipped unless the GPU is xpu. For a float32 bias narrowed to half
+        # dtype before addmm, with keep fused on, the addmm is still unfused so the pointwise
+        # kernel loads the float32 bias; asserts no extern addmm.
         # When bias is fp32 and cast to a half dtype (e.g. AMP), unfusing
         # lets the Triton pointwise kernel load the fp32 bias directly,
         # preserving precision instead of truncating before fused addmm.
@@ -1748,6 +2102,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile()
         def fn(bias, a, b):
+            # [FUNCTION DOC] HELPER: Casts bias to the half dtype then gelu of addmm.
             bias_half = bias.to(dtype)
             return torch.nn.functional.gelu(torch.ops.aten.addmm(bias_half, a, b))
 
@@ -1763,13 +2118,21 @@ class TestPatternMatcher(TestCase):
         }
     )
     def test_unfuse_bias_addmm_half_dtypes_narrowing_cast_numerics(self, dtype):
+        # [FUNCTION DOC] Numerics check of unfusing narrowing-cast biases: builds a stack of
+        # eight residual linear layers, computes a float64 reference, runs eager and compiled
+        # under autocast with the half dtype and requires the compiled RMSE to be within 3x of
+        # the eager RMSE (plus a small epsilon).
         # Verify that unfusing a narrowing-cast bias produces results whose
         # RMSE vs fp64 stays within 3x of eager's RMSE (the torchbench
         # accuracy check threshold for half dtypes).
         torch.manual_seed(42)
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eight 256 by 256 linear layers with biases near 1.0 and scaled
+            # down weights, applied with residual connections.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Builds the module list of linear layers and overwrites
+                # each bias and weight data in place.
                 super().__init__()
                 self.linears = torch.nn.ModuleList(
                     [torch.nn.Linear(256, 256) for _ in range(8)]
@@ -1779,6 +2142,8 @@ class TestPatternMatcher(TestCase):
                     l.weight.data *= 0.1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: For each layer sets x to the layer output plus x,
+                # returns the result.
                 for l in self.linears:
                     x = l(x) + x  # residual add is pointwise use
                 return x
@@ -1787,6 +2152,8 @@ class TestPatternMatcher(TestCase):
         x = torch.randn(32, 256, device=GPU_TYPE)
 
         def rmse(a, b):
+            # [FUNCTION DOC] HELPER: Root mean square error between two tensors computed in
+            # float32, returned as a python float.
             return torch.sqrt(torch.mean((a.float() - b.float()) ** 2)).item()
 
         # fp64 ground truth
@@ -1813,6 +2180,9 @@ class TestPatternMatcher(TestCase):
         self.assertLessEqual(compiled_err, 3.0 * eager_err + 1e-4)
 
     def test_addmm_alpha_beta_with_pointwise(self):
+        # [FUNCTION DOC] Issue 167313: addmm with alpha 0.8 and beta 0.2 followed by relu must
+        # match eager and be unfused (no extern addmm); the same check is done for default alpha
+        # and beta.
         # Test that addmm with alpha/beta != 1 is unfused correctly with pointwise ops
         # See https://github.com/pytorch/pytorch/issues/167313
         x = torch.rand(2, device=GPU_TYPE)
@@ -1820,6 +2190,7 @@ class TestPatternMatcher(TestCase):
         b = torch.rand(3, 2, device=GPU_TYPE)
 
         def f(x, a, b):
+            # [FUNCTION DOC] HELPER: Relu of addmm with scaling arguments.
             return torch.nn.functional.relu(torch.addmm(x, a, b, alpha=0.8, beta=0.2))
 
         fc = torch.compile(f)
@@ -1837,6 +2208,7 @@ class TestPatternMatcher(TestCase):
 
         # Test with alpha=1, beta=1 (default) - should also unfuse
         def f_default(x, a, b):
+            # [FUNCTION DOC] HELPER: Relu of default addmm.
             return torch.nn.functional.relu(torch.addmm(x, a, b))
 
         fc_default = torch.compile(f_default)
@@ -1850,6 +2222,11 @@ class TestPatternMatcher(TestCase):
         FileCheck().check_not("extern_kernels.addmm(").run(code[0])
 
     def test_serialized_patterns_up_to_date(self):
+        # [FUNCTION DOC] Verifies that serialized precompiled patterns are in sync with their
+        # source: after loading patterns (with the generation env var removed) it regenerates
+        # each pattern from its search function with example inputs remapped into a fresh fake
+        # mode, compares pretty printed forms and requires pattern equality. A mismatch message
+        # tells the developer to rerun the pattern generation script.
         import torch.utils._pytree as pytree
         from torch._inductor.fx_passes import joint_graph
         from torch._inductor.pattern_matcher import _known_precompiled_patterns
@@ -1864,6 +2241,8 @@ class TestPatternMatcher(TestCase):
                 # different FakeTensorMode we need to update them to our
                 # FakeTensorMode().
                 def remap_fake_tensor(x):
+                    # [FUNCTION DOC] HELPER: Maps a real tensor to a fake tensor in the current
+                    # fake mode; other values are returned unchanged.
                     if isinstance(x, torch.Tensor):
                         return torch._subclasses.FakeTensor.from_tensor(x, mode)
                     return x
@@ -1902,9 +2281,14 @@ class TestPatternMatcher(TestCase):
     )
     @unittest.skipIf(not IS_BIG_GPU, "templates require big gpu")
     def test_original_aten_preserved_split_addmm(self):
+        # [FUNCTION DOC] Marked as expected failure on SM89. With the TRITON gemm backend and
+        # original_aten kernel names, a bias addmm with a sin epilogue is decomposed into mm and
+        # add (one pattern match) and the generated template kernel name contains addmm; no
+        # extern addmm is called.
         # bias addmm -> elementwise should be decomposed into
         # mm -> add -> elementwise.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Sin of addmm with bias z.
             return torch.addmm(z, x, y).sin()
 
         args = [
@@ -1927,6 +2311,10 @@ class TestPatternMatcher(TestCase):
 
     @inductor_config.patch(fx_graph_remote_cache=False)
     def test_match_equivalent_function_invocations1(self):
+        # [FUNCTION DOC] A graph pattern matching addmm with optional beta and alpha keywords is
+        # registered in a test pass appended to post grad patterns and must match addmm calls
+        # written without keywords, with beta, and with beta and alpha (one match each); the
+        # replacement removes extern addmm.
         counter = 0
         test_pass = PatternMatcherPass()
 
@@ -1937,12 +2325,15 @@ class TestPatternMatcher(TestCase):
         ]
 
         def f0(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm with default scaling.
             return torch.ops.aten.addmm(inp, a, b)
 
         def f1(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm with beta given.
             return torch.ops.aten.addmm(inp, a, b, beta=1.0)
 
         def f2(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm with beta and alpha given.
             return torch.ops.aten.addmm(inp, a, b, beta=1.0, alpha=1.0)
 
         # This graph pattern should successfully match all of the above functions
@@ -1958,10 +2349,13 @@ class TestPatternMatcher(TestCase):
             pass_dict=test_pass,
         )
         def addmm_replacement(match: Match, inp, mat1, mat2, beta, alpha):
+            # [FUNCTION DOC] HELPER: Handler that counts the match and replaces it, under the
+            # fake mode, with a matmul scaled by alpha plus the input scaled by beta.
             nonlocal counter
             counter += 1
 
             def repl(inp, x1, x2):
+                # [FUNCTION DOC] HELPER: Computes the matmul times alpha plus inp times beta.
                 return (x1 @ x2) * alpha + inp * beta
 
             with V.fake_mode:
@@ -1984,6 +2378,9 @@ class TestPatternMatcher(TestCase):
 
     @inductor_config.patch(fx_graph_remote_cache=False)
     def test_replace_by_example_in_pre_grad(self):
+        # [FUNCTION DOC] Same graph pattern as the previous test but applied in the pre grad
+        # stage through the pre_grad_custom_pass option with early timing; the handler runs once
+        # and output matches eager.
         counter = 0
         test_pass = PatternMatcherPass()
 
@@ -1994,6 +2391,7 @@ class TestPatternMatcher(TestCase):
         ]
 
         def fn(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm call.
             return torch.ops.aten.addmm(inp, a, b)
 
         # This graph pattern should successfully match all of the above functions
@@ -2009,10 +2407,13 @@ class TestPatternMatcher(TestCase):
             pass_dict=test_pass,
         )
         def addmm_replacement(match: Match, inp, mat1, mat2, beta, alpha):
+            # [FUNCTION DOC] HELPER: Handler that counts the match and replaces it with a matmul
+            # scaled by alpha plus the input scaled by beta.
             nonlocal counter
             counter += 1
 
             def repl(inp, x1, x2):
+                # [FUNCTION DOC] HELPER: Computes the matmul times alpha plus inp times beta.
                 return (x1 @ x2) * alpha + inp * beta
 
             match.replace_by_example(repl, [inp, mat1, mat2])
@@ -2030,12 +2431,16 @@ class TestPatternMatcher(TestCase):
             self.assertEqual(actual, expected)
 
     def test_addmm_dtype_mismatch(self):
+        # [FUNCTION DOC] A float16 linear without bias followed by adding a float32
+        # tensor must not be turned into addmm (dtype mismatch); output equals eager and
+        # the code has no addmm.
         a = torch.nn.Linear(1024, 1024, bias=False).to(GPU_TYPE)
         a = a.to(dtype=torch.float16)
 
         w = torch.randn(1024, 1024, device=GPU_TYPE)
 
         def func():
+            # [FUNCTION DOC] HELPER: Runs the linear on float16 ones then adds the float32 w.
             x = torch.ones(1024, 1024, device=GPU_TYPE, dtype=torch.float16)
             x = a(x)
             x = x + w
@@ -2046,7 +2451,12 @@ class TestPatternMatcher(TestCase):
         FileCheck().check_not("addmm").run(code[0])
 
     def test_replace_mul_zero(self):
+        # [FUNCTION DOC] Checks the multiply-by-zero replacement: for integer inputs the
+        # multiplication by zero is folded away so no kernel runs; for floats it must
+        # stay (so nan or inf times zero gives nan) and a kernel run appears. Results
+        # compared with eager.
         def test(x, y):
+            # [FUNCTION DOC] HELPER: x plus y times zero.
             return x + (y * 0)
 
         # For integer dtypes, x * 0 is uniformly 0, so the multiply is folded
@@ -2070,6 +2480,9 @@ class TestPatternMatcher(TestCase):
 
     @inductor_config.patch(fx_graph_remote_cache=False)
     def test_match_equivalent_function_invocations2(self):
+        # [FUNCTION DOC] Pattern with no beta or alpha keywords registered in a test pass:
+        # matches the plain addmm call only (one match for each function individually since the
+        # counter is reset per function).
         counter = 0
         test_pass = PatternMatcherPass()
 
@@ -2080,12 +2493,15 @@ class TestPatternMatcher(TestCase):
         ]
 
         def f0(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm with default scaling.
             return torch.ops.aten.addmm(inp, a, b)
 
         def f1(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm with beta given.
             return torch.ops.aten.addmm(inp, a, b, beta=1.0)
 
         def f2(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm with beta and alpha given.
             return torch.ops.aten.addmm(inp, a, b, beta=1.0, alpha=1.0)
 
         # This graph pattern should only match f0
@@ -2094,10 +2510,13 @@ class TestPatternMatcher(TestCase):
             pass_dict=test_pass,
         )
         def addmm_replacement(match: Match, inp, mat1, mat2):
+            # [FUNCTION DOC] HELPER: Handler that counts the match and replaces it with matmul
+            # plus input under fake mode.
             nonlocal counter
             counter += 1
 
             def repl(inp, x1, x2):
+                # [FUNCTION DOC] HELPER: Computes matmul plus inp.
                 return x1 @ x2 + inp
 
             with V.fake_mode:
@@ -2115,11 +2534,17 @@ class TestPatternMatcher(TestCase):
                 torch.testing.assert_close(actual, expected)
 
     def test_input_output_same(self):
+        # [FUNCTION DOC] register_replacement where the pattern returns one of its
+        # inputs as an output: add replaced by mul pair. With a custom post grad pass
+        # that applies the patterns, sorts and removes dead code, the compiled code has
+        # neither add nor mul remaining.
         def pattern(x, y):
+            # [FUNCTION DOC] HELPER: Pattern: returns the sum and the first input.
             out1 = torch.add(x, y)
             return out1, x
 
         def replace(x, y):
+            # [FUNCTION DOC] HELPER: Replacement: returns the product and the product times y.
             out1 = torch.mul(x, y)
             out2 = torch.mul(out1, y)
             return out1, out2
@@ -2129,6 +2554,8 @@ class TestPatternMatcher(TestCase):
         register_replacement(pattern, replace, inputs, fwd_only, my_patterns)
 
         def custom_pass(graph: torch.fx.Graph) -> torch.fx.Graph:
+            # [FUNCTION DOC] HELPER: Post grad pass that applies the patterns, stable
+            # topologically sorts the graph, removes dead code and returns the graph.
             _ = my_patterns.apply(graph)
             stable_topological_sort(graph)
             graph.eliminate_dead_code()
@@ -2140,6 +2567,7 @@ class TestPatternMatcher(TestCase):
             }
         )
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Add, then subtract x.
             res = torch.add(x, y)
             sub = torch.sub(res, x)
             return sub
@@ -2151,6 +2579,8 @@ class TestPatternMatcher(TestCase):
 
     @inductor_config.patch(fx_graph_remote_cache=False)
     def test_match_equivalent_function_invocations3(self):
+        # [FUNCTION DOC] Pattern with only a beta keyword registered in a test pass; counter is
+        # checked to be one for each function individually.
         counter = 0
         test_pass = PatternMatcherPass()
 
@@ -2161,12 +2591,15 @@ class TestPatternMatcher(TestCase):
         ]
 
         def f0(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm with default scaling.
             return torch.ops.aten.addmm(inp, a, b)
 
         def f1(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm with beta given.
             return torch.ops.aten.addmm(inp, a, b, beta=1.0)
 
         def f2(inp, a, b):
+            # [FUNCTION DOC] HELPER: addmm with beta and alpha given.
             return torch.ops.aten.addmm(inp, a, b, beta=1.0, alpha=1.0)
 
         # This graph pattern should only match f1
@@ -2177,10 +2610,13 @@ class TestPatternMatcher(TestCase):
             pass_dict=test_pass,
         )
         def addmm_replacement(match: Match, inp, mat1, mat2, beta):
+            # [FUNCTION DOC] HELPER: Handler that counts the match and replaces it with matmul
+            # plus input under fake mode.
             nonlocal counter
             counter += 1
 
             def repl(inp, x1, x2):
+                # [FUNCTION DOC] HELPER: Computes matmul plus inp.
                 return x1 @ x2 + inp
 
             with V.fake_mode:
@@ -2198,7 +2634,12 @@ class TestPatternMatcher(TestCase):
                 torch.testing.assert_close(actual, expected)
 
     def test_stable_topological_sort(self):
+        # [FUNCTION DOC] Checks stable_topological_sort keeps already sorted graphs
+        # unchanged, keeps placeholder order when they are reversed relative to
+        # declaration, and moves an out-of-order node to after its dependencies while
+        # keeping the relative order of others.
         def fn1(a, b):
+            # [FUNCTION DOC] HELPER: Adds its two arguments.
             return a + b
 
         graph = torch.fx.Graph()
@@ -2224,10 +2665,16 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(list(graph.nodes), [b, a, c])
 
     def test_scaled_softmax(self):
+        # [FUNCTION DOC] Scaled softmax pattern: multiply or divide by a scalar, broadcastable
+        # tensor scale, or tensor with a different leading dim before a softmax over dim zero is
+        # matched (1 match, 3 nodes; 4 nodes for bfloat16 with a float reference). A scale
+        # varying along the softmax dim is not matched.
         def mul_softmax(a, b):
+            # [FUNCTION DOC] HELPER: Softmax over dim zero of a times b.
             return F.softmax(a * b, dim=0)
 
         def div_softmax(x, inv_scale):
+            # [FUNCTION DOC] HELPER: Softmax over dim zero of x divided by inv_scale.
             return F.softmax(x / inv_scale, dim=0)
 
         x = torch.randn(10, 10)
@@ -2265,7 +2712,13 @@ class TestPatternMatcher(TestCase):
 
     @inductor_config.patch(fx_graph_cache=False)
     def test_scaled_softmax_nonfinite_matches_eager(self):
+        # [FUNCTION DOC] With non-finite intermediates (large scales giving nan), the compiled
+        # scaled softmax rewrite must give the same non-finite results as eager, while still
+        # being matched at least once.
         def check(fn, args):
+            # [FUNCTION DOC] HELPER: Resets dynamo and counters, runs eager and compiled,
+            # compares the first output for closeness, asserts the last outputs are all nan in
+            # both, and asserts at least one match.
             torch._dynamo.reset()
             counters.clear()
             expected = fn(*args)
@@ -2276,15 +2729,20 @@ class TestPatternMatcher(TestCase):
             self.assertGreaterEqual(counters["inductor"]["pattern_matcher_count"], 1)
 
         def mul_softmax(x, scale):
+            # [FUNCTION DOC] HELPER: Multiplies x by scale three times and returns x and its
+            # softmax over dim zero.
             for _ in range(3):
                 x = x * scale
             return x, F.softmax(x, dim=0)
 
         def div_softmax(x, inv_scale):
+            # [FUNCTION DOC] HELPER: Divides x by the scale and returns x and its softmax.
             x = x / inv_scale
             return x, F.softmax(x, dim=0)
 
         def duplicated_mul_softmax(x, scale):
+            # [FUNCTION DOC] HELPER: Two separate chains of three scale multiplications; returns
+            # the first chain and the softmax of the second.
             y = x
             for _ in range(3):
                 y = y * scale
@@ -2306,7 +2764,11 @@ class TestPatternMatcher(TestCase):
 
     @inductor_config.patch(fx_graph_cache=False)
     def test_scaled_amax_sub_nonfinite_matches_eager(self):
+        # [FUNCTION DOC] For a scaled value subtracted by its amax over dim zero, large scale
+        # overflowing to infinity must give nan for the infinite row and negative infinity for
+        # the other, matching eager, with at least one pattern match counted.
         def fn(x, scale):
+            # [FUNCTION DOC] HELPER: Multiplies x by scale and subtracts the amax over dim zero.
             y = x * scale
             return y - torch.amax(y, dim=0, keepdim=True)
 
@@ -2322,7 +2784,14 @@ class TestPatternMatcher(TestCase):
         self.assertGreaterEqual(counters["inductor"]["pattern_matcher_count"], 1)
 
     def test_mutation_op_matching(self):
+        # [FUNCTION DOC] Checks is_mutation_op on FX nodes: true for a grad mode switch, in-
+        # place copy_ and relu_, manual_seed, set_, autocast enter and exit, c10d out variants,
+        # resize_storage_bytes_, fsdp split copy and copy_ ops; false for rshift scalar, the
+        # functional all_gather_into_tensor, and a custom op declared with no mutated args.
         def check(type, func_name, args, kwargs, expect=True):
+            # [FUNCTION DOC] HELPER: Builds a one-node graph via the named graph method kind
+            # (raises an error if it is not function or method call), runs is_mutation_op on the
+            # node and asserts the result matches expect.
             if type not in ["call_function", "call_method"]:
                 raise AssertionError
             graph = torch.fx.Graph()
@@ -2379,6 +2848,7 @@ class TestPatternMatcher(TestCase):
 
         @torch.library.custom_op("vllm::fused_rms_norm_quant_static", mutates_args=[])
         def fused_rms_norm_quant_static(out: torch.Tensor, input: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: Custom op declared as non-mutating; its body does nothing.
             pass
 
         check(
@@ -2390,6 +2860,10 @@ class TestPatternMatcher(TestCase):
         )
 
     def test_multioutput_register_replacement(self):
+        # [FUNCTION DOC] Registers a multi-output replacement in a fake vllm library: a pattern
+        # of rms_norm followed by int8 quant (both with auto functionalized mutation) is
+        # replaced by a fused op. After applying through a custom post grad pass in a custom
+        # backend, the compiled code no longer contains the separate quant op.
         @torch.library.custom_op(
             "vllm::fused_rms_norm_quant_static", mutates_args=["result", "scale"]
         )
@@ -2401,6 +2875,8 @@ class TestPatternMatcher(TestCase):
             azp: torch.Tensor,
             epsilon: float,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Custom op with mutated result and scale arguments that
+            # computes bogus values and fills the scale with 0.5; prints a marker string.
             print("vllm::fused_rms_norm_quant_static")
             result_rms = torch.mul(input, weight) + epsilon
             _result = torch.mul(result_rms, scale).to(torch.int8)
@@ -2413,6 +2889,7 @@ class TestPatternMatcher(TestCase):
             weight: torch.Tensor,
             epsilon: float,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Custom op that mutates result; body computes bogus data.
             # bogus implementation doesn't matter
             _result = torch.mul(input, weight) + epsilon
 
@@ -2425,6 +2902,8 @@ class TestPatternMatcher(TestCase):
             scale: torch.Tensor,
             azp: torch.Tensor | None = None,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Custom op that mutates result and scale; fills scale with
+            # 0.5, bogus data.
             # bogus implementation doesn't matter
             _result = torch.mul(input, scale).to(torch.int8)
             scale.fill_(0.5)
@@ -2436,6 +2915,8 @@ class TestPatternMatcher(TestCase):
             weight: torch.Tensor,
             scale: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Pattern function: auto functionalized rms_norm followed by
+            # auto functionalized quant op; returns the quant result and scale outputs.
             at1 = auto_functionalized(
                 torch.ops.vllm.rms_norm.default,
                 result=result_rms,
@@ -2460,6 +2941,8 @@ class TestPatternMatcher(TestCase):
             weight: torch.Tensor,
             scale: torch.Tensor,
         ):
+            # [FUNCTION DOC] HELPER: Replacement function: single auto functionalized fused op;
+            # returns result and scale outputs.
             at = auto_functionalized(
                 torch.ops.vllm.fused_rms_norm_quant_static.default,
                 result=result,
@@ -2472,9 +2955,11 @@ class TestPatternMatcher(TestCase):
             return at[1], at[2]
 
         def empty_bf16(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Empty bfloat16 tensor of the given shape.
             return torch.empty(*args, **kwargs, dtype=torch.bfloat16)
 
         def empty_int8(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Empty int8 tensor of the given shape.
             return torch.empty(*args, **kwargs, dtype=torch.int8)
 
         my_patterns = PatternMatcherPass()
@@ -2490,6 +2975,8 @@ class TestPatternMatcher(TestCase):
         )
 
         def custom_pass(graph: torch.fx.Graph) -> torch.fx.Graph:
+            # [FUNCTION DOC] HELPER: Post grad pass that applies the patterns and removes dead
+            # code, returns the graph.
             _count = my_patterns.apply(graph)
             # print(f"Count: {_count}")
             graph.eliminate_dead_code()
@@ -2499,6 +2986,8 @@ class TestPatternMatcher(TestCase):
         def custom_backend(
             graph: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
         ) -> Callable:
+            # [FUNCTION DOC] HELPER: Backend that copies the inductor config, sets the custom
+            # post grad pass, and calls compile_fx with those patches.
             from torch._inductor import config
 
             current_config = config.shallow_copy_dict()
@@ -2509,6 +2998,8 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile(backend=custom_backend)
         def my_func_static(x, w, epsilon):
+            # [FUNCTION DOC] HELPER: Compiled function creating output buffers, casting inputs
+            # to bfloat16, and calling the pattern function to get quant result and scale.
             quant_result = torch.empty_like(x, dtype=torch.int8)
             result_rms = torch.empty_like(x, dtype=torch.bfloat16)
             scale = torch.ones((1, 1))
@@ -2532,15 +3023,23 @@ class TestPatternMatcher(TestCase):
         self.assertTrue("static_scaled_int8_quant" not in code)
 
     def test_nested_replacement_args_do_not_percolate_tags(self):
+        # [FUNCTION DOC] ReplacementPatternEntry.replace_with_graph with a nested arguments
+        # tuple must not copy the recompute and ac_graph_id meta tags from the replaced node
+        # onto its inputs; the new graph still contains a mul and getitem.
         class DummyMatch:
+            # [CLASS DOC] HELPER: Minimal stand-in for a match object exposing nodes and
+            # output nodes.
             def __init__(self, outputs):
+                # [FUNCTION DOC] HELPER: Stores the output nodes as both nodes and outputs.
                 self.nodes = outputs
                 self._outputs = outputs
 
             def output_nodes(self):
+                # [FUNCTION DOC] HELPER: Returns the stored output nodes.
                 return self._outputs
 
             def erase_nodes(self):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
         graph = torch.fx.Graph()
@@ -2552,6 +3051,7 @@ class TestPatternMatcher(TestCase):
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
         def replacement(args):
+            # [FUNCTION DOC] HELPER: Unpacks a pair argument and multiplies the two elements.
             a, b = args
             return torch.mul(a, b)
 
@@ -2580,7 +3080,10 @@ class TestPatternMatcher(TestCase):
         self.assertIn("operator.getitem", graph_str)
 
     def test_fwd_only_generate_original_aten_meta(self):
+        # [FUNCTION DOC] fwd_only traced graph carries original_aten metadata on the
+        # sigmoid node.
         def f(x):
+            # [FUNCTION DOC] HELPER: Sigmoid via the aten op.
             return torch.ops.aten.sigmoid(x)
 
         sample_input = torch.randn(3, 5, device=GPU_TYPE)
@@ -2592,9 +3095,12 @@ class TestPatternMatcher(TestCase):
         self.assertTrue("original_aten" in sigmoid_nodes[0].meta)
 
     def test_fwd_only_uses_get_decomp_fn(self):
+        # [FUNCTION DOC] fwd_only uses the table from get_decomp_fn: by default gelu decomposes
+        # into erf-based ops, with an empty table it stays as gelu.
         """fwd_only traces the pattern graph using the table from get_decomp_fn."""
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Gelu of x.
             return F.gelu(x)
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -2614,14 +3120,19 @@ class TestPatternMatcher(TestCase):
         self.assertNotIn(aten.erf.default, targets_nodec)
 
     def test_register_replacement_get_decomp_fn(self):
+        # [FUNCTION DOC] A pattern registered with get_decomp_fn empty (dict) matches a graph
+        # traced without decompositions (one replacement) and does not match one traced with
+        # default decompositions.
         """A pattern registered with get_decomp_fn matches graphs traced with
         the same decomposition table, and does not match graphs traced with a
         different one."""
 
         def gelu_pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern: gelu of x.
             return F.gelu(x)
 
         def gelu_double(x):
+            # [FUNCTION DOC] HELPER: Replacement: gelu times 2.
             return F.gelu(x) * 2.0
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -2647,12 +3158,18 @@ class TestPatternMatcher(TestCase):
 
     @inductor_config.patch(is_predispatch=True)
     def test_remove_noop_pass_with_remove_passes(self):
+        # [FUNCTION DOC] With predispatch on, compiling with remove_pre_grad_passes set to
+        # remove_noop or unset gives matching results; at the pre grad pass level, the graph
+        # with remove_noop removed has at least as many view ops as the default.
         def fn_with_noop(x):
+            # [FUNCTION DOC] HELPER: Views x to its own shape then adds one.
             batch_size, dim = x.shape
             y = x.view(batch_size, dim)
             return y + 1
 
         def count_view_ops(graph_module):
+            # [FUNCTION DOC] HELPER: Counts nodes of call_function type whose target is view or
+            # reshape in a graph module.
             count = 0
             for node in graph_module.graph.nodes:
                 if node.op == "call_function" and node.target in [
@@ -2711,17 +3228,27 @@ class TestPatternMatcher(TestCase):
         )
 
     def test_bound_method_pattern_matcher(self):
+        # [FUNCTION DOC] A pattern defined via bound methods of a helper class with an exponent
+        # attribute (sum of powers replaced by power of sum) is registered through
+        # register_replacement. A compiled function with such sums gets exactly one replacement
+        # applied; outputs match the manually rewritten function.
         class ReluSumPattern:
+            # [CLASS DOC] HELPER: Holds an exponent and provides bound methods used as pattern,
+            # replacement, example inputs and registration.
             def __init__(self, e: float):
+                # [FUNCTION DOC] HELPER: Stores the exponent.
                 self.e = e
 
             def pattern(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Pattern: sum of x, y and z each raised to the exponent.
                 return x.pow(self.e) + y.pow(self.e) + z.pow(self.e)
 
             def replacement(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Replacement: sum of x, y and z raised to the exponent.
                 return (x + y + z).pow(self.e)
 
             def inputs(self):
+                # [FUNCTION DOC] HELPER: Returns three empty 5 by 5 example tensors.
                 return [
                     torch.empty(5, 5),  # x
                     torch.empty(5, 5),  # y
@@ -2729,6 +3256,8 @@ class TestPatternMatcher(TestCase):
                 ]
 
             def register(self, pm: PatternMatcherPass):
+                # [FUNCTION DOC] HELPER: Registers the bound pattern and replacement methods
+                # with the example inputs and fwd_only tracing into the given pass.
                 register_replacement(
                     self.pattern, self.replacement, self.inputs(), fwd_only, pm
                 )
@@ -2739,12 +3268,16 @@ class TestPatternMatcher(TestCase):
         count = 0
 
         def custom_pass(graph: torch.fx.Graph) -> torch.fx.Graph:
+            # [FUNCTION DOC] HELPER: Post grad pass that stores the number of applied
+            # replacements in an enclosing variable, removes dead code and returns the graph.
             nonlocal count
             count = my_patterns.apply(graph)
             graph.eliminate_dead_code()
             return graph
 
         def custom_backend(graph: torch.fx.GraphModule, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend that sets the custom post pass and disables auto
+            # functionalized v2 in a copy of the inductor config, then calls compile_fx.
             from torch._inductor import config
 
             current_config = config.shallow_copy_dict()
@@ -2756,6 +3289,8 @@ class TestPatternMatcher(TestCase):
 
         @torch.compile(fullgraph=True, backend=custom_backend)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Computes sums of powers of x, y and z for exponents two,
+            # three and four plus five.
             y = x.relu()
             z = y.tanh()
             z2 = x.pow(2) + y.pow(2) + z.pow(2)
@@ -2764,6 +3299,8 @@ class TestPatternMatcher(TestCase):
             return z4 + 5
 
         def fn_replaced(x):
+            # [FUNCTION DOC] HELPER: Same as the compiled function but with the final exponent
+            # four sum written in its replaced form.
             y = x.relu()
             z = y.tanh()
             z2 = x.pow(2) + y.pow(2) + z.pow(2)
@@ -2778,12 +3315,17 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(fn_result, fn_replaced_result)
 
     def test_empty_like_pattern_matching(self):
+        # [FUNCTION DOC] A pattern using an uninitialized empty tensor times two added to x is
+        # replaced by x times three. The compiled function using empty_like instead of empty
+        # must be matched (count of one) and return x times three.
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern: x plus empty tensor of x's shape times two.
             y = torch.empty(x.shape, device=x.device, dtype=x.dtype)
             z = y * 2
             return x + z
 
         def replacement(x):
+            # [FUNCTION DOC] HELPER: Replacement: x times three.
             return x * 3
 
         my_patterns = PatternMatcherPass()
@@ -2793,11 +3335,15 @@ class TestPatternMatcher(TestCase):
         count = 0
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that stores and returns the number of
+            # applied replacements.
             nonlocal count
             count = my_patterns.apply(graph)
             return count
 
         def replacement(x):
+            # [FUNCTION DOC] HELPER: Replacement: x times three (redefinition of the
+            # earlier one).
             return x * 3
 
         my_patterns = PatternMatcherPass()
@@ -2805,6 +3351,7 @@ class TestPatternMatcher(TestCase):
         register_replacement(pattern, replacement, inputs, fwd_only, my_patterns)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: x plus empty_like of x times two.
             y = torch.empty_like(x)
             z = y * 2
             return x + z
@@ -2820,12 +3367,18 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(count, 1)
 
     def test_get_attr_tensor_constant_pattern_matching(self):
+        # [FUNCTION DOC] A generated pattern containing a constant tensor holding the
+        # minimum finite value of the dtype matches the corresponding graph but not one
+        # with a different constant.
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern: maximum of x plus one and a constant tensor of the
+            # dtype's minimum.
             y = x + 1
             fill = torch.tensor(torch.finfo(y.dtype).min)
             return torch.maximum(y, fill)
 
         def different_constant(x):
+            # [FUNCTION DOC] HELPER: Same as the pattern but with a constant of zero.
             y = x + 1
             fill = torch.tensor(0.0)
             return torch.maximum(y, fill)
@@ -2848,7 +3401,12 @@ class TestPatternMatcher(TestCase):
         self.assertFalse(generated_pattern.match(other_maximum))
 
     def test_pretty_print_get_attr_tensor_constant_under_fake_mode(self):
+        # [FUNCTION DOC] Under fake mode and tracing context, pretty printing a generated
+        # pattern with a get_attr tensor constant yields text containing the tensor constructor
+        # with a float32 dtype.
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern: maximum of x plus one and a constant tensor of the
+            # dtype's minimum.
             y = x + 1
             fill = torch.tensor(torch.finfo(y.dtype).min)
             return torch.maximum(y, fill)
@@ -2863,6 +3421,9 @@ class TestPatternMatcher(TestCase):
         self.assertIn("dtype=torch.float32", pattern_str)
 
     def test_pretty_print_get_attr_nonfinite_tensor_constant_executes(self):
+        # [FUNCTION DOC] Pretty printing a GetAttr pattern with inf, negative inf and nan (and
+        # complex counterparts) produces text that can be executed to rebuild an equal pattern;
+        # text must contain the non-finite literal spellings.
         get_attr_pattern = GetAttr(
             torch.tensor([float("inf"), -float("inf"), float("nan")])
         )
@@ -2890,6 +3451,8 @@ class TestPatternMatcher(TestCase):
         self.assertIn("complex(2.0, float('inf'))", complex_pattern_str)
 
     def test_pretty_print_get_attr_tensor_constant_requires_contiguous(self):
+        # [FUNCTION DOC] Pretty printing a GetAttr pattern built from a non-contiguous tensor
+        # slice raises NotImplementedError mentioning a non-contiguous get_attr tensor.
         get_attr_pattern = GetAttr(torch.arange(6)[1:5:2])
 
         with self.assertRaisesRegex(
@@ -2898,7 +3461,13 @@ class TestPatternMatcher(TestCase):
             PatternPrettyPrinter.run(get_attr_pattern)
 
     def test_get_attr_nonfinite_tensor_constant_pattern_matching(self):
+        # [FUNCTION DOC] GetAttr pattern matching with non-finite tensor constants: a pattern
+        # holding inf, negative inf and nan matches a get_attr node whose constant is an equal
+        # clone (nan compared as equal) and does not match when a value differs; same for a
+        # complex tensor with a nan real part.
         def make_attr_node(value):
+            # [FUNCTION DOC] HELPER: Builds a graph with one get_attr node reading a module
+            # attribute holding value, wraps it in a GraphModule and returns the get_attr node.
             graph = torch.fx.Graph()
             attr = graph.get_attr("constant")
             graph.output(attr)
@@ -2927,7 +3496,13 @@ class TestPatternMatcher(TestCase):
         )
 
     def test_get_attr_tensor_constant_metadata_must_match(self):
+        # [FUNCTION DOC] GetAttr matching requires matching tensor metadata, not only values: a
+        # tensor with the same size, stride and storage offset matches, while a contiguous copy,
+        # a different storage offset, and a tensor with a different dtype or requires_grad flag
+        # do not.
         def make_attr_node(value):
+            # [FUNCTION DOC] HELPER: Builds a graph with one get_attr node reading a module
+            # attribute holding value, wraps it in a GraphModule and returns the get_attr node.
             graph = torch.fx.Graph()
             attr = graph.get_attr("constant")
             graph.output(attr)
@@ -2956,7 +3531,13 @@ class TestPatternMatcher(TestCase):
         )
 
     def test_get_attr_fake_tensor_constant_requires_value(self):
+        # [FUNCTION DOC] GetAttr with fake tensor constants: a fake tensor created
+        # without a known real value never matches a real get_attr constant, while a
+        # fake tensor made constant from a real tensor (make_constant) matches the
+        # get_attr node holding the real tensor.
         def make_attr_node(value):
+            # [FUNCTION DOC] HELPER: Builds a graph with one get_attr node reading a module
+            # attribute holding value, wraps it in a GraphModule and returns the get_attr node.
             graph = torch.fx.Graph()
             attr = graph.get_attr("constant")
             graph.output(attr)
@@ -2977,15 +3558,24 @@ class TestPatternMatcher(TestCase):
         self.assertTrue(GetAttr(known_fake).match(make_attr_node(expected)))
 
     def test_register_replacement_with_get_attr_tensor_constant(self):
+        # [FUNCTION DOC] register_replacement with a pattern containing a constant tensor (dtype
+        # minimum) in the pattern: applying the pass on a traced graph with the same constant
+        # gives one replacement; after dead code elimination the module output equals the
+        # replacement and no get_attr node remains.
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern: maximum of x plus one and a constant tensor of the
+            # dtype's minimum.
             y = x + 1
             fill = torch.tensor(torch.finfo(y.dtype).min)
             return torch.maximum(y, fill)
 
         def replacement(x):
+            # [FUNCTION DOC] HELPER: Replacement: x plus two.
             return x + 2
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Same computation as the pattern, used to build the
+            # graph to rewrite.
             y = x + 1
             fill = torch.tensor(torch.finfo(y.dtype).min)
             return torch.maximum(y, fill)
@@ -3003,10 +3593,15 @@ class TestPatternMatcher(TestCase):
         self.assertFalse(any(n.op == "get_attr" for n in gm.graph.nodes))
 
     def test_register_replacement_single_tensor_input(self):
+        # [FUNCTION DOC] register_replacement must reject a single tensor given as example
+        # inputs: raises TypeError with a message saying example_inputs must be a list or tuple
+        # and naming the type received.
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern: x plus one.
             return x + 1
 
         def replacement(x):
+            # [FUNCTION DOC] HELPER: Replacement: x minus one.
             return x - 1
 
         my_patterns = PatternMatcherPass()
@@ -3022,6 +3617,10 @@ class TestPatternMatcher(TestCase):
             )
 
     def _inject_test_metadata(self, graph):
+        # [FUNCTION DOC] HELPER: Fills metadata on every call_function node of graph: a
+        # stack_trace string derived from the node name, an nn_module_stack dictionary, a
+        # numeric debug handle of 42 and a custom dictionary. The graph is mutated in place; the
+        # original docstring says it injects identifiable metadata for tests.
         """Inject identifiable metadata on all call_function nodes for testing."""
         for node in graph.nodes:
             if node.op == "call_function":
@@ -3031,7 +3630,15 @@ class TestPatternMatcher(TestCase):
                 node.meta["custom"] = {"test_key": "test_value"}
 
     def test_replace_random_pass_preserves_stack_trace_on_rng_prims(self):
+        # [FUNCTION DOC] Traces a function with a randn call in fake tracing mode, sets
+        # stack_trace and source_fn_stack metadata on the randn node, then runs
+        # replace_random_passes under the fake mode. Each of the generated seeds, lookup_seed
+        # and random prim nodes must carry the same stack_trace and source_fn_stack, and have
+        # value and tensor_meta metadata with the expected shape and dtype (seeds: size 1 int64,
+        # lookup: scalar int64, random: size 4 float32).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds a random normal tensor of x's shape on its
+            # device to x.
             return x + torch.randn(x.shape, device=x.device)
 
         gm = make_fx(fn, tracing_mode="fake")(torch.randn(4))
@@ -3103,12 +3710,18 @@ class TestPatternMatcher(TestCase):
             )
 
     def test_metadata_propagation_register_replacement(self):
+        # [FUNCTION DOC] Compiles an addition with a custom post grad pass that injects metadata
+        # then applies a register_replacement that turns add into mul. Only checks that
+        # compilation and execution succeed (metadata transfer runs inside replacement); there
+        # are no assertions on the metadata.
         """Verify metadata from matched nodes transfers to replacement nodes."""
 
         def pattern(x, y):
+            # [FUNCTION DOC] HELPER: Pattern: x plus y.
             return x + y
 
         def replacement(x, y):
+            # [FUNCTION DOC] HELPER: Replacement: x times y.
             return x * y
 
         my_patterns = PatternMatcherPass()
@@ -3119,12 +3732,15 @@ class TestPatternMatcher(TestCase):
         register_replacement(pattern, replacement, inputs, fwd_only, my_patterns)
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that injects metadata on nodes then applies
+            # the patterns; returns nothing.
             self._inject_test_metadata(graph)
             # _transfer_meta runs inside replace_with_graph for
             # each old->new pair to propagate metadata fields
             my_patterns.apply(graph)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: x plus y.
             return x + y
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -3136,13 +3752,18 @@ class TestPatternMatcher(TestCase):
         compiled_fn(x, y)
 
     def test_metadata_propagation_register_replacement_multinode(self):
+        # [FUNCTION DOC] Same as the single node variant but with a two-node pattern (add then
+        # multiply by two) replaced by add then multiply by three; checks only that compilation
+        # runs without error.
         """Verify metadata propagation for multi-node patterns."""
 
         def pattern(x, y):
+            # [FUNCTION DOC] HELPER: Pattern: sum of x and y times two.
             tmp = x + y
             return tmp * 2
 
         def replacement(x, y):
+            # [FUNCTION DOC] HELPER: Replacement: sum of x and y times three.
             return (x + y) * 3
 
         my_patterns = PatternMatcherPass()
@@ -3153,10 +3774,13 @@ class TestPatternMatcher(TestCase):
         register_replacement(pattern, replacement, inputs, fwd_only, my_patterns)
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that injects metadata on nodes then applies
+            # the patterns.
             self._inject_test_metadata(graph)
             my_patterns.apply(graph)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sum of x and y times two.
             tmp = x + y
             return tmp * 2
 
@@ -3169,6 +3793,9 @@ class TestPatternMatcher(TestCase):
         compiled_fn(x, y)
 
     def test_metadata_propagation_graph_pattern_replace_by_example(self):
+        # [FUNCTION DOC] Registers a graph pattern on add that replaces it with a multiply via
+        # replace_by_example under the fake mode; custom post grad pass injects metadata first.
+        # Checks only that compilation and execution succeed.
         """Verify metadata propagation for replace_by_example (single-node match)."""
 
         test_pass = PatternMatcherPass()
@@ -3178,17 +3805,23 @@ class TestPatternMatcher(TestCase):
             pass_dict=test_pass,
         )
         def add_to_mul(match: Match, x, y):
+            # [FUNCTION DOC] HELPER: Handler that replaces the matched add with a
+            # multiply using replace_by_example.
             def repl(a, b):
+                # [FUNCTION DOC] HELPER: Replacement body: product of a and b.
                 return a * b
 
             with V.fake_mode:
                 match.replace_by_example(repl, [x, y])
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that injects metadata then applies
+            # the test pass.
             self._inject_test_metadata(graph)
             test_pass.apply(graph)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: x plus y.
             return x + y
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -3200,6 +3833,10 @@ class TestPatternMatcher(TestCase):
         compiled_fn(x, y)
 
     def test_replace_by_example_returns_inserted_nodes(self):
+        # [FUNCTION DOC] replace_by_example returns the nodes it inserted: a graph pattern
+        # replaces add with a product plus b and records targets of call_function nodes
+        # returned; asserts the compiled result is x times y plus y and the recorded targets are
+        # mul followed by add.
         test_pass = PatternMatcherPass()
         replacement_targets = []
 
@@ -3208,7 +3845,11 @@ class TestPatternMatcher(TestCase):
             pass_dict=test_pass,
         )
         def add_to_mul_add(match: Match, x, y):
+            # [FUNCTION DOC] HELPER: Handler that replaces the matched add with a function
+            # computing a product plus b and appends the call_function targets of the returned
+            # nodes to the enclosing list.
             def repl(a, b):
+                # [FUNCTION DOC] HELPER: Replacement body: product of a and b plus b.
                 prod = a * b
                 return prod + b
 
@@ -3220,9 +3861,11 @@ class TestPatternMatcher(TestCase):
             )
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that applies the test pass.
             test_pass.apply(graph)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: x plus y.
             return x + y
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -3235,6 +3878,9 @@ class TestPatternMatcher(TestCase):
         self.assertEqual(replacement_targets, [aten.mul.Tensor, aten.add.Tensor])
 
     def test_metadata_propagation_replace_by_example_multinode(self):
+        # [FUNCTION DOC] Same as the single node variant for a two-node match (add followed by
+        # multiply replaced by subtract followed by multiply); metadata is injected first; only
+        # verifies compilation and execution complete.
         """Verify metadata propagation for replace_by_example with a multi-node
         match.  The output node should inherit metadata from the matched output
         node via replace_with_graph's replace() inner function."""
@@ -3250,17 +3896,23 @@ class TestPatternMatcher(TestCase):
             pass_dict=test_pass,
         )
         def add_mul_to_sub(match: Match, x, y, z):
+            # [FUNCTION DOC] HELPER: Handler that replaces the matched add-then-mul with a
+            # subtract-then-mul using replace_by_example.
             def repl(a, b, c):
+                # [FUNCTION DOC] HELPER: Replacement body: difference of a and b times c.
                 return (a - b) * c
 
             with V.fake_mode:
                 match.replace_by_example(repl, [x, y, z])
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that injects metadata then applies
+            # the test pass.
             self._inject_test_metadata(graph)
             test_pass.apply(graph)
 
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Sum of x and y, times z.
             return (x + y) * z
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -3273,6 +3925,10 @@ class TestPatternMatcher(TestCase):
         compiled_fn(x, y, z)
 
     def test_metadata_propagation_lowering_pattern(self):
+        # [FUNCTION DOC] Manually exercises the metadata transfer used by lowering pattern
+        # entries: a handler creates a multiply node before the matched add, copies meta with
+        # the private transfer function, redirects uses and erases the match. Asserts the
+        # handler ran exactly once during compilation.
         """Verify metadata propagation for LoweringPatternEntry.apply.
 
         LoweringPatternEntry uses _transfer_meta to copy _COPY_META_FIELDS
@@ -3289,6 +3945,9 @@ class TestPatternMatcher(TestCase):
             pass_dict=test_pass,
         )
         def manual_lowering(match: Match, x, y):
+            # [FUNCTION DOC] HELPER: Handler that inserts a multiply before the matched output
+            # node, transfers metadata from the old node to the new node, replaces all uses,
+            # erases the matched nodes and increments the enclosing counter.
             nonlocal counter
             # Manually exercise the LoweringPatternEntry code path:
             # create a replacement node, propagate meta, and replace
@@ -3302,10 +3961,13 @@ class TestPatternMatcher(TestCase):
             counter += 1
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that injects metadata then applies
+            # the test pass.
             self._inject_test_metadata(graph)
             test_pass.apply(graph)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: x plus y.
             return x + y
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -3320,14 +3982,24 @@ class TestPatternMatcher(TestCase):
 
 @inductor_config.patch(fx_graph_cache=False)
 class TestPatternMatcherLogging(LoggingTestCase):
+    # [CLASS DOC] Logging tests for the pattern matcher (based on LoggingTestCase), run on the
+    # GPU device type with the FX graph cache turned off for the whole class. Tests set the
+    # pattern match debug environment variable to enable detailed log records and then check the
+    # emitted records and counters.
     device_type = GPU_TYPE
 
     @make_logging_test()
     def test_pattern_match_debug_output(self, records):
+        # [FUNCTION DOC] Records logs while an add-to-mul replacement is applied with the debug
+        # variable naming add; asserts the compiled result equals x times y and that the
+        # Specific pattern match record message contains a match description with args x and y
+        # and the add call text.
         def pattern(x, y):
+            # [FUNCTION DOC] HELPER: Pattern: x plus y.
             return x + y
 
         def replacement(x, y):
+            # [FUNCTION DOC] HELPER: Replacement: x times y.
             return x * y
 
         my_patterns = PatternMatcherPass()
@@ -3338,9 +4010,12 @@ class TestPatternMatcherLogging(LoggingTestCase):
         register_replacement(pattern, replacement, inputs, fwd_only, my_patterns)
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that applies the patterns and
+            # returns the count.
             return my_patterns.apply(graph)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: x plus y.
             return x + y
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -3363,10 +4038,16 @@ class TestPatternMatcherLogging(LoggingTestCase):
 
     @make_logging_test()
     def test_failed_match_constant_args_format_string(self, records):
+        # [FUNCTION DOC] Registers an add-one pattern, compiles a function adding two with the
+        # debug variable set to add; the result is unchanged and the Specific pattern match
+        # record message reports a constant args mismatch of 2 against 1 together with the
+        # printed pattern.
         def pattern(x):
+            # [FUNCTION DOC] HELPER: Pattern: x plus one.
             return x + 1
 
         def replacement(x):
+            # [FUNCTION DOC] HELPER: Replacement: x times two.
             return x * 2
 
         my_patterns = PatternMatcherPass()
@@ -3376,9 +4057,12 @@ class TestPatternMatcherLogging(LoggingTestCase):
         register_replacement(pattern, replacement, inputs, fwd_only, my_patterns)
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that applies the patterns and
+            # returns the count.
             return my_patterns.apply(graph)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: x plus two.
             return x + 2
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -3400,16 +4084,23 @@ class TestPatternMatcherLogging(LoggingTestCase):
 
     @make_logging_test()
     def test_pattern_match_debug_multiple_nodes(self, records):
+        # [FUNCTION DOC] Two patterns (add and sub) are registered; with the debug
+        # variable listing add and sub, log records for specific pattern match of both
+        # add and sub must exist.
         def pattern_add(x, y):
+            # [FUNCTION DOC] HELPER: Pattern for add: x plus y.
             return x + y
 
         def replacement_add(x, y):
+            # [FUNCTION DOC] HELPER: Replacement for add: x times y.
             return x * y
 
         def pattern_sub(x, y):
+            # [FUNCTION DOC] HELPER: Pattern for sub: x minus y.
             return x - y
 
         def replacement_sub(x, y):
+            # [FUNCTION DOC] HELPER: Replacement for sub: x times y.
             return x * y
 
         my_patterns = PatternMatcherPass()
@@ -3425,9 +4116,12 @@ class TestPatternMatcherLogging(LoggingTestCase):
         )
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that applies the patterns and
+            # returns the count.
             return my_patterns.apply(graph)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sum of (x plus y) and (x minus y).
             return (x + y) + (x - y)
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -3447,16 +4141,22 @@ class TestPatternMatcherLogging(LoggingTestCase):
 
     @make_logging_test()
     def test_pattern_match_debug_all_nodes(self, records):
+        # [FUNCTION DOC] Same as the multiple nodes test, but with the debug variable set to
+        # all; records for both add and sub must exist.
         def pattern_add(x, y):
+            # [FUNCTION DOC] HELPER: Pattern for add: x plus y.
             return x + y
 
         def replacement_add(x, y):
+            # [FUNCTION DOC] HELPER: Replacement for add: x times y.
             return x * y
 
         def pattern_sub(x, y):
+            # [FUNCTION DOC] HELPER: Pattern for sub: x minus y.
             return x - y
 
         def replacement_sub(x, y):
+            # [FUNCTION DOC] HELPER: Replacement for sub: x times y.
             return x * y
 
         my_patterns = PatternMatcherPass()
@@ -3472,9 +4172,12 @@ class TestPatternMatcherLogging(LoggingTestCase):
         )
 
         def custom_pass(graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Post grad pass that applies the patterns and
+            # returns the count.
             return my_patterns.apply(graph)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sum of (x plus y) and (x minus y).
             return (x + y) + (x - y)
 
         x = torch.randn(4, 4, device=GPU_TYPE)
@@ -3491,10 +4194,18 @@ class TestPatternMatcherLogging(LoggingTestCase):
         self.assertTrue(self.hasRecord(records, "Specific pattern match: sub"))
 
     def test_gumbel_max_trick(self):
+        # [FUNCTION DOC] Statistical test of the Gumbel max trick rewrite for sampling: compiles
+        # a sampling function (temperature scaled softmax divided by exponential noise then
+        # argmax), draws one million samples from logits with a known distribution, and requires
+        # each category frequency within 10 percent relative error of expected; also asserts the
+        # apply_gumbel_max_trick counter equals one. Can be flaky by nature (random sampling).
         counters.clear()
 
         @torch.compile
         def sample(logits, temperature):
+            # [FUNCTION DOC] HELPER: Compiled sampler: divides logits by max of temperature and
+            # a small floor, applies softmax, divides probabilities by exponential noise and
+            # returns the argmax index per row as int.
             logits = logits / max(temperature, 1e-5)
             probs = torch.nn.functional.softmax(logits, dim=-1)
             q = torch.empty_like(logits).exponential_(1)
@@ -3530,6 +4241,9 @@ class TestPatternMatcherLogging(LoggingTestCase):
         self.assertTrue(counters["inductor"]["apply_gumbel_max_trick"] == 1)
 
     def test_per_pattern_counter(self):
+        # [FUNCTION DOC] With the pattern match debug variable set to 1, compiling a bmm records
+        # a per-pattern counter dictionary; asserts it is a nonempty dict and that the key for
+        # the bmm call function pattern has the value one.
         """Test that per-pattern counters track individual pattern matches"""
         with unittest.mock.patch.dict(
             os.environ, {"TORCHINDUCTOR_PATTERN_MATCH_DEBUG": "1"}
@@ -3537,6 +4251,7 @@ class TestPatternMatcherLogging(LoggingTestCase):
             counters.clear()
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Batched matmul of x and y.
                 return torch.bmm(x, y)
 
             x = torch.randn(4, 10, 10, device=GPU_TYPE)
@@ -3554,6 +4269,10 @@ class TestPatternMatcherLogging(LoggingTestCase):
             self.assertEqual(per_pattern["CallFunction_aten.bmm.default"], 1)
 
     def test_per_pattern_counter_accumulation(self):
+        # [FUNCTION DOC] Per-pattern counters accumulate across compilations: counts
+        # after compiling a bmm function, then a second function without clearing
+        # counters, must equal the first count plus a count measured by recompiling the
+        # second function on cleared counters.
         """Test that per-pattern counters accumulate across compilations"""
         with unittest.mock.patch.dict(
             os.environ, {"TORCHINDUCTOR_PATTERN_MATCH_DEBUG": "1"}
@@ -3566,6 +4285,7 @@ class TestPatternMatcherLogging(LoggingTestCase):
             y = torch.randn(2, 10, 10, device=GPU_TYPE)
 
             def fn1(a, b):
+                # [FUNCTION DOC] HELPER: Batched matmul.
                 return torch.bmm(a, b)
 
             compiled1 = torch.compile(fn1)
@@ -3574,6 +4294,7 @@ class TestPatternMatcherLogging(LoggingTestCase):
 
             # Compile second function without clearing counters
             def fn2(a, b):
+                # [FUNCTION DOC] HELPER: Batched matmul times two.
                 return torch.bmm(a, b) * 2
 
             compiled2 = torch.compile(fn2)
@@ -3590,6 +4311,11 @@ class TestPatternMatcherLogging(LoggingTestCase):
             self.assertEqual(accumulated_count, count1 + count2)
 
     def test_list_tensor_pattern_replacement(self):
+        # [FUNCTION DOC] Registers a replacement for a custom op taking and returning a list of
+        # tensors (defined in a scoped library with a fake implementation) that returns its
+        # input list unchanged. For list lengths one and two, a custom backend applying the pass
+        # must report one replacement, the result must equal the inputs, and the op must be gone
+        # from the graph.
         with torch.library._scoped_library("_test_pm_list", "FRAGMENT") as lib:
             lib.define("list_op(Tensor[] xs) -> Tensor[]")
             lib.impl(
@@ -3600,16 +4326,24 @@ class TestPatternMatcherLogging(LoggingTestCase):
 
             @torch.library.register_fake("_test_pm_list::list_op", lib=lib)
             def list_op_fake(xs):
+                # [FUNCTION DOC] HELPER: Fake implementation returning the input list.
                 return xs
 
             def src_pattern(xs: list[torch.Tensor]):
+                # [FUNCTION DOC] HELPER: Pattern: calls the custom list op on xs.
                 return torch.ops._test_pm_list.list_op.default(xs)
 
             def target_pattern(xs: list[torch.Tensor]):
+                # [FUNCTION DOC] HELPER: Replacement: returns xs.
                 return xs
 
             class Backend:
+                # [CLASS DOC] HELPER: Torch compile backend that registers the list pattern at
+                # construction, applies it to the graph on call, records the count and graph,
+                # lints, recompiles and returns the forward.
                 def __init__(self, example_inputs) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the pattern pass, zeroes the count, clears
+                    # the graph and registers the replacement with a list of the example inputs.
                     self.pm = PatternMatcherPass()
                     self.count = 0
                     self.graph = None
@@ -3622,6 +4356,9 @@ class TestPatternMatcherLogging(LoggingTestCase):
                     )
 
                 def __call__(self, gm, example_inputs):
+                    # [FUNCTION DOC] HELPER: Applies the pass to the graph, stores the
+                    # replacement count, lints and recompiles the module, saves the graph and
+                    # returns the module forward function.
                     self.count = self.pm.apply(gm.graph)
                     gm.graph.lint()
                     gm.recompile()
@@ -3629,10 +4366,15 @@ class TestPatternMatcherLogging(LoggingTestCase):
                     return gm.forward
 
             def run_case(length):
+                # [FUNCTION DOC] HELPER: Resets dynamo, builds the backend for a list of the
+                # given length of empty tensors, compiles the custom list op call, runs it on
+                # random inputs and asserts one replacement, equal outputs and that the op is
+                # absent from the recorded graph (fails the test if no graph was recorded).
                 torch._dynamo.reset()
                 backend = Backend([torch.empty(4, 5) for _ in range(length)])
 
                 def fn(xs):
+                    # [FUNCTION DOC] HELPER: Calls the custom list op on xs.
                     return torch.ops._test_pm_list.list_op.default(xs)
 
                 xs = [torch.randn(4, 5) for _ in range(length)]
@@ -3654,7 +4396,13 @@ class TestPatternMatcherLogging(LoggingTestCase):
             run_case(2)
 
     def test_scalar_workaround_arg_survives_specific_match(self):
+        # [FUNCTION DOC] Checks a replacement with a scalar workaround on the dim argument: a
+        # softmax written as amax, subtract, exp, sum and divide over dim one is replaced by
+        # softmax even though the pattern was traced with dim negative one. The extra check
+        # records the matched dim; asserts one replacement, recorded dim equals one, and results
+        # equal softmax.
         def src_pattern(x, dim):
+            # [FUNCTION DOC] HELPER: Pattern: explicit softmax decomposition over the given dim.
             xmax = x.amax(dim=dim, keepdim=True)
             xsub = x - xmax
             xexp = xsub.exp()
@@ -3662,9 +4410,11 @@ class TestPatternMatcherLogging(LoggingTestCase):
             return xexp / xsum
 
         def target_pattern(x, dim):
+            # [FUNCTION DOC] HELPER: Replacement: softmax over the given dim.
             return torch.softmax(x, dim=dim)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Explicit softmax decomposition over dim one.
             xmax = x.amax(dim=1, keepdim=True)
             xsub = x - xmax
             xexp = xsub.exp()
@@ -3675,6 +4425,8 @@ class TestPatternMatcherLogging(LoggingTestCase):
         dims = []
 
         def extra_check(match):
+            # [FUNCTION DOC] HELPER: Match check that appends the matched dim keyword to the
+            # enclosing list and accepts.
             dims.append(match.kwargs["dim"])
             return True
 
@@ -3699,6 +4451,12 @@ class TestPatternMatcherLogging(LoggingTestCase):
         self.assertEqual(gm(x), torch.softmax(x, dim=1))
 
     def test_opaque_obj_custom_op(self):
+        # [FUNCTION DOC] Replacement involving an opaque object argument: in a scoped library
+        # defines an original op and a replacement op taking a tensor and the OpaqueScaleFactor
+        # (with fake implementations), registers the pattern, runs a compiled function with a
+        # custom backend; asserts the result is input plus 4 (replacement op multiplication
+        # swapped for add), one replacement, and the graph holds the replacement op but no
+        # original op.
         with torch.library._scoped_library("_test_pm", "FRAGMENT") as lib:
             lib.define(
                 f"original_op(Tensor x, {get_opaque_type_name(OpaqueScaleFactor)} s) -> Tensor"
@@ -3707,6 +4465,8 @@ class TestPatternMatcherLogging(LoggingTestCase):
 
             @torch.library.register_fake("_test_pm::original_op", lib=lib)
             def _orig_fake(x, s):
+                # [FUNCTION DOC] HELPER: Fake implementation for the original op returning an
+                # empty tensor like x.
                 return torch.empty_like(x)
 
             lib.define(
@@ -3718,12 +4478,16 @@ class TestPatternMatcherLogging(LoggingTestCase):
 
             @torch.library.register_fake("_test_pm::replacement_op", lib=lib)
             def _repl_fake(x, s):
+                # [FUNCTION DOC] HELPER: Fake implementation for the replacement op returning an
+                # empty tensor like x.
                 return torch.empty_like(x)
 
             def pattern(x, factor):
+                # [FUNCTION DOC] HELPER: Pattern: calls the original op.
                 return torch.ops._test_pm.original_op(x, factor)
 
             def replacement(x, factor):
+                # [FUNCTION DOC] HELPER: Replacement: calls the replacement op.
                 return torch.ops._test_pm.replacement_op(x, factor)
 
             patterns = PatternMatcherPass()
@@ -3739,12 +4503,16 @@ class TestPatternMatcherLogging(LoggingTestCase):
             post_pass_graph = None
 
             def custom_pass(graph):
+                # [FUNCTION DOC] HELPER: Post grad pass that applies the patterns, stores the
+                # count and graph in enclosing variables and returns the graph.
                 nonlocal count, post_pass_graph
                 count = patterns.apply(graph)
                 post_pass_graph = graph
                 return graph
 
             def custom_backend(graph, example_inputs):
+                # [FUNCTION DOC] HELPER: Backend copying the inductor config, setting the custom
+                # post grad pass and compiling the graph with compile_fx.
                 from torch._inductor.compile_fx import compile_fx
 
                 current_config = inductor_config.get_config_copy()
@@ -3753,6 +4521,7 @@ class TestPatternMatcherLogging(LoggingTestCase):
 
             @torch.compile(backend=custom_backend)
             def f(x, s):
+                # [FUNCTION DOC] HELPER: Compiled function calling the original op.
                 return torch.ops._test_pm.original_op(x, s)
 
             inp = torch.randn(4, 4)
