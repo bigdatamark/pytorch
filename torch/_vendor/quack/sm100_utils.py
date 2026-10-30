@@ -1,4 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
+# [MODULE DOC] Blackwell (SM100) shared-memory layout helpers for operand A, covering cp.async
+# loads and TMA gather4 loads. They wrap the CUTLASS Blackwell helper functions. Importing has
+# no side effects.
 
 from typing import Type, Union
 
@@ -18,6 +21,11 @@ def make_smem_layout_cpasync_a(
     loc=None,
     ip=None,
 ) -> Union[cute.Layout, cute.ComposedLayout]:
+    # [FUNCTION DOC] Build the staged shared-memory layout of operand A for a cp.async
+    # (non-TMA) load path. The per-stage A shape is derived from the tiled MMA and the M and K
+    # part of the MMA tiler; a swizzled atom is chosen for the A major mode and dtype, then
+    # tiled to that shape with a trailing stage mode of the given size (mode order swapped for
+    # MN-major A). Returns the staged layout.
     """
     :param tiled_mma: The tiled MMA used to partition tensor A
     :type tiled_mma: cute.TiledMma
@@ -72,6 +80,11 @@ def make_smem_layout_atom_tma_gather_a(
     loc=None,
     ip=None,
 ) -> Union[cute.Layout, cute.ComposedLayout]:
+    # [FUNCTION DOC] Build the shared-memory layout atom used for TMA gather4 loads of A.
+    # Starts from the usual swizzled atom for the A major mode and dtype, then replaces its
+    # row extent (K-major A) or its K extent (MN-major A) with the gather size (default 4),
+    # keeping the original strides, and re-wraps the result in the same swizzle. Returns the
+    # composed layout.
     """SMEM load layout atom for A with TMA gather4."""
     is_k_major = tiled_mma.op.a_major_mode == OperandMajorMode.K
     a_smem_shape = tiled_mma.partition_shape_A(
@@ -128,6 +141,10 @@ def make_smem_layout_tma_gather_a(
     loc=None,
     ip=None,
 ) -> Union[cute.Layout, cute.ComposedLayout]:
+    # [FUNCTION DOC] Build the staged shared-memory layout of A for TMA gather4 loads: takes
+    # the gather atom from the atom helper and tiles it to the per-stage A shape with a
+    # trailing stage mode of the given size (mode order swapped for MN-major A). Returns the
+    # staged layout.
     """SMEM load layout for A with TMA gather4."""
     is_k_major = tiled_mma.op.a_major_mode == OperandMajorMode.K
     a_smem_shape = tiled_mma.partition_shape_A(

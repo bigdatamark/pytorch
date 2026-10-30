@@ -1,4 +1,8 @@
 # Copyright (c) 2025, Tri Dao.
+# [MODULE DOC] Hopper (SM90) helpers for GEMM-style kernels in the CuTe DSL: shared-memory
+# layout construction, tiled-MMA construction with warpgroup MMA atoms, epilogue partitioning,
+# and thin wrappers that issue warpgroup MMAs with optional A/B swapping and stage indexing.
+# Also exports an alias for the epilogue layout builder. Importing has no side effects.
 
 from typing import Literal, Type, Union, Optional
 
@@ -22,6 +26,12 @@ def make_smem_layout(
     loc=None,
     ip=None,
 ) -> Union[cute.Layout, cute.ComposedLayout]:
+    # [FUNCTION DOC] Build a swizzled shared-memory layout for the given dtype, layout enum
+    # and tile. The tile shape is flattened by taking per-mode products; the major-mode size
+    # defaults to the second extent for an N-major C layout and otherwise the first. The
+    # swizzle atom comes from the Hopper helper for that layout, dtype and size. Atoms are
+    # tiled to the tile shape, with a trailing stage mode when a stage count is given (mode
+    # order is swapped for M-major layouts). Returns the unstaged or staged layout.
     shape = cute.product_each(cute.shape(tile, loc=loc, ip=ip), loc=loc, ip=ip)
     if const_expr(major_mode_size is None):
         major_mode_size = shape[1] if layout.is_n_major_c() else shape[0]
@@ -53,6 +63,11 @@ def make_tiled_mma(
     b_dtype: Optional[Type[Numeric]] = None,
     acc_dtype: Type[Numeric] = Float32,
 ) -> cute.TiledMma:
+    # [FUNCTION DOC] Create a Hopper warpgroup tiled MMA with tile (64, tiler_n). The B dtype
+    # defaults to the A dtype and the accumulator dtype to Float32. Majors are given as the
+    # strings K or MN (any other string raises KeyError); with swap_AB the two major modes are
+    # exchanged (the dtypes are not). The A operand comes from registers for source RS and
+    # from shared memory otherwise. Returns the tiled MMA from the CUTLASS trivial builder.
     """`b_dtype` defaults to `a_dtype`; pass it for mixed-precision MMAs (e.g. fp8).
     `acc_dtype` defaults to Float32."""
     if b_dtype is None:
@@ -85,6 +100,11 @@ def partition_for_epilogue(
     loc=None,
     ip=None,
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Partition a coordinate tensor for the epilogue of one thread. The tensor
+    # is divided into epilogue tiles, then partitioned with the thread slice of the tiled copy
+    # either according to the source layout (when register tensors follow the source) or the
+    # destination layout. Returns the thread partition with modes for copy element, copy M,
+    # copy N, epilogue M and epilogue N.
     thr_copy = tiled_copy.get_slice(tidx)
     cT_epi = cute.flat_divide(cT, epi_tile)
     # (CPY, CPY_M, CPY_N, EPI_M, EPI_N)
@@ -105,6 +125,12 @@ def gemm(
     # A_in_regs: cutlass.Constexpr[bool] = False,
     swap_AB: cutlass.Constexpr[bool] = False,
 ) -> None:
+    # [FUNCTION DOC] JIT-compiled warpgroup GEMM. With swap_AB it calls itself with A and B
+    # exchanged and swapping disabled. Otherwise it fences the warpgroup, builds a fresh MMA
+    # atom (to avoid mutating the shared one), sets accumulation to off for the first K block
+    # when zero_init is set, issues one MMA per K block of the fragments with accumulation on
+    # afterwards, commits the group, and waits until at most wg_wait groups remain in flight
+    # when wg_wait is not negative. Updates acc in place; returns None.
     if const_expr(swap_AB):
         gemm(tiled_mma, acc, tCrB, tCrA, zero_init=zero_init, wg_wait=wg_wait, swap_AB=False)
     else:
@@ -131,6 +157,11 @@ def gemm_zero_init(
     wg_wait: int = -1,
     swap_AB: bool = False,
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Allocate an FP32 register accumulator for the given output shape and
+    # run a zero-initialised GEMM into it. Optional A and B indices select a stage from the
+    # last mode of the fragments. With swap_AB the shape is reversed and operands and
+    # indices are exchanged. The default wg_wait of -1 means no wait for the MMA group.
+    # Returns the accumulator.
     if const_expr(swap_AB):
         return gemm_zero_init(
             tiled_mma, shape[::-1], tCrB, tCrA, B_idx, A_idx, wg_wait, swap_AB=False
@@ -154,6 +185,10 @@ def gemm_w_idx(
     wg_wait: int = -1,
     swap_AB: bool = False,
 ) -> None:
+    # [FUNCTION DOC] GEMM wrapper that optionally picks a stage of A and B fragments by index
+    # (last mode) and forwards to the base GEMM with the given zero_init and wg_wait; with
+    # swap_AB it exchanges operands and indices first. Accumulates into acc in place and
+    # returns None.
     if const_expr(swap_AB):
         gemm_w_idx(tiled_mma, acc, tCrB, tCrA, zero_init, B_idx, A_idx, wg_wait, swap_AB=False)
     else:
@@ -169,6 +204,13 @@ def partition_fragment_ABC(
     sB: Optional[cute.Tensor],
     swap_AB: bool = False,
 ):
+    # [FUNCTION DOC] Allocate the accumulator and operand fragments for a Hopper tiled MMA
+    # thread slice. Whether A is in registers is read from the MMA op. Without swapping the
+    # FP32 accumulator has the M by N shape, A is a fragment of the partitioned shared tensor
+    # (or a register-shaped fragment of M by K when A comes from registers) and B is a
+    # fragment of the partitioned shared tensor. With swap_AB the accumulator is N by M and
+    # the roles of A and B are exchanged. Asserts that required shared tensors are not None.
+    # Returns a tuple of accumulator, A fragment, B fragment.
     is_rs = thr_mma.op.a_src == warpgroup.OperandSource.RMEM
     if const_expr(not swap_AB):
         acc = cute.make_rmem_tensor(thr_mma.partition_shape_C(shape_mnk[:2]), Float32)

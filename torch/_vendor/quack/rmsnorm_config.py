@@ -1,4 +1,10 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# [MODULE DOC] Launch-configuration objects for the RMSNorm/LayerNorm forward and backward
+# kernels. Provides frozen dataclasses for the forward and backward launch knobs, hand-tuned
+# heuristic factories per architecture, SM-count heuristics for the persistent backward grid,
+# helpers that enumerate the full autotuning search space, and pruners that drop
+# configurations that do not fit a given call. Importing only imports torch and defines these
+# names; CUDA is queried lazily by the functions.
 
 """Launch configuration for the RMSNorm forward and backward kernels.
 
@@ -15,6 +21,11 @@ import torch
 
 @dataclass(frozen=True)
 class RmsNormFwdConfig:
+    # [CLASS DOC] Immutable (hashable) launch configuration for the forward kernel: CTA thread
+    # count, threads cooperating per row, cluster size, whether x and residual are reloaded
+    # from shared or global memory after the row reduction (None keeps them in registers), and
+    # whether the weight and bias load is deferred until after the reduction. The class method
+    # builds a heuristic default.
     num_threads: int
     threads_per_row: int
     cluster_n: int
@@ -32,6 +43,10 @@ class RmsNormFwdConfig:
         arch_major: Optional[int] = None,
         is_layernorm: bool = False,
     ) -> "RmsNormFwdConfig":
+        # [FUNCTION DOC] Return the hand-tuned forward config for a row length N and element
+        # bit width. When arch_major is None it is read from the current CUDA device (0 when
+        # CUDA is absent). Every architecture currently goes through the single Hopper-style
+        # ladder function; the is_layernorm flag changes cluster and reload thresholds.
         """Pick a launch config from the hand-tuned analytical heuristic.
 
         ``arch_major`` defaults to the current device's capability. The same
@@ -47,6 +62,14 @@ class RmsNormFwdConfig:
 def _for_hopper_fwd(
     N: int, dtype_width: int, arch_major: int, is_layernorm: bool
 ) -> RmsNormFwdConfig:
+    # [FUNCTION DOC] HELPER: Heuristic forward config. Uses 128 threads for rows up to 16384
+    # elements, otherwise 256; threads per row come from a ladder over N (8, 16, 32, 64, 128
+    # up to the limits 64, 128, 3072, 6144, 16384, and 256 beyond). Cluster size is 1 below
+    # SM90; otherwise it is picked from a threshold table (different tables for SM12x with
+    # 32-bit data, 16-bit data, fp32 LayerNorm and fp32 RMSNorm) and falls back to the
+    # architecture maximum (8 on SM12x, 16 elsewhere) for the largest rows. Reload from shared
+    # memory is used for rows above 16384 (LayerNorm) or 8192 (RMSNorm) elements. The weight
+    # load is never delayed.
     num_threads = 128 if N <= 16 * 1024 else 256
 
     threads_per_row = 256
@@ -93,6 +116,11 @@ def _for_hopper_fwd(
 
 @dataclass(frozen=True)
 class RmsNormBwdConfig:
+    # [CLASS DOC] Immutable (hashable) launch configuration for the backward kernel: CTA
+    # thread count, threads per row, cluster size, whether the weight-times-dout term and x
+    # are reloaded from shared memory (None keeps them in registers), whether TMA is
+    # requested, and the number of shared-memory pipeline stages used by the prefetch pipeline
+    # (default 2). The class method builds a heuristic default.
     num_threads: int
     threads_per_row: int
     cluster_n: int
@@ -115,6 +143,11 @@ class RmsNormBwdConfig:
         arch_major: Optional[int] = None,
         T_hint: int = 0,
     ) -> "RmsNormBwdConfig":
+        # [FUNCTION DOC] Return the hand-tuned backward config for row length N, element bit
+        # widths of x and dout, and a hint of the number of rows (T_hint, 0 meaning unknown).
+        # When arch_major is None it is read from the current device. Architectures 10 and
+        # above use the Blackwell heuristic; all others use the Hopper-tuned one, which
+        # ignores dout width and the row hint.
         """Pick a launch config from the hand-tuned analytical heuristic.
 
         ``arch_major`` defaults to the current device's capability.
@@ -130,6 +163,12 @@ class RmsNormBwdConfig:
 
 
 def _for_hopper_bwd(N: int, dtype_width: int, arch_major: int) -> RmsNormBwdConfig:
+    # [FUNCTION DOC] HELPER: Heuristic backward config for pre-Blackwell GPUs. Uses 128
+    # threads for rows up to 4096 elements, otherwise 256; threads per row come from a ladder
+    # over N (8 up to 64 through 128 up to 4096, 256 beyond). Cluster size is 1 below SM90 and
+    # otherwise comes from a threshold table (a tighter one for SM12x with 32-bit data),
+    # falling back to the architecture maximum. The weight-times-dout term is reloaded from
+    # shared memory for rows above 16384 elements; x is never reloaded; TMA is off.
     num_threads = 128 if N <= 4096 else 256
     for limit, threads in [(64, 8), (128, 16), (256, 32), (512, 64), (4096, 128)]:
         if N <= limit:
@@ -165,6 +204,18 @@ def _for_hopper_bwd(N: int, dtype_width: int, arch_major: int) -> RmsNormBwdConf
 def _for_blackwell_bwd(
     N: int, dtype_width: int, dout_width: int, T_hint: int = 0
 ) -> RmsNormBwdConfig:
+    # [FUNCTION DOC] HELPER: Heuristic backward config for Blackwell. Rows up to 512 elements
+    # get 128 threads, a small threads-per-row value from a ladder, no cluster, no reloads and
+    # no TMA. Larger rows are classified by row bytes (N times the wider of the x and dout
+    # byte sizes): at least 48 KB uses 128 threads, a cluster of 8 (4 when the row hint is
+    # positive and at most 1024 and the row is at most 64 KB) raised if needed so the shared
+    # buffers fit; above 16 KB uses 256 threads with no cluster; otherwise 128 threads with no
+    # cluster. TMA is enabled for clusters of 4 or more or for wide rows with 32-bit data;
+    # reloads of x and of the weight-times-dout term are enabled from per-thread fragment size
+    # and cluster size rules. Smem stages keep the default.
+    # KNOWN ISSUE: The docstring talks about a separate x byte size governing the X tile,
+    # but the code computes only the wider byte size and the summed byte size; no x-only
+    # value exists.
     """Pick a launch config for RMSNorm bwd on Blackwell.
 
     All thresholds are expressed in ``row_bytes = N * max(x, dout)`` so a
@@ -252,6 +303,10 @@ def _for_blackwell_bwd(
 
 
 def _get_sm_count_hopper(N: int, sm_count: int) -> int:
+    # [FUNCTION DOC] HELPER: Number of CTAs for the persistent backward grid on Hopper-style
+    # GPUs. A multiple of the SM count that shrinks with N (16 down to 1 for rows up to 256,
+    # 1024, 2048, 4096, larger) is used for N up to 8192; half the SM count up to 16384; and
+    # twice the SM count beyond. Returns an int.
     # This should be tuned on how many CTAs can be launched on each SM.
     sm_count_multiple = (
         16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
@@ -266,6 +321,9 @@ def _get_sm_count_hopper(N: int, sm_count: int) -> int:
 
 
 def _get_sm_count_blackwell(N: int, sm_count: int) -> int:
+    # [FUNCTION DOC] HELPER: Number of CTAs for the persistent backward grid on Blackwell: 16,
+    # 8, 4 or 2 times the SM count for N up to 256, 1024, 2048 and beyond respectively.
+    # Returns an int.
     if N <= 256:
         return sm_count * 16
     if N <= 1024:
@@ -276,6 +334,9 @@ def _get_sm_count_blackwell(N: int, sm_count: int) -> int:
 
 
 def get_sm_count(N: int, device: torch.device) -> int:
+    # [FUNCTION DOC] Return the persistent-grid CTA count for the given device and row length.
+    # Queries the CUDA device properties (so it needs CUDA) and dispatches to the Blackwell
+    # rule for compute capability major 10 or higher, otherwise to the Hopper rule.
     props = torch.cuda.get_device_properties(device)
     if props.major >= 10:
         return _get_sm_count_blackwell(N, props.multi_processor_count)
@@ -297,6 +358,10 @@ _AUTOTUNE_SMEM_STAGES = (2, 3)
 
 
 def _max_dynamic_smem_bytes() -> int:
+    # [FUNCTION DOC] HELPER: Return the per-CTA opt-in dynamic shared-memory capacity of the
+    # current CUDA device in bytes, falling back to the default per-block capacity when the
+    # opt-in attribute is missing. Returns 0 when CUDA is unavailable, which callers treat as
+    # no memory guard.
     """Per-CTA opt-in dynamic smem capacity for the current device.
 
     Returns 0 when CUDA is unavailable (callers should treat this as "no
@@ -316,6 +381,12 @@ def _bump_cluster_n_for_smem(
     sum_bytes: int,
     max_cluster: int,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Grow the cluster size so the backward x and dout shared buffers
+    # fit. The needed number of CTAs is the buffer bytes (N times stages times the summed
+    # element bytes) divided, rounding up, by the opt-in shared memory minus a fixed 4 KB
+    # reserve; that is rounded up to a power of two, never goes below the given cluster_n and
+    # is capped at max_cluster. Returns cluster_n unchanged when CUDA is unavailable. It does
+    # not raise when the cap is hit; the backward class later raises its own overflow error.
     """Raise ``cluster_n`` to the smallest power of 2 such that the bwd's
     sX+sdO data buffers fit under the device's opt-in dynamic smem.
 
@@ -340,6 +411,8 @@ def _bump_cluster_n_for_smem(
 
 
 def _detect_arch_major() -> int:
+    # [FUNCTION DOC] HELPER: Return the major compute capability of the current CUDA device,
+    # or 0 when CUDA is unavailable so that search-space construction works on CPU-only hosts.
     """Return the major device capability of the current CUDA device.
 
     Falls back to 0 (no-cluster, no-TMA) when CUDA is unavailable so the
@@ -351,6 +424,8 @@ def _detect_arch_major() -> int:
 
 
 def _max_cluster_for(arch_major: int) -> int:
+    # [FUNCTION DOC] HELPER: Largest allowed cluster size for an architecture major version: 1
+    # below 9, 8 on 12, and 16 otherwise.
     """Maximum cluster_n supported on this arch."""
     if arch_major < 9:
         return 1
@@ -359,6 +434,12 @@ def _max_cluster_for(arch_major: int) -> int:
 
 
 def get_all_fwd_configs() -> List[RmsNormFwdConfig]:
+    # [FUNCTION DOC] Enumerate the forward autotune search space for the current device. Takes
+    # the cartesian product of CTA threads 128 and 256, threads per row 64, 128 and 256,
+    # cluster sizes 1 to 16 up to the architecture maximum, and the reload options (none,
+    # shared, global); the delayed weight load option is fixed to off. Combinations where
+    # threads per row exceed or do not divide the CTA thread count are skipped. Returns a list
+    # of forward config objects.
     """Exhaustive search space of RMSNorm fwd configs for the current device.
 
     The search space is over launch knobs only — ``device_capacity`` is not a
@@ -396,6 +477,12 @@ def get_all_fwd_configs() -> List[RmsNormFwdConfig]:
 
 
 def get_all_bwd_configs() -> List[RmsNormBwdConfig]:
+    # [FUNCTION DOC] Enumerate the backward autotune search space for the current device.
+    # Takes the cartesian product of CTA threads 128 and 256, threads per row 64, 128 and 256,
+    # cluster sizes up to the architecture maximum, reload options (none or shared) for both
+    # the weight-times-dout term and x, TMA off or on (on only for SM90 and above) and 2 or 3
+    # pipeline stages. Combinations where threads per row exceed or do not divide the CTA
+    # thread count are skipped. Returns a list of backward config objects.
     """Exhaustive search space of RMSNorm bwd configs for the current device.
 
     Like :func:`get_all_fwd_configs`, the current device's capability bounds
@@ -445,6 +532,10 @@ def get_all_bwd_configs() -> List[RmsNormBwdConfig]:
 
 
 def prune_invalid_rmsnorm_fwd_configs(configs, named_args: dict, **kwargs):
+    # [FUNCTION DOC] Autotuner pruning hook for the forward. Merges the named arguments with
+    # the keyword arguments, reads the input tensor and its last dimension N, and removes any
+    # candidate whose threads per row times cluster size exceeds N. Each candidate is expected
+    # to carry the config in its keyword mapping. Returns the surviving candidate list.
     """Drop configs whose CTA layout doesn't fit the row width.
 
     The search space (see :func:`get_all_fwd_configs`) is already restricted to
@@ -465,6 +556,12 @@ def prune_invalid_rmsnorm_fwd_configs(configs, named_args: dict, **kwargs):
 
 
 def prune_invalid_rmsnorm_bwd_configs(configs, named_args: dict, **kwargs):
+    # [FUNCTION DOC] Autotuner pruning hook for the backward. Applies the same
+    # threads-times-cluster limit as the forward pruner, and additionally drops TMA candidates
+    # that the kernel would silently disable: per-head mode (decided from an explicit flag or
+    # from the input having three dimensions), or a per-cluster tile row whose byte size for x
+    # or for dout (dout defaults to the x element size) is not a multiple of 16. Returns the
+    # surviving candidate list.
     """Same per-call shape filter as the fwd, plus three ``use_tma`` drops
     that mirror the runtime ``USE_TMA`` guard in :class:`RMSNormBackward`
     (``USE_TMA = use_tma and not per_head and row_bytes_x % 16 == 0 and

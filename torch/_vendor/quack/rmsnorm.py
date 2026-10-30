@@ -1,4 +1,12 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# [MODULE DOC] Fused RMSNorm and LayerNorm forward/backward GPU kernels written with the CuTe
+# DSL, plus Python entry points. Forward supports optional weight, bias, a fused residual add
+# (with the summed residual written back) and optional per-head weights; backward is a
+# persistent-grid kernel producing the input gradient and per-CTA partial weight and bias
+# gradients that the host sums. Kernels are compiled lazily and cached, with launch configs
+# from heuristics or an autotuner. Also contains an autograd Function, a functional wrapper, a
+# drop-in nn module and reference implementations. Importing builds the autotune search spaces
+# and wraps the tuned entry points but compiles nothing.
 
 import math
 from typing import Optional, Tuple, Type
@@ -37,6 +45,10 @@ from cutlass.base_dsl.arch import Arch
 
 
 def _bucket_T_hint(T_hint: int) -> int:
+    # [FUNCTION DOC] HELPER: Bucket a row-count hint for the JIT cache key by rounding it up
+    # to the next power of two (a value that is already a power of two is kept). A hint of
+    # zero or below, the marker for an unknown or symbolic size, is returned as 0. Returns
+    # an int.
     """Round ``T_hint`` up to the next power of 2 to bucket the JIT cache key.
 
     Each base-2 order of magnitude becomes a single bucket so adjacent T
@@ -52,6 +64,10 @@ def _bucket_T_hint(T_hint: int) -> int:
 
 
 def _ensure_contiguous(t):
+    # [FUNCTION DOC] HELPER: Return a tensor whose last dimension has stride 1. While
+    # compiling with torch.compile it always returns the result of a contiguous call (strides
+    # cannot be inspected on fake tensors); otherwise the tensor itself is returned when the
+    # last stride is already 1, avoiding a copy. Only the last dimension is checked.
     """Ensure last-dim stride is 1. Under torch.compile use unconditional .contiguous()
     (dynamo can't inspect strides on fake tensors); otherwise check first to avoid copies.
     """
@@ -61,6 +77,12 @@ def _ensure_contiguous(t):
 
 
 class RMSNorm(ReductionBase):
+    # [CLASS DOC] Forward kernel host object, a reduction-base subclass, for fused RMSNorm or
+    # LayerNorm of rows of length N: optional residual add, weight and bias, and optional
+    # saving of reciprocal std and mean. Holds the element dtype, the is_layernorm flag (two
+    # reduction stages for LayerNorm, one for RMSNorm), the launch config and its unpacked
+    # knobs. The cluster size is chosen at call time from the GPU architecture. Inputs may be
+    # two-dimensional (rows by N) or three-dimensional (rows by heads by N, per-head mode).
     def __init__(
         self,
         dtype: Type[cutlass.Numeric],
@@ -68,6 +90,10 @@ class RMSNorm(ReductionBase):
         is_layernorm: bool = False,
         config: Optional["RmsNormFwdConfig"] = None,
     ):
+        # [FUNCTION DOC] Create the forward kernel object. Stage count of the reduction buffer
+        # is 2 for LayerNorm and 1 for RMSNorm. When no config is given, one is taken from the
+        # analytical heuristic for this N, dtype width and kind. Stores the config, the reload
+        # and delayed weight-load options, and the thread, threads-per-row and cluster values.
         super().__init__(dtype, N, stage=2 if is_layernorm else 1)
         self.is_layernorm = is_layernorm
         if config is None:
@@ -82,12 +108,18 @@ class RMSNorm(ReductionBase):
         self._cluster_n_val = config.cluster_n
 
     def _num_threads(self):
+        # [FUNCTION DOC] HELPER: Return the thread count from the config instead of the
+        # base default.
         return self._num_threads_val
 
     def _threads_per_row(self):
+        # [FUNCTION DOC] HELPER: Return the threads-per-row value from the config.
         return self._threads_per_row_val
 
     def _set_cluster_n(self):
+        # [FUNCTION DOC] HELPER: Set cluster_n: 1 on architectures older than SM90, otherwise
+        # the configured value limited to 8 on SM12x and 16 elsewhere. The architecture comes
+        # from the active DSL. Side effect: updates the instance attribute.
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
         # SM8x (Ampere/Ada) lacks cluster support
         if arch < Arch.sm_90:
@@ -111,6 +143,15 @@ class RMSNorm(ReductionBase):
         eps: Float32,
         stream: cuda.CUstream,
     ):
+        # [FUNCTION DOC] JIT host entry. Takes the tensors for x, weight, bias, residual,
+        # output, residual output, reciprocal std and mean (several optional) plus epsilon and
+        # a stream. Asserts that x matches the configured dtype. Picks the cluster size, sets
+        # the vector width to the 128-bit width of the widest participating dtype (reduced by
+        # the greatest common divisor with N), caps the cluster, builds the tiled copy,
+        # broadcasts weight and bias over the tile rows and the saved statistics over a
+        # trailing column mode, and launches the kernel with one CTA per row tile, a grid axis
+        # for the cluster and a grid axis for heads (1 unless the input is three-dimensional).
+        # No return value.
         assert mX.element_type == self.dtype
         self._set_cluster_n()
         largest_dtype_width = const_expr(
@@ -156,6 +197,19 @@ class RMSNorm(ReductionBase):
         tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
     ):
+        # [FUNCTION DOC] Device kernel for one row tile (and one column slice per CTA of a
+        # cluster). Allocates shared tiles for x and residual and the reduction buffer; in
+        # per-head mode slices every tensor on the head given by the grid z index. Copies x
+        # and residual into shared memory asynchronously (predicated for a ragged last column
+        # block, skipping rows beyond the batch), loads weight and bias early unless delayed,
+        # sums x and residual in FP32 and optionally writes that sum as the residual output.
+        # For LayerNorm it row-reduces the sum for the mean (written out by the column-0
+        # thread of the first cluster CTA when requested), optionally reloads x from shared or
+        # global memory, zeroes out-of-range lanes and reduces the squared deviations; for
+        # RMSNorm it reduces the sum of squares. The reciprocal std (inverse square root of
+        # the mean square plus epsilon) is optionally stored. Then x may be reloaded,
+        # normalised (centred for LayerNorm), scaled by weight, shifted by bias, converted to
+        # the output dtype and stored for valid rows.
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, bidz = cute.arch.block_idx()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
@@ -363,6 +417,15 @@ def _rmsnorm_fwd(
     eps: float = 1e-6,
     is_layernorm: bool = False,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Validate and dispatch the forward kernel in place. Asserts that
+    # x, weight and residual are float16, bfloat16 or float32; returns immediately for an
+    # empty x. Writes the result into the given output (and residual output, reciprocal std
+    # and mean buffers when provided) by running the compiled kernel for the dtypes, N, which
+    # optional outputs exist, LayerNorm flag, and per-head mode (true when weight or bias is
+    # two-dimensional) found in the arguments. Returns None.
+    # KNOWN ISSUE: The docstring says it returns the normalised tensor, but the function
+    # returns nothing and writes into the output argument; it also lists only some of
+    # the parameters.
     """RMSNorm/LayerNorm forward pass.
     Args:
         x: Input tensor of shape (M, N)
@@ -418,6 +481,12 @@ def _compile_rmsnorm_fwd(
     per_head,
     config: Optional[RmsNormFwdConfig] = None,
 ):
+    # [FUNCTION DOC] HELPER: Cached (by the jit cache decorator, keyed on the arguments)
+    # compile step for the forward kernel. Creates symbolic batch (and head) sizes, fake
+    # tensors for every present dtype with a divisibility hint equal to the common divisor of
+    # N and the 128-bit vector widths, builds the kernel object with the optional config, and
+    # compiles it with the TVM FFI option and a fake stream. Returns the compiled callable
+    # taking x, weight, bias, residual, out, residual out, reciprocal std, mean and epsilon.
     batch_sym = cute.sym_int()
     head_sym = cute.sym_int() if per_head else None
     batch_shape = (batch_sym, head_sym) if per_head else (batch_sym,)
@@ -459,6 +528,13 @@ def rmsnorm_fwd(
     eps: float = 1e-6,
     store_rstd: bool = False,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    # [FUNCTION DOC] Public untuned forward RMSNorm. Allocates the output (dtype out_dtype or
+    # that of x), the optional FP32 reciprocal std (shape of x without the last dimension,
+    # only when store_rstd is set) and a residual output when a residual is given or
+    # residual_dtype differs from the x dtype (residual_dtype defaults to the residual dtype).
+    # Runs the forward in RMSNorm mode with the heuristic config. Returns a tuple of output,
+    # residual output (the input x itself when no residual output was allocated) and
+    # reciprocal std or None.
     # Need to wrap to handle the case where residual_out is a alias of x, which makes torch.library
     # and torch.compile unhappy. Also allocate memory for out and residual_out if they are None
     # so that _layer_norm_fwd_impl doesn't have to return them.
@@ -499,6 +575,11 @@ def rmsnorm_fwd_tuned(
     per_head: bool = False,
     config: Optional[RmsNormFwdConfig] = None,
 ) -> None:
+    # [FUNCTION DOC] Autotuned forward entry, wrapped by the autotune decorator which supplies
+    # a config chosen from the forward search space (cached per shape, dtype, LayerNorm flag
+    # and per-head flag). Raises RuntimeError when called without a config. Writes into the
+    # provided output buffers by running the kernel compiled for that config; unlike the plain
+    # helper it does no dtype validation and no empty-tensor early exit. Returns None.
     """Autotuned RMSNorm/LayerNorm forward dispatch.
 
     The ``@autotune`` decorator injects ``config`` from the exhaustive search
@@ -533,6 +614,10 @@ def rmsnorm_fwd_tuned(
 
 
 def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6):
+    # [FUNCTION DOC] Reference forward in FP32: adds the residual if present, divides by the
+    # root of the mean square over the last dimension plus epsilon, multiplies by weight and
+    # adds bias when given. Returns the output cast to the dtype of x, or a pair of that
+    # output and the summed residual cast to the residual dtype when a residual is passed.
     x_f32 = x.float()
     if residual is not None:
         residual_f32 = residual.float()
@@ -548,6 +633,14 @@ def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6):
 
 
 def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
+    # [FUNCTION DOC] Reference backward in FP32 for 2D x. Forms the normalised input from the
+    # saved reciprocal std, multiplies dout by the weight when present, computes the input
+    # gradient as the weighted gradient minus the normalised input times its row mean, scaled
+    # by the reciprocal std, and the weight gradient as the column sum of dout times the
+    # normalised input. Returns the input gradient in the dtype of x and the weight gradient
+    # in the weight dtype (None without weight).
+    # KNOWN ISSUE: The eps argument is accepted but never used; the reciprocal std unsqueeze
+    # on dimension 1 means only 2D inputs are supported.
     """Reference implementation for RMSNorm backward pass."""
     x_f32 = x.float()
     x_hat = x_f32 * rstd.unsqueeze(1)
@@ -567,6 +660,14 @@ def rmsnorm_bwd_ref(x, w, dout, rstd, eps=1e-6):
 
 
 class RMSNormBackward(ReductionBase):
+    # [CLASS DOC] Backward kernel host object, a reduction-base subclass. Persistent grid
+    # (launched with the given SM-style CTA count): each CTA loops over row tiles, computes
+    # the input gradient and accumulates FP32 partial weight and bias gradients. Holds the
+    # dtype, N, per-head flag, the config and its reload options, and USE_TMA (true only if
+    # the config asks for TMA, the mode is not per-head, and the per-CTA row byte sizes of x
+    # and dout are multiples of 16). Uses a two-stage reduction buffer. Optional inputs are
+    # the weight and the residual-output gradient; optional outputs are the weight, bias and
+    # residual gradients.
     def __init__(
         self,
         dtype: cutlass.Numeric,
@@ -576,6 +677,12 @@ class RMSNormBackward(ReductionBase):
         per_head: bool = False,
         config: Optional["RmsNormBwdConfig"] = None,
     ):
+        # [FUNCTION DOC] Create the backward kernel object (two reduction stages, FP32
+        # reduction). dout dtype defaults to the x dtype. Without a config, takes one from the
+        # analytical backward heuristic using N, both element widths and the row-count hint.
+        # Stores the config and reload options, computes the TMA eligibility flag, and raises
+        # ValueError when N is above 131072 and the dtype is 32 bits or wider (not enough
+        # shared memory).
         # 2 stages for double buffering when computing mean of x_hat * wdy
         super().__init__(dtype, N, stage=2, reduction_dtype=Float32)
         dout_width = dout_dtype.width if dout_dtype is not None else dtype.width
@@ -602,12 +709,16 @@ class RMSNormBackward(ReductionBase):
             raise ValueError("RMSNormBackward does not support N > 128k with dtype >= 32 bits")
 
     def _num_threads(self):
+        # [FUNCTION DOC] HELPER: Return the thread count from the config.
         return self._num_threads_val
 
     def _threads_per_row(self):
+        # [FUNCTION DOC] HELPER: Return the threads-per-row value from the config.
         return self._threads_per_row_val
 
     def _set_cluster_n(self):
+        # [FUNCTION DOC] HELPER: Set cluster_n: 1 before SM90, otherwise the configured value
+        # limited to 8 on SM12x and 16 elsewhere. Side effect: updates the instance attribute.
         arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
         # SM8x (Ampere/Ada) lacks cluster support
         if arch < Arch.sm_90:
@@ -631,6 +742,14 @@ class RMSNormBackward(ReductionBase):
         sm_count: Int32,
         stream: cuda.CUstream,
     ):
+        # [FUNCTION DOC] JIT host entry for the backward. Takes x, weight, dout,
+        # residual-output gradient, saved reciprocal std, and output tensors for dx, partial
+        # dW, partial dB and residual gradient, the CTA count and a stream. Asserts the x
+        # dtype, picks and caps the cluster size, builds the tiled copy with a vector width
+        # from the widest participating dtype, broadcasts the weight over tile rows, creates
+        # TMA atoms and views for x and dout when TMA is used, and launches the kernel with
+        # grid of CTA count by cluster size by heads (heads only in per-head mode). No
+        # return value.
         assert mX.element_type == self.dtype
         self._set_cluster_n()
         largest_dtype_width = const_expr(
@@ -699,6 +818,21 @@ class RMSNormBackward(ReductionBase):
         tiled_copy: cute.TiledCopy,
         threads_per_row: cutlass.Constexpr[int],
     ):
+        # [FUNCTION DOC] Persistent device kernel. Each CTA walks row tiles with a grid-sized
+        # stride. Setup: shared multi-stage buffers for x and dout, reduction buffer and
+        # cluster barriers (and TMA pipeline barriers), per-head slicing, fp32 partial
+        # weight/bias accumulators zeroed, the weight tile loaded once into registers (zero
+        # padded on ragged N), then a prefetch of one fewer than the stage count of tiles by
+        # TMA (issued by warp 0) or cp.async (with zero fill for rows past the batch). Per
+        # tile: issue the next prefetch, load reciprocal std and the optional residual-output
+        # gradient, wait for the data, form the normalised x and weight times dout, row-reduce
+        # their mean product (with full/empty barrier handshakes when clustered), optionally
+        # reload x or the product from shared memory, compute the input gradient, add the
+        # residual gradient, store it (and the residual gradient copy), and accumulate dout
+        # times normalised x into the weight partial and dout into the bias partial. At the
+        # end the row partials of the CTA are summed via shared memory (reusing the x buffer
+        # as FP32) and written by one row to the partial output indexed by the CTA index;
+        # clustered CTAs wait on the last empty barrier so peers do not exit early.
         tidx, _, _ = cute.arch.thread_idx()
         warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if const_expr(self.per_head):
@@ -1127,6 +1261,15 @@ def _rmsnorm_bwd(
     dresidual: Optional[Tensor] = None,
     sm_count: Optional[int] = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Validate and run the backward in place. Asserts x has 2 or 3
+    # dimensions, supported dtypes, and that residual gradients match the shape of x; returns
+    # at once for empty x. The per-head mode follows from three dimensions. CTA count comes
+    # from the first dimension of the partial weight or bias buffer, otherwise it must be
+    # passed (asserted). Fills dx, the partial weight and bias buffers and the residual
+    # gradient using the cached compiled kernel keyed by dtypes, N, flags and the bucketed row
+    # count (0 when the row count is symbolic). Returns None.
+    # KNOWN ISSUE: The docstring claims it returns a tuple of dx and dw; the function returns
+    # None and writes into the passed buffers. It also omits most parameters.
     """RMSNorm backward pass.
     Args:
         x: Input tensor of shape (M, N) or (M, H, N) for per-head
@@ -1195,6 +1338,12 @@ def _compile_rmsnorm_bwd(
     T_hint=0,
     config: Optional[RmsNormBwdConfig] = None,
 ):
+    # [FUNCTION DOC] HELPER: Cached compile step for the backward kernel. Creates symbolic
+    # batch sizes (a separate one for the partial buffers) and optional head size, fake
+    # tensors for x, dout, dx and residual gradients with a divisibility hint, the weight,
+    # FP32 reciprocal std and FP32 partial weight/bias buffers (present only when requested),
+    # builds the kernel object with the row-count hint, per-head flag and optional config, and
+    # compiles it with the TVM FFI option. Returns the compiled callable.
     batch_sym, batch_partial_sym = cute.sym_int(), cute.sym_int()
     head_sym = cute.sym_int() if per_head else None
     batch_shape = (batch_sym, head_sym) if per_head else (batch_sym,)
@@ -1243,6 +1392,18 @@ def rmsnorm_bwd(
     has_bias: bool = False,
     has_residual: bool = False,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+    # [FUNCTION DOC] Public untuned backward. Allocates dx, a separate residual gradient
+    # only if the incoming residual-output gradient has a different dtype from dx, FP32
+    # partial weight and optional bias buffers with one slice per CTA (the CTA count comes
+    # from the device SM count, divided by the number of heads in per-head mode, at least
+    # 1). Runs the kernel for non-empty inputs and sums the partials over the CTA axis,
+    # casting to the weight dtype; for empty inputs returns zero gradients shaped like the
+    # weight. When a residual existed and no separate residual gradient was made, it is the
+    # same tensor as dx. Returns dx, weight gradient, bias gradient and residual gradient
+    # (each possibly None).
+    # KNOWN ISSUE: The bias gradient is cast using the weight dtype and, for empty input, is
+    # shaped like the weight; calling with a bias gradient request but no weight fails because
+    # the weight is None.
     device = x.device
     N = x.size(-1)
     per_head = x.dim() == 3
@@ -1303,6 +1464,13 @@ def rmsnorm_bwd_tuned(
     has_db_partial: bool = False,
     config: Optional[RmsNormBwdConfig] = None,
 ) -> None:
+    # [FUNCTION DOC] Autotuned backward entry; the autotune decorator supplies a config from
+    # the backward search space, cached per shape, dtype and the per-head and partial-buffer
+    # flags. Raises RuntimeError when called without config. CTA count is taken from the
+    # partial weight buffer, else the partial bias buffer, else the argument; raises
+    # ValueError if none of them is available. Runs the kernel compiled for that config with
+    # no row-count hint, writing into the supplied buffers. Does no dtype validation or
+    # empty-input exit. Returns None.
     """Autotuned RMSNorm backward dispatch.
 
     The ``@autotune`` decorator injects ``config`` from the exhaustive search
@@ -1351,6 +1519,10 @@ def rmsnorm_bwd_tuned(
 
 
 class RMSNormFunction(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for the fused norm. Expects the batch dimensions already
+    # flattened by the wrapper so the ranks stay fixed across recompiles. Forward saves, for
+    # backward, the normalised input (x, or the summed residual when a residual was used),
+    # weight and reciprocal std, plus flags for bias, residual and prenorm mode.
     """Autograd wrapper for rmsnorm.
 
     All input reshaping (flattening batch dims, per-head layout) is done in the
@@ -1371,6 +1543,11 @@ class RMSNormFunction(torch.autograd.Function):
         eps=1e-6,
         prenorm=False,
     ):
+        # [FUNCTION DOC] Forward. Makes x and the residual last-dim contiguous, decides that
+        # the reciprocal std is needed when any of x, weight or bias requires grad, and runs
+        # the untuned forward. Stores the saved tensors and flags on the context. Returns the
+        # output alone, or the pair of output and residual output when prenorm is set.
+        # Gradients are defined for the first three inputs and the residual.
         x = _ensure_contiguous(x)
         if residual is not None:
             residual = _ensure_contiguous(residual)
@@ -1396,6 +1573,13 @@ class RMSNormFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        # [FUNCTION DOC] Backward. Reads the saved tensors, makes dout contiguous, uses the
+        # extra incoming gradient as the residual-output gradient only when prenorm and a
+        # residual were used, and runs the untuned backward. Returns gradients for the
+        # inputs: dx, weight, bias and residual, then four None entries for the
+        # non-differentiable arguments.
+        # KNOWN ISSUE: When prenorm is set without a residual, the second output is the input
+        # x itself but its incoming gradient is ignored, so that path's gradient is dropped.
         x, weight, rstd = ctx.saved_tensors
         dout = _ensure_contiguous(dout)
         if ctx.prenorm and ctx.has_residual:
@@ -1424,6 +1608,14 @@ def rmsnorm(
     eps: float = 1e-6,
     prenorm: bool = False,
 ) -> Tensor:
+    # [FUNCTION DOC] Public functional RMSNorm with autograd. Per-head mode is detected when
+    # the weight or bias is two-dimensional, in which case the last two dimensions of x are
+    # kept as the trailing shape; otherwise only the last one. Flattens the leading dimensions
+    # of x and the residual into one row dimension, applies the autograd function, and
+    # reshapes the result (or each element of a tuple result) back to the shape of x. Returns
+    # the output tensor, or a tuple of output and residual output when prenorm is set.
+    # KNOWN ISSUE: The docstring omits bias, residual, out_dtype, residual_dtype and prenorm,
+    # and the tuple return in prenorm mode.
     """RMSNorm with automatic differentiation support.
 
     Args:
@@ -1453,6 +1645,9 @@ def rmsnorm(
 
 
 class QuackRMSNorm(torch.nn.RMSNorm):
+    # [CLASS DOC] Module subclass of the standard RMSNorm module that keeps its parameters and
+    # constructor semantics but computes the forward pass with the fused GPU kernel through
+    # the functional wrapper. The state is the base class weight and eps.
     """RMSNorm module that behaves like torch.nn.RMSNorm.
 
     This class provides a drop-in replacement for torch.nn.RMSNorm that uses
@@ -1470,9 +1665,14 @@ class QuackRMSNorm(torch.nn.RMSNorm):
     def __init__(
         self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True, device=None, dtype=None
     ):
+        # [FUNCTION DOC] Forward the normalized dimension, epsilon (default 1e-6), affine
+        # flag, device and dtype to the base module constructor.
         super().__init__(dim, eps, elementwise_affine, device=device, dtype=dtype)
 
     def forward(self, x: Tensor) -> Tensor:
+        # [FUNCTION DOC] Apply the fused RMSNorm kernel to the input using this module's
+        # weight (which may be None when not affine) and epsilon. Returns the normalised
+        # tensor of the same shape.
         """Apply RMSNorm to the input tensor.
 
         Args:
@@ -1492,6 +1692,11 @@ def layernorm_fwd(
     return_rstd: bool = False,
     return_mean: bool = False,
 ):
+    # [FUNCTION DOC] LayerNorm forward through the shared kernel in LayerNorm mode. Asserts
+    # that x is 2D with a supported dtype, weight is 1D FP32 and the optional bias is 1D FP32.
+    # Allocates the output like x and optional FP32 per-row reciprocal std and mean buffers,
+    # runs the kernel, and returns the output, followed by reciprocal std and/or mean in that
+    # order when requested.
     """LayerNorm forward pass using the unified RMSNorm/LayerNorm kernel.
 
     Args:
@@ -1533,12 +1738,18 @@ def layernorm_fwd(
 
 
 def layernorm_ref(x: Tensor, w: Tensor, eps: float = 1e-6) -> Tensor:
+    # [FUNCTION DOC] Reference LayerNorm: converts x to FP32 and applies the standard layer
+    # norm with the weight, no bias, over the shape of the weight; returns the result cast to
+    # the dtype of x.
     """Reference implementation for LayerNorm."""
     x_f32 = x.float()
     return torch.nn.functional.layer_norm(x_f32, w.shape, w, None, eps).to(x.dtype)
 
 
 def layernorm_rstd_ref(x: torch.Tensor, eps: float = 1e-6):
+    # [FUNCTION DOC] Reference reciprocal standard deviation for LayerNorm: in FP32 takes the
+    # row mean, the biased variance over the last dimension, and returns the inverse square
+    # root of the variance plus epsilon, with the last dimension reduced away.
     x_f32 = x.float()
     mean = x_f32.mean(dim=-1, keepdim=True)
     var = ((x_f32 - mean) ** 2).mean(dim=-1)
@@ -1546,4 +1757,6 @@ def layernorm_rstd_ref(x: torch.Tensor, eps: float = 1e-6):
 
 
 def layernorm_mean_ref(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Reference mean for LayerNorm: the FP32 mean of x over its last dimension,
+    # with that dimension reduced away.
     return x.float().mean(dim=-1)

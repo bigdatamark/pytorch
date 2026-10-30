@@ -1,4 +1,9 @@
 # Copyright (c) 2025-2026, Vijay Thakkar, Tri Dao.
+# [MODULE DOC] Rounding-mode selection and stochastic-rounding primitives for GEMM epilogues.
+# Defines the RoundingMode enum, constants for deriving per-tile random seeds and for the
+# Philox generator, and DSL user ops that perform wide multiplies, the Blackwell stochastic
+# FP32 to BF16 conversion, a Philox random generator, and a vector-level conversion helper.
+# Importing has no side effects beyond defining these names.
 """Rounding mode control and stochastic rounding primitives for GEMM epilogues.
 
 Provides a RoundingMode enum for configuring how epilogues downconvert the
@@ -18,6 +23,10 @@ from cutlass.cutlass_dsl import dsl_user_op, Int32, T
 
 
 class RoundingMode(IntEnum):
+    # [CLASS DOC] Integer enum selecting how an epilogue converts the accumulator dtype to the
+    # output dtype: RN is round-to-nearest-even (0), RS is stochastic rounding (1). The
+    # stochastic mode only works on SM100 or newer GPUs and only for BF16 output; this class
+    # itself performs no checking.
     """Rounding modes for epilogue dtype downconversion.
 
     RN — Round to nearest even (default hardware behavior)
@@ -52,6 +61,10 @@ def epilogue_sr_seed(
     loc=None,
     ip=None,
 ) -> Int32:
+    # [FUNCTION DOC] Derive a per-output-tile integer seed for stochastic rounding. Adds to
+    # the base seed a weighted sum of the tile coordinate entries for M, N and batch (the K
+    # entry at position 2 is ignored) and the subtile index, using the stride constants
+    # defined above. Returns the combined Int32 seed. Pure arithmetic with no side effects.
     return base_seed + (
         tile_coord_mnkl[0] * EPILOGUE_SR_SEED_M_STRIDE
         + tile_coord_mnkl[1] * EPILOGUE_SR_SEED_N_STRIDE
@@ -69,6 +82,9 @@ def epilogue_aux_out_sr_seed(
     loc=None,
     ip=None,
 ) -> Int32:
+    # [FUNCTION DOC] Same seed derivation as the main epilogue seed function but for the
+    # auxiliary output tensor: the base seed is first offset by a fixed salt constant so that
+    # the auxiliary stream differs from the primary one. Returns the Int32 seed.
     return epilogue_sr_seed(
         base_seed + EPILOGUE_SR_SEED_AUX_OUT_SALT,
         tile_coord_mnkl,
@@ -80,6 +96,10 @@ def epilogue_aux_out_sr_seed(
 
 @dsl_user_op
 def mul_wide_u32(a: Uint32, b: Uint32, *, loc=None, ip=None) -> tuple:
+    # [FUNCTION DOC] Emit inline PTX that multiplies two unsigned 32-bit values into a full
+    # 64-bit product and returns it as a pair of Uint32 values, high word first and low word
+    # second. The inline assembly has no side effects, so the compiler may reorder or
+    # eliminate it.
     """Unsigned 32b x 32b -> 64 wide multiply via PTX `mul.wide.u32`.
 
     Returns (hi, lo) as a pair of Uint32 values.
@@ -111,6 +131,11 @@ def cvt_f32x2_bf16x2_rs(
     loc=None,
     ip=None,
 ) -> cutlass.Int32:
+    # [FUNCTION DOC] Convert two FP32 values to one packed BF16x2 word with the Blackwell
+    # stochastic-rounding PTX conversion, saturating on overflow. The random bits supply the
+    # rounding entropy. The first input ends up in the low 16 bits of the result and the
+    # second input in the high 16 bits. Returns an Int32 holding the packed pair. Only valid
+    # on SM100 or newer hardware.
     """Convert 2 FP32 values to packed BF16x2 using stochastic rounding.
 
     Uses Blackwell PTX instruction: cvt.rs.satfinite.bf16x2.f32 dst, src_hi, src_lo, rand
@@ -140,6 +165,12 @@ def philox(
     loc=None,
     ip=None,
 ) -> tuple:
+    # [FUNCTION DOC] Philox 4x32 counter-based pseudo-random generator specialised to a single
+    # 32-bit counter and a single 32-bit key (the other counter words and the second key word
+    # start at zero). Runs the requested number of rounds (default 7, a Python-level count so
+    # the loop is unrolled at trace time); each round does two wide multiplies with the Philox
+    # round constants, mixes words with exclusive-or, and advances the key words by the Philox
+    # key constants. Returns a tuple of four Uint32 random words.
     """Philox 4x32b counter-based random number generator.
 
     Given a 32b counter and a 32b key, returns four pseudo-random uint32 words
@@ -180,6 +211,13 @@ def convert_f32_to_bf16_sr(
     loc=None,
     ip=None,
 ):
+    # [FUNCTION DOC] Convert an MLIR FP32 vector to a BF16 vector of the same length using
+    # stochastic rounding. Raises an AssertionError unless the element count is even and the
+    # number of element pairs is a multiple of 4. Elements are processed in adjacent pairs;
+    # each group of four pairs shares one Philox draw whose counter combines the group index
+    # (shifted into the upper 16 bits) with the thread id, keyed by the seed, and each pair
+    # consumes one of the four words as entropy. The packed results are gathered into an
+    # integer vector and bit-cast to BF16. Returns the BF16 MLIR vector.
     """Convert an MLIR FP32 vector to BF16 with stochastic rounding.
 
     Processes elements in pairs using Philox PRNG for entropy and the hardware

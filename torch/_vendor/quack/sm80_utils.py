@@ -1,4 +1,7 @@
 # Copyright (c) 2025-2026, Tri Dao.
+# [MODULE DOC] Small helpers for Ampere-class (SM80) tensor-core MMA kernels written with the
+# CuTe DSL. Currently only a function that partitions shared-memory operands and allocates the
+# accumulator for a thread slice of a tiled MMA.
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 
@@ -10,6 +13,13 @@ def partition_fragment_ABC(
     sB: cute.Tensor,
     swap_AB: bool = False,
 ):
+    # [FUNCTION DOC] Partition operands for one thread of a tiled MMA. Without swapping,
+    # builds an FP32 register accumulator from the M and N part of the tile shape, partitions
+    # the shared-memory A and B tensors, and makes register fragments from the first pipeline
+    # stage of each partition. With swap_AB, the roles are exchanged: the accumulator uses the
+    # N by M shape, B is partitioned as the first operand and A as the second. Returns a tuple
+    # of accumulator, shared A partition, shared B partition, A fragment, B fragment. Neither
+    # shared tensor may be None; this is not checked here.
     if const_expr(not swap_AB):
         acc = cute.make_rmem_tensor(thr_mma.partition_shape_C(shape_mnk[:2]), Float32)
         tCsA = thr_mma.partition_A(sA)
