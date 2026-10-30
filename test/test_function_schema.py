@@ -1,14 +1,26 @@
 # Owner(s): ["module: unknown"]
 
+# [MODULE DOC] Unit tests for the function schema API: parsing schema strings with parse_schema,
+# round-tripping registered schemas through text, hashing, backward and forward compatibility
+# checks, and parsing of special argument types. Importing has no side effects; running the file
+# executes the tests.
 import torch
 from torch._C import parse_schema
 from torch.testing._internal.common_utils import run_tests, TestCase, HardwareClassification
 
 
 class TestFunctionSchema(TestCase):
+    # [CLASS DOC] Test case holding all function schema tests. It is marked with the generic
+    # hardware classification attribute and keeps no per-test state; every test builds its own
+    # schema objects.
     hw_classification = HardwareClassification.GENERIC
 
     def test_serialize_and_deserialize(self):
+        # [FUNCTION DOC] Takes every schema registered in the runtime and requires more than one
+        # thousand of them. Each schema is converted to text and parsed again, then the parsed
+        # schema must equal the original and must be backward compatible with it. Schemas whose
+        # text mentions an internal opaque PyObject type are skipped because that spelling is
+        # deliberately not parseable.
         schemas = torch._C._jit_get_all_schemas()
         # so far we have around 1700 registered schemas
         self.assertGreater(len(schemas), 1000)
@@ -23,6 +35,9 @@ class TestFunctionSchema(TestCase):
             self.assertTrue(parsed_schema.is_backward_compatible_with(schema))
 
     def test_out_schema(self):
+        # [FUNCTION DOC] Checks the is_out flag of the last argument: it is set for a trailing
+        # keyword-only write-aliased tensor named out in an out overload, and unset for a schema
+        # whose last argument is an ordinary tensor.
         schema_with_out = parse_schema(
             "any.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)"
         )
@@ -33,6 +48,10 @@ class TestFunctionSchema(TestCase):
         self.assertFalse(schema_without_out.arguments[-1].is_out)
 
     def test_hash_schema(self):
+        # [FUNCTION DOC] Checks hash behavior of schemas. Equal schema text gives equal hashes;
+        # hashes differ when the overload name, an extra keyword-only argument, a default value,
+        # positional versus keyword-only placement, an argument alias annotation, or the alias
+        # annotation of the return or of different arguments differs.
         schema1 = parse_schema("any.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)")
         schema2 = parse_schema("any.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)")
         self.assertEqual(hash(schema1), hash(schema2))
@@ -76,6 +95,9 @@ class TestFunctionSchema(TestCase):
         self.assertNotEqual(hash(alias_schema3), hash(alias_schema5))
 
     def test_backward_compatible_structure(self):
+        # [FUNCTION DOC] Checks backward compatibility rules on schema structure using one old
+        # schema. An identical schema is compatible; a changed operator name, a changed overload
+        # name, an added vararg marker, or a different number of outputs is not.
         old_schema = parse_schema("any.over(Tensor self, *, Tensor b) -> Tensor")
         # BC: A new schema without changes.
         new_schema = parse_schema("any.over(Tensor self, *, Tensor b) -> Tensor")
@@ -96,6 +118,10 @@ class TestFunctionSchema(TestCase):
         self.assertFalse(new_schema.is_backward_compatible_with(old_schema))
 
     def test_backward_compatible_outputs(self):
+        # [FUNCTION DOC] Checks backward compatibility rules for return types. A return that
+        # becomes optional is incompatible, while the reverse direction (optional to non-optional)
+        # is compatible; a different return type or a named return is incompatible with the old
+        # unnamed one.
         old_schema = parse_schema("any.over(Tensor self, *, Tensor b) -> Tensor")
         # No-BC: A new schema with output becoming of optional type.
         new_schema = parse_schema("any.over(Tensor self, *, Tensor b) -> Tensor?")
@@ -110,6 +136,12 @@ class TestFunctionSchema(TestCase):
         self.assertFalse(new_schema.is_backward_compatible_with(old_schema))
 
     def test_backward_compatible_arguments(self):
+        # [FUNCTION DOC] Checks backward compatibility rules for arguments against an old schema
+        # with a keyword-only tensor and integer. Fewer arguments, new arguments without default,
+        # new non-appended arguments, reordered keyword-only arguments, renamed arguments and
+        # incompatible type changes are rejected. Appended arguments with defaults, keyword-only
+        # arguments made positional, widening to optional, and gaining a default are accepted; the
+        # reverse direction of making positional arguments keyword-only is rejected.
         old_schema = parse_schema("any(Tensor self, *, Tensor b, int c) -> Tensor")
         # No-BC: A new schema with less arguments.
         new_schema = parse_schema("any(Tensor self, *, Tensor b) -> Tensor")
@@ -158,6 +190,12 @@ class TestFunctionSchema(TestCase):
         self.assertFalse(new_schema.is_backward_compatible_with(old_schema))
 
     def test_backward_compatible_with_smart_serialization(self):
+        # [FUNCTION DOC] Checks backward compatibility when new arguments with defaults are added,
+        # with and without a trailing out argument. With an out argument, adding a defaulted
+        # argument before out or adding extra out arguments after is accepted, while a defaulted
+        # argument placed before a required one or an out argument placed before the original out
+        # is rejected. Without out, appending defaulted arguments is accepted and inserting one
+        # before an existing defaulted argument is rejected.
         # cases where out arg is provided
         old_schema = parse_schema(
             "foo(Tensor self, *, int a, Tensor(a!) out) -> Tensor(a!)"
@@ -207,11 +245,20 @@ class TestFunctionSchema(TestCase):
         )
 
     def test_string_optional_parameter_default_value(self):
+        # [FUNCTION DOC] Parses a schema with an optional string argument that has a quoted
+        # default value, converts the parsed schema to text and parses it again, and requires both
+        # parsed schemas to be equal.
         schema_a = parse_schema('example::op(str? order="NCHW") -> (Tensor)')
         schema_b = parse_schema(str(schema_a))
         self.assertEqual(schema_a, schema_b)
 
     def test_forward_compatible_arguments_without_out(self):
+        # [FUNCTION DOC] Checks the forward compatibility check against an old schema that has one
+        # defaulted trailing argument. Removing it and appending another defaulted scalar argument
+        # are compatible. Appending a defaulted argument of container type, changing a default
+        # value, renaming it, adding a defaulted argument before it, turning it into a required
+        # argument, or giving a required argument a default are all incompatible, and the exact
+        # reason message is compared for each rejection.
         old_schema = parse_schema("any(Tensor self, int a, int b=1) -> Tensor")
         # deleting default arg is FC compatible
         new_schema = parse_schema("any(Tensor self, int a) -> Tensor")
@@ -269,6 +316,9 @@ class TestFunctionSchema(TestCase):
         )
 
     def test_forward_compatible_arguments_real_use_case(self):
+        # [FUNCTION DOC] Regression test using the slice operator: changing the defaults of the
+        # start and end arguments from integers to optional values defaulting to none is forward
+        # incompatible, and the reason names the start argument.
         # this change introduced forward incompatibility in the past
         old_slice_schema = parse_schema(
             "slice(Tensor(a) self, int dim=0, int start=0, int end=0, int step=1) -> Tensor(a)"
@@ -284,6 +334,10 @@ class TestFunctionSchema(TestCase):
         )
 
     def test_forward_compatible_arguments_with_out(self):
+        # [FUNCTION DOC] Checks the forward compatibility check for schemas that have a trailing
+        # out argument. Removing or appending a defaulted argument is compatible; adding an extra
+        # write-aliased tensor argument makes the number of out arguments differ and is rejected
+        # with a message about the same number of out arguments.
         old_schema = parse_schema(
             "any(Tensor self, *, int a, int b=1, Tensor(a!) out) -> Tensor(a!)"
         )
@@ -307,18 +361,28 @@ class TestFunctionSchema(TestCase):
         )
 
     def test_schema_error(self):
+        # [FUNCTION DOC] Requires that parsing a schema that combines a vararg marker with an
+        # argument having a default value raises a runtime error whose message says that varargs
+        # schemas cannot have default value arguments.
         with self.assertRaisesRegex(
             RuntimeError, r"schemas with vararg \(...\) can't have default value args"
         ):
             parse_schema("any.foo(int arg1, int arg2=0, ...)")
 
     def test_tensor_list_alias_annotation_properly_parsed(self):
+        # [FUNCTION DOC] Parses a schema with a keyword-only list of write-aliased tensors and
+        # checks that the last argument alias info is marked as write and that converting the
+        # schema back to text reproduces the original string.
         schema_str = "foo(Tensor self, *, Tensor(a!)[] out) -> ()"
         schema = parse_schema(schema_str)
         self.assertTrue(schema.arguments[-1].alias_info.is_write)
         self.assertEqual(str(schema), schema_str)
 
     def test_tensor_option_arguments_properly_parsed(self):
+        # [FUNCTION DOC] Parses a to-copy style schema with tensor option arguments and checks the
+        # internal fake types of the memory format, layout and device arguments (integer optional,
+        # integer optional, device optional), while the printed schema keeps the real type names
+        # and equals the input string.
         schema_str = (
             "_to_copy(Tensor self, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, "
             "bool? pin_memory=None, bool non_blocking=False, MemoryFormat? memory_format=None) -> Tensor"
@@ -334,6 +398,9 @@ class TestFunctionSchema(TestCase):
         self.assertEqual(str(schema), schema_str)
 
     def test_sym_int_argument_properly_parsed(self):
+        # [FUNCTION DOC] Parses a schema that returns a symbolic integer. The fake type of the
+        # return is plain int, the real type is SymInt, and printing the schema gives back the
+        # original string.
         schema_str = "sym_size.int(Tensor self, int dim) -> SymInt"
         schema = parse_schema(schema_str)
         # fake type of SymInt is int

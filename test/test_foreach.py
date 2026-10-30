@@ -1,5 +1,11 @@
 # Owner(s): ["module: mta"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for the multi-tensor (foreach) operators. TestForeach is instantiated per
+# device type and compares each foreach operator against a per-tensor reference loop over the
+# operator database: parity, fast versus slow path selection checked through the profiler on CUDA,
+# error cases, mixed devices and dtypes, large inputs, autograd behavior and gradcheck.
+# TestForeachMM covers the grouped matrix multiply operator on CPU and CUDA. Import time
+# instantiates the device-generic and parametrized test classes.
 import itertools
 import os
 import random
@@ -57,10 +63,20 @@ _BOOL_SUB_ERR_MSG = "Subtraction, the `-` operator"
 
 
 class RegularFuncWrapper:
+    # [CLASS DOC] HELPER: Adapter that runs the ordinary per-tensor reference function over a list
+    # of argument lists, so it can be called with the same interface as the foreach wrapper. Holds
+    # the wrapped function in an attribute.
     def __init__(self, func):
+        # [FUNCTION DOC] HELPER: Stores the reference function.
         self.func = func
 
     def __call__(self, inputs, scalars=None, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the reference function once per position over the zipped
+        # input lists and returns the list of results. With a scalars list it requires exactly
+        # three input lists (raises AssertionError otherwise) and passes the matching scalar as
+        # the value keyword to each call. Otherwise, if there are two inputs and the second is a
+        # number or tensor, it overwrites the second input in the caller's list with that value
+        # repeated for each tensor.
         if scalars is not None:
             if len(inputs) != 3:
                 raise AssertionError(f"expected len(inputs) == 3, got {len(inputs)}")
@@ -79,12 +95,26 @@ class RegularFuncWrapper:
 
 
 class ForeachFuncWrapper:
+    # [CLASS DOC] HELPER: Wrapper around a foreach function that, on CUDA, checks whether the
+    # multi tensor apply kernel was launched exactly when the test expects the fast path, and for
+    # in-place functions checks the result is the first input object. Holds the wrapped function
+    # and an is_inplace flag derived from the trailing underscore in its name (false when no
+    # function exists).
     def __init__(self, func):
+        # [FUNCTION DOC] HELPER: Stores the foreach function (possibly none) and sets the in-place
+        # flag from whether its name ends with an underscore.
         self.func = func
         # Some foreach functions don't have in-place implementations.
         self.is_inplace = False if func is None else func.__name__.endswith("_")
 
     def __call__(self, inputs, is_cuda, expect_fastpath, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the wrapped foreach function with the first argument as the
+        # positional inputs and returns its result. The keyword zero_size is removed before the
+        # call. On CUDA with the profiler available (and not on CUDA 12.6 or 12.8, where profiler
+        # results are flaky) the call runs under the profiler and raises AssertionError unless the
+        # multi tensor apply kernel (or on ROCm a launch marker) was seen exactly when
+        # expect_fastpath is true and zero_size is false. For in-place functions it raises
+        # AssertionError if the returned object is not the first input.
         actual = None
         zero_size = kwargs.pop("zero_size", False)
 
@@ -125,19 +155,32 @@ class ForeachFuncWrapper:
 
 
 class InplaceForeachVersionBumpCheck:
+    # [CLASS DOC] HELPER: Context manager used around in-place foreach calls. It records the
+    # version counters of the given tensors at construction and, on exit, asserts the current
+    # versions are not smaller than the recorded ones. Holds the test case, tensor list and
+    # original version list.
+    # KNOWN ISSUE: The check compares two lists of integers with a lexicographic
+    #   greater-or-equal assertion, so it only guarantees the first differing tensor has a
+    #   non-smaller version; it does not prove every tensor was bumped.
     def __init__(
         self,
         testcase: TestCase,
         tensorlist: "List[torch.Tensor]",  # noqa: F821
     ) -> None:
+        # [FUNCTION DOC] HELPER: Remembers the test case and tensor list and snapshots each tensor
+        # version counter.
         self._testcase = testcase
         self._tensorlist = tensorlist
         self._orig_version_counts = [t._version for t in tensorlist]
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Does nothing; present so the object works in a with statement.
         pass
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC] HELPER: Asserts through the test case that the current version counters,
+        # as a list, are greater than or equal to the recorded ones. It runs even when the body
+        # raised, and does not suppress exceptions.
         # note(crcrpar): some methods e.g. `_binary_test` could call the given inplace function multiple times
         self._testcase.assertGreaterEqual(
             [t._version for t in self._tensorlist], self._orig_version_counts
@@ -145,7 +188,13 @@ class InplaceForeachVersionBumpCheck:
 
 
 def get_transform_func(num_tensors, dtype, device, is_fastpath):
+    # [FUNCTION DOC] HELPER: Returns a function that maps sample values for autograd tests.
+    # Non-tensors and zero-dimensional tensors are returned unchanged; any other tensor is
+    # replaced by a new random square tensor of side num_tensors with the given dtype and device
+    # that requires grad, non-contiguous unless is_fastpath is true.
     def transform(t):
+        # [FUNCTION DOC] HELPER: The mapping function described by the enclosing factory; see the
+        # enclosing function for behavior.
         if not torch.is_tensor(t):
             return t
         if torch.is_tensor(t) and t.ndim == 0:
@@ -165,11 +214,21 @@ def get_transform_func(num_tensors, dtype, device, is_fastpath):
 # as the pair would go through `multi_tensor_apply_kernel` if inputs are not zero size.
 @unittest.mock.patch.dict(os.environ, {"KINETO_LOG_LEVEL": "5"})
 class TestForeach(TestCase):
+    # [CLASS DOC] Device-generic test case for the foreach operators, instantiated per device type
+    # with environment variable KINETO_LOG_LEVEL set to 5 during tests. Stateless; shared helpers
+    # build the wrapped foreach and reference callables from an operator database entry and
+    # compare their results. Zero-size inputs are only expected to avoid kernels on accelerators.
     @property
     def is_cuda(self):
+        # [FUNCTION DOC] Property that is true when the device type of the current instantiation
+        # is cuda.
         return self.device_type == "cuda"
 
     def _get_funcs(self, op):
+        # [FUNCTION DOC] HELPER: Returns four callables for an operator entry: foreach wrapper for
+        # the out-of-place variant, regular wrapper for its reference, foreach wrapper for the
+        # in-place variant, and regular wrapper for the in-place reference. Wrappers around
+        # missing variants hold none.
         return (
             ForeachFuncWrapper(op.method_variant),
             RegularFuncWrapper(op.ref),
@@ -193,6 +252,10 @@ class TestForeach(TestCase):
         dtypes=(torch.float32,),
     )
     def test_all_zero_size_tensors_do_not_launch_kernel(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator-only, float32 only. For zero-size sample inputs of every
+        # foreach operator in the databases, runs the out-of-place variant and, if present, the
+        # in-place variant (inside a version bump check) through the foreach wrapper with
+        # zero_size set, so the wrapper asserts no multi tensor apply kernel is launched.
         wrapped_op, _, inplace_op, _ = self._get_funcs(op)
 
         for sample in op.sample_zero_size_inputs(device, dtype):
@@ -228,6 +291,12 @@ class TestForeach(TestCase):
         ),
     )
     def test_parity(self, device, dtype, op, noncontiguous, inplace):
+        # [FUNCTION DOC] Parity test over all operator databases, parametrized by noncontiguous
+        # and in-place. For each sample it computes whether the fast path is expected (not for
+        # noncontiguous inputs, samples that disable it, or integer/bool division). In-place runs
+        # use cloned reference inputs and a version bump check. If the foreach call raises, the
+        # reference must raise the same exception type; otherwise results must equal the reference
+        # output.
         if inplace:
             _, _, func, ref = self._get_funcs(op)
         else:
@@ -275,6 +344,13 @@ class TestForeach(TestCase):
         alpha,
         scalar_self_arg: bool,
     ):
+        # [FUNCTION DOC] HELPER: Compares a wrapped foreach binary operator against its reference.
+        # Runs the operator (with a version bump check if in-place); on a RuntimeError the
+        # reference must raise the same type whose message matches the first line of the error,
+        # otherwise results must be equal. Scalar-self mode calls the underlying reference
+        # function with the scalar first for every tensor. Unless in scalar-self mode and when
+        # alpha is given, repeats with an alpha keyword using the original inputs without cloning,
+        # with looser absolute tolerance for half and bfloat16 on ROCm.
         ref_inputs = (
             [[t.detach().clone() for t in inputs[0]], inputs[1]]
             if is_inplace
@@ -327,7 +403,15 @@ class TestForeach(TestCase):
     @ops(filter(lambda op: op.supports_scalar_self_arg, foreach_binary_op_db))
     @parametrize("is_fastpath", (True, False))
     def test_binary_op_with_scalar_self_support(self, device, dtype, op, is_fastpath):
+        # [FUNCTION DOC] For binary operators that accept a scalar as first argument, runs for the
+        # first sample with a numeric right-hand side the binary comparison with the scalar on the
+        # left. If the operator supports autograd and dtype is float32, also builds fresh
+        # requires-grad tensors, sums outputs of the foreach and the reference, calls backward on
+        # both, and asserts the gradients are equal. The alpha entry is removed from the sample
+        # keyword mapping as a side effect.
         def clone(arg):
+            # [FUNCTION DOC] HELPER: Recursively copies lists and tuples, replacing each tensor by
+            # a detached clone that requires grad and returning non-tensors unchanged.
             if isinstance(arg, (list, tuple)):
                 return [clone(a) for a in arg]
             if torch.is_tensor(arg):
@@ -382,6 +466,14 @@ class TestForeach(TestCase):
     def test_pointwise_op_with_tensor_of_scalarlist_overload(
         self, device, dtype, op, is_fastpath
     ):
+        # [FUNCTION DOC] For pointwise foreach operators (addcmul style) with a fast path,
+        # supplies the scalars as a one-dimensional tensor for both variants and checks error
+        # messages for a zero-dimensional tensor, a CUDA tensor, a wrong length and a
+        # non-contiguous scalar tensor. Then tests implicit broadcasting with inputs of shapes
+        # square, column and row for both variants.
+        # KNOWN ISSUE: In the broadcasting section the expected fast path flag is the logical
+        #   and of is_fastpath and disable_fastpath, whereas the earlier calls use is_fastpath and
+        #   not disable_fastpath; the polarity looks inverted or accidental.
         for sample in op.sample_inputs(
             device,
             dtype,
@@ -526,6 +618,12 @@ class TestForeach(TestCase):
         custom_values_err=None,
         **kwargs,
     ):
+        # [FUNCTION DOC] HELPER: Same comparison as the binary helper for three-input pointwise
+        # operators: runs the operator, using cloned reference inputs and a version bump check for
+        # in-place, and compares with the reference or matches the RuntimeError. If scalars is
+        # given, calls again with the scalars keyword: on RuntimeError, with no custom message it
+        # must match the reference error, otherwise the error text must contain the custom
+        # message; on success the result must equal the reference.
         ref_inputs = (
             [[t.detach().clone() for t in inputs[0]], inputs[1], inputs[2]]
             if is_inplace
@@ -566,6 +664,10 @@ class TestForeach(TestCase):
 
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16))
     def test_add_scalar_with_empty_list_and_empty_tensor(self, device, dtype):
+        # [FUNCTION DOC] For every dtype, adds a scalar out of place and in place to lists holding
+        # one zero-element tensor (a plain empty one and one with zero stride) and checks the
+        # result equals the input; also runs an in-place multiply as a regression test for an old
+        # issue.
         # TODO: enable empty list case
         for tensors in [
             [torch.randn([0], device=device, dtype=dtype)],
@@ -583,6 +685,10 @@ class TestForeach(TestCase):
     @onlyAccelerator
     @dtypes(torch.float32)
     def test_foreach_check_stride_ignore_dims_of_one(self, device, dtype):
+        # [FUNCTION DOC] Accelerator, float32. Builds two tensors that have the same shape and
+        # differ only in the strides of a size-one dimension, adds them in both orders with the
+        # foreach add through the wrapper expecting the fast path, and checks each output equals
+        # the plain sum.
         # default tensor stride is (9, 9, 3, 1).
         tensor = torch.ones((2, 1, 3, 3), device=device, dtype=dtype)
         strided_tensor = torch.ones(
@@ -603,6 +709,9 @@ class TestForeach(TestCase):
         dtypes=OpDTypes.supported,
     )
     def test_binary_op_scalar_with_overlapping_tensors(self, device, dtype, op):
+        # [FUNCTION DOC] For binary foreach operators, applies the operator with scalar 1 to an
+        # expanded (overlapping memory) tensor and compares to the reference. For boolean
+        # subtraction both must raise the known boolean subtraction RuntimeError.
         foreach_op, ref = op.method_variant, op.ref
         tensors = [torch.ones(1, 1, device=device, dtype=dtype).expand(2, 1, 3)]
 
@@ -622,6 +731,8 @@ class TestForeach(TestCase):
         allowed_dtypes=[torch.float],
     )
     def test_binary_op_scalar_with_different_tensor_dtypes(self, device, dtype, op):
+        # [FUNCTION DOC] Checks that a binary foreach operator with scalar 1 on a list mixing a
+        # float tensor and a long tensor does not raise RuntimeError.
         foreach_op = op.method_variant
         tensors = [
             torch.tensor([1.1], dtype=torch.float, device=device),
@@ -640,6 +751,11 @@ class TestForeach(TestCase):
         dtypes=OpDTypes.supported,
     )
     def test_binary_op_list_error_cases(self, device, dtype, op):
+        # [FUNCTION DOC] Skipped under dynamo. Checks error messages of binary tensor-list foreach
+        # operators (out-of-place and in-place): two empty lists, one empty list, lists of
+        # different lengths in both orders, non-broadcastable shapes (message must match the
+        # regular operator), boolean subtraction, and with several accelerators tensors on
+        # different devices (including a result type error for in-place integer division).
         foreach_op, foreach_op_, ref, ref_ = (
             op.method_variant,
             op.inplace_variant,
@@ -729,6 +845,10 @@ class TestForeach(TestCase):
         dtypes=OpDTypes.supported,
     )
     def test_binary_op_list_slow_path(self, device, dtype, op):
+        # [FUNCTION DOC] Requires an accelerator. Runs the binary comparison with fast path
+        # disabled for the slow-path layouts: zero-stride expanded tensor, transposed tensor,
+        # non-contiguous tensors and a strided slice; each for out-of-place and in-place variants
+        # without alpha.
         foreach_op, native_op, foreach_op_, native_op_ = self._get_funcs(op)
         # 0-strides
         tensor1 = make_tensor((10, 10), dtype=dtype, device=device)
@@ -843,6 +963,9 @@ class TestForeach(TestCase):
         dtypes=floating_types_and(torch.half, torch.bfloat16),
     )
     def test_binary_op_float_inf_nan(self, device, dtype, op):
+        # [FUNCTION DOC] Builds lists of infinity, negative infinity and NaN pairs and compares
+        # binary foreach operators and their in-place variants against references, expecting the
+        # fast path.
         inputs = (
             [
                 torch.tensor([float("inf")], device=device, dtype=dtype),
@@ -878,6 +1001,11 @@ class TestForeach(TestCase):
     @onlyAccelerator
     @ops(foreach_unary_op_db)
     def test_unary_op_tensors_on_different_devices(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator-only. Takes a two-tensor sample, moves the second tensor to
+        # CPU, and checks the unary foreach operator either raises an error matching the reference
+        # or equals it; then, if an in-place variant exists, checks it the same way and that the
+        # tensors equal the expected output; otherwise asserts the reference in-place function is
+        # missing.
         method, ref, inplace_method, ref_inplace = self._get_funcs(op)
         # tensors: ['accelerator', 'cpu']
         tensors = next(
@@ -917,6 +1045,9 @@ class TestForeach(TestCase):
     @onlyAccelerator
     @ops(filter(lambda op: op.supports_out, foreach_binary_op_db))
     def test_binary_op_tensors_on_different_devices(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator-only. Pairs accelerator tensors with CPU tensors in each list
+        # entry and checks the out-of-place and in-place foreach binary operator either raise
+        # errors matching the per-tensor operator or give equal results.
         _acc_tensors = next(
             iter(
                 op.sample_inputs(
@@ -962,6 +1093,10 @@ class TestForeach(TestCase):
     @onlyAccelerator
     @ops(foreach_pointwise_op_db, allowed_dtypes=floating_types())
     def test_pointwise_op_tensors_on_different_devices(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator-only, floating dtypes. Builds three lists each holding one
+        # accelerator and one CPU tensor, runs the out-of-place pointwise foreach operator and
+        # compares to the per-device reference results, then runs the in-place variant and
+        # compares the first list.
         # tensors1: ['accelerator', 'cpu]
         # tensors2: ['accelerator', 'cpu]
         # tensors3: ['accelerator', 'cpu]
@@ -1009,6 +1144,13 @@ class TestForeach(TestCase):
         allowed_dtypes=(torch.half, torch.bfloat16),
     )
     def test_foreach_l2_large_value_input(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator, half and bfloat16, norm operators. Scales inputs so each
+        # squared L2 norm exceeds the dtype maximum, runs the foreach norm with order 2 through
+        # the wrapper expecting the fast path, and checks results against the reference: no
+        # infinities for float16, infinity for non-empty tensors otherwise.
+        # KNOWN ISSUE: The sample_inputs keyword is spelled with a typo, so the intended
+        #   requires-grad setting is probably not passed correctly; the surrounding tests use the
+        #   correct spelling.
         ord, N = 2, 10
         max_value = torch.finfo(dtype).max
         scaler = torch.tensor([max_value]).sqrt().to(device=device, dtype=dtype)
@@ -1052,6 +1194,9 @@ class TestForeach(TestCase):
     def test_foreach_max_with_different_tensor_sizes_and_negative_values(
         self, device, dtype
     ):
+        # [FUNCTION DOC] Calls the foreach max on a small tensor of negative values and a large
+        # tensor of positive values and asserts each result equals the maximum of the
+        # corresponding tensor.
         # Small tensor with all negative values
         x = torch.rand(4, device=device, dtype=dtype) * (-5)
         # Large tensor with positive values
@@ -1071,6 +1216,12 @@ class TestForeach(TestCase):
     @parametrize("use_cuda_graph", (False, True))
     @parametrize("w_empty", (False, True))
     def test_big_num_tensors(self, device, dtype, op, use_cuda_graph, w_empty):
+        # [FUNCTION DOC] Accelerator, floating dtypes, parametrized by CUDA graph use and by
+        # interspersing empty tensors. Builds a list of 4000 small tensors (some empty at fixed
+        # positions except for the max operator), runs the reduce foreach operator for each
+        # applicable norm order (zero, one, two, plus infinity only when no empties) and compares
+        # with the reference. With CUDA graph the function is captured and replayed (skip on
+        # non-CUDA devices).
         # foreach_max cannot handle empty tensors as max requires an identity
         intersperse_empty_tensors = w_empty and op.name != "_foreach_max"
 
@@ -1127,11 +1278,16 @@ class TestForeach(TestCase):
     @onlyCUDA
     @dtypes(torch.complex128)
     def test_foreach_scalarlist_complex_double_many_tensors(self, device, dtype):
+        # [FUNCTION DOC] CUDA, complex128. Regression test for chunking of the multi tensor apply
+        # path with 600 tensors: divides by a list of scalars out of place and in place and
+        # compares to per-tensor division.
         # Prevent regressions for complex double MTA chunking, see #189827
         N = 600
         scalars = [i + 2.0 for i in range(N)]
 
         def make_tensors():
+            # [FUNCTION DOC] HELPER: Returns a fresh list of 600 single-element complex tensors
+            # filled with increasing values.
             return [
                 torch.full((1, 1, 1), i + 1, dtype=dtype, device=device)
                 for i in range(N)
@@ -1151,6 +1307,10 @@ class TestForeach(TestCase):
     @ops(foreach_reduce_op_db)
     @parametrize("w_empty", (False, True))
     def test_foreach_reduce_large_input(self, device, dtype, op, w_empty):
+        # [FUNCTION DOC] Accelerator, parametrized by whether an empty tensor sits between two
+        # tensors. Runs a reduce foreach operator on tensors larger than the chunk limit (about 42
+        # million elements, order 2 for norm) and compares with the reference; the fast path is
+        # expected unless a norm of a non floating dtype.
         # test inputs larger than kChunkSize (65536) * max_num_blocks (2240 for the 32kb config)
         N = 65536 * 320 * 2
         disable_fastpath = False
@@ -1183,6 +1343,9 @@ class TestForeach(TestCase):
         [o for o in foreach_reduce_op_db if o.name == "_foreach_norm"],
     )
     def test_foreach_norm_empty_tensor_inf_error(self, device, dtype, op):
+        # [FUNCTION DOC] Checks that the foreach norm raises RuntimeError saying the infinity norm
+        # of an empty tensor has no identity, both for a lone empty tensor and a mixed list; for
+        # floating dtypes also checks order 1 and 2 norms of an empty tensor are zero.
         """Test that _foreach_norm errors on empty tensors with ord=infinity"""
         import math
 
@@ -1214,6 +1377,9 @@ class TestForeach(TestCase):
         [o for o in foreach_reduce_op_db if o.name == "_foreach_max"],
     )
     def test_foreach_max_empty_tensor_error(self, device, dtype, op):
+        # [FUNCTION DOC] Checks that the foreach max raises RuntimeError saying the maximum of an
+        # empty tensor is undefined, for a lone empty tensor and for a list with an empty and a
+        # non-empty tensor.
         """Test that _foreach_max errors on empty tensors"""
         # Test with single empty tensor
         empty_tensor = torch.empty(0, dtype=dtype, device=device)
@@ -1238,6 +1404,10 @@ class TestForeach(TestCase):
         dtypes=(torch.float,),
     )
     def test_inplace_foreach_leaf_check_and_grad_fn(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator, float. Skips if there is no in-place variant. Checks an
+        # in-place foreach call raises RuntimeError mentioning a leaf variable requiring grad when
+        # the first (then also the second) input requires grad; then with non-leaf clones checks
+        # only the tensor that required grad gets a grad function after the call.
         inplace_op = op.inplace_variant
         if inplace_op is None:
             self.skipTest("no in-place op available")
@@ -1277,6 +1447,9 @@ class TestForeach(TestCase):
         dtypes=(torch.float,),
     )
     def test_outplace_with_invalid_grads(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator, float, out-of-place operators. With two inputs requiring
+        # grad, calls the foreach operator, backpropagates a ones gradient through the first
+        # output only, and checks the first input has a gradient while the second does not.
         func, *_ = self._get_funcs(op)
         sample = next(
             iter(
@@ -1311,8 +1484,19 @@ class TestForeach(TestCase):
         dtypes=(torch.float32,),
     )
     def test_lifetime_of_grad_fn_when_result_is_saved(self, device, dtype, op):
+        # [FUNCTION DOC] For operators whose backward needs the result, checks that the result's
+        # grad function does not outlive the output: it stores a weak reference in the grad
+        # function metadata and asserts it dies once the output is deleted. For the power operator
+        # it skips samples with integer-like scalar or scalar list exponents, since their backward
+        # does not use the result, and swaps a float scalar first argument into the input
+        # position. Deletes any fast path keys from the sample keywords.
         def get_ref(func, sample):
+            # [FUNCTION DOC] HELPER: Calls the function on the sample, attaches a fresh object
+            # into the metadata of the first output grad function, and returns the outputs
+            # together with a weak reference to that object.
             class Foo:
+                # [CLASS DOC] HELPER: Empty marker class whose instance is stored in grad function
+                # metadata so a weak reference can detect when it is freed.
                 pass
 
             out = func(
@@ -1328,6 +1512,8 @@ class TestForeach(TestCase):
             return out, ref
 
         def _test(func, sample):
+            # [FUNCTION DOC] HELPER: Asserts the weak reference is alive while the outputs exist
+            # and dead after the outputs are deleted.
             out, ref = get_ref(func, sample)
             self.assertIsNotNone(ref())
             del out
@@ -1359,6 +1545,11 @@ class TestForeach(TestCase):
 
     @unittest.skipIf(not TEST_MULTIACCELERATOR, "multi-GPU not supported")
     def test_tensors_grouping(self):
+        # [FUNCTION DOC] Skipped without multiple accelerators. Builds ten random-device
+        # random-dtype tensors, a list of none and a list of random tensors, groups them by device
+        # and dtype with indices, and asserts every tensor in the grouped lists has the group
+        # device and dtype, indices map back to the original entries, the none list stays none,
+        # and the total tensor count is twenty.
         num_tensors_per_list = 10
         num_devices = torch.accelerator.device_count()
         dtypes = (torch.float16, torch.float32, torch.float64)
@@ -1394,6 +1585,9 @@ class TestForeach(TestCase):
 
     @onlyAccelerator
     def test_0dim_tensor_overload_cpu_ok(self, device):
+        # [FUNCTION DOC] Accelerator-only. Checks multiplying and dividing accelerator
+        # zero-dimensional tensors by a CPU zero-dimensional tensor works and equals per-tensor
+        # results.
         tensors = [torch.ones((), device=device, dtype=torch.float32) for _ in range(2)]
         scalar_cpu_tensor = torch.tensor(4.0, device="cpu")
 
@@ -1406,6 +1600,10 @@ class TestForeach(TestCase):
     @onlyAccelerator
     @dtypes(*floating_types_and(torch.half, torch.bfloat16))
     def test_pointwise_op_with_0d_tensor1(self, device, dtype):
+        # [FUNCTION DOC] Accelerator, floating dtypes. Regression test that foreach addcmul (both
+        # orderings of the zero-dimensional tensors) and addcdiv (zero-dimensional tensors only in
+        # the first position) with zero-dimensional tensor operands take the fast path and equal
+        # per-tensor results, also for the in-place variants.
         # Test that foreach_addcmul/addcdiv uses fast path when tensor1 is a list of 0D tensors
         # This is a regression test for the optimization that allows 0D tensors in tensor1
         # to use the fast CUDA kernel path instead of falling back to the slow path.
@@ -1486,6 +1684,8 @@ class TestForeach(TestCase):
 
     @onlyAccelerator
     def test_div_reciprocal(self, device):
+        # [FUNCTION DOC] Accelerator-only. Checks foreach division of a float tensor by 10 gives
+        # the same mantissa and exponent as ordinary division by 10.
         expect_m, expect_e = torch.frexp(
             torch.div(torch.tensor(0.1, device=device), 10.0)
         )
@@ -1499,6 +1699,10 @@ class TestForeach(TestCase):
     @dtypes(*floating_types_and(torch.half, torch.bfloat16))
     @dtypesIfXPU(torch.half, torch.bfloat16)
     def test_addcmul_alpha_one_fma_parity(self, device, dtype):
+        # [FUNCTION DOC] Accelerator, floating dtypes. For several scalar values held in
+        # zero-dimensional tensors, checks addcmul with value one, foreach addcmul and add with
+        # alpha equal to the scalar agree exactly (zero tolerance); then checks a regular
+        # non-zero-dimensional case matches exactly.
         # Test that addcmul with alpha=1 produces bitwise identical results
         # to add with alpha=scalar_val (when tensor1 is a 0D tensor with that value).
         # This verifies that the alpha=1 special case uses FMA correctly.
@@ -1583,6 +1787,9 @@ class TestForeach(TestCase):
 
     @onlyAccelerator
     def test_0dim_tensor_overload_exception(self, device):
+        # [FUNCTION DOC] Accelerator-only. Checks RuntimeError messages for foreach add with a CPU
+        # scalar tensor plus alpha on accelerator tensors, and for mul and add with a
+        # one-dimensional scalar tensor on mixed device lists.
         # check exceptions of fast path
         tensors = [
             make_tensor((2, 2), dtype=torch.float, device=device) for _ in range(2)
@@ -1605,6 +1812,12 @@ class TestForeach(TestCase):
     @onlyAccelerator
     @ops(filter(lambda op: op.name == "_foreach_copy", foreach_binary_op_db))
     def test_foreach_copy_with_multi_device_inputs(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator, copy operator. Runs in-place foreach copy, with both
+        # blocking modes, and compares with per-tensor copy; with several accelerators repeats
+        # with sources moved to device index one.
+        # KNOWN ISSUE: The device argument is rebound to the second accelerator inside the loop
+        #   when multiple accelerators exist, so later samples and iterations create their inputs
+        #   on that device instead of the original one.
         foreach_copy_ = op.inplace_variant
         copy_ = op.ref_inplace
         for non_blocking in (False, True):
@@ -1628,6 +1841,9 @@ class TestForeach(TestCase):
     @onlyAccelerator
     @ops(filter(lambda op: op.name == "_foreach_copy", foreach_binary_op_db))
     def test_foreach_copy_with_multi_dtypes(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator, copy operator. For each floating source dtype different from
+        # the destination dtype, copies through the wrapper expecting the fast path and asserts
+        # exact equality with a per-tensor copy.
         # check (a) multi_tensor_apply is called and (b) numerical parity with for-loop and Tensor.copy_
         foreach_copy_ = ForeachFuncWrapper(op.inplace_variant)
 
@@ -1654,6 +1870,9 @@ class TestForeach(TestCase):
     @onlyAccelerator
     @ops(filter(lambda op: op.name == "_foreach_copy", foreach_binary_op_db))
     def test_foreach_copy_with_mixed_dtypes_within_tensor(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator, copy operator. For samples with at least two tensors, copies
+        # between a list of uniform dtype and a list cycling float32, bfloat16 and float16 in both
+        # directions, expecting no fast path, and asserts exact equality with per-tensor copies.
         foreach_copy_ = ForeachFuncWrapper(op.inplace_variant)
 
         for sample in op.sample_inputs(
@@ -1701,6 +1920,9 @@ class TestForeach(TestCase):
     @largeTensorTest("40GB")
     @skipXPU
     def test_foreach_copy_with_multi_dtypes_large_input(self, device):
+        # [FUNCTION DOC] Accelerator, serial, large tensor and not on XPU. Regression test copying
+        # a bfloat16 tensor with more than two to the power 31 elements into a float32 tensor with
+        # foreach copy and comparing with the ordinary copy.
         # see https://github.com/pytorch/pytorch/issues/156261
         self_tensor = torch.empty(2**31 + 1, device=device, dtype=torch.float32)
         src_tensor = torch.ones(2**31 + 1, device=device, dtype=torch.bfloat16)
@@ -1712,6 +1934,10 @@ class TestForeach(TestCase):
     @requires_gpu_and_triton
     @ops(filter(lambda op: op.name == "_foreach_copy", foreach_binary_op_db))
     def test_foreach_copy_with_different_device_inputs(self, device, dtype, op):
+        # [FUNCTION DOC] Requires GPU and triton. Skips complex dtypes. Compiles a wrapper around
+        # the foreach copy and checks the compiled result equals per-tensor copies when sources
+        # are on CPU and destinations on the accelerator, and when destinations are on CPU and
+        # sources on the accelerator.
         if dtype in (torch.complex128, torch.complex64):
             self.skipTest("Complex dtype not supported")
         # check foreach_copy when self and src tensorList have different device
@@ -1719,6 +1945,8 @@ class TestForeach(TestCase):
         copy_ = op.ref_inplace
 
         def fn(self_tensor, src_tensor, non_blocking):
+            # [FUNCTION DOC] HELPER: Forwards its three arguments to the foreach copy function and
+            # returns the result; compiled by the test.
             return foreach_copy(self_tensor, src_tensor, non_blocking)
 
         fn = torch.compile(fn)
@@ -1757,6 +1985,13 @@ class TestForeach(TestCase):
         "inplace", (False, True), name_fn=lambda x: "inplace" if x else "outplace"
     )
     def test_autodiff(self, device, dtype, op, inplace):
+        # [FUNCTION DOC] Accelerator, float64 and complex128, parametrized by in-place. Skips if
+        # the variant or autograd is not supported. For samples with five tensors, uses a helper
+        # to decide if the sample works or to expect a given error; then runs gradcheck (forward
+        # and backward as supported) either expecting success or a RuntimeError matching the
+        # pattern. For in-place operators also checks each output tensor has its own grad
+        # function, hooks fire only for the used tensor, and a joint backward fires hooks in
+        # reverse order.
         if (not inplace) and not op.supports_out:
             self.skipTest("out-of-place not implemented")
         if inplace and op.has_no_in_place:
@@ -1805,6 +2040,9 @@ class TestForeach(TestCase):
                 # Call `clone` to avoid inplace modifications likewise
                 # `torch.testing._internal.common_utils.TestGradients._get_safe_inplace`
                 def inplace_func(*tensorlist):
+                    # [FUNCTION DOC] HELPER: Clones all input tensors, applies the in-place
+                    # operator with the sample arguments (and alpha if present) to the clones, and
+                    # returns the original tensor list for gradcheck.
                     kwargs = (
                         {"alpha": sample.kwargs["alpha"]}
                         if "alpha" in sample.kwargs
@@ -1819,6 +2057,8 @@ class TestForeach(TestCase):
             else:
 
                 def outplace_func(*tensorlist):
+                    # [FUNCTION DOC] HELPER: Applies the out-of-place operator to the tensors with
+                    # the sample arguments (and alpha if present) and returns the result list.
                     kwargs = (
                         {"alpha": sample.kwargs["alpha"]}
                         if "alpha" in sample.kwargs
@@ -1833,6 +2073,9 @@ class TestForeach(TestCase):
             )
 
             def call_gradcheck():
+                # [FUNCTION DOC] HELPER: Runs gradcheck on the chosen function with the sample
+                # input, raising on failure, checking forward and backward modes as supported and
+                # not batched checks.
                 gradcheck(
                     func,
                     sample.input,
@@ -1858,7 +2101,11 @@ class TestForeach(TestCase):
                 hook_buffer = []
 
                 def get_grad_fn_hook(i):
+                    # [FUNCTION DOC] HELPER: Returns a hook that appends the given index to the
+                    # shared hook buffer when called.
                     def hook(grad_inputs, grad_outputs) -> None:
+                        # [FUNCTION DOC] HELPER: Records the index of the enclosing factory in the
+                        # hook buffer; ignores the gradient arguments and returns nothing.
                         hook_buffer.append(i)
 
                     return hook
@@ -1903,6 +2150,15 @@ class TestForeach(TestCase):
 # so that we can use this function as something like the first argument of `filter` function.
 # Even after moving this function to testing, I personally think it'd be better to check the error message.
 def check_autodiff_sample(op, sample, dtype, is_inplace):
+    # [FUNCTION DOC] HELPER: Decides how autodiff tests treat a sample. Returns a pair of a flag
+    # (true when the sample can be checked normally) and an error text pattern. Known unsupported
+    # combinations return false with the expected error: in-place abs on complex, boolean
+    # subtraction, out-of-place norm forward gradient size, complex right-hand side with float64
+    # for lerp, clamp, maximum, minimum, and arithmetic in-place ops; other complex-with-float64
+    # out-of-place cases return false with empty text, meaning skip. Otherwise returns true and
+    # empty text.
+    # KNOWN ISSUE: The second lerp in-place branch is unreachable, since the earlier lerp branch
+    #   already returns for every case.
     if op.name == "_foreach_abs" and is_inplace and dtype == torch.complex128:
         return False, "In-place abs is not supported for complex tensors."
     if op.name == "_foreach_sub" and (
@@ -1972,7 +2228,15 @@ _FOREACH_MM_SHAPES = [
 
 
 class TestForeachMM(TestCase):
+    # [CLASS DOC] Test case for the grouped matrix multiply foreach operator, covering CPU and
+    # CUDA correctness, gradients, routing between the backends and fallbacks. Stateless;
+    # instantiated as parametrized tests.
     def _check(self, shapes, dtype, device):
+        # [FUNCTION DOC] HELPER: Builds random left and right matrices for each shape triple
+        # (rows, columns, inner size), runs the foreach matrix multiply and compares each result
+        # with a plain matrix multiply, asserting equal length. Float32 uses relaxed tolerance
+        # because grouped backends may accumulate differently; failure messages name the group
+        # index.
         A = [torch.randn(M, K, dtype=dtype, device=device) for M, _, K in shapes]
         B = [torch.randn(K, N, dtype=dtype, device=device) for _, N, K in shapes]
         ref = [torch.mm(a, b) for a, b in zip(A, B)]
@@ -1992,6 +2256,7 @@ class TestForeachMM(TestCase):
         name_fn=lambda label, shapes: label,
     )
     def test_foreach_mm_cpu(self, label, shapes):
+        # [FUNCTION DOC] Runs the shared check for each parametrized shape set on CPU in float32.
         self._check(shapes, torch.float32, "cpu")
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -2002,9 +2267,13 @@ class TestForeachMM(TestCase):
     )
     @parametrize("dtype", [torch.bfloat16, torch.float32])
     def test_foreach_mm_cuda(self, label, shapes, dtype):
+        # [FUNCTION DOC] Skipped without CUDA. Runs the shared check for each shape set and dtype
+        # (bfloat16 or float32) on CUDA.
         self._check(shapes, dtype, "cuda")
 
     def test_foreach_mm_gradcheck(self):
+        # [FUNCTION DOC] Runs gradcheck in float64 on the foreach matrix multiply with four 32 by
+        # 32 pairs of inputs requiring grad.
         G = 4
         shapes = [(32, 32, 32)] * G
         A = [
@@ -2017,6 +2286,8 @@ class TestForeachMM(TestCase):
         ]
 
         def fn(*tensors):
+            # [FUNCTION DOC] HELPER: Splits the flat argument tuple into two equal halves (one per
+            # group) and returns the foreach matrix multiply result list.
             return torch._foreach_mm(list(tensors[:G]), list(tensors[G:]))
 
         gradcheck(fn, (*A, *B))
@@ -2036,6 +2307,9 @@ class TestForeachMM(TestCase):
     def test_foreach_mm_can_use_nvmath_cublaslt_grouped_mm(
         self, label, a_dtype, b_dtype, K, expected
     ):
+        # [FUNCTION DOC] Checks the private predicate for nvmath grouped matmul usage: it is true
+        # only for two bfloat16 lists with inner size 16 (aligned) and false for mixed dtypes,
+        # float32 and bfloat16 with inner size 4.
         from torch._native.ops.foreach_mm.impl import (
             _can_use_nvmath_cublaslt_grouped_mm,
         )
@@ -2092,6 +2366,10 @@ class TestForeachMM(TestCase):
         name_fn=lambda label, *_: label,
     )
     def test_foreach_mm_route(self, label, dtype, shapes, available, expected):
+        # [FUNCTION DOC] Mocks the nvmath availability probe in the implementation module with the
+        # given availability, builds metadata-only matrices from the shapes, and asserts the
+        # private routing function returns the expected backend name (nvmath cublasLt, cutlass, or
+        # loop).
         from torch._native.ops.foreach_mm import impl
 
         A = [torch.randn(M, K, dtype=dtype) for (M, N, K) in shapes]
@@ -2119,6 +2397,9 @@ class TestForeachMM(TestCase):
         name_fn=lambda label, *_: label,
     )
     def test_foreach_mm_cond_rejects(self, label, a_shape, b_shape, a_dtype, b_dtype):
+        # [FUNCTION DOC] Skipped without CUDA SM90 or newer. Builds two CUDA matrices per side
+        # with the given shapes and dtypes and asserts the private condition function rejects them
+        # (mixed or unsupported dtype, zero-sized dimension).
         from torch._native.ops.foreach_mm.impl import _foreach_mm_cond
 
         A = [torch.randn(*a_shape, dtype=a_dtype, device="cuda") for _ in range(2)]
@@ -2140,6 +2421,9 @@ class TestForeachMM(TestCase):
         name_fn=lambda label, shapes: label,
     )
     def test_foreach_mm_fallback_correctness(self, label, shapes):
+        # [FUNCTION DOC] Skipped without CUDA SM90 or newer. For zero-sized dimensions and a group
+        # count of 1024, with the nvmath probe mocked as unavailable, checks the foreach matrix
+        # multiply equals per-matrix multiply on CUDA bfloat16.
         from torch._native.ops.foreach_mm import impl
 
         A = [
@@ -2185,6 +2469,9 @@ class TestForeachMM(TestCase):
         name_fn=lambda label, shapes: label,
     )
     def test_foreach_mm_nvmath(self, label, shapes):
+        # [FUNCTION DOC] Needs nvmath and CUDA SM90 or newer. Skips if the cuBLASLt grouped GEMM
+        # probe reports unavailable; otherwise runs the shared check for large, nonsquare, mixed
+        # and many-group shapes in bfloat16 on CUDA.
         from torch._native.ops.foreach_mm.impl import _check_nvmath_cublaslt
 
         if not _check_nvmath_cublaslt():

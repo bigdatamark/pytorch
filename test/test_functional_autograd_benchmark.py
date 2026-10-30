@@ -1,5 +1,8 @@
 # Owner(s): ["module: autograd"]
 
+# [MODULE DOC] Smoke test that runs the functional autograd benchmark script in a subprocess for a
+# few models and checks that it exits successfully and writes output. Import time reads an
+# environment variable to detect coverage collection.
 import os
 
 import subprocess
@@ -18,7 +21,15 @@ PYTORCH_COLLECT_COVERAGE = bool(os.environ.get("PYTORCH_COLLECT_COVERAGE"))
 
 # This is a very simple smoke test for the functional autograd benchmarking script.
 class TestFunctionalAutogradBenchmark(TestCase):
+    # [CLASS DOC] Test case that launches the benchmark script as a child process through a shared
+    # helper; it keeps no state of its own. One test runs the quick models and a slow-marked test
+    # runs the large ones.
     def _test_runner(self, model, disable_gpu=False):
+        # [FUNCTION DOC] HELPER: Runs the benchmark script with a temporary output file, zero
+        # timed iterations (warmup only), only the vjp task and only the given model name;
+        # optionally passes a negative gpu index to disable the GPU, and uses the python
+        # executable name on Windows. Asserts the exit code is zero and the output file is not
+        # empty.
         # Note about windows:
         # The temporary file is exclusively open by this process and the child process
         # is not allowed to open it again. As this is a simple smoke test, we choose for now
@@ -52,6 +63,9 @@ class TestFunctionalAutogradBenchmark(TestCase):
         "Can deadlocks with gcov, see https://github.com/pytorch/pytorch/issues/49656",
     )
     def test_fast_tasks(self):
+        # [FUNCTION DOC] Runs the helper for each of the fast models in turn (resnet18, the two
+        # ppl regression models, wav2letter, transformer, multiheadattn). Skipped when coverage
+        # collection is enabled because of a known deadlock with gcov.
         fast_tasks = [
             "resnet18",
             "ppl_simple_reg",
@@ -70,6 +84,9 @@ class TestFunctionalAutogradBenchmark(TestCase):
         "NamedTemporaryFile on windows does not have all the features we need.",
     )
     def test_slow_tasks(self):
+        # [FUNCTION DOC] Slow-test only (and skipped on Windows). Runs the helper for fcn_resnet
+        # and detr with the GPU disabled because CI GPUs lack memory; the deepspeech model is
+        # deliberately left out as too slow.
         slow_tasks = ["fcn_resnet", "detr"]
         # deepspeech is voluntarily excluded as it takes too long to run without
         # proper tuning of the number of threads it should use.

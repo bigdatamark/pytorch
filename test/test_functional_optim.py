@@ -1,5 +1,9 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests that functional (per-parameter) optimizers registered for distributed use
+# give the same parameters as the regular optimizers, and that custom functional optimizers can be
+# registered. Import time pulls in the distributed functional optimizer registry only if
+# distributed support is available.
 import unittest
 
 import torch
@@ -16,18 +20,31 @@ from torch.testing._internal.common_utils import (
 
 
 class MyModule(torch.nn.Module):
+    # [CLASS DOC] Tiny two-layer bias-free linear network (3 to 3 features) with a relu between
+    # layers, used as the model for optimizer parity checks.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Seeds the global random generator with zero, then creates two
+        # bias-free linear layers of size 3 by 3. Seeding makes every instance start with
+        # identical weights.
         super().__init__()
         torch.manual_seed(0)
         self.lin1 = nn.Linear(3, 3, bias=False)
         self.lin2 = nn.Linear(3, 3, bias=False)
 
     def forward(self, t1):
+        # [FUNCTION DOC] HELPER: Applies the first layer, a relu, then the second layer to the
+        # input and returns the result.
         return self.lin2(F.relu(self.lin1(t1)))
 
 
 # dummy class to showcase custom optimizer registration with functional wrapper
 class MyDummyFnOptimizer:
+    # [CLASS DOC] HELPER: Dummy functional optimizer class that only demonstrates registration
+    # with the functional optimizer map. It validates hyperparameters and stores them in a
+    # defaults mapping; stepping is not supported.
+    # KNOWN ISSUE: The weight decay check raises for a weight decay of exactly zero (including
+    #   the default of zero), so constructing this class with default arguments fails; the check
+    #   looks like it should reject only negative values.
     def __init__(
         self,
         params: list[Tensor],
@@ -37,6 +54,13 @@ class MyDummyFnOptimizer:
         weight_decay: float = 0.0,
         _allow_empty_param_list: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Validates the learning rate, epsilon, both beta values and weight
+        # decay, raising ValueError with a message for out-of-range values, then stores them in
+        # the defaults mapping. Also raises ValueError for an empty parameter list unless the
+        # private allow-empty flag is set.
+        # KNOWN ISSUE: The weight decay condition is inverted relative to its message: a weight
+        #   decay of zero (the default) raises ValueError, so the default constructor call cannot
+        #   succeed.
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:
@@ -60,6 +84,8 @@ class MyDummyFnOptimizer:
             raise ValueError("optimizer got an empty parameter list")
 
     def step_param(self, param: Tensor, grad: Tensor | None):
+        # [FUNCTION DOC] HELPER: Placeholder for the per-parameter step. Under no-grad mode it
+        # always raises RuntimeError saying the step for a single parameter is unsupported.
         # call the custom optimizer step_param implementation
         with torch.no_grad():
             raise RuntimeError(
@@ -67,6 +93,8 @@ class MyDummyFnOptimizer:
             )
 
     def step(self, gradients: list[Tensor | None]):
+        # [FUNCTION DOC] HELPER: Placeholder for the whole-list step. Under no-grad mode it always
+        # raises RuntimeError saying step is unsupported.
         # call the custom optimizer step implementation
         with torch.no_grad():
             raise RuntimeError("MyDummyFnOptimizer does not support step() as of now")
@@ -83,9 +111,14 @@ if torch.distributed.is_available():
     not torch.distributed.is_available(), "These are testing distributed functions"
 )
 class TestFunctionalOptimParity(TestCase):
+    # [CLASS DOC] Test case comparing regular optimizers with their functional counterparts and
+    # checking registration of a custom functional optimizer. Skipped entirely if distributed
+    # support is unavailable. Marked with the generic hardware classification.
     hw_classification = HardwareClassification.GENERIC
 
     def _validate_parameters(self, params_1, params_2):
+        # [FUNCTION DOC] HELPER: Walks two parameter iterables in parallel and asserts each pair
+        # is equal.
         for p1, p2 in zip(params_1, params_2):
             self.assertEqual(p1, p2)
 
@@ -94,6 +127,13 @@ class TestFunctionalOptimParity(TestCase):
     # we disable dynamo here.
     @torch._disable_dynamo(recursive=False)
     def _test_functional_optim_parity(self, optim_cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Parity check for one optimizer class. Builds two identically
+        # seeded models, a regular optimizer on the first and the registered functional optimizer
+        # (created with an empty parameter list) on the second; raises ValueError if no functional
+        # version is registered or it lacks per-parameter stepping. For ten iterations it runs
+        # forward and backward on the same input, steps the regular optimizer, applies the
+        # functional step to each parameter with its gradient, then asserts parameters match and
+        # differ from their starting values. Dynamo is disabled for this method only.
         module_optim = MyModule()
         module_functional = MyModule()
         optim_params = module_optim.parameters()
@@ -150,6 +190,9 @@ class TestFunctionalOptimParity(TestCase):
                 self.assertNotEqual(old_module_functional_params[i], functional_param)
 
     def _test_functional_optim_registration(self):
+        # [FUNCTION DOC] HELPER: Registers the dummy optimizer class under its class name in the
+        # functional optimizer map (global side effect) and raises ValueError if looking it up
+        # afterwards finds nothing.
         fn_map_key = "MyDummyFnOptimizer"
         fn_optim = MyDummyFnOptimizer
         register_functional_optim(fn_map_key, fn_optim)
@@ -158,15 +201,22 @@ class TestFunctionalOptimParity(TestCase):
             raise ValueError(f"Functional optimizer not registered for {fn_map_key}")
 
     def test_functional_optim_registration(self):
+        # [FUNCTION DOC] Runs the registration helper.
         self._test_functional_optim_registration()
 
     def test_functional_optim_parity_sgd(self):
+        # [FUNCTION DOC] Parity check for SGD with learning rate 0.01, momentum 0.9 and weight
+        # decay 0.01.
         self._test_functional_optim_parity(SGD, 1e-2, momentum=0.9, weight_decay=0.01)
 
     def test_functional_optim_parity_adam(self):
+        # [FUNCTION DOC] Parity check for Adam with learning rate 0.01, the default betas and
+        # epsilon 1e-6.
         self._test_functional_optim_parity(Adam, 1e-2, betas=(0.9, 0.999), eps=1e-6)
 
     def test_functional_optim_parity_adam_w(self):
+        # [FUNCTION DOC] Parity check for AdamW with learning rate 0.01, the default betas and
+        # epsilon 1e-6.
         self._test_functional_optim_parity(AdamW, 1e-2, betas=(0.9, 0.999), eps=1e-6)
 
 
