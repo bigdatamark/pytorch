@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests for the builtin hash function inside TorchScript. Each test compiles a
+# small function that compares the hash of two values and uses checkScript to confirm scripted
+# results equal eager results, for tuples, tensors, None, bool, float, int, string and device
+# values. Not runnable directly: running the file as a script raises an error that points to the
+# umbrella test runner.
 
 import os
 import sys
@@ -15,8 +20,13 @@ from torch.testing._internal.jit_utils import JitTestCase
 
 
 class TestHash(JitTestCase):
+    # [CLASS DOC] JitTestCase containing one test per hashable type, plus one error case for
+    # tuples with unhashable members.
     def test_hash_tuple(self):
+        # [FUNCTION DOC] Checks that scripting the hash-equality comparison of two integer pairs
+        # matches eager for equal pairs, different pairs and reordered pairs.
         def fn(t1: Tuple[int, int], t2: Tuple[int, int]) -> bool:
+            # [FUNCTION DOC] HELPER: Returns whether the hashes of two integer pairs are equal.
             return hash(t1) == hash(t2)
 
         self.checkScript(fn, ((1, 2), (1, 2)))
@@ -24,8 +34,15 @@ class TestHash(JitTestCase):
         self.checkScript(fn, ((1, 2), (2, 1)))
 
     def test_hash_tuple_nested_unhashable_type(self):
+        # [FUNCTION DOC] Scripts a function that hashes a tuple containing an integer and a
+        # list, then asserts that calling it raises a RuntimeError mentioning unhashable, with
+        # the hash call highlighted.
         # Tuples may contain unhashable types like `list`, check that we error
         # properly in that case.
+        # [FUNCTION DOC] HELPER: Scripted function returning the hash of a tuple of an int and a
+        # list of ints.
+        # KNOWN ISSUE: this block sits above the decorator, not inside the body, because the
+        # test asserts on highlighted source text of the failing call.
         @torch.jit.script
         def fn_unhashable(t1: Tuple[int, List[int]]):
             return hash(t1)
@@ -34,9 +51,13 @@ class TestHash(JitTestCase):
             fn_unhashable((1, [1]))
 
     def test_hash_tensor(self):
+        # [FUNCTION DOC] Checks that hashing tensors is by identity: the same tensor, a distinct
+        # tensor with equal values and a tensor with different values are compared via
+        # checkScript against eager.
         """Tensors should hash by identity"""
 
         def fn(t1, t2):
+            # [FUNCTION DOC] HELPER: Returns whether the hashes of two tensors are equal.
             return hash(t1) == hash(t2)
 
         tensor1 = torch.tensor(1)
@@ -48,7 +69,10 @@ class TestHash(JitTestCase):
         self.checkScript(fn, (tensor1, tensor2))
 
     def test_hash_none(self):
+        # [FUNCTION DOC] Checks that two None values hash equal, in script and eager, via
+        # checkScript with no arguments.
         def fn():
+            # [FUNCTION DOC] HELPER: Returns whether the hashes of two None values are equal.
             n1 = None
             n2 = None
             return hash(n1) == hash(n2)
@@ -56,7 +80,10 @@ class TestHash(JitTestCase):
         self.checkScript(fn, ())
 
     def test_hash_bool(self):
+        # [FUNCTION DOC] Checks hash equality for all four combinations of two booleans
+        # via checkScript.
         def fn(b1: bool, b2: bool):
+            # [FUNCTION DOC] HELPER: Returns whether the hashes of two booleans are equal.
             return hash(b1) == hash(b2)
 
         self.checkScript(fn, (True, False))
@@ -65,7 +92,10 @@ class TestHash(JitTestCase):
         self.checkScript(fn, (False, False))
 
     def test_hash_float(self):
+        # [FUNCTION DOC] Checks hash equality of float pairs, including equal values, different
+        # values, infinity and NaN, via checkScript against eager.
         def fn(f1: float, f2: float):
+            # [FUNCTION DOC] HELPER: Returns whether the hashes of two floats are equal.
             return hash(f1) == hash(f2)
 
         self.checkScript(fn, (1.2345, 1.2345))
@@ -76,7 +106,10 @@ class TestHash(JitTestCase):
         self.checkScript(fn, (float("nan"), float("inf")))
 
     def test_hash_int(self):
+        # [FUNCTION DOC] Checks hash equality of integer pairs, including equal, different,
+        # negated and zero values, via checkScript.
         def fn(i1: int, i2: int):
+            # [FUNCTION DOC] HELPER: Returns whether the hashes of two integers are equal.
             return hash(i1) == hash(i2)
 
         self.checkScript(fn, (123, 456))
@@ -86,7 +119,10 @@ class TestHash(JitTestCase):
         self.checkScript(fn, (123, 0))
 
     def test_hash_string(self):
+        # [FUNCTION DOC] Checks hash equality of string pairs (equal, different, empty)
+        # via checkScript.
         def fn(s1: str, s2: str):
+            # [FUNCTION DOC] HELPER: Returns whether the hashes of two strings are equal.
             return hash(s1) == hash(s2)
 
         self.checkScript(fn, ("foo", "foo"))
@@ -94,7 +130,10 @@ class TestHash(JitTestCase):
         self.checkScript(fn, ("foo", ""))
 
     def test_hash_device(self):
+        # [FUNCTION DOC] Builds two CUDA device objects and one CPU device object (no CUDA
+        # runtime required for this) and checks hash equality of several pairs via checkScript.
         def fn(d1: torch.device, d2: torch.device):
+            # [FUNCTION DOC] HELPER: Returns whether the hashes of two device objects are equal.
             return hash(d1) == hash(d2)
 
         gpu0 = torch.device("cuda:0")

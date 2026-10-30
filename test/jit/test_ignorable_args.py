@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests that TorchScript code generation omits trailing arguments equal to schema
+# defaults (for slice) and keeps explicit keyword arguments (for the out argument of add). Not
+# runnable directly: running the file as a script raises an error that points to the umbrella
+# test runner.
 
 import os
 import sys
@@ -17,7 +21,14 @@ from torch.testing._internal.jit_utils import JitTestCase
 
 # Tests that Python slice class is supported in TorchScript
 class TestIgnorableArgs(JitTestCase):
+    # [CLASS DOC] JitTestCase for printing and round-tripping of calls whose trailing arguments
+    # equal defaults.
     def test_slice_ignorable_args_for_slice(self):
+        # [FUNCTION DOC] Parses a textual IR graph that builds a 2 by 6 integer tensor and
+        # applies two slice operations (dimension 0 starting at 2, dimension 1 ending at 1, with
+        # the other bounds unset or default). Builds a function from it, makes an export/import
+        # copy, and uses FileCheck to assert the printed source drops trailing default arguments
+        # in the nested slice calls. Also asserts the original and copy return equal results.
         graph_str = """graph():
             %13 : int = prim::Constant[value=0]()
             %10 : bool = prim::Constant[value=0]()
@@ -49,8 +60,12 @@ class TestIgnorableArgs(JitTestCase):
         self.assertEqual(function(), function_copy())
 
     def test_add_out_ignorable_args(self):
+        # [FUNCTION DOC] Scripts a function calling add with an explicit out argument and checks
+        # with FileCheck that the generated source still shows the out keyword argument.
         @torch.jit.script
         def fn(x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Scripted function adding two tensors, writing the result
+            # into the second tensor via the out argument; returns nothing.
             torch.add(x, y, out=y)
 
         FileCheck().check("torch.add(x, y, out=y)").run(fn.code)

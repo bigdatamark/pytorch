@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests for JIT graph rewrite passes. Currently covers the fuse_linear pass that
+# turns matmul with a transposed weight (plus optional in-place bias add) into a single linear
+# operation. Not runnable directly: running the file as a script raises an error that points to
+# the umbrella test runner.
 
 import torch
 import torch._C
@@ -8,14 +12,28 @@ from torch.testing._internal.jit_utils import JitTestCase
 
 
 class TestGraphRewritePasses(JitTestCase):
+    # [CLASS DOC] JitTestCase with tests for graph rewrite passes.
     def test_fuse_linear(self):
+        # [FUNCTION DOC] Traces a functional linear module with and without bias, applies the
+        # fuse_linear pass and checks with FileCheck that a linear operation appears while
+        # matmul, addmm, in-place add and transpose operations are gone, that the fused node
+        # keeps the source range of the original matmul, and that the traced module still runs.
+        # Then traces a module doing a three-dimensional matmul and verifies the pass leaves it
+        # unfused (matmul stays, no linear) and it still runs.
         class FunctionalLinear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing matmul of the input with the transpose of a
+            # stored weight and adding the stored bias in place when the bias is not None.
+            # Weight and bias are plain tensors kept as attributes. Only traced.
             def __init__(self, weight, bias):
+                # [FUNCTION DOC] HELPER: Stores the given weight and bias tensors as attributes.
                 super().__init__()
                 self.weight = weight
                 self.bias = bias
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns matmul of the input with the transposed weight;
+                # when a bias is present, adds it in place to that result first. Returns the
+                # result tensor.
                 res = torch.matmul(x, self.weight.t())
                 if self.bias is not None:
                     res.add_(self.bias)
@@ -44,11 +62,17 @@ class TestGraphRewritePasses(JitTestCase):
 
         # check matmuls are not fused
         class Matmul(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that multiplies the input by a stored weight
+            # with matmul, used to check that the fuse pass does not fuse a non-linear
+            # matmul. Only traced.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Stores the given weight tensor as an attribute.
                 super().__init__()
                 self.weight = weight
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns matmul of the input with the stored weight
+                # without transposing it.
                 return torch.matmul(x, self.weight)
 
         x = torch.rand(5, 6, 5)
