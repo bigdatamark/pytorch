@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for one-dimensional set operations (intersect, xor, union, difference,
+# membership, ediff1d, unique) ported from the NumPy test suite. Under Dynamo the real NumPy
+# functions are used; otherwise the torch._numpy wrappers (only unique is imported there). The
+# whole set-ops class is skipped unconditionally (TODO implement these ops), so only the unique
+# tests actually run. Import time: picks the np backend based on TEST_WITH_TORCHDYNAMO.
 
 """Test functions for 1D array set operations."""
 
@@ -35,7 +40,13 @@ else:
 @skipIf(True, reason="TODO implement these ops")
 @instantiate_parametrized_tests
 class TestSetOps(TestCase):
+    # [CLASS DOC] Test case for the set-operation functions. Skipped entirely: by an unconditional
+    # skip decorator (ops not implemented) and for NumPy older than 1.24. Stateless; each test
+    # builds small arrays and compares results with expected arrays via assert_array_equal.
+    # KNOWN ISSUE: the NumPy version check compares version strings lexicographically.
     def test_intersect1d(self):
+        # [FUNCTION DOC] Checks intersect1d on unique inputs (assume_unique), inputs with
+        # duplicates, and empty lists; the result must be the sorted common values.
         # unique inputs
         a = np.array([5, 7, 1, 2])
         b = np.array([2, 4, 3, 1, 5])
@@ -54,9 +65,14 @@ class TestSetOps(TestCase):
         assert_array_equal([], intersect1d([], []))
 
     def test_intersect1d_array_like(self):
+        # [FUNCTION DOC] Checks intersect1d accepts an object exposing the array protocol and
+        # plain lists, returning the common elements.
         # See gh-11772
         class Test:
+            # [CLASS DOC] HELPER: Minimal stand-in object whose array conversion yields a range of
+            # three integers; used to verify array-like inputs are accepted.
             def __array__(self):
+                # [FUNCTION DOC] HELPER: Array-protocol hook; returns an array of integers 0 to 2.
                 return np.arange(3)
 
         a = Test()
@@ -66,6 +82,9 @@ class TestSetOps(TestCase):
         assert_array_equal(res, [1, 2, 3])
 
     def test_intersect1d_indices(self):
+        # [FUNCTION DOC] Checks intersect1d with return_indices for unique, duplicated and multi-
+        # dimensional inputs: the returned indices must select the common values from each input
+        # (for 2-D input the flat indices are converted with unravel_index first).
         # unique inputs
         a = np.array([1, 2, 3, 4])
         b = np.array([2, 1, 4, 6])
@@ -105,6 +124,8 @@ class TestSetOps(TestCase):
         assert_array_equal(ea, b[ui2])
 
     def test_setxor1d(self):
+        # [FUNCTION DOC] Checks setxor1d returns the sorted symmetric difference for overlapping,
+        # disjoint and partially overlapping inputs, and an empty result for empty inputs.
         a = np.array([5, 7, 1, 2])
         b = np.array([2, 4, 3, 1, 5])
 
@@ -129,6 +150,9 @@ class TestSetOps(TestCase):
         assert_array_equal([], setxor1d([], []))
 
     def test_ediff1d(self):
+        # [FUNCTION DOC] Checks ediff1d on empty, one-element and two-element arrays, including
+        # scalar and list values for the to_begin and to_end options which are prepended/appended
+        # to the diffs.
         zero_elem = np.array([])
         one_elem = np.array([1])
         two_elem = np.array([1, 2])
@@ -173,6 +197,10 @@ class TestSetOps(TestCase):
         ],
     )
     def test_ediff1d_forbidden_type_casts(self, ary, prepend, append, expected):
+        # [FUNCTION DOC] Parametrized (array, prepend, append, name of offending argument).
+        # Verifies ediff1d raises a type error whose message says the dtype of the named option
+        # must be compatible, when prepending or appending values that cannot be safely cast to
+        # the array dtype (gh-11490).
         # verify resolution of gh-11490
 
         # specifically, raise an appropriate
@@ -212,6 +240,10 @@ class TestSetOps(TestCase):
         ],
     )
     def test_ediff1d_scalar_handling(self, ary, prepend, append, expected):
+        # [FUNCTION DOC] Parametrized. Verifies ediff1d keeps working with scalar or array
+        # prepend/append values that can be cast under the same-kind rule: result equals the
+        # expected array and its dtype equals the expected dtype, else an AssertionError is
+        # raised.
         # maintain backwards-compatibility
         # of scalar prepend / append behavior
         # in ediff1d following fix for gh-11490
@@ -225,13 +257,23 @@ class TestSetOps(TestCase):
     @skipIf(True, reason="NP_VER: fails with NumPy 1.22.x")
     @parametrize("kind", [None, "sort", "table"])
     def test_isin(self, kind):
+        # [FUNCTION DOC] Parametrized over algorithm kind (default, sort, table); additionally
+        # skipped. Compares isin against a slow reference built from a vectorized membership
+        # check, over multidimensional, array-like, zero-d, scalar and empty inputs of several
+        # dtypes, then checks fixed expected masks for duplicated and unique inputs with small and
+        # repeated second arrays. Empty-list and empty-input cases are skipped for the table kind
+        # (float dtype unsupported).
         def _isin_slow(a, b):
+            # [FUNCTION DOC] HELPER: Reference membership test of one element against the
+            # flattened list of the second argument; returns a boolean.
             b = np.asarray(b).flatten().tolist()
             return a in b
 
         isin_slow = np.vectorize(_isin_slow, otypes=[bool], excluded={1})
 
         def assert_isin_equal(a, b):
+            # [FUNCTION DOC] HELPER: Asserts the isin result for the given kind equals the slow
+            # reference result for the same two inputs.
             x = np.isin(a, b, kind=kind)
             y = isin_slow(a, b)
             assert_array_equal(x, y)
@@ -371,6 +413,7 @@ class TestSetOps(TestCase):
             assert_array_equal(isin([], [], kind=kind), [])
 
     def test_isin_char_array(self):
+        # [FUNCTION DOC] Checks isin on string arrays returns the expected membership mask.
         a = np.array(["a", "b", "c", "d", "e", "c", "e", "b"])
         b = np.array(["a", "c"])
 
@@ -381,6 +424,9 @@ class TestSetOps(TestCase):
 
     @parametrize("kind", [None, "sort", "table"])
     def test_isin_invert(self, kind):
+        # [FUNCTION DOC] Parametrized over kind. Verifies the invert option yields the logical
+        # negation of the normal result, for integer arrays with small and large second arrays,
+        # and for float32 arrays when the kind is default or sort.
         "Test isin's invert parameter"
         # We use two different sizes for the b array here to test the
         # two different paths in isin().
@@ -409,6 +455,11 @@ class TestSetOps(TestCase):
     )
     @parametrize("kind", [None, "sort", "table"])
     def test_in1d_ravel(self, kind):
+        # [FUNCTION DOC] Parametrized over kind; skipped for NumPy 2.4 and later. Verifies in1d
+        # flattens multidimensional inputs and returns a flat mask, with unique and non-unique
+        # assumptions.
+        # KNOWN ISSUE: in1d is never imported in this module, so this would fail with a name error
+        # if run.
         # Test that in1d ravels its input arrays. This is not documented
         # behavior however. The test is to ensure consistentency.
         a = np.arange(6).reshape(2, 3)
@@ -422,6 +473,8 @@ class TestSetOps(TestCase):
         assert_array_equal(in1d(a, long_b, assume_unique=False, kind=kind), ec)
 
     def test_isin_hit_alternate_algorithm(self):
+        # [FUNCTION DOC] Uses integer arrays with an extreme value range so the non-table
+        # algorithm is hit; checks normal and inverted results, and a unique-assuming call.
         """Hit the standard isin code with integers"""
         # Need extreme range to hit standard code
         # This hits it without the use of kind='table'
@@ -439,6 +492,8 @@ class TestSetOps(TestCase):
 
     @parametrize("kind", [None, "sort", "table"])
     def test_isin_boolean(self, kind):
+        # [FUNCTION DOC] Parametrized over kind. Checks isin on boolean arrays, normal and
+        # inverted.
         """Test that isin works for boolean input"""
         a = np.array([True, False])
         b = np.array([False, False, False])
@@ -448,6 +503,8 @@ class TestSetOps(TestCase):
 
     @parametrize("kind", [None, "sort"])
     def test_isin_timedelta(self, kind):
+        # [FUNCTION DOC] Parametrized over kind (default, sort). Compares isin on timedelta-
+        # converted random integers with the result on the plain integers.
         """Test that isin works for timedelta input"""
         rstate = np.random.RandomState(0)
         a = rstate.randint(0, 100, size=10)
@@ -458,6 +515,7 @@ class TestSetOps(TestCase):
         assert_array_equal(truth, isin(a_timedelta, b_timedelta, kind=kind))
 
     def test_isin_table_timedelta_fails(self):
+        # [FUNCTION DOC] Checks isin with the table kind raises a value error for timedelta input.
         a = np.array([0, 1, 2], dtype="timedelta64[s]")
         b = a
         # Make sure it raises a value error:
@@ -473,6 +531,9 @@ class TestSetOps(TestCase):
     )
     @parametrize("kind", [None, "sort", "table"])
     def test_isin_mixed_dtype(self, dtype1, dtype2, kind):
+        # [FUNCTION DOC] Parametrized over two integer dtypes and kind. For the table kind with
+        # these mixed int8/int16 pairs expects a runtime error mentioning exceeding the maximum;
+        # otherwise expects the fixed mask for the mixed-dtype membership.
         """Test that isin works as expected for mixed dtype input."""
         is_dtype2_signed = np.issubdtype(dtype2, np.signedinteger)
         ar1 = np.array([0, 0, 1, 1], dtype=dtype1)
@@ -499,6 +560,8 @@ class TestSetOps(TestCase):
 
     @parametrize("kind", [None, "sort", "table"])
     def test_isin_mixed_boolean(self, kind):
+        # [FUNCTION DOC] Parametrized over kind. For every integer type code, checks isin between
+        # boolean and integer zero arrays in both argument orders against fixed expected masks.
         """Test that isin works as expected for bool/int input."""
         for dtype in np.typecodes["AllInteger"]:
             a = np.array([True, False, False], dtype=bool)
@@ -511,6 +574,8 @@ class TestSetOps(TestCase):
             assert_array_equal(isin(a, b, kind=kind), expected)
 
     def test_isin_first_array_is_object(self):
+        # [FUNCTION DOC] Checks isin when the first input is an object list holding None and the
+        # second is an integer array: the result is a single false.
         ar1 = [None]
         ar2 = np.array([1] * 10)
         expected = np.array([False])
@@ -518,6 +583,8 @@ class TestSetOps(TestCase):
         assert_array_equal(result, expected)
 
     def test_isin_second_array_is_object(self):
+        # [FUNCTION DOC] Checks isin when the second input is an object array of None and the
+        # first a scalar integer: the result is a single false.
         ar1 = 1
         ar2 = np.array([None] * 10)
         expected = np.array([False])
@@ -525,6 +592,8 @@ class TestSetOps(TestCase):
         assert_array_equal(result, expected)
 
     def test_isin_both_arrays_are_object(self):
+        # [FUNCTION DOC] Checks isin when both inputs hold None objects: the result is a single
+        # true.
         ar1 = [None]
         ar2 = np.array([None] * 10)
         expected = np.array([True])
@@ -533,6 +602,8 @@ class TestSetOps(TestCase):
 
     @xfail
     def test_isin_both_arrays_have_structured_dtype(self):
+        # [FUNCTION DOC] Expected failure. Builds structured arrays with an integer and an object
+        # field and expects isin to report a match.
         # Test arrays of a structured data type containing an integer field
         # and a field of dtype `object` allowing for arbitrary Python objects
         dt = np.dtype([("field1", int), ("field2", object)])
@@ -543,6 +614,9 @@ class TestSetOps(TestCase):
         assert_array_equal(result, expected)
 
     def test_isin_with_arrays_containing_tuples(self):
+        # [FUNCTION DOC] Checks isin on object arrays containing tuples, normal and inverted,
+        # using flattened results, for equal arrays and for partially overlapping arrays; a
+        # trailing integer element is used to force tuple construction and then sliced off.
         ar1 = np.array([(1,), 2], dtype=object)
         ar2 = np.array([(1,), 2], dtype=object)
         expected = np.array([True, True])
@@ -576,6 +650,9 @@ class TestSetOps(TestCase):
         assert_array_equal(result, np.invert(expected))
 
     def test_isin_errors(self):
+        # [FUNCTION DOC] Checks isin error behavior: unknown kind and table kind on object arrays
+        # raise value errors; table kind with a range that would overflow int32 or int64 raises a
+        # runtime error, while default and sort kinds fall back and return the correct mask.
         """Test that isin raises expected errors."""
 
         # Error 1: `kind` is not one of 'sort' 'table' or None.
@@ -607,6 +684,8 @@ class TestSetOps(TestCase):
             assert_array_equal(result, [True] + [False] * 4)
 
     def test_union1d(self):
+        # [FUNCTION DOC] Checks union1d returns sorted unique values of both inputs, flattens
+        # multi-dimensional input (gh-10340), and handles empty inputs.
         a = np.array([5, 4, 7, 1, 2])
         b = np.array([2, 4, 3, 3, 2, 1, 5])
 
@@ -625,6 +704,8 @@ class TestSetOps(TestCase):
         assert_array_equal([], union1d([], []))
 
     def test_setdiff1d(self):
+        # [FUNCTION DOC] Checks setdiff1d returns sorted values of the first input absent from the
+        # second, for empty inputs, and that an empty unsigned 32-bit input keeps its dtype.
         a = np.array([6, 5, 4, 7, 1, 2, 7, 4])
         b = np.array([2, 4, 3, 3, 2, 1, 5])
 
@@ -643,6 +724,8 @@ class TestSetOps(TestCase):
         assert_equal(setdiff1d(a, []).dtype, np.uint32)
 
     def test_setdiff1d_unique(self):
+        # [FUNCTION DOC] Checks setdiff1d with assume_unique keeps the order of the first input's
+        # remaining values.
         a = np.array([3, 2, 1])
         b = np.array([7, 5, 2])
         expected = np.array([3, 1])
@@ -650,11 +733,14 @@ class TestSetOps(TestCase):
         assert_equal(actual, expected)
 
     def test_setdiff1d_char_array(self):
+        # [FUNCTION DOC] Checks setdiff1d on string arrays.
         a = np.array(["a", "b", "c"])
         b = np.array(["a", "b", "s"])
         assert_array_equal(setdiff1d(a, b), np.array(["c"]))
 
     def test_manyways(self):
+        # [FUNCTION DOC] Consistency check: setxor1d must equal the difference of the union and
+        # the intersection of the same two arrays.
         a = np.array([5, 7, 1, 2, 8])
         b = np.array([9, 8, 2, 4, 3, 1, 5])
 
@@ -667,12 +753,21 @@ class TestSetOps(TestCase):
 
 @instantiate_parametrized_tests
 class TestUnique(TestCase):
+    # [CLASS DOC] Test case for unique with the optional return flags and axis handling.
+    # Stateless; contains one helper method shared by the axis tests.
     @skipIf(
         TEST_WITH_TORCHDYNAMO and int(numpy.__version__[0]) >= 2,
         "fails with dynamo and numpy >= 2.0",
     )
     def test_unique_1d(self):
+        # [FUNCTION DOC] Skipped under Dynamo with NumPy 2 or newer. Runs the nested checker over
+        # all integer and float dtypes (complex skipped), checking values, inverse indices and
+        # counts; return_index checks are commented out. Also checks nested tuples flatten, and
+        # that the inverse of an empty input has the platform index dtype.
         def check_all(a, b, i1, i2, c, dt):
+            # [FUNCTION DOC] HELPER: Applies unique with values only, with inverse, with counts,
+            # and with inverse plus counts, comparing against the expected values, inverse and
+            # counts; message strings name the failing check and dtype.
             base_msg = "check {0} failed for type {1}"
 
             msg = base_msg.format("values", dt)
@@ -768,6 +863,9 @@ class TestUnique(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="unique with nans")
     def test_unique_1d_2(self):
+        # [FUNCTION DOC] Expected-pass-under-Dynamo test of unique with NaN handling (float,
+        # complex, and all-NaN inputs), checking values, first-occurrence indices, inverse and
+        # counts.
         # test for ticket 2111 - float
         a = [2.0, np.nan, 1.0, np.nan]
         ua = [1.0, 2.0, np.nan]
@@ -802,10 +900,14 @@ class TestUnique(TestCase):
         assert_equal(np.unique(all_nans, return_counts=True), (ua, ua_cnt))
 
     def test_unique_axis_errors(self):
+        # [FUNCTION DOC] Checks unique raises an axis error for out-of-range positive and negative
+        # axes.
         assert_raises(np.AxisError, unique, np.arange(10), axis=2)
         assert_raises(np.AxisError, unique, np.arange(10), axis=-2)
 
     def test_unique_axis_list(self):
+        # [FUNCTION DOC] Checks unique with an axis gives the same result for nested lists as for
+        # the equivalent array, for both axes.
         msg = "Unique failed on list of lists"
         inp = [[0, 1, 0], [0, 1, 0]]
         inp_arr = np.asarray(inp)
@@ -815,6 +917,9 @@ class TestUnique(TestCase):
     @xpassIfTorchDynamo_np  # _run_axis_tests xfails with the message
     #   torch has different unique ordering behaviour"
     def test_unique_axis(self):
+        # [FUNCTION DOC] Expected-pass under Dynamo. Runs the axis helper for each integer and
+        # float dtype, then checks uniqueness of rows of boolean views and that negative and
+        # positive zero rows collapse into one.
         types = []
         types.extend(np.typecodes["AllInteger"])
         types.extend(np.typecodes["AllFloat"])
@@ -834,12 +939,17 @@ class TestUnique(TestCase):
 
     @parametrize("axis", [0, -1])
     def test_unique_1d_with_axis(self, axis):
+        # [FUNCTION DOC] Parametrized over axis zero and minus one. Checks unique on a one-
+        # dimensional array with an axis returns sorted unique values.
         x = np.array([4, 3, 2, 3, 2, 1, 2, 2])
         uniq = unique(x, axis=axis)
         assert_array_equal(uniq, [1, 2, 3, 4])
 
     @xpassIfTorchDynamo_np  # (reason="unique / return_index")
     def test_unique_axis_zeros(self):
+        # [FUNCTION DOC] Expected-pass under Dynamo. Checks unique with all return flags on arrays
+        # that have zero-length dimensions (gh 15559): dtype, shape, indices, inverse and counts,
+        # then the output shape for every axis of a shape with several zero dimensions.
         # issue 15559
         single_zero = np.empty(shape=(2, 0), dtype=np.int8)
         uniq, idx, inv, cnt = unique(
@@ -887,6 +997,8 @@ class TestUnique(TestCase):
             )
 
     def test_unique_sort_order_with_axis(self):
+        # [FUNCTION DOC] Checks unique with an axis sorts integer rows numerically for several
+        # signed integer types, not as byte strings (gh-10495).
         # These tests fail if sorting along axis is done by treating subarrays
         # as unsigned byte strings.  See gh-10495.
         fmt = "sort order incorrect for integer type '%s'"
@@ -896,6 +1008,9 @@ class TestUnique(TestCase):
             assert_array_equal(a, b, fmt % dt)
 
     def _run_axis_tests(self, dtype):
+        # [FUNCTION DOC] HELPER: Runs unique axis checks for one dtype on a small 2-D array and a
+        # 3-D array (no axis, axis zero, one and two), then verifies returned indices, inverse and
+        # counts reconstruct the data. Some message variables go unused.
         data = np.array(
             [[0, 1, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [1, 0, 0, 0]]
         ).astype(dtype)
@@ -948,6 +1063,8 @@ class TestUnique(TestCase):
     @skipIf(True, reason="NP_VER: fails on CI with older NumPy")
     @xpassIfTorchDynamo_np  # (reason="unique / return_index / nans")
     def test_unique_nanequals(self):
+        # [FUNCTION DOC] Skipped; also expected-pass under Dynamo. Checks unique with NaNs:
+        # collapsed by default, kept separate when the equal_nan option is false (issue 20326).
         # issue 20326
         a = np.array([1, 1, np.nan, np.nan, np.nan])
         unq = np.unique(a)
