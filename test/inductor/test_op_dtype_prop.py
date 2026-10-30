@@ -1,4 +1,14 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for dtype propagation and dtype-aware code generation in Inductor's Triton
+# backend. At import time it appends the test directory to the module search path, imports
+# functorch and filelock, and builds a module-level list of pointwise OpInfo entries: names of
+# non-mutating lowered pointwise ops are collected from the lowerings registry, then the op
+# database is filtered to those names, excluding variants with reduction in their variant name.
+# A single test class runs those ops with runtime dtype/shape asserts enabled, plus targeted
+# tests of float32 upcasting in generated Triton code, low precision reductions, symbolic
+# (unbacked/dynamic) scalar kernel argument dtypes and 64-bit random generation. The class is
+# instantiated for CUDA and XPU only; when run as a script tests run only if a GPU is available
+# (requires filelock).
 import importlib
 import os
 import re
@@ -55,6 +65,9 @@ pointwise_ops = [
 
 
 class TestCase(InductorTestCase):
+    # [CLASS DOC] Test case (instantiated per device type for cuda and xpu) with generic OpInfo-
+    # driven dtype propagation test and many specific checks of generated Triton source for
+    # casts, static dtype assertions and kernel signature dtypes. It holds no state of its own.
     @ops(
         pointwise_ops,
         allowed_dtypes=(
@@ -71,7 +84,15 @@ class TestCase(InductorTestCase):
     @config.patch("test_configs.static_cpp_dtype_assert", True)
     @disable_cache_limit()
     def test_op_dtype_propagation(self, op, dtype):
+        # [FUNCTION DOC] OpInfo test over pointwise ops restricted to float32, float64, int32,
+        # int64 and bool. Runs under configs enabling runtime Triton dtype and shape assertions
+        # and static C++ dtype assertions, with the dynamo cache limit disabled. For each sample
+        # input it runs the op eagerly and via a dynamic-shape compiled wrapper and asserts both
+        # results are equal.
         def run(op, args, kwargs):
+            # [FUNCTION DOC] HELPER: Calls the given operator with the given positional and
+            # keyword arguments and returns its result; compiled as a unit so the operator runs
+            # inside the compiled region.
             return op(*args, **kwargs)
 
         sample_inputs_itr = op.sample_inputs(GPU_TYPE, dtype, requires_grad=False)
@@ -87,8 +108,13 @@ class TestCase(InductorTestCase):
     @parametrize("upcast_to_fp32", [False, True])
     @config.patch("triton.use_block_ptr", True)
     def test_codegen_upcast_to_fp32(self, upcast_to_fp32):
+        # [FUNCTION DOC] Parametrized over whether loads are upcast to float32. With block
+        # pointers enabled, compiles a product of four float16 tensors and checks that the
+        # generated Triton source contains a cast to float32 if and only if upcasting is
+        # configured.
         @torch.compile
         def func(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Compiled product of four tensors.
             return a * b * c * d
 
         inps = (torch.rand((32, 32), device=GPU_TYPE, dtype=torch.float16),) * 4
@@ -114,8 +140,15 @@ class TestCase(InductorTestCase):
     @parametrize("input_dtype", [torch.float16, torch.bfloat16])
     @config.patch("triton.use_block_ptr", True)
     def test_low_precision_reduction(self, input_shape, reduction_func, input_dtype):
+        # [FUNCTION DOC] Parametrized over input shape, reduction function (prod, sum, argmax,
+        # argmin, min, max) and low precision dtype (float16, bfloat16). With upcasting of loads
+        # disabled, compiles a reduction of a product of four tensors and checks that the Triton
+        # source still contains a cast to float32 (the reduction itself upcasts) and that
+        # compiled and eager results are equal.
         @torch.compile
         def func(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Applies the parametrized reduction function to the product
+            # of four tensors.
             return reduction_func(a * b * c * d)
 
         inps = (torch.rand(input_shape, device=GPU_TYPE, dtype=input_dtype),) * 4
@@ -126,6 +159,9 @@ class TestCase(InductorTestCase):
             self.assertEqual(func(*inps), func_opt(*inps))
 
     def test_op_dtype_support(self):
+        # [FUNCTION DOC] Checks the table of supported dtypes of Triton ops: for a fixed list of
+        # math ops that get upcast to float32, float16 and bfloat16 must not be listed as
+        # supported while float32 and float64 must be.
         """
         Triton codegen upcasts values to float32 for certain ops.
         Check that those ops have accurate dtype information.
@@ -176,6 +212,17 @@ class TestCase(InductorTestCase):
     @parametrize("input_dtype", [torch.float16, torch.bfloat16])
     @config.patch("triton.use_block_ptr", True)
     def test_dtype_aware_codegen(self, op_name: str, load_upcast_to_fp32, input_dtype):
+        # [FUNCTION DOC] Parametrized over op name (all entries of the supported dtype table),
+        # whether loads are upcast, and half precision input dtype (float16, bfloat16). Requires
+        # a GPU. Looks up the torch function for the op name (stripping a libdevice prefix),
+        # maps it to the name used in Triton source (round becomes nearbyint, sqrt becomes
+        # sqrt_rn, with a device-specific override table), and derives the number of required
+        # args as the smallest parameter count among its signatures. Compiles the op over random
+        # inputs and inspects the generated source: for atan on non-ROCm CUDA it expects the
+        # approximate reciprocal instruction, a separate float32 upcast statement iff loads are
+        # not upcast, and a downcast when outputs are converted. For other ops a regex checks
+        # that the call has an inline float32 cast of its operand (followed by a downcast if
+        # outputs convert) exactly when loads are not already upcast.
         """
         Test dtype aware codegen for some tl.math/libdevice calls.
         Operands should be upcast to float32, and the output should be downcast to float16.
@@ -235,6 +282,9 @@ class TestCase(InductorTestCase):
 
     @config.patch("triton.codegen_upcast_to_fp32", False)
     def test_binary_math_mixed_precision(self):
+        # [FUNCTION DOC] With load upcasting disabled, compiles a hypot of a float16 and a
+        # float32 tensor and checks results are close to eager, that the source has exactly one
+        # cast to float32 (only the half precision operand) and no cast to float16.
         """
         Test a binary math operator where only one input needs to be upcast.
         """
@@ -264,7 +314,12 @@ class TestCase(InductorTestCase):
     @config.patch("test_configs.runtime_triton_shape_assert", True)
     @config.patch("triton.codegen_upcast_to_fp32", False)
     def test_downcast_div_mod(self):
+        # [FUNCTION DOC] With dtype/shape assertions on and upcasting disabled, compiles a
+        # function returning both remainder and true division of two float16 tensors. Checks the
+        # generated source contains a static assert on dtype and the compiled outputs equal
+        # eager.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns the remainder and the quotient of two tensors.
             return x % y, x / y
 
         x, y = (torch.rand([8], dtype=torch.float16, device=GPU_TYPE) for _ in range(2))
@@ -278,7 +333,12 @@ class TestCase(InductorTestCase):
     @config.patch("test_configs.runtime_triton_dtype_assert", True)
     @config.patch("test_configs.runtime_triton_shape_assert", True)
     def test_constant(self):
+        # [FUNCTION DOC] Compiles a function with no inputs that creates a float16 constant-
+        # filled tensor and checks the source has a static dtype assert and the output equals
+        # eager.
         def fn():
+            # [FUNCTION DOC] HELPER: Returns a one-element tuple holding a float16 tensor of
+            # shape two by three filled with a constant, on the GPU.
             return (torch.full((2, 3), 3.1416, device=GPU_TYPE, dtype=torch.float16),)
 
         out, code = run_and_get_code(torch.compile(fn))
@@ -290,7 +350,11 @@ class TestCase(InductorTestCase):
     @config.patch("test_configs.static_cpp_dtype_assert", True)
     @config.patch("triton.persistent_reductions", False)
     def test_any(self):
+        # [FUNCTION DOC] With persistent reductions disabled and dtype/shape assertions enabled,
+        # compiles an any-reduction over a boolean tensor of 40 elements and checks the result
+        # equals eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Reduces the input with logical any.
             return torch.any(x)
 
         x = torch.rand([40], device=GPU_TYPE).to(torch.bool)
@@ -301,6 +365,10 @@ class TestCase(InductorTestCase):
     @config.patch("test_configs.runtime_triton_shape_assert", True)
     @config.patch("test_configs.static_cpp_dtype_assert", True)
     def test_assoc_scan(self):
+        # [FUNCTION DOC] With dtype/shape assertions enabled, calls the associative scan higher-
+        # order op directly (pointwise combine mode, last dimension) with an add-abs combine
+        # function on a random tensor. Only checks that tracing/execution with the dtype checks
+        # does not raise; no result check.
         from torch._higher_order_ops.associative_scan import associative_scan
 
         x = torch.randn(10, device=GPU_TYPE)
@@ -312,6 +380,11 @@ class TestCase(InductorTestCase):
     @parametrize("upcast_to_fp32", (False, True))
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_upcast_rank_0_cpu(self, dtype: torch.dtype, upcast_to_fp32: bool):
+        # [FUNCTION DOC] Parametrized over dtype (float16, bfloat16) and upcast setting. Adds a
+        # rank-0 CPU tensor to a rank-1 GPU tensor of the same dtype and checks the result is
+        # close to eager. Since Inductor upcasts rank-0 CPU args to float32, the source must
+        # contain a downcast to the original dtype zero times when upcasting is on and exactly
+        # once when it is off.
         """
         Test whether we implicitly upcast CPU tensors of rank 0 to float32.
         """
@@ -341,6 +414,10 @@ class TestCase(InductorTestCase):
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._inductor.config.patch("_use_fp64_for_unbacked_floats", True)
     def test_unbacked_float_uses_fp64_signature(self):
+        # [FUNCTION DOC] Requires a GPU, scalar output capture and the option using float64 for
+        # unbacked floats. Compiles (full graph) a foreach multiply of a float32 list by a
+        # scalar read from a float64 tensor, and checks the Triton source declares that scalar
+        # kernel argument with a 64-bit float in the signature and casts it down to float32.
         """
         Test that unbacked float scalars from .item() use fp64 in kernel signature
         and are cast down to fp32 when used with fp32 tensors.
@@ -350,6 +427,8 @@ class TestCase(InductorTestCase):
         """
 
         def fn(inputs, scalar_tensor):
+            # [FUNCTION DOC] HELPER: Reads a Python float from the scalar tensor (an unbacked
+            # symbol) and multiplies each tensor of the input list by it with the foreach op.
             # .item() creates an unbacked float symbol that becomes a kernel arg
             val = scalar_tensor.item()
             return torch._foreach_mul(inputs, val)
@@ -371,6 +450,10 @@ class TestCase(InductorTestCase):
     @config.patch("test_configs.runtime_triton_dtype_assert", True)
     @config.patch("test_configs.runtime_triton_shape_assert", True)
     def test_index_expr_ks_arg_dtype_int(self):
+        # [FUNCTION DOC] Requires a GPU, dtype/shape assertions. With dynamic shapes, adds two
+        # int32 tensors with a scalar alpha. Checks the result equals eager, that the symbolic
+        # kernel argument is typed as 64-bit integer in the signature, and that the source casts
+        # back to int32 (index dtype).
         """
         ks* kernel args are always int64 in the Triton signature (per
         _decide_tl_dtype), even when the kernel's index_dtype is int32.
@@ -378,6 +461,7 @@ class TestCase(InductorTestCase):
         """
 
         def fn(a, b, alpha):
+            # [FUNCTION DOC] HELPER: Adds the two tensors with the given alpha multiplier.
             return torch.add(a, b, alpha=alpha)
 
         a = torch.randint(0, 10, (5, 5), device=GPU_TYPE, dtype=torch.int32)
@@ -394,6 +478,9 @@ class TestCase(InductorTestCase):
     @config.patch("test_configs.runtime_triton_dtype_assert", True)
     @config.patch("test_configs.runtime_triton_shape_assert", True)
     def test_index_expr_ks_arg_dtype_float(self):
+        # [FUNCTION DOC] Requires a GPU, dtype/shape assertions. Compiles dynamically a batched
+        # matmul divided by a ratio computed from the square root of a symbolic size, and checks
+        # the result is close to eager and that the source casts to float32.
         """
         When a symbolic scalar is used in a float context (e.g. math.sqrt of
         a tensor size), index_expr emits an explicit final cast to the
@@ -403,6 +490,9 @@ class TestCase(InductorTestCase):
 
         @torch.compile(dynamic=True)
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Computes the reciprocal square root-style scalar from the
+            # size of the second dimension of the first input, then returns the batched matmul
+            # divided by that scalar.
             r = 1 / math.sqrt(a.size(1))
             return torch.bmm(a, b) / r
 
@@ -419,8 +509,14 @@ class TestCase(InductorTestCase):
     @config.patch("test_configs.runtime_triton_dtype_assert", True)
     @config.patch("test_configs.runtime_triton_shape_assert", True)
     def test_randint_symbolic_bounds_use_value_expr(self):
+        # [FUNCTION DOC] Requires a GPU, scalar output capture, dtype/shape assertions. Draws
+        # random int64 values in a range from two to the 32nd up to a symbolic upper bound read
+        # from a tensor holding two to the 40th. Checks dtype is int64, all values lie in the
+        # range, and the source uses the 64-bit random integer helper and casts to int64.
         @torch.compile(fullgraph=True)
         def fn(high):
+            # [FUNCTION DOC] HELPER: Random integer tensor of shape five by five between a fixed
+            # lower bound and the scalar upper bound taken from the input tensor.
             return torch.randint(2**32, high.item(), (5, 5), device=GPU_TYPE)
 
         high = torch.tensor(2**40, device=GPU_TYPE, dtype=torch.int64)
@@ -436,7 +532,15 @@ class TestCase(InductorTestCase):
     @parametrize("dynamic", [True, False])
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     def test_int64_symint_not_downcast_to_int32_index_expr(self, dynamic):
+        # [FUNCTION DOC] Parametrized over dynamic mode; requires a GPU and scalar output
+        # capture. Compiles (full graph) random int64 generation whose upper bound is an
+        # unbacked value known to exceed two to the 31st. Checks all samples are within range,
+        # the symbolic argument is typed as 64-bit integer, and the source uses the 64-bit
+        # random helper with an int64 cast, i.e. the index expression is not downcast to int32.
         def fn(x, hi):
+            # [FUNCTION DOC] HELPER: Reads an unbacked size from the tensor, asserts it is a
+            # valid size larger than two to the 31st, and returns random int64 values below it
+            # with length of the first input dimension.
             h = hi.item()
             torch._check_is_size(h)
             torch._check(h > 2**31)

@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for Inductor's NVIDIA Universal GEMM (NVGEMM, cutlass_api based) backend
+# and related flex_gemm higher-order op, scheduling and heuristics. Contains module helpers that
+# build test tensors in several memory layouts and a standard autotune config, and test classes
+# that compile matmul, bmm, addmm, grouped and scaled (MXFP8, NVFP4) GEMMs with the NVGEMM
+# backend on Blackwell GPUs and compare against eager results or inspect generated code. The
+# main test class is skipped unless the cutlass_api library is available and the device is a
+# datacenter Blackwell part. No significant import-time side effects apart from imports.
 
 
 import threading
@@ -35,15 +42,26 @@ from torch.utils._triton import has_triton_reduction_ordering
 
 
 def _round_up(x, multiple):
+    # [FUNCTION DOC] HELPER: Rounds the first argument up to the nearest multiple of the second
+    # using integer arithmetic and returns it.
     return ((x + multiple - 1) // multiple) * multiple
 
 
 def _prep_k(K, scale_size):
+    # [FUNCTION DOC] HELPER: Number of scale blocks along K padded for the swizzled scale layout:
+    # the ceiling division of K by the scale block size, rounded up to a multiple of four.
     """Prepare K dimension for swizzle requirements (round up ceildiv to multiple of 4)."""
     return _round_up(ceildiv(K, scale_size), 4)
 
 
 def _create_tensor_with_layout(layout, rows, cols, dtype, device="cuda"):
+    # [FUNCTION DOC] HELPER: Builds a two dimensional test tensor of the given rows and columns on
+    # the given device (default cuda) with the requested dtype, in one of four layouts: contiguous
+    # (fresh tensor), aligned_offset (strided view into a larger storage starting at a 16 byte
+    # aligned offset), view (a flat random tensor reshaped), padded (strided view with row pitch
+    # eight elements wider than the columns). Values are random normal for floating dtypes, random
+    # small integers (minus one to one) cast for float8, and random bytes reinterpreted for packed
+    # float4. Raises ValueError for an unknown layout.
     """Create a tensor with the specified layout and dtype.
 
     Supports float16, bfloat16, float8_e4m3fn, and float4_e2m1fn_x2.
@@ -52,6 +70,9 @@ def _create_tensor_with_layout(layout, rows, cols, dtype, device="cuda"):
     is_fp8 = dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
 
     def _make_flat(n):
+        # [FUNCTION DOC] HELPER: Returns a random one dimensional tensor of n elements on the
+        # enclosing device with the enclosing dtype, generated according to its kind (packed float4
+        # from random bytes, float8 from small integers, otherwise normal).
         if is_fp4:
             return torch.randint(0, 256, (n,), device=device, dtype=torch.uint8).view(
                 torch.float4_e2m1fn_x2
@@ -85,6 +106,9 @@ def _create_tensor_with_layout(layout, rows, cols, dtype, device="cuda"):
 
 
 def _nvgemm_config(**overrides):
+    # [FUNCTION DOC] HELPER: Returns a config mapping for tests: autotuning enabled, the only GEMM
+    # backend NVGEMM, at most three profiled configs, and ATen fallback disabled. Any keyword
+    # overrides are merged on top and win. Returns a fresh dictionary each call.
     """Standard NVGEMM test config. Always disables ATen fallback."""
     cfg = {
         "max_autotune": True,
@@ -103,6 +127,10 @@ def _nvgemm_config(**overrides):
 )
 @instantiate_parametrized_tests
 class TestNVUniversalGemm(TestCase):
+    # [CLASS DOC] Main NVGEMM test case, skipped unless cutlass_api is available and the GPU is
+    # a datacenter Blackwell. Parametrized tests are instantiated by the class decorator. Each
+    # test compiles a small function under an NVGEMM-only autotune config after resetting dynamo
+    # and compares to eager output (or inspects code / kernel cache behavior).
     """Test cases for NVIDIA Universal GEMM functionality."""
 
     @parametrize("dtype", (torch.float16, torch.bfloat16))
@@ -119,6 +147,9 @@ class TestNVUniversalGemm(TestCase):
         ),
     )
     def test_matmul(self, dtype, layout_a, layout_b):
+        # [FUNCTION DOC] Parametrized over half precision dtype and a pair of layouts for the
+        # two operands. Compiles a matmul with M of 513 (not a multiple of 16; only N and K need
+        # to be) and compares to eager with default tolerances.
         """Test matmul with various dtypes and tensor layouts.
 
         M=513 tests that non-divisible M dimension works
@@ -127,6 +158,7 @@ class TestNVUniversalGemm(TestCase):
         m, n, k = 513, 512, 512
 
         def matmul(a, b):
+            # [FUNCTION DOC] HELPER: Plain matrix product of two tensors.
             return a @ b
 
         a = _create_tensor_with_layout(layout_a, m, k, dtype)
@@ -142,6 +174,12 @@ class TestNVUniversalGemm(TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_arch_filter_rejects_min_cc_only_kernels(self):
+        # [FUNCTION DOC] Regression test that the arch filter in the kernel cache is exact. Gets
+        # the device compute capability and its target, clears the kernel cache, takes the
+        # manifest of kernels, and selects those designed for a minimum capability not above the
+        # device one, then those among them whose supported targets include the device target.
+        # Asserts the first set is non-empty and the second is strictly smaller, i.e. an arch
+        # specific kernel is rejected where a minimum-only check would accept it.
         """designed_for_min_cc <= device cc is insufficient: an arch-conditional
         sm90 kernel reports min_cc=90 but only lists a cc=90 target and won't
         compile on sm100. The exact-arch filter (via _device_target) must reject
@@ -171,6 +209,9 @@ class TestNVUniversalGemm(TestCase):
 
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_matmul_swap_ab(self, dtype):
+        # [FUNCTION DOC] Parametrized over half precision dtype. With the swap-operands option
+        # enabled, compiles a small-M matmul and checks the result equals eager, so swapped
+        # operands and transposed output round-trip correctly.
         """swap_ab computes (B^T @ A^T)^T so the large N lands on the M-axis,
         improving tile utilization for small-M shapes. Verify a small-M matmul
         stays numerically correct with swap_ab enabled (the swapped operands and
@@ -179,6 +220,7 @@ class TestNVUniversalGemm(TestCase):
         m, n, k = 16, 512, 512
 
         def matmul(a, b):
+            # [FUNCTION DOC] HELPER: Plain matrix product of two tensors.
             return a @ b
 
         a = _create_tensor_with_layout("contiguous", m, k, dtype)
@@ -194,6 +236,11 @@ class TestNVUniversalGemm(TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_cudagraphs_intermediate_addmm(self):
+        # [FUNCTION DOC] Regression test for CUDA graphs with an NVGEMM addmm whose output is an
+        # intermediate consumed by a second addmm. With cudagraphs enabled it runs the compiled
+        # chain three times and compares the last result with a float32 eager reference cast to
+        # bfloat16 using loose tolerances. Checks that capture does not fail because the cached
+        # kernel retains the intermediate.
         """An NVGEMM addmm whose bias-epilogue output is an intermediate consumed
         downstream must not leave that output retained by the cached EFC kernel,
         or CUDA graph capture fails ("tensor(s) in the cudagraph pool not tracked
@@ -209,6 +256,8 @@ class TestNVUniversalGemm(TestCase):
         w = torch.randn(k, k, dtype=dtype, device="cuda") * 0.1
 
         def chain(bias, x, w):
+            # [FUNCTION DOC] HELPER: Two chained addmm operations that share the bias and weight
+            # transpose; the first result is an intermediate feeding the second.
             # h is an NVGEMM addmm output consumed downstream (not the graph's
             # final output), which is what triggers the retention bug.
             h = torch.addmm(bias, x, w.t())
@@ -228,6 +277,10 @@ class TestNVUniversalGemm(TestCase):
         torch.testing.assert_close(result, expected, rtol=1.6e-2, atol=1e-1)
 
     def test_efc_epilogue_lookup_no_deadlock(self):
+        # [FUNCTION DOC] Regression test that looking up an epilogue EFC kernel with an unknown
+        # name, no pre-resolved base kernel and an empty cache does not deadlock, since the
+        # cache lock is reentrant. Runs the lookup in a worker thread, waits up to 120 seconds,
+        # asserts the thread finished and that the lookup returned None.
         """get_efc_kernel_with_epilogue holds _cache_lock and, when the base EFC
         kernel is not pre-resolved and misses the args cache, calls
         get_kernel_by_name -> _ensure_caches, which re-acquires _cache_lock on the
@@ -243,6 +296,9 @@ class TestNVUniversalGemm(TestCase):
         result = []
 
         def worker():
+        # [FUNCTION DOC] HELPER: Thread body that performs the kernel cache lookup of an
+        # epilogue kernel for a nonexistent name and appends the returned value to the enclosing
+        # result list.
             result.append(
                 kernel_cache.get_efc_kernel_with_epilogue(
                     "__nonexistent_kernel__", None, base_kernel=None
@@ -259,6 +315,11 @@ class TestNVUniversalGemm(TestCase):
         self.assertIsNone(result[0])
 
     def test_unaligned_base_pointer_rejected(self):
+        # [FUNCTION DOC] Checks that a matmul whose first operand has a base pointer not 16 byte
+        # aligned (a view starting 117 bfloat16 elements into a storage) is rejected: running
+        # the compiled function raises an error whose message matches no valid choice
+        # (NoValidChoicesError), because the NVGEMM backend is the only choice and fallback is
+        # off.
         """Test that matmul with unaligned base pointer is rejected.
 
         cutlass_api requires 16-byte aligned base pointers. Since alignment
@@ -270,6 +331,7 @@ class TestNVUniversalGemm(TestCase):
         device = "cuda"
 
         def matmul(a, b):
+            # [FUNCTION DOC] HELPER: Plain matrix product of two tensors.
             return a @ b
 
         # offset=117 elements * 2 bytes = 234 bytes (NOT 16-byte aligned)
@@ -288,6 +350,10 @@ class TestNVUniversalGemm(TestCase):
 
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_reinterpret_view_from_slice(self, dtype):
+        # [FUNCTION DOC] Parametrized over half precision dtype. Projects an input, splits the
+        # result into two column slices (reinterpret views with non-contiguous strides),
+        # multiplies one by the transpose of the other, and checks the compiled NVGEMM result
+        # equals eager.
         """Test that sliced tensors (creating ReinterpretViews) work correctly.
 
         When tensors are slices of a shared buffer (e.g., from a fused projection),
@@ -297,6 +363,8 @@ class TestNVUniversalGemm(TestCase):
         device = "cuda"
 
         def fn(x, weight):
+            # [FUNCTION DOC] HELPER: Projects x with the weight, splits columns into two halves
+            # and returns the first half times the transpose of the second.
             projected = x @ weight  # (m, 2*n)
             a, b = projected.split(n, dim=1)  # Each is (m, n)
             return a @ b.t()  # (m, m)
@@ -314,6 +382,9 @@ class TestNVUniversalGemm(TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_workspace_allocation(self):
+        # [FUNCTION DOC] Mocks the kernel workspace size method of the cutlass_api kernel class
+        # to report 1024 bytes (no real kernel needs a workspace), compiles a matmul and checks
+        # the generated code passes the workspace argument and the result equals eager.
         """Test that workspace allocation works correctly.
 
         Since no current CUTLASS kernels require a workspace, we mock the
@@ -324,6 +395,7 @@ class TestNVUniversalGemm(TestCase):
         device = "cuda"
 
         def matmul(a, b):
+            # [FUNCTION DOC] HELPER: Plain matrix product of two tensors.
             return a @ b
 
         a = torch.randn(m, k, device=device, dtype=dtype)
@@ -335,6 +407,8 @@ class TestNVUniversalGemm(TestCase):
         import cutlass_api
 
         def patched_get_workspace_size(self, args):
+        # [FUNCTION DOC] HELPER: Replacement for the kernel workspace size query that ignores
+        # its arguments and always returns 1024.
             return 1024
 
         with patch.object(
@@ -354,11 +428,16 @@ class TestNVUniversalGemm(TestCase):
 
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_bmm_non_standard_batch_stride(self, dtype):
+        # [FUNCTION DOC] Parametrized over half precision dtype. Builds batched operands by
+        # transposing tensors so the batch stride is not the largest one, raises AssertionError
+        # if the setup somehow produced standard batch strides, then compiles a batched matmul
+        # under NVGEMM and compares to eager.
         """Test BMM path with non-standard batch strides."""
         batch, m, n, k = 8, 64, 256, 128
         device = "cuda"
 
         def bmm(a, b):
+            # [FUNCTION DOC] HELPER: Batched matrix product of two tensors.
             return torch.bmm(a, b)
 
         # Transpose creates non-largest batch stride
@@ -401,10 +480,16 @@ class TestNVUniversalGemm(TestCase):
         ),
     )
     def test_scaled_gemm_mxfp8(self, layout_a, m, n, k):
+        # [FUNCTION DOC] Parametrized over the layout of A and shape (m, n, k). Builds float8
+        # e4m3 operands (B is a transposed random matrix), block-32 power-of-two scale tensors
+        # sized with the padded K block count, and compares the compiled scaled matrix multiply
+        # with float32 output against eager.
         """Test MXFP8 scaled GEMM with NVGEMM backend."""
         block_size = 32
 
         def scaled_mm(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Scaled matrix multiply with the given scales and float32
+            # output dtype.
             return torch._scaled_mm(
                 a, b, scale_a=scale_a, scale_b=scale_b, out_dtype=torch.float32
             )
@@ -439,6 +524,11 @@ class TestNVUniversalGemm(TestCase):
         ),
     )
     def test_scaled_gemm_nvf4_padded_scales(self, m, n, k):
+        # [FUNCTION DOC] Parametrized over shape. NVFP4 scaled GEMM with scale tensors padded to
+        # 128 rows of the M or N dimension (more elements than the kernel strictly needs); the
+        # kernel must accept both padded and unpadded scale sizes. Compiles with the autotune
+        # choice restricted by a regex to the vendored choice, and compares to eager allowing
+        # NaNs (random fp4 data can decode to NaN).
         """Test NVF4 with padded scales (M or N < 128).
 
         torch._scaled_mm creates scales with block_size_mn=128 padding,
@@ -448,6 +538,8 @@ class TestNVUniversalGemm(TestCase):
         packed_k = k // 2
 
         def scaled_mm(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Scaled matrix multiply with the given scales and bfloat16
+            # output dtype.
             return torch._scaled_mm(
                 a, b, scale_a=scale_a, scale_b=scale_b, out_dtype=torch.bfloat16
             )
@@ -483,6 +575,12 @@ class TestNVUniversalGemm(TestCase):
         torch.testing.assert_close(result, expected, equal_nan=True)
 
     def test_scaled_gemm_grouped_n_reduce_provider(self):
+        # [FUNCTION DOC] Directly exercises the cutlass operators API for a blockwise scaled
+        # NVFP4 GEMM with a local reduce output. Builds fp4 operands, swizzled fp8 scale
+        # tensors, a bfloat16 output and a float32 reduce output that gets a sum per group of 32
+        # columns along the second axis. Creates the gemm arguments, picks the first candidate
+        # EFC-only scaled kernel whose tile width equals N, compiles and runs it on the current
+        # stream, and asserts the reduce output equals the group sums of the main output.
         from cutlass import Float32
         from cutlass.operators import ScaleMode, ScaleSwizzleMode
 
@@ -546,6 +644,12 @@ class TestNVUniversalGemm(TestCase):
         )
 
     def test_scaled_gemm_unit_dim_epilogue_non_current_stream(self):
+        # [FUNCTION DOC] Directly exercises a scaled NVFP4 GEMM with M equal to one and a bias
+        # add epilogue function, run on a stream other than the current one. Computes the eager
+        # scaled matmul plus bias as reference, builds epilogue arguments, picks a candidate
+        # kernel (selection arguments exclude the epilogue) with tile width equal to N, compiles
+        # it, synchronizes and sleeps the GPU to make a race visible, runs the kernel on a fresh
+        # stream, synchronizes it and asserts the output equals the reference.
         from cutlass import Float32
         from cutlass.operators import ScaleMode, ScaleSwizzleMode
         from cutlass.operators.arguments import EpilogueArguments
@@ -641,11 +745,18 @@ class TestNVUniversalGemm(TestCase):
         ),
     )
     def test_scaled_gemm_nvf4(self, out_dtype, layout_a, m, n, k):
+        # [FUNCTION DOC] Parametrized over output dtype (float32, bfloat16), A layout and shape.
+        # NVF4 scaled GEMM (float4 data with float8 scales, block size 16) with scales padded to
+        # 128 rows along M and N and four along K blocks. Compiles under NVGEMM restricted by
+        # regex to the vendored choice and compares to eager with NaN equality, since random fp4
+        # can produce NaN.
         """Test NVF4 (Float4 + Float8E4M3FN scales, block_size=16) with NVGEMM backend."""
         packed_k = k // 2
         block_size = 16
 
         def scaled_mm(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Scaled matrix multiply with the given scales and the
+            # parametrized output dtype.
             return torch._scaled_mm(
                 a, b, scale_a=scale_a, scale_b=scale_b, out_dtype=out_dtype
             )
@@ -687,6 +798,9 @@ class TestNVUniversalGemm(TestCase):
         ("contiguous", "aligned_offset", "view", "padded"),
     )
     def test_grouped_gemm(self, layout_a):
+        # [FUNCTION DOC] Parametrized over the layout of A. Grouped GEMM test with four groups
+        # of 256 by 256 bfloat16 operands through the NVGEMM backend. Only the TN layout
+        # (column-major B) is supported.
         """Test grouped GEMM with NVGEMM backend and various A layouts.
 
         GroupedGemm currently only supports TN layout (column-major B).
@@ -696,6 +810,7 @@ class TestNVUniversalGemm(TestCase):
         device = "cuda"
 
         def grouped_mm(a, b, offsets):
+            # [FUNCTION DOC] HELPER: Grouped matrix multiply of A and B using the group offsets.
             return torch._grouped_mm(a, b, offs=offsets)
 
         b = torch.randn(g, n, k, device=device, dtype=dtype).permute(0, 2, 1)
@@ -720,6 +835,11 @@ class TestNVUniversalGemm(TestCase):
         torch.testing.assert_close(result, expected)
 
     def test_grouped_gemm_varying_offsets(self):
+        # [FUNCTION DOC] Compiles one grouped matmul (four groups, bfloat16, column-major B) and
+        # runs it with two offset tensors that have the same total rows but different group
+        # sizes (equal groups versus 32, 96, 48, 80). Raises AssertionError if the sizes do not
+        # sum equally. Checks each result against eager and that the two results differ, showing
+        # offsets are handled at runtime and not baked in.
         """Test that different offset distributions produce correct results.
 
         Runs the same compiled function with two different offset distributions
@@ -730,6 +850,7 @@ class TestNVUniversalGemm(TestCase):
         device = "cuda"
 
         def grouped_mm(a, b, offsets):
+            # [FUNCTION DOC] HELPER: Grouped matrix multiply of A and B using the group offsets.
             return torch._grouped_mm(a, b, offs=offsets)
 
         b = torch.randn(g, n, k, device=device, dtype=dtype).permute(0, 2, 1)
@@ -771,9 +892,17 @@ class TestNVUniversalGemm(TestCase):
 
 
 class TestNVUniversalGemmHeuristics(TestCase):
+    # [CLASS DOC] Unit tests of the heuristics filter and of the GEMM epilogue IR reduction
+    # analysis that run without cutlass_api or a GPU, using mock kernel and input objects. Has
+    # two mock factories.
     """Unit tests for NVUniversalGemmHeuristics without requiring actual libraries."""
 
     def test_grouped_reduction_conversion_contract(self):
+        # [FUNCTION DOC] Checks the grouped reduction recognition on loop IR expressions: a sum
+        # of squares of the loaded accumulator converted to float32 is classified as sum with
+        # square; the same value passing through a float16 conversion first, or through a
+        # bitcast conversion, is not recognized and gives None. Uses a store of the reduction
+        # and a group size of four with a bfloat16 output.
         from torch._inductor.kernel.loop_ir_epilogue_lowering import (
             GemmEpilogueIRExpression as Expr,
             GemmEpilogueIRStore,
@@ -783,6 +912,10 @@ class TestNVUniversalGemmHeuristics(TestCase):
         load = Expr("load", ("gemm", 0, None))
 
         def classify(value):
+            # [FUNCTION DOC] HELPER: Wraps the given value in a squared sum reduction expression
+            # stored at output index zero and returns what the grouped reduction analysis
+            # reports for the gemm buffer with group size four and bfloat16 output (a pair of
+            # reduction and pre-op kinds, or None).
             square = Expr("mul", (value, value))
             reduction = Expr("reduction", (torch.float32, torch.float32, "sum", square))
             return grouped_reduction_ir(
@@ -799,6 +932,10 @@ class TestNVUniversalGemmHeuristics(TestCase):
         self.assertIsNone(classify(Expr("to_dtype", (bitcast, torch.float32))))
 
     def test_grouped_reduction_ir_normalizes_loop_representation(self):
+        # [FUNCTION DOC] Checks that the analysis object built from a stored sum reduction of
+        # the loaded gemm accumulator reports, for the output, group size four, axis one and
+        # float32 dtype, a reduction config equal to one with the sum reduction and the identity
+        # pre-op.
         from torch._inductor.kernel.gemm_epilogue import GemmReductionConfig
         from torch._inductor.kernel.loop_ir_epilogue_lowering import (
             GemmEpilogueIRAnalysis,
@@ -816,6 +953,9 @@ class TestNVUniversalGemmHeuristics(TestCase):
         )
 
     def test_grouped_reduction_rejects_ambiguous_composite(self):
+        # [FUNCTION DOC] A stored value that adds a sum reduction and a max reduction of the
+        # same load is an ambiguous composite; the grouped reduction analysis must return None
+        # for it.
         from torch._inductor.kernel.loop_ir_epilogue_lowering import (
             GemmEpilogueIRExpression as Expr,
             GemmEpilogueIRStore,
@@ -834,6 +974,9 @@ class TestNVUniversalGemmHeuristics(TestCase):
         self.assertIsNone(grouped_reduction_ir(store, "gemm", 4, torch.float32))
 
     def test_epilogue_ir_preserves_empty_tuple_argument(self):
+        # [FUNCTION DOC] Checks that building an epilogue IR expression with an argument tuple
+        # containing an empty tuple keeps that argument unchanged and that the keyword arguments
+        # are empty.
         from torch._inductor.kernel.loop_ir_epilogue_lowering import (
             GemmEpilogueIRExpression,
         )
@@ -843,6 +986,8 @@ class TestNVUniversalGemmHeuristics(TestCase):
         self.assertEqual(expression.kwargs, ())
 
     def _create_mock_kernel(self, tile_m, tile_n, tile_k, cluster_m, cluster_n):
+        # [FUNCTION DOC] HELPER: Returns a mock kernel whose metadata design has the given tile
+        # shape (three values) and cluster shape (two values).
         """Create a mock kernel with the given tile/cluster configuration."""
         kernel = MagicMock()
         kernel.metadata.design.tile_shape = (tile_m, tile_n, tile_k)
@@ -850,6 +995,9 @@ class TestNVUniversalGemmHeuristics(TestCase):
         return kernel
 
     def _create_mock_inputs(self, m=512, n=512, k=512, dtype=torch.float16):
+        # [FUNCTION DOC] HELPER: Returns a mock GEMM inputs object: hinted M, N, K as given, the
+        # given dtype, operand indices zero and one, and hinted strides for row-major operands
+        # of those sizes.
         """Create a mock MMKernelInputs."""
         inputs = MagicMock()
         inputs.mnk_hinted.return_value = (m, n, k)
@@ -860,6 +1008,8 @@ class TestNVUniversalGemmHeuristics(TestCase):
         return inputs
 
     def test_fallback_when_heuristics_unavailable(self):
+        # [FUNCTION DOC] When the heuristics report they should not run, filtering ten mock
+        # kernels with a count of three must return exactly the first three kernels.
         """Test that filter_kernels returns first N kernels when heuristics unavailable."""
         heuristics = NVUniversalGemmHeuristics()
 
@@ -873,6 +1023,9 @@ class TestNVUniversalGemmHeuristics(TestCase):
         self.assertEqual(result, kernels[:3])
 
     def test_fallback_when_no_configs_extracted(self):
+        # [FUNCTION DOC] When heuristics should run but the kernels' design objects lack a tile
+        # shape (so no configs can be extracted), filtering five kernels with a count of two
+        # returns the first two.
         """Test fallback when kernel configs cannot be extracted."""
         heuristics = NVUniversalGemmHeuristics()
 
@@ -891,6 +1044,10 @@ class TestNVUniversalGemmHeuristics(TestCase):
         self.assertEqual(result, kernels[:2])
 
     def test_filter_kernels_sorts_by_runtime(self):
+        # [FUNCTION DOC] With mocked heuristic configs giving estimated runtimes for three
+        # kernels, checks the filter returns kernels ordered fastest first (the second, the
+        # third, the first), truncates to the requested count of two by dropping the slowest,
+        # and returns all three for a count of ten.
         """Test that filter_kernels returns kernels sorted by estimated runtime and respects count."""
         heuristics = NVUniversalGemmHeuristics()
 
@@ -938,9 +1095,16 @@ class TestNVUniversalGemmHeuristics(TestCase):
     "Requires cutlass_api, nvMatmulHeuristics, and Blackwell GPU",
 )
 class TestNVUniversalGemmHeuristicsIntegration(TestCase):
+    # [CLASS DOC] Integration tests that call the real nvMatmulHeuristics library; skipped
+    # unless cutlass_api, the heuristics library and a datacenter Blackwell GPU are all
+    # available.
     """Integration tests for nvMatmulHeuristics with real library calls."""
 
     def test_fp4_heuristic_configs(self):
+        # [FUNCTION DOC] Asks the heuristics for up to five configs for a 256 by 512 by 1024 FP4
+        # block scaled GEMM (row-major A, column-major B, float32 accumulator and output) and
+        # asserts at least one config is returned with positive tile M, tile N and estimated
+        # runtime.
         """Test that nvMatmulHeuristics returns configs for FP4 blockscaled GEMM."""
         heuristics = NVUniversalGemmHeuristics()
 
@@ -968,6 +1132,8 @@ class TestNVUniversalGemmHeuristicsIntegration(TestCase):
             self.assertGreater(cfg.estimated_runtime, 0)
 
     def test_fp8_heuristic_configs(self):
+        # [FUNCTION DOC] Same as the FP4 heuristics test but for float8 e4m3 operands: expects
+        # at least one config with positive tile sizes and estimated runtime.
         """Test that nvMatmulHeuristics returns configs for FP8 GEMM."""
         heuristics = NVUniversalGemmHeuristics()
 
@@ -1000,13 +1166,21 @@ class TestNVUniversalGemmHeuristicsIntegration(TestCase):
     "NVIDIA Universal GEMM (cutlass_api) library not available or not on Blackwell",
 )
 class TestNVUniversalGemmDynamicShapes(TestCase):
+    # [CLASS DOC] NVGEMM tests with dynamic shapes; skipped unless cutlass_api is available and
+    # the GPU is datacenter Blackwell.
     """Test cases for NVIDIA Universal GEMM with dynamic shapes."""
 
     @torch._dynamo.config.patch({"capture_dynamic_output_shape_ops": True})
     def test_unbacked_symint_rejected(self):
+        # [FUNCTION DOC] With capture of data dependent output shape ops enabled, compiles
+        # dynamically a function whose matrix row count comes from the nonzero count of a tensor
+        # (an unbacked symbolic size). Asserts that running it raises an error matching no valid
+        # choice, i.e. NVGEMM rejects unbacked symbolic sizes.
         """Test that NVGEMM rejects unbacked symbolic integers."""
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: Builds a ones matrix whose row count is the number of
+            # nonzero entries of x and returns its product with w.
             nz = torch.nonzero(x)  # Creates unbacked symint for nz.size(0)
             a = torch.ones(nz.size(0), w.size(0), dtype=w.dtype, device=w.device)
             return a @ w
@@ -1024,9 +1198,14 @@ class TestNVUniversalGemmDynamicShapes(TestCase):
                 compiled_fn(x, w)
 
     def test_dynamic_shapes(self):
+        # [FUNCTION DOC] Stress test: one dynamic-shape compiled matmul is called with a
+        # sequence of bfloat16 shapes, some tiny shapes flagged as unsupported (must raise the
+        # no valid choice error) and the others supported (result must match eager). Unsupported
+        # shapes recur after supported ones.
         """Stress test dynamic shapes with extreme variations."""
 
         def matmul(a, b):
+            # [FUNCTION DOC] HELPER: Plain matrix product of two tensors.
             return a @ b
 
         torch._dynamo.reset()
@@ -1064,6 +1243,10 @@ class TestNVUniversalGemmDynamicShapes(TestCase):
 )
 @instantiate_parametrized_tests
 class TestNVUniversalGemmEpilogueFusion(TestCase):
+    # [CLASS DOC] NVGEMM epilogue fusion tests: each compiles a function with benchmarking
+    # mocked out for deterministic fusion decisions and checks both results and generated code
+    # markers. Class constants M, N, K are all 512. Parametrized tests are instantiated by the
+    # class decorator.
     """Test cases for NVIDIA Universal GEMM epilogue fusion.
 
     Tests verify both correctness and that fusion actually occurs by examining
@@ -1074,6 +1257,12 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
     M, N, K = 512, 512, 512
 
     def _compile_and_check(self, fn, *args):
+        # [FUNCTION DOC] HELPER: Resets dynamo, compiles the function with NVGEMM autotuning
+        # (two profiled configs, caches force disabled) while the scheduler fused-node and
+        # codegen module benchmarks are mocked to fixed times, and runs it with the given args
+        # capturing generated code. Returns the result, the joined generated code and a flag
+        # that is true when the code contains the epilogue function name and the epilogue
+        # arguments class name.
         torch._dynamo.reset()
         with (
             config.patch(
@@ -1102,11 +1291,14 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
 
     @parametrize("dtype", (torch.float16, torch.bfloat16))
     def test_matmul_pointwise_epilogue_fusion(self, dtype):
+        # [FUNCTION DOC] Parametrized over half precision dtype. A relu after a matmul must be
+        # fused into the GEMM epilogue; checks results close to eager and the fusion flag.
         """Pointwise op (relu) is fused into the GEMM epilogue."""
         a = torch.randn(self.M, self.K, device="cuda", dtype=dtype)
         b = torch.randn(self.K, self.N, device="cuda", dtype=dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Relu of a matrix product.
             return torch.relu(a @ b)
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b)
@@ -1114,10 +1306,15 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertTrue(epilogue_fused, "pointwise op was NOT fused into epilogue")
 
     def test_matmul_multi_store_epilogue_fusion(self):
+        # [FUNCTION DOC] A matmul whose float32 result feeds both a relu output and an add-one
+        # output must fuse into the epilogue with two stores: results match eager, the fusion
+        # flag is true and the code contains the second output pointer name.
         a = torch.randn(self.M, self.K, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(self.K, self.N, device="cuda", dtype=torch.bfloat16)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Returns a pair: relu of the float32 product, and the same
+            # product plus one.
             result = (a @ b).float()
             return torch.relu(result), result + 1.0
 
@@ -1127,11 +1324,16 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertIn("out_ptr1", code)
 
     def test_flex_gemm_pointwise_epilogue_fusion(self):
+        # [FUNCTION DOC] flex_gemm with a matrix multiply and a relu epilogue body using the
+        # NVGEMM backend option: the result must equal relu of the product within tolerance and
+        # the epilogue must be fused.
         dtype = torch.bfloat16
         a = torch.randn(self.M, self.K, device="cuda", dtype=dtype)
         b = torch.randn(self.K, self.N, device="cuda", dtype=dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Calls flex_gemm with a matrix multiply, the two inputs and
+            # a relu body.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -1144,12 +1346,21 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertTrue(epilogue_fused, "FlexGEMM body was NOT fused into epilogue")
 
     def test_flex_gemm_preserves_output_for_unfused_reduction(self):
+        # [FUNCTION DOC] flex_gemm whose epilogue returns the relu of the accumulator together
+        # with a grouped sum (groups of 32 along the last axis) of its float32 view; the
+        # reduction output is not fused as a reduction but both outputs must be preserved.
+        # Compares both outputs to eager with tolerances, asserts the epilogue is fused and the
+        # second output pointer exists in the code.
         dtype = torch.bfloat16
         a = torch.randn(128, 64, device="cuda", dtype=dtype)
         b = torch.randn(64, 128, device="cuda", dtype=dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Runs flex_gemm with a matrix multiply and the epilogue
+            # defined below.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: Epilogue body returning the relu of the accumulator and
+                # the sum over groups of 32 of its float32 reshaped view.
                 grouped = acc.float().view(128, -1, 32)
                 return acc.relu(), grouped.sum(-1)
 
@@ -1169,6 +1380,10 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
 
     @parametrize("operation", ("mul", "sigmoid", "gelu"))
     def test_scaled_mm_pointwise_epilogue_fusion(self, operation):
+        # [FUNCTION DOC] Parametrized over operation (scale by one half, sigmoid, gelu). NVFP4
+        # scaled GEMM with bfloat16 output and padded swizzled fp8 scales, followed by the
+        # chosen unary pointwise op; the op must be fused into the scaled epilogue and the
+        # result must match eager (NaN equality allowed).
         """Unary pointwise op is fused into an NVFP4 scaled GEMM epilogue."""
         m, n, k = self.M, self.N, self.K
         packed_k = k // 2
@@ -1188,6 +1403,8 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
         def fn(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Scaled matmul with bfloat16 output followed by the unary op
+            # chosen by the enclosing parameter (sigmoid, gelu, or multiplication by one half).
             result = torch._scaled_mm(
                 a,
                 b,
@@ -1210,10 +1427,14 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
     def test_matmul_single_store_epilogue_chain(self):
+        # [FUNCTION DOC] A float32 matmul result followed by relu and an add-one gives a single
+        # stored output: results match eager, the epilogue is fused, and no second output
+        # pointer is present.
         a = torch.randn(self.M, self.K, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(self.K, self.N, device="cuda", dtype=torch.bfloat16)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Relu of the float32 product plus one.
             return torch.relu((a @ b).float()) + 1.0
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b)
@@ -1222,6 +1443,10 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertNotIn("out_ptr1", code)
 
     def test_scaled_mm_multi_store_epilogue_fusion(self):
+        # [FUNCTION DOC] NVFP4 scaled GEMM with bfloat16 output whose result is returned along
+        # with a float32 relu and a float32 half-scaled copy: three stores. Compares all three
+        # outputs to eager, requires the epilogue to be fused and the second and third output
+        # pointers to appear in the code.
         m, n, k = self.M, self.N, self.K
         packed_k = k // 2
         a = _create_tensor_with_layout(
@@ -1240,6 +1465,8 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
         def fn(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Scaled matmul returning the bfloat16 result, the relu of
+            # its float32 view and the float32 view scaled by one half.
             result = torch._scaled_mm(
                 a,
                 b,
@@ -1274,6 +1501,12 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         ),
     )
     def test_scaled_mm_broadcast_epilogue_fusion(self, case):
+        # [FUNCTION DOC] Parametrized over a case: a tuple of bias specs (shape and dtype) plus
+        # whether fusion is expected (all listed cases expect fusion): full, row vector, one-
+        # row, one-column, row plus column together, and float32 bias. Builds an NVFP4 scaled
+        # GEMM with padded scales, adds each random bias and applies relu. Asserts the fusion
+        # flag equals the expectation and the result matches eager with NaN equality (random fp4
+        # can give NaNs).
         bias_specs, expected_fused = case
         m, n, k = self.M, self.N, self.K
         packed_k = k // 2
@@ -1297,6 +1530,8 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
         def fn(a, b, scale_a, scale_b, *biases):
+            # [FUNCTION DOC] HELPER: Scaled matmul with bfloat16 output, then adds every
+            # supplied bias in turn and returns the relu.
             result = torch._scaled_mm(
                 a,
                 b,
@@ -1319,6 +1554,9 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
 
     @parametrize("bias_shape", ((1,), (1, 1)))
     def test_scaled_mm_unit_dim_broadcast_epilogue_fusion(self, bias_shape):
+        # [FUNCTION DOC] Parametrized over a unit bias shape (one element or one by one). NVFP4
+        # scaled GEMM with M equal to one, N 128, then a bias add and relu. Asserts the epilogue
+        # is fused and the result equals eager.
         m, n, k = 1, 128, self.K
         packed_k = k // 2
         a = _create_tensor_with_layout(
@@ -1338,6 +1576,7 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         bias = torch.randn(bias_shape, device="cuda", dtype=torch.bfloat16)
 
         def fn(a, b, scale_a, scale_b, bias):
+            # [FUNCTION DOC] HELPER: Scaled matmul with bfloat16 output, plus bias, then relu.
             result = torch._scaled_mm(
                 a,
                 b,
@@ -1385,6 +1624,14 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         name_fn=lambda case: f"axis_{case[0]}_{case[1]}_group_{case[2]}",
     )
     def test_scaled_mm_grouped_reduce_fusion(self, case):
+        # [FUNCTION DOC] Parametrized over (axis, reduction kind, group size) with reductions
+        # sum, mean, prod, amax and amin, groups of 4, 8, 16 along axis zero or 32, 64 along
+        # axis one. Builds an NVFP4 scaled GEMM (N doubles to 256 for groups above 32) that
+        # returns the bfloat16 result and a grouped reduction of its float32 view. Asserts both
+        # outputs equal eager and the code uses the local reduce output. For the axis one, sum,
+        # group 32 case it also checks, when Triton supports reduction ordering (otherwise
+        # skips), that strict numerics disables the local reduce output and the code mentions
+        # the inner tree reduction ordering.
         axis, reduction, group = case
         m, n, k = 128, 256 if group > 32 else 128, 512
         packed_k = k // 2
@@ -1404,6 +1651,9 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
         def fn(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Scaled matmul with bfloat16 output plus a grouped reduction
+            # (kind, axis and group from the enclosing parameters) over the float32 view, split
+            # in groups along the chosen axis. Returns the result and the reduced tensor.
             result = torch._scaled_mm(
                 a,
                 b,
@@ -1444,6 +1694,9 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
             self.assertIn("ReductionOrdering.INNER_TREE", strict_code)
 
     def test_scaled_mm_grouped_reduce_source_fusion(self):
+        # [FUNCTION DOC] NVFP4 scaled GEMM returning relu of the result and the mean of the
+        # squared float32 values over groups of 32 on the last axis. Asserts both outputs equal
+        # eager and the code uses a local reduce output with the square pre-op source.
         m, n, k, group = 128, 128, 512, 32
         packed_k = k // 2
         a = _create_tensor_with_layout(
@@ -1462,6 +1715,8 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
         def fn(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Scaled matmul with bfloat16 output; returns its relu and
+            # the grouped mean of squares of the float32 view.
             result = torch._scaled_mm(
                 a,
                 b,
@@ -1481,6 +1736,9 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
 
     @config.patch(emulate_precision_casts=True)
     def test_scaled_mm_grouped_reduce_rejects_intermediate_fp16(self):
+        # [FUNCTION DOC] With precision-cast emulation enabled, a grouped reduction whose input
+        # passes through a float16 intermediate cannot be fused as a local reduce. Asserts the
+        # compiled results equal eager and the code does not contain the local reduce output.
         m, n, k, group = 128, 128, 512, 32
         packed_k = k // 2
         a = _create_tensor_with_layout(
@@ -1499,6 +1757,9 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
         def fn(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Scaled matmul with bfloat16 output; returns its relu and
+            # the grouped mean of squares of a float32 view obtained after a round trip through
+            # float16.
             result = torch._scaled_mm(
                 a,
                 b,
@@ -1514,6 +1775,10 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertNotIn("'local_reduce_out'", code)
 
     def test_scaled_mm_grouped_reduce_feeds_main(self):
+        # [FUNCTION DOC] Group size four along axis zero: the grouped mean is expanded back and
+        # subtracted from the main float32 result, so the reduction feeds the main output.
+        # Asserts equality with eager and that the code flags that the local reduce feeds the
+        # main output.
         m, n, k, group = 128, 128, 512, 4
         packed_k = k // 2
         a = _create_tensor_with_layout(
@@ -1532,6 +1797,8 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
         def fn(a, b, scale_a, scale_b):
+            # [FUNCTION DOC] HELPER: Scaled matmul with bfloat16 output; returns the float32
+            # result minus the group mean broadcast back to full shape.
             result = torch._scaled_mm(
                 a,
                 b,
@@ -1548,6 +1815,8 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertIn("'local_reduce_feeds_main': True", code)
 
     def test_matmul_add_relu_chained(self):
+        # [FUNCTION DOC] A matmul plus bias followed by relu forms a single pointwise chain that
+        # is fused as one epilogue; results match eager and the fusion flag is true.
         """Multi-op pointwise chain (a@b + bias → relu) collapses to one
         ComputedBuffer and is fused as a single epilogue."""
         dtype = torch.bfloat16
@@ -1556,6 +1825,7 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         bias = torch.randn(self.M, self.N, device="cuda", dtype=dtype)
 
         def fn(a, b, bias):
+            # [FUNCTION DOC] HELPER: Relu of matrix product plus bias.
             return torch.relu((a @ b) + bias)
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b, bias)
@@ -1563,12 +1833,15 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertTrue(epilogue_fused, "bias+relu chain was NOT fused into epilogue")
 
     def test_matmul_cast_dtype(self):
+        # [FUNCTION DOC] A cast of the bfloat16 product to float32 must be fused into the
+        # epilogue; results match eager.
         """Output-dtype cast in the epilogue."""
         dtype = torch.bfloat16
         a = torch.randn(self.M, self.K, device="cuda", dtype=dtype)
         b = torch.randn(self.K, self.N, device="cuda", dtype=dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Product converted to float32.
             return (a @ b).to(torch.float32)
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b)
@@ -1576,12 +1849,15 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertTrue(epilogue_fused, "dtype cast was NOT fused into epilogue")
 
     def test_plain_matmul_no_epilogue(self):
+        # [FUNCTION DOC] A plain matrix product must not have epilogue fusion markers in the
+        # code, and the result matches eager.
         """Test that plain matmul does NOT produce epilogue fusion markers."""
         dtype = torch.bfloat16
         a = torch.randn(self.M, self.K, device="cuda", dtype=dtype)
         b = torch.randn(self.K, self.N, device="cuda", dtype=dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Plain matrix product.
             return a @ b
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b)
@@ -1595,12 +1871,16 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         "https://github.com/pytorch/pytorch/issues/190235"
     )
     def test_reduction_not_fused(self):
+        # [FUNCTION DOC] Checks that a sum reduction after a GEMM is not fused into the epilogue
+        # (flag false) and the result is close to eager. Currently skipped unconditionally
+        # because of CI failures.
         """Test that reductions after GEMM are NOT fused into the epilogue."""
         dtype = torch.bfloat16
         a = torch.randn(self.M, self.K, device="cuda", dtype=dtype)
         b = torch.randn(self.K, self.N, device="cuda", dtype=dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Sum over the last dimension of a matrix product.
             return (a @ b).sum(dim=-1)
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b)
@@ -1614,6 +1894,10 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         )
 
     def test_epilogue_fusion_eliminates_intermediate(self):
+        # [FUNCTION DOC] When a relu is fused, no separate intermediate GEMM buffer is
+        # allocated. Checks fusion and result, then scans every generated line that defines the
+        # main function of an NVGEMM kernel and requires its signature to have exactly the two
+        # input pointers, one output pointer and the stream keyword argument.
         """Verify that epilogue fusion eliminates the intermediate GEMM buffer.
 
         When relu is fused, the GEMM output should not be allocated separately.
@@ -1625,6 +1909,7 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         b = torch.randn(self.K, self.N, device="cuda", dtype=dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Relu of a matrix product.
             return torch.relu(a @ b)
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b)
@@ -1641,6 +1926,9 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
                 )
 
     def test_epilogue_with_aux_input(self):
+        # [FUNCTION DOC] An epilogue of bias add followed by relu, where the bias is a full-size
+        # tensor, is fused with the bias passed in as an extra kernel argument; results match
+        # eager.
         """Epilogue that reads an auxiliary tensor (bias) gets it as a kernel arg."""
         dtype = torch.bfloat16
         a = torch.randn(self.M, self.K, device="cuda", dtype=dtype)
@@ -1648,6 +1936,7 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         bias = torch.randn(self.M, self.N, device="cuda", dtype=dtype)
 
         def fn(a, b, bias):
+            # [FUNCTION DOC] HELPER: Relu of matrix product plus bias.
             return torch.relu((a @ b) + bias)
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b, bias)
@@ -1660,12 +1949,15 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         name_fn=lambda shape: "x".join(map(str, shape)),
     )
     def test_epilogue_with_broadcast_aux_input(self, bias_shape):
+        # [FUNCTION DOC] Parametrized over broadcastable bias shapes (row vector, one-row, one-
+        # column). Same fusion and numerical check as the full bias test.
         dtype = torch.bfloat16
         a = torch.randn(self.M, self.K, device="cuda", dtype=dtype)
         b = torch.randn(self.K, self.N, device="cuda", dtype=dtype)
         bias = torch.randn(bias_shape, device="cuda", dtype=dtype)
 
         def fn(a, b, bias):
+            # [FUNCTION DOC] HELPER: Relu of matrix product plus bias.
             return torch.relu((a @ b) + bias)
 
         result, code, epilogue_fused = self._compile_and_check(fn, a, b, bias)
@@ -1673,6 +1965,13 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         self.assertTrue(epilogue_fused, "broadcast bias+relu was not fused")
 
     def test_efc_disk_cache_round_trip(self):
+        # [FUNCTION DOC] Skips if no cached EFC kernel with bfloat16 inputs and outputs and a
+        # ttt layout in its name is found. Otherwise compiles that kernel for a bfloat16 GEMM,
+        # unwraps the compiled object to the inner JIT function (checking it is not a plain
+        # closure), stores it to the disk cache under a temporary path in the system temp
+        # directory and reads it back (must not be None), rewraps it and runs the kernel on the
+        # current stream with a fresh output. Asserts the output is close to a float32
+        # reference. Side effect: writes a cache file under the temp directory.
         """Verify that EFC kernel compiled artifacts can be serialized to disk
         and reloaded correctly.
 
@@ -1752,6 +2051,12 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         "https://github.com/pytorch/pytorch/issues/190234"
     )
     def test_workspace_runtime_integration(self):
+        # [FUNCTION DOC] End-to-end check that workspace handling works at runtime when kernel
+        # workspace size is mocked to 4096. Wraps the NVGEMM module benchmark method to record
+        # every returned pair of time and path while compiling a relu matmul with NVGEMM
+        # autotuning, and asserts the result matches eager, the benchmark was called, and at
+        # least one benchmark time is finite. Currently skipped unconditionally because of CI
+        # failures.
         """End-to-end: mock the chosen kernel's workspace_size to non-zero and
         actually let benchmark_codegened_module run, exercising the runtime
         path that consumes the generated get_args()/call() helpers.
@@ -1773,12 +2078,16 @@ class TestNVUniversalGemmEpilogueFusion(TestCase):
         b = torch.randn(self.K, self.N, device="cuda", dtype=torch.bfloat16)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Relu of matrix product.
             return torch.relu(a @ b)
 
         bench_results: list[tuple[float, str]] = []
         orig_bench = CUDACombinedScheduling._benchmark_nvgemm_module
 
         def capturing_bench(self, module):
+            # [FUNCTION DOC] HELPER: Calls the original benchmark method, appends its returned
+            # time and path to the enclosing list of benchmark results, and returns them
+            # unchanged.
             ms, path = orig_bench(self, module)
             bench_results.append((ms, path))
             return ms, path
