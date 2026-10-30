@@ -1,4 +1,9 @@
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Tests for torch.utils._config_module using the fake config modules in
+# torch.testing._internal (fake_config_module, fake_config_module2, fake_config_module3). Covers
+# value loading, env-var defaults/forcing, overrides, patching (reentrancy, threads),
+# save/load/codegen, hashing and dirty tracking, dict caching, aliases and deprecation. Import-
+# time side effect: sets four environment variables used by the fake config modules.
 import os
 import pickle
 import queue
@@ -22,7 +27,12 @@ from torch.utils._config_module import _ConfigEntry, _UNSET_SENTINEL, Config
 
 
 class TestConfigModule(TestCase):
+    # [CLASS DOC] Test case exercising the ConfigModule machinery through the fake config modules.
+    # The tearDown resets shared module-level state, so tests may mutate config freely.
     def tearDown(self):
+        # [FUNCTION DOC] Resets all per-entry user overrides to the unset sentinel, clears the
+        # hide flag and deprecation-warned flag on every entry, and clears the hash, dirty-key and
+        # dict caches so changes made by one test do not leak into the next.
         # Config changes get persisted between test cases
         for k in config._config:
             config._config[k].user_override.set(_UNSET_SENTINEL)
@@ -35,6 +45,9 @@ class TestConfigModule(TestCase):
             config._config[k]._deprecation_warned = False
 
     def test_base_value_loading(self):
+        # [FUNCTION DOC] Checks default values of every basic config type (bool, nested bool,
+        # optional, int, float, str, list, set, tuple, dict, None) and that reading an unknown
+        # name raises AttributeError.
         self.assertTrue(config.e_bool)
         self.assertTrue(config.nested.e_bool)
         self.assertTrue(config.e_optional)
@@ -52,10 +65,15 @@ class TestConfigModule(TestCase):
             config.does_not_exist
 
     def test_type_loading(self):
+        # [FUNCTION DOC] Checks that the declared type of an optional bool entry and of a None-
+        # default entry is reported as bool or None.
         self.assertEqual(config.get_type("e_optional"), bool | None)
         self.assertEqual(config.get_type("e_none"), bool | None)
 
     def test_overrides(self):
+        # [FUNCTION DOC] Assigns a new value to each config type, verifies it is read back, and
+        # checks that optional entries accept None. Assigning an unknown name must raise
+        # AttributeError.
         config.e_bool = False
         self.assertFalse(config.e_bool)
         config.nested.e_bool = False
@@ -88,6 +106,9 @@ class TestConfigModule(TestCase):
             config.does_not_exist = 0
 
     def test_hide_not_added_to_instance_dict_on_write(self):
+        # [FUNCTION DOC] Verifies that a normal write does not add a hide attribute to the entry
+        # instance dictionary (it stays at the class default), while a write to an entry whose
+        # hide flag is set clears that flag.
         # A normal config write must not materialize 'hide' in the _ConfigEntry instance
         # __dict__; it should stay on the class default. An unconditional hide=False write
         # on every setattr would add it (pure overhead), so __setattr__ clears hide only
@@ -102,12 +123,16 @@ class TestConfigModule(TestCase):
         self.assertFalse(entry.hide)
 
     def test_none_override_semantics(self):
+        # [FUNCTION DOC] Verifies that explicitly assigning None is a real override (reads back
+        # None, not the default), then resets all overrides to the unset sentinel by hand.
         config.e_bool = None
         self.assertIsNone(config.e_bool)
         for k in config._config:
             config._config[k].user_override.set(_UNSET_SENTINEL)
 
     def test_reference_semantics(self):
+        # [FUNCTION DOC] Verifies that list, set and dict defaults are returned by reference, so
+        # in-place mutation of the returned container is visible on later reads.
         config.e_list.append(2)
         self.assertEqual(config.e_list, [1, 2])
         config.e_set.add(2)
@@ -116,6 +141,9 @@ class TestConfigModule(TestCase):
         self.assertEqual(config.e_dict, {1: 2, 2: 3})
 
     def test_env_name_semantics(self):
+        # [FUNCTION DOC] Checks environment-variable semantics: a default env name sets the
+        # initial value (parsed as bool, so "0" is False) and can be overridden by assignment,
+        # while a forced env name keeps the value true even after assignment of False.
         self.assertTrue(config.e_env_default)
         self.assertFalse(config.e_env_default_FALSE)
         self.assertTrue(config.e_env_force)
@@ -125,16 +153,24 @@ class TestConfigModule(TestCase):
         self.assertTrue(config.e_env_force)
 
     def test_env_name_string_semantics(self):
+        # [FUNCTION DOC] Checks that string entries taking defaults from env vars keep the raw
+        # string, including the empty string, and can be overridden by assignment.
         self.assertEqual(config.e_env_default_str, "1234")
         self.assertEqual(config.e_env_default_str_empty, "")
         config.e_env_default_str = "override"
         self.assertEqual(config.e_env_default_str, "override")
 
     def test_multi_env(self):
+        # [FUNCTION DOC] Checks that entries in the second fake module listing multiple env var
+        # names (default and forced variants) resolve to true.
         self.assertTrue(config2.e_env_default_multi)
         self.assertTrue(config2.e_env_force_multi)
 
     def test_save_config(self):
+        # [FUNCTION DOC] Saves the config under a FutureWarning filter, unpickles the bytes and
+        # compares against the full expected mapping including ignored keys, then changes values,
+        # reloads the saved bytes, and checks that the saved entry is restored while the ignored
+        # one is not.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=FutureWarning)
             p = config.save_config()
@@ -177,6 +213,8 @@ class TestConfigModule(TestCase):
         self.assertFalse(config.e_ignored)
 
     def test_save_config_with_patch(self):
+        # [FUNCTION DOC] Checks that saving config inside a patch context records the patched
+        # value (False for the boolean entry) while all other entries keep their defaults.
         self.assertTrue(config.e_bool)
         with config.patch(e_bool=False):
             p = config.save_config()
@@ -213,6 +251,9 @@ class TestConfigModule(TestCase):
             )
 
     def test_save_config_portable(self):
+        # [FUNCTION DOC] Checks the portable save format: a plain mapping with the same entries
+        # but without the underscore-prefixed and cache-ignore bookkeeping keys. Reloads it after
+        # changes and checks the regular entry is restored but the underscore-ignored one is not.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=FutureWarning)
             p = config.save_config_portable()
@@ -252,6 +293,9 @@ class TestConfigModule(TestCase):
         self.assertFalse(config._e_ignored)
 
     def test_codegen_config(self):
+        # [FUNCTION DOC] Sets one entry and an ignored entry to False, generates source text for
+        # the config, and compares it with an exact expected string listing only entries that
+        # differ from defaults or come from environment settings.
         config.e_bool = False
         config.e_ignored = False
         code = config.codegen_config()
@@ -266,6 +310,10 @@ torch.testing._internal.fake_config_module.e_env_force = True""",
         )
 
     def test_codegen_config_function(self):
+        # [FUNCTION DOC] Stores functions in list, set and function-valued entries of the third
+        # fake module and checks that generated code imports the owning modules and renders list
+        # members as quoted dotted names, set members unquoted, and the function entry as a dotted
+        # reference.
         import logging
         import warnings
 
@@ -283,6 +331,9 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         )
 
     def test_get_hash(self):
+        # [FUNCTION DOC] Checks get_hash against a fixed expected digest, that repeated calls
+        # return the cached value, that a manually injected cache value is returned, that changing
+        # a hashed entry changes the hash, and that changing a compile-ignored entry does not.
         hash_value = b"#d\x8b\xd3\xbc'\xf5\x0c\xcd\xb6\x87zDw6g"
 
         with warnings.catch_warnings():
@@ -319,6 +370,9 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         )
 
     def test_dict_copy_semantics(self):
+        # [FUNCTION DOC] Compares shallow_copy_dict, to_dict and get_config_copy results with the
+        # full expected mapping (including ignored keys), then mutates a nested dict default and
+        # verifies the earlier copies are unaffected by that mutation.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=FutureWarning)
             p = config.shallow_copy_dict()
@@ -433,6 +487,9 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(p3["e_dict"], {1: 2})
 
     def test_patch(self):
+        # [FUNCTION DOC] Checks patch as a context manager with positional name/value and keyword
+        # forms, that the value is restored on exit, and that patching an unknown name raises
+        # AssertionError.
         self.assertTrue(config.e_bool)
         with config.patch("e_bool", False):
             self.assertFalse(config.e_bool)
@@ -445,10 +502,15 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
                 pass
 
     def _assert_patch_reentrant_across_threads(self, fn):
+        # [FUNCTION DOC] HELPER: Runs the given function in two threads with a shared two-party
+        # barrier, collects any exceptions as text, and asserts none occurred and the config is
+        # back to default.
         barrier = threading.Barrier(2, timeout=5)
         errors: queue.SimpleQueue[str] = queue.SimpleQueue()
 
         def worker():
+            # [FUNCTION DOC] HELPER: Thread body that calls the supplied function with the barrier
+            # and records any exception representation in the shared queue.
             try:
                 fn(barrier)
             except Exception as e:
@@ -474,9 +536,14 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertTrue(config.e_bool)
 
     def test_patch_context_manager_is_reentrant_across_threads(self):
+        # [FUNCTION DOC] Uses one patcher object as a context manager in two threads at once and
+        # checks the patched value is seen in both before and after the barrier (reentrant across
+        # threads).
         patcher = config.patch(e_bool=False)
 
         def fn(barrier):
+            # [FUNCTION DOC] HELPER: Enters the shared patcher, checks the value is patched, waits
+            # at the barrier, and checks again.
             with patcher:
                 self.assertFalse(config.e_bool)
                 barrier.wait()
@@ -485,6 +552,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self._assert_patch_reentrant_across_threads(fn)
 
     def test_patch_context_manager_is_reentrant_when_nested(self):
+        # [FUNCTION DOC] Enters the same patcher object twice, nested, and checks the patched
+        # value holds through the inner exit and is restored only after the outer exit.
         patcher = config.patch(e_bool=False)
 
         with patcher:
@@ -496,8 +565,12 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertTrue(config.e_bool)
 
     def test_patch_decorator_is_reentrant_across_threads(self):
+        # [FUNCTION DOC] Uses patch as a function decorator and runs the decorated function in two
+        # threads, checking the patched value is visible in each (reentrant across threads).
         @config.patch(e_bool=False)
         def fn(barrier):
+            # [FUNCTION DOC] HELPER: Decorated function body; checks the patched value, waits at
+            # the barrier, checks again.
             self.assertFalse(config.e_bool)
             barrier.wait()
             self.assertFalse(config.e_bool)
@@ -505,12 +578,17 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self._assert_patch_reentrant_across_threads(fn)
 
     def test_make_closur_patcher(self):
+        # [FUNCTION DOC] Checks the closure patcher: calling the returned change function applies
+        # the override and returns a revert callable that restores the original value.
         revert = config._make_closure_patcher(e_bool=False)()
         self.assertFalse(config.e_bool)
         revert()
         self.assertTrue(config.e_bool)
 
     def test_unittest_patch(self):
+        # [FUNCTION DOC] Checks that unittest.mock patching of a config attribute, including
+        # nested patches of the same name, behaves correctly and restores the original value
+        # afterwards.
         with patch("torch.testing._internal.fake_config_module.e_bool", False):
             with patch("torch.testing._internal.fake_config_module.e_bool", False):
                 self.assertFalse(config.e_bool)
@@ -519,6 +597,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertTrue(config.e_bool)
 
     def test_bad_jk_type(self):
+        # [FUNCTION DOC] Checks that constructing a config entry with a non-boolean default and a
+        # justknob raises AssertionError.
         with self.assertRaises(
             AssertionError,
             msg="AssertionError: justknobs only support booleans, thisisnotvalid is not a boolean",
@@ -526,6 +606,9 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
             _ConfigEntry(Config(default="bad", justknob="fake_knob"), "test")
 
     def test_alias(self):
+        # [FUNCTION DOC] Checks aliasing between the two fake modules: both read the same default,
+        # and patching either the aliasing or the aliased name changes the value seen through
+        # both.
         self.assertFalse(config2.e_aliasing_bool)
         self.assertFalse(config.e_aliased_bool)
         with config2.patch(e_aliasing_bool=True):
@@ -535,12 +618,16 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
             self.assertTrue(config2.e_aliasing_bool)
 
     def test_reference_is_default(self):
+        # [FUNCTION DOC] Checks that the is-default query is true for an untouched mutable default
+        # and false after the returned dict has been mutated in place.
         t = config.e_dict
         self.assertTrue(config._is_default("e_dict"))
         t["a"] = "b"
         self.assertFalse(config._is_default("e_dict"))
 
     def test_invalid_config_int(self):
+        # [FUNCTION DOC] Checks that an integer entry with a default env name and an int value
+        # type is rejected with AssertionError at construction.
         with self.assertRaises(AssertionError):
             _ConfigEntry(
                 Config(default=2, env_name_default="FAKE_DISABLE", value_type=int),
@@ -548,6 +635,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
             )
 
     def test_invalid_config_float(self):
+        # [FUNCTION DOC] Checks that a float entry with a forced env name and a float value type
+        # is rejected with AssertionError at construction.
         with self.assertRaises(AssertionError):
             _ConfigEntry(
                 Config(default=2, env_name_force="FAKE_DISABLE", value_type=float),
@@ -555,6 +644,9 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
             )
 
     def test_deprecated_config(self):
+        # [FUNCTION DOC] Checks that reading or writing a deprecated entry emits exactly one
+        # FutureWarning naming the entry, saying it is no longer needed and will be removed, and
+        # that the entry still works normally including under patch.
         """Test that deprecated configs warn on access but still work normally."""
         config._config["e_deprecated"]._deprecation_warned = False
 
@@ -585,6 +677,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertTrue(config.e_deprecated)
 
     def test_deprecated_config_warn_once(self):
+        # [FUNCTION DOC] Checks that the deprecation warning is emitted only once per entry across
+        # repeated reads and a write.
         """Test that deprecation warning is only issued once per config."""
         config._config["e_deprecated"]._deprecation_warned = False
 
@@ -599,6 +693,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
             self.assertEqual(len(w), 1)
 
     def test_deprecated_alias_config(self):
+        # [FUNCTION DOC] Checks that an aliased deprecated entry warns with its own name and
+        # custom message, and that its value comes from the entry it aliases.
         """Test that aliased deprecated configs issue their own warning."""
         config._config["e_deprecated_alias"]._deprecation_warned = False
 
@@ -612,6 +708,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
             self.assertIn("use something else instead", str(w[0].message))
 
     def test_no_warnings_for_normal_user_code(self):
+        # [FUNCTION DOC] Compiles and runs a trivial function with the eager backend and checks
+        # that no FutureWarning mentioning deprecated config was emitted.
         """Test that normal user operations don't produce deprecation warnings."""
         import torch
 
@@ -621,6 +719,7 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
             # Simple user code - compile and run a function
             @torch.compile(backend="eager")
             def fn(x):
+                # [FUNCTION DOC] HELPER: Compiled function that returns its input plus one.
                 return x + 1
 
             _ = fn(torch.ones(3))
@@ -640,6 +739,7 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
             )
 
     def test_patch_then_global(self):
+        # [FUNCTION DOC] Checks that a global assignment after a patch context has exited sticks.
         self.assertTrue(config.e_bool)
         with config.patch(e_bool=False):
             self.assertFalse(config.e_bool)
@@ -648,17 +748,23 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertFalse(config.e_bool)
 
     def test_is_default_patch(self):
+        # [FUNCTION DOC] Checks that an entry is not considered default while a patch overrides
+        # it.
         self.assertTrue(config.e_bool)
         with config.patch(e_bool=False):
             self.assertFalse(config._is_default("e_bool"))
 
     def test_dict_patch(self):
+        # [FUNCTION DOC] Checks that the internal dict snapshot reflects a value patched at that
+        # time.
         self.assertTrue(config.e_bool)
         with config.patch(e_bool=False):
             d = config._get_dict()
             self.assertFalse(d["e_bool"])
 
     def test_set_in_patch(self):
+        # [FUNCTION DOC] Checks that assigning inside a patch context takes effect, but that
+        # leaving the patch restores the original default, discarding the explicit assignment.
         self.assertEqual(config.e_int, 1)
         with config.patch(e_int=2):
             self.assertEqual(config.e_int, 2)
@@ -668,6 +774,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(config.e_int, 1)
 
     def test_nested_patch(self):
+        # [FUNCTION DOC] Checks nested patches of overlapping entries: inner values shadow outer
+        # ones, unpatched entries keep outer values, and each exit restores the previous layer.
         self.assertEqual(config.e_int, 1)
         self.assertEqual(config.e_string, "string")
         with config.patch(e_int=2, e_string="inner"):
@@ -683,12 +791,15 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(config.e_string, "string")
 
     def test_get_dict_readonly_values_caching(self):
+        # [FUNCTION DOC] Checks that two readonly snapshots of the config dict compare equal.
         """readonly_values=True should return cached results on repeated calls."""
         d1 = config._get_dict(readonly_values=True)
         d2 = config._get_dict(readonly_values=True)
         self.assertEqual(d1, d2)
 
     def test_get_dict_readonly_values_cache_invalidation(self):
+        # [FUNCTION DOC] Checks that changing an entry after a readonly snapshot is reflected in
+        # the next readonly snapshot.
         """Mutating a config key should be reflected in subsequent cached calls."""
         d1 = config._get_dict(readonly_values=True)
         self.assertEqual(d1["e_int"], 1)
@@ -697,6 +808,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(d2["e_int"], 42)
 
     def test_get_dict_readonly_values_does_not_mutate_prior_result(self):
+        # [FUNCTION DOC] Checks that changing config after taking a readonly snapshot does not
+        # alter the snapshot already returned.
         """Mutating config after a cached call should not affect the prior result."""
         d1 = config._get_dict(readonly_values=True)
         self.assertEqual(d1["e_int"], 1)
@@ -706,6 +819,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(d2["e_int"], 42)
 
     def test_get_dict_readonly_values_multiple_cache_keys(self):
+        # [FUNCTION DOC] Checks that snapshots taken with different ignored-key filters are cached
+        # independently and both pick up a later change.
         """Different filter arguments should produce independent cached results."""
         d_all = config._get_dict(readonly_values=True)
         d_filtered = config._get_dict(ignored_keys=["e_int"], readonly_values=True)
@@ -720,6 +835,9 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(d_filtered2["e_string"], "changed")
 
     def test_get_dict_readonly_values_full_dirty_clears_cache(self):
+        # [FUNCTION DOC] Sets every non-alias entry up to one more than the dirty-key cap to its
+        # default, then checks the dirty-key tracker becomes None (fully dirty) and a snapshot is
+        # still produced.
         """Exceeding the dirty keys cap should trigger a full cache rebuild."""
         config._get_dict(readonly_values=True)
         # Mutate more distinct keys than the cap to force fully dirty state.
@@ -732,6 +850,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertIsNotNone(d)
 
     def test_get_dict_non_readonly_ignores_cache(self):
+        # [FUNCTION DOC] Checks that non-readonly snapshots do not populate the cache variable and
+        # always reflect current values.
         """Non-readonly calls should not use or pollute the cache."""
         d1 = config._get_dict(readonly_values=False)
         self.assertIsNone(config._get_dict_cache_var.get())
@@ -741,6 +861,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(d1["e_int"], 1)
 
     def test_get_dict_cache_not_poisoned_by_caller_mutation(self):
+        # [FUNCTION DOC] Checks that mutating a returned readonly snapshot does not corrupt later
+        # cached snapshots.
         """Mutating a returned dict must not affect subsequent cached calls."""
         d1 = config._get_dict(readonly_values=True)
         d1["e_int"] = 999
@@ -748,6 +870,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(d2["e_int"], 1)
 
     def test_get_dict_cache_invalidated_by_delattr(self):
+        # [FUNCTION DOC] Checks that deleting an overridden entry invalidates the cache so the
+        # default is returned afterwards.
         """Deleting a config key should invalidate the cache."""
         config.e_int = 42
         d1 = config._get_dict(readonly_values=True)
@@ -758,6 +882,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(d2["e_int"], 1)
 
     def test_get_dict_cache_invalidated_by_patch(self):
+        # [FUNCTION DOC] Checks that snapshots see values changed by patch on entry and the
+        # restored value after exit.
         """Config changes via patch() should be reflected in cached results."""
         d1 = config._get_dict(readonly_values=True)
         self.assertEqual(d1["e_int"], 1)
@@ -768,6 +894,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(d3["e_int"], 1)
 
     def test_get_dict_cache_invalidated_by_closure_patcher(self):
+        # [FUNCTION DOC] Checks that applying and reverting a closure patcher is reflected in
+        # snapshots.
         """Config changes via _make_closure_patcher should be reflected in cached results."""
         d1 = config._get_dict(readonly_values=True)
         self.assertEqual(d1["e_int"], 1)
@@ -782,6 +910,9 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertEqual(d3["e_int"], 1)
 
     def test_get_hash_per_thread_isolation(self):
+        # [FUNCTION DOC] Computes the hash in the main thread, changes an entry in a second thread
+        # and hashes there, then checks the main thread hash is unchanged and the thread hash
+        # differs. Re-raises any exception captured from the thread.
         """Each thread should compute its own hash based on its own config values."""
         import threading
 
@@ -791,6 +922,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         error = [None]
 
         def thread_fn():
+            # [FUNCTION DOC] HELPER: Thread body that sets the integer entry to a new value,
+            # stores the hash in a shared list, and stores any exception in a shared list.
             try:
                 config.e_int = 999
                 thread_hash[0] = config.get_hash()
@@ -809,6 +942,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertNotEqual(thread_hash[0], base_hash)
 
     def test_hash_dirty_on_setattr(self):
+        # [FUNCTION DOC] Checks the hash dirty flag is cleared after hashing and set after a plain
+        # write.
         """Direct config assignment should mark the hash dirty."""
         config.get_hash()
         self.assertFalse(config._hash_dirty_var.get())
@@ -816,6 +951,7 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertTrue(config._hash_dirty_var.get())
 
     def test_hash_dirty_on_delattr(self):
+        # [FUNCTION DOC] Checks the hash dirty flag is set after deleting an overridden entry.
         """Deleting a config key should mark the hash dirty."""
         config.get_hash()
         self.assertFalse(config._hash_dirty_var.get())
@@ -823,6 +959,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertTrue(config._hash_dirty_var.get())
 
     def test_hash_dirty_on_patch(self):
+        # [FUNCTION DOC] Checks the dirty flag is set on entering a patch, cleared by hashing, and
+        # set again after exit restores old values.
         """Entering and exiting a patch should mark the hash dirty."""
         config.get_hash()
         self.assertFalse(config._hash_dirty_var.get())
@@ -834,6 +972,8 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertTrue(config._hash_dirty_var.get())
 
     def test_hash_dirty_on_closure_patcher(self):
+        # [FUNCTION DOC] Checks the dirty flag is set by applying a closure patcher and again by
+        # reverting it.
         """_make_closure_patcher should mark the hash dirty on apply and revert."""
         config.get_hash()
         self.assertFalse(config._hash_dirty_var.get())
@@ -846,6 +986,7 @@ torch.testing._internal.fake_config_module3.e_func = _warnings.warn""",
         self.assertTrue(config._hash_dirty_var.get())
 
     def test_hash_dirty_on_load_config(self):
+        # [FUNCTION DOC] Checks the dirty flag is set after loading a previously saved config.
         """Loading a saved config should mark the hash dirty."""
         saved = config.save_config()
         config.get_hash()

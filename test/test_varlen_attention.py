@@ -1,4 +1,12 @@
 # Owner(s): ["module: sdpa"]
+# [MODULE DOC] Tests for torch.nn.attention.varlen (varlen_attn and varlen_attn_out) on packed
+# variable-length batches. Defines backend context managers (FA2 default, FA3, FA4, cuDNN), a
+# small attention block used to compare packed varlen results against padded scaled dot product
+# attention and a float32 golden reference, helpers to build ragged batches and paged KV caches,
+# and a device-generic TestVarlenAttention class. Covers numerics (forward and gradients), custom
+# op registration and opcheck compliance, batch invariance, seqused_k and block_table KV caches,
+# cuDNN specifics (LSE layout, cached graph layouts, validation errors) and grouped query
+# attention rules. At import time the test class is instantiated for the cuda device type only.
 import math
 import unittest
 from collections import namedtuple
@@ -38,6 +46,9 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 @contextmanager
 def use_fa3():
+    # [FUNCTION DOC] HELPER: Context manager that activates the FA3 flash attention implementation
+    # and restores the previous implementation on exit. Raises unittest.SkipTest if activation
+    # fails with a missing module or runtime error (FA3 not installed).
     try:
         activate_flash_attention_impl("FA3")
     except (ModuleNotFoundError, RuntimeError) as err:
@@ -52,6 +63,9 @@ def use_fa3():
 
 @contextmanager
 def use_fa4():
+    # [FUNCTION DOC] HELPER: Context manager that activates the FA4 flash attention implementation
+    # and restores the previous implementation on exit. Raises unittest.SkipTest if activation
+    # fails with a missing module or runtime error.
     try:
         activate_flash_attention_impl("FA4")
     except (ModuleNotFoundError, RuntimeError) as err:
@@ -63,6 +77,9 @@ def use_fa4():
 
 
 def _use_backend(backend):
+    # [FUNCTION DOC] HELPER: Maps a backend name (fa2, fa3, fa4 or cudnn) to a fresh context
+    # manager: fa2 and cudnn give a do-nothing context, fa3 and fa4 give the activation managers
+    # above. An unknown name raises KeyError.
     return {
         "fa2": nullcontext,
         "fa3": use_fa3,
@@ -72,6 +89,10 @@ def _use_backend(backend):
 
 
 def _check_cudnn_varlen_supported(device):
+    # [FUNCTION DOC] HELPER: Skips the calling test (raises unittest.SkipTest) unless cuDNN varlen
+    # attention is usable: the platform must support cuDNN attention, the cuDNN version must be
+    # known and at least 9.18, and the varlen module must decide to use cuDNN for the device index
+    # (the current CUDA device is used when the device has no index).
     if not PLATFORM_SUPPORTS_CUDNN_ATTENTION:
         raise unittest.SkipTest("cuDNN Attention is not supported on this system")
     cudnn_version = torch.backends.cudnn.version()
@@ -89,6 +110,9 @@ def _check_cudnn_varlen_supported(device):
 
 @contextmanager
 def _use_cudnn_varlen(_should_use_cudnn, device):
+    # [FUNCTION DOC] HELPER: Context manager that, when the flag is true, first checks cuDNN
+    # varlen support (may skip the test) and then patches the varlen module so its cuDNN-selection
+    # predicate returns the given flag for the duration of the block, restoring it afterwards.
     if _should_use_cudnn:
         _check_cudnn_varlen_supported(device)
 
@@ -99,6 +123,9 @@ def _use_cudnn_varlen(_should_use_cudnn, device):
 
 
 def _varlen_backends(*, include_fa4_paged_kv: bool) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the list of flash attention backend names to parametrize
+    # over: always fa2, fa3 when running on an SM90 device, and fa4 when the device is SM100 or
+    # later (SM90 or later when paged KV is not needed) and is not SM120 or later.
     fa4_supported = (
         SM100OrLater if include_fa4_paged_kv else SM90OrLater
     ) and not SM120OrLater
@@ -113,18 +140,29 @@ VarlenShape = namedtuple(
 
 
 class OpLoggingMode(TorchDispatchMode):
+    # [CLASS DOC] HELPER: Dispatch mode that records the string name of every operator dispatched
+    # inside it in a list attribute called_ops and then runs the operator unchanged.
     """Logging mode that captures all dispatched operations"""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes the empty list of recorded operator names.
         self.called_ops = []
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] HELPER: Dispatch hook; appends the string form of the operator to the
+        # record and returns the result of running the operator with the given arguments (keyword
+        # arguments default to empty).
         op_name = str(func)
         self.called_ops.append(op_name)
         return func(*args, **(kwargs or {}))
 
 
 class AttentionBlock(nn.Module):
+    # [CLASS DOC] HELPER: Small attention module with a query projection, a combined key/value
+    # projection and an output projection (all bias-free linear layers) used to run the same
+    # weights through varlen attention on packed input and through scaled dot product attention on
+    # padded input. Number of key/value heads defaults to the number of query heads; it is smaller
+    # for GQA.
     def __init__(
         self,
         embed_dim: int,
@@ -133,6 +171,9 @@ class AttentionBlock(nn.Module):
         dtype: torch.dtype,
         num_kv_heads: int | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Stores the dimensions (the head size is the embedding size
+        # divided by the number of query heads) and creates the three linear projections on the
+        # given device and dtype.
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -159,12 +200,17 @@ class AttentionBlock(nn.Module):
 
     @property
     def enable_gqa(self):
+        # [FUNCTION DOC] HELPER: Property that is true when the number of key/value heads differs
+        # from the number of query heads (grouped query attention).
         return self.num_kv_heads != self.num_heads
 
     def get_varlen_qkv(
         self,
         x_packed: torch.Tensor,
     ):
+        # [FUNCTION DOC] HELPER: Projects packed tokens into query, key and value tensors shaped
+        # as tokens by heads by head size; key and value come from splitting the combined
+        # projection. Returns the tuple of the three tensors (key and value are views).
         q = self.q_proj(x_packed).view(-1, self.num_heads, self.head_dim)
         kv = self.kv_proj(x_packed).view(-1, 2, self.num_kv_heads, self.head_dim)
         k, v = kv[:, 0], kv[:, 1]
@@ -178,6 +224,10 @@ class AttentionBlock(nn.Module):
         scale: float | None = None,
         window_size: tuple[int, int] = (-1, -1),
     ):
+        # [FUNCTION DOC] HELPER: Runs varlen attention on packed tokens using the same cumulative
+        # sequence offsets and maximum length for queries and keys, passing the optional scale,
+        # the window size and the GQA flag, then applies the output projection. Returns packed
+        # output of shape tokens by embedding size.
         q, k, v = self.get_varlen_qkv(x_packed)
 
         attn_out = varlen_attn(
@@ -203,6 +253,13 @@ class AttentionBlock(nn.Module):
         scale: float | None = None,
         window_size: tuple[int, int] = (-1, -1),
     ):
+        # [FUNCTION DOC] HELPER: Reference path using padded input and per-sequence lengths.
+        # Builds a boolean attention mask from the padding, intersects it with a lower-triangular
+        # mask when the window is exactly the causal window (unbounded left, zero right) and with
+        # a band mask built by a loop when either window bound is non-negative, then calls scaled
+        # dot product attention with the mask (forcing the math backend when GQA is enabled) and
+        # applies the output projection. Returns padded output of shape batch by length by
+        # embedding size.
         batch_size, seq_len, _ = x_padded.shape
 
         q = self.q_proj(x_padded)
@@ -278,6 +335,9 @@ class AttentionBlock(nn.Module):
 
 
 def pack_sequences(seqs, device):
+    # [FUNCTION DOC] HELPER: Concatenates a list of per-sequence tensors along the token
+    # dimension. Returns the packed tensor, an int32 cumulative offsets tensor with one extra
+    # leading zero, and the maximum sequence length as a Python integer.
     x_packed = torch.cat(seqs, dim=0)
     seq_lens = torch.tensor([len(s) for s in seqs], device=device)
     cu_seq = torch.zeros(len(seqs) + 1, device=device, dtype=torch.int32)
@@ -288,6 +348,9 @@ def pack_sequences(seqs, device):
 
 
 def gather_paged_cache(cache: torch.Tensor, block_table: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Rebuilds a logical batch-major KV tensor from a physical page pool by
+    # gathering pages in the order given by the block table (one row per sequence). Returns a
+    # tensor of shape batch by pages-times-page-size by heads by head size.
     """Gather a logical batched KV cache from a physical page pool."""
     page_size, num_heads, head_dim = cache.shape[1:]
     index = block_table.flatten().long().view(-1, 1, 1, 1)
@@ -301,6 +364,12 @@ def create_variable_length_batch(
     dtype: torch.dtype,
     seq_lengths: list[int] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Builds random float32 sequences and the matching packed, padded and
+    # reference-padded inputs. When no lengths are given, each of the batch-size lengths is a
+    # random multiple of 64 capped at the maximum; otherwise the lengths must match the batch size
+    # or a ValueError is raised. Returns a mapping with the lengths tensor, cumulative offsets,
+    # packed and padded inputs in the target dtype (both requiring grad), the float32 padded
+    # reference input (requiring grad), and the maximum length.
     if seq_lengths is None:
         seq_lengths = []
         for _ in range(shape.batch_size):
@@ -341,6 +410,9 @@ def create_variable_length_batch(
 
 
 class TestVarlenAttention(NNTestCase):
+    # [CLASS DOC] Device-generic tests for varlen attention, instantiated for cuda. Includes the
+    # shared comparison helper used by the numerics tests and individual tests for ops, caches and
+    # cuDNN.
     def _test_varlen_vs_sdpa(
         self,
         device,
@@ -352,6 +424,15 @@ class TestVarlenAttention(NNTestCase):
         _should_use_cudnn=False,
         sdpa_backend=None,
     ):
+        # [FUNCTION DOC] HELPER: Core numerics check. Builds a ragged batch (fixed lengths when
+        # cuDNN is required, random otherwise) and two attention blocks sharing weights: float32
+        # golden and low-precision. Runs the varlen forward under the chosen backend (spying on
+        # the cuDNN forward when required and failing if it is not called), the padded SDPA
+        # forward, and the golden forward, and asserts per-sequence varlen error is within twice
+        # the SDPA error plus a rounding tolerance. Then feeds a shared random output gradient
+        # through all three paths (again spying on the cuDNN backward) and applies the same bound
+        # to the input gradients. Raises AssertionError on failure. On ROCm it selects the
+        # preferred flash library first.
         if TEST_WITH_ROCM:
             torch.backends.cuda.preferred_rocm_fa_library(sdpa_backend)
 
@@ -555,6 +636,11 @@ class TestVarlenAttention(NNTestCase):
         _varlen_backends(include_fa4_paged_kv=False),
     )
     def test_basic_functionality(self, device, dtype, backend, sdpa_backend=None):
+        # [FUNCTION DOC] Smoke test for packed varlen attention with two equal-length sequences:
+        # checks output shape, device and dtype, checks that the out-buffer variant writes in
+        # place (same storage) and matches the allocating variant within a dtype-dependent
+        # tolerance, and checks the input gradient exists with matching shape and dtype. Runs per
+        # backend and dtype.
         if TEST_WITH_ROCM:
             torch.backends.cuda.preferred_rocm_fa_library(sdpa_backend)
 
@@ -636,6 +722,9 @@ class TestVarlenAttention(NNTestCase):
     )
     @parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_custom_op_compliance(self, device, dtype, sdpa_backend=None):
+        # [FUNCTION DOC] Runs operator compliance checks on the registered custom ops: full
+        # opcheck on the forward op, schema and fake tensor checks only on the backward op (double
+        # backward is not supported) and on the out-variant op.
         if TEST_WITH_ROCM:
             torch.backends.cuda.preferred_rocm_fa_library(sdpa_backend)
         torch.manual_seed(42)
@@ -718,6 +807,10 @@ class TestVarlenAttention(NNTestCase):
     )
     @parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_custom_op_registration(self, device, dtype, sdpa_backend=None):
+        # [FUNCTION DOC] Compiles the block forward with the eager backend under a dispatch
+        # logging mode, runs forward and backward, and asserts the custom forward and backward
+        # varlen ops were dispatched. Then compiles a small function that calls the out-variant
+        # and asserts the custom out op was dispatched. Raises AssertionError otherwise.
         if TEST_WITH_ROCM:
             torch.backends.cuda.preferred_rocm_fa_library(sdpa_backend)
         torch.manual_seed(42)
@@ -768,6 +861,8 @@ class TestVarlenAttention(NNTestCase):
         q, k, v = attention_block.get_varlen_qkv(x_packed.detach())
 
         def run_varlen_out(q, k, v, cu_seq, max_len):
+            # [FUNCTION DOC] HELPER: Allocates an empty buffer shaped like the query, fills it via
+            # the out-variant varlen attention, and returns the buffer.
             out_buf = torch.empty_like(q)
             varlen_attn_out(out_buf, q, k, v, cu_seq, cu_seq, max_len, max_len)
             return out_buf
@@ -813,6 +908,9 @@ class TestVarlenAttention(NNTestCase):
     def test_varlen_vs_sdpa(
         self, device, dtype, scale, window_size, backend, enable_gqa, sdpa_backend=None
     ):
+        # [FUNCTION DOC] Parametrized comparison of varlen attention against padded SDPA across
+        # dtypes, scales, window sizes, backends and GQA, delegating to the shared helper without
+        # cuDNN.
         self._test_varlen_vs_sdpa(
             device,
             dtype,
@@ -829,6 +927,8 @@ class TestVarlenAttention(NNTestCase):
     @parametrize("dtype", [torch.bfloat16, torch.float16])
     @parametrize("_should_use_cudnn", [True])
     def test_cudnn_attention_varlen(self, device, dtype, _should_use_cudnn):
+        # [FUNCTION DOC] Same numerics comparison as the generic test but forcing the cuDNN path
+        # (default scale, no window, no GQA); skipped on ROCm.
         self._test_varlen_vs_sdpa(
             device,
             dtype,
@@ -864,6 +964,11 @@ class TestVarlenAttention(NNTestCase):
     def test_batch_invariance(
         self, device, dtype, num_splits, window_size, backend, sdpa_backend=None
     ):
+        # [FUNCTION DOC] Checks batch invariance: attention for a target sequence computed alone
+        # must equal its slice of a batch where it is packed with another sequence, for both the
+        # allocating and the out-variant. Exact equality is asserted when a single split is
+        # requested and for cuDNN; for FA3 with default splits the results are asserted to differ.
+        # cuDNN with a window or a split count is skipped, as is a split count on ROCm.
         use_cudnn = backend == "cudnn"
         if use_cudnn and (window_size != (-1, -1) or num_splits is not None):
             self.skipTest("cuDNN does not support window_size or num_splits")
@@ -1022,6 +1127,11 @@ class TestVarlenAttention(NNTestCase):
     def test_seqused_k_kv_cache(
         self, device, dtype, actual_kv_lens, backend, sdpa_backend=None
     ):
+        # [FUNCTION DOC] Single-token queries against a padded KV cache whose unused rows are
+        # filled with NaN, using seqused_k to give real key lengths. Asserts the output has no NaN
+        # and equals the reference computed from tightly packed keys; also checks the out-variant
+        # matches and writes in place. CK on ROCm is skipped; cases with short KV lengths are
+        # marked expected failures for non-FA2 backends.
         if TEST_WITH_ROCM:
             if sdpa_backend == "ck":
                 self.skipTest("CK backend does not support seqused_k")
@@ -1150,6 +1260,11 @@ class TestVarlenAttention(NNTestCase):
     def test_block_table_kv_cache(
         self, device, dtype, page_size, compile, actual_kv_lens, backend
     ):
+        # [FUNCTION DOC] Paged KV cache test using a shuffled block table over a page pool. Resets
+        # Dynamo state first. Compares paged attention (optionally compiled with full graph), the
+        # out-variant, and for non-FA2 backends a compiled flash aten op, against a reference
+        # built from the gathered contiguous keys. For FA2 additionally requires bitwise equality
+        # with a single split. FA2 is skipped unless the page size is a multiple of 256.
         if backend == "fa2" and page_size % 256 != 0:
             self.skipTest("FA2 paged KV requires page_size divisible by 256")
 
@@ -1319,6 +1434,10 @@ class TestVarlenAttention(NNTestCase):
         ],
     )
     def test_cudnn_kv_cache(self, device, dtype, paged, page_size, strided_table):
+        # [FUNCTION DOC] Runs cuDNN varlen attention with seqused_k on either a packed contiguous
+        # KV cache or a paged cache (optionally with a non-contiguous block table), asserts the
+        # cuDNN forward ran exactly once, and compares the output against a per-sequence float32
+        # softmax attention reference within a loose tolerance.
         """Test cuDNN seqused_k with packed and paged KV caches."""
         torch.manual_seed(42)
         actual_kv_lens = [200, 128, 7, 300]
@@ -1402,6 +1521,9 @@ class TestVarlenAttention(NNTestCase):
     @skipIfRocm
     @parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_cudnn_varlen_lse(self, device, dtype):
+        # [FUNCTION DOC] Requests the log-sum-exp auxiliary output from cuDNN varlen attention,
+        # asserts the cuDNN forward ran once and the LSE has heads by total-query-tokens layout,
+        # and compares it with a log-sum-exp computed per sequence from float32 scores.
         """cuDNN returns log-sum-exp in (num_heads, total_q) layout."""
         torch.manual_seed(42)
         num_heads, head_dim = 4, 64
@@ -1451,6 +1573,10 @@ class TestVarlenAttention(NNTestCase):
     @skipIfRocm
     @parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_cudnn_varlen_cached_graph_grad_out_layout(self, device, dtype):
+        # [FUNCTION DOC] Runs the varlen backward through cuDNN with grad outputs of different
+        # layouts (contiguous, padded row stride, zero stride expanded, misaligned storage) to
+        # make sure cached backward graphs are keyed by layout. Each is compared with the
+        # non-cuDNN gradient and the cuDNN backward must be called once per layout.
         """Key cached backward graphs by grad_output layout."""
         torch.manual_seed(42)
         num_heads, head_dim = 4, 64
@@ -1466,6 +1592,9 @@ class TestVarlenAttention(NNTestCase):
         q, k, v = tensors
 
         def grads(grad_out, use_cudnn):
+            # [FUNCTION DOC] HELPER: Runs varlen attention on the shared inputs with or without
+            # cuDNN and returns gradients of the output with respect to the three input tensors
+            # for the given gradient.
             with _use_cudnn_varlen(use_cudnn, device):
                 out = varlen_attn(q, k, v, cu_seq_q, cu_seq_q, max_len, max_len)
                 return torch.autograd.grad(out, tensors, grad_out)
@@ -1506,6 +1635,10 @@ class TestVarlenAttention(NNTestCase):
     @skipIfRocm
     @parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_cudnn_varlen_cached_graph_aux_layouts(self, device, dtype):
+        # [FUNCTION DOC] Calls the raw cuDNN attention forward then the backward with contiguous
+        # auxiliary tensors to prime the graph cache, and with permuted output/gradient, padded
+        # output, and padded LSE layouts; asserts each gradient set matches the first within
+        # tolerance.
         """Key cached backward graphs by output and LSE layouts."""
         _check_cudnn_varlen_supported(device)
         torch.manual_seed(42)
@@ -1535,6 +1668,9 @@ class TestVarlenAttention(NNTestCase):
         out, lse, seed, offset = result[0], result[1], result[6], result[7]
 
         def backward(output, output_grad, stats):
+            # [FUNCTION DOC] HELPER: Calls the raw cuDNN attention backward op with the given
+            # output gradient, output and statistics and the enclosing query, key, value, seed,
+            # offset and offsets; returns its gradient results.
             return torch.ops.aten._cudnn_attention_backward(
                 output_grad,
                 q,
@@ -1586,6 +1722,12 @@ class TestVarlenAttention(NNTestCase):
 
     @skipIfRocm
     def test_cudnn_kv_cache_validation(self, device):
+        # [FUNCTION DOC] Checks cuDNN KV cache argument validation: bad shapes, devices and dtypes
+        # of seqused_k and block_table must raise RuntimeError with specific messages; a narrower
+        # value head size works and matches a reference; mismatched key head size, page count,
+        # page size or head count, differing key and value dtypes, unsupported dtype, misaligned
+        # key storage, and tensors requiring gradient (through both the custom op and the aten op)
+        # must raise RuntimeError.
         """Validate cuDNN KV-cache metadata and inference-only inputs."""
         dtype = torch.bfloat16
         batch_size, num_heads, head_dim, page_size = 2, 8, 64, 64
@@ -1609,6 +1751,9 @@ class TestVarlenAttention(NNTestCase):
         seqused_k = torch.tensor([200, 128], device=device, dtype=torch.int32)
 
         def run(query=q, key=k, value=v, **overrides):
+            # [FUNCTION DOC] HELPER: Calls varlen attention with cuDNN forced on, using the
+            # enclosing query, key, value, seqused_k and block_table unless overridden by keyword
+            # arguments, under no-grad.
             kwargs = dict(seqused_k=seqused_k, block_table=block_table)
             kwargs.update(overrides)
             with _use_cudnn_varlen(True, device), torch.no_grad():
@@ -1723,6 +1868,10 @@ class TestVarlenAttention(NNTestCase):
         + (["fa4"] if SM100OrLater and not SM120OrLater else []),
     )
     def test_enable_gqa(self, device, dtype, backend):
+        # [FUNCTION DOC] Checks grouped query attention rules: with fewer key/value heads and no
+        # GQA flag both varlen_attn and varlen_attn_out raise ValueError; a head count that does
+        # not divide query heads raises ValueError even with the flag; with the flag the
+        # allocating and out-variants succeed and produce equal results.
         torch.manual_seed(42)
 
         head_dim = 64
