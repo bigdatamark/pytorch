@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: quantization"]
 # ruff: noqa: F841
+# [MODULE DOC] Unit tests for PyTorch's quantized operators (torch.ao quantized kernels). Test
+# classes cover pointwise/activation ops, pooling, interpolation, normalization, dynamic quantized
+# linear/RNN/conv, static quantized linear, embedding bag ops, and conv ops including the
+# pt2e/oneDNN variants. Module-level helpers provide numpy reference implementations (linear,
+# pooling shape, fp8 quant/dequant) and two subprocess-friendly oneDNN fast-path checks.
+# Import-time side effects: disables hypothesis deadlines, computes the np_dtype mapping and the
+# TEST_ROCM flag. Running the file directly is rejected at the bottom with raise_on_run_directly,
+# which points to the main quantization test entry file.
 
 
 import copy
@@ -70,6 +78,10 @@ np_dtype = {torch.quint8: np.uint8, torch.qint8: np.int8, torch.qint32: np.int32
 TEST_ROCM = TEST_CUDA and torch.version.hip is not None and ROCM_HOME is not None
 
 class PointwisePostOp(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple describing a oneDNN pointwise post-op for pt2e tests. Fields:
+    # binary_attr (binary op name, default none), alpha, unary_attr (unary op name), scalars (extra
+    # scalar arguments) and algorithm (e.g. approximation mode name). The scalars default is a
+    # single shared list object, so it must not be mutated.
     binary_attr : str = "none"
     alpha : float = 1.0
     unary_attr : str = "none"
@@ -85,6 +97,12 @@ class PointwisePostOp(NamedTuple):
 def avoid_vpmaddubsw_overflow_linear(
     batch_size, input_channels, output_channels, X, X_min, X_max, W, W_min, W_max
 ):
+    # [FUNCTION DOC] HELPER: Adjusts the uint8 weight matrix W in place so that pairs of adjacent
+    # input channels cannot overflow the signed 16-bit intermediate of the vpmaddubsw instruction
+    # used by FBGEMM. Raises unittest.SkipTest when numpy is 2.1 or newer. For each (batch row,
+    # output channel) and each channel pair, if the shifted product sum leaves the int16 range the
+    # second weight is recomputed to bring it back; a second pass raises AssertionError if any pair
+    # is still out of range. Odd trailing channel ignored.
     if Version(np.__version__) >= Version("2.1"):
         raise unittest.SkipTest("numpy 2.1 overflow error")
     for i, j in np.ndindex((batch_size, output_channels)):
@@ -115,6 +133,11 @@ def avoid_vpmaddubsw_overflow_linear(
 
 # Reference quantized Linear operator
 def qlinear_ref(X_q, X_scale, X_zp, W_q, W_scale, W_zp, b_q, Y_scale, Y_zp, dtype=np.uint8):
+    # [FUNCTION DOC] HELPER: Numpy reference for a quantized linear op. Flattens X_q to 2-D,
+    # computes the integer matmul with the weight transposed, subtracts the zero-point correction
+    # terms (row/column offsets) and adds the optional integer bias b_q, then requantizes with
+    # scale Y_scale / (X_scale * W_scale) and zero point Y_zp to dtype. Returns the quantized
+    # output array; raises AssertionError if flattening is not 2-D.
     X_q = np.reshape(X_q, (-1, X_q.shape[X_q.ndim - 1]))
     row_offsets_ref = X_q.sum(axis=1).astype(np.int32).reshape((-1, 1))
     col_offsets_ref = W_q.sum(axis=1).astype(np.int32).reshape((1, -1))
@@ -135,6 +158,10 @@ def qlinear_ref(X_q, X_scale, X_zp, W_q, W_scale, W_zp, b_q, Y_scale, Y_zp, dtyp
 """Computes the output shape given pooling parameters."""
 def pool_output_shape(input_size, kernel_size, padding, stride,
                       dilation, ceiling_mode=False):
+    # [FUNCTION DOC] HELPER: Computes one spatial output size of a pooling op from input size,
+    # kernel size, padding, stride (None means use the kernel size) and dilation. In ceiling mode
+    # the size is rounded up, and reduced by one when the last window would start entirely in the
+    # padding. Returns the integer output size.
     if stride is None:
         stride = kernel_size
     output_size = (
@@ -150,6 +177,11 @@ Util for creating a random tensor and quantization params when Hypothesis
 is undesirable.
 """
 def _get_random_tensor_and_q_params(shapes, rand_scale, torch_type):
+    # [FUNCTION DOC] HELPER: Builds a random float tensor of the given shapes scaled around zero
+    # (uniform in a range of width rand_scale centered at 0) plus quantization params for
+    # torch_type. qint32 and qint8 get a random zero point, quint8 uses 127; the scale is the value
+    # range divided by the number of bins, replaced by a tiny epsilon when zero. Returns the tuple
+    # (tensor, scale, zero_point).
     X = (torch.rand(*shapes, dtype=torch.float) - 0.5) * rand_scale
     # Calculate reasonable quantization params
     min_val = torch.min(X)
@@ -171,6 +203,13 @@ def _get_random_tensor_and_q_params(shapes, rand_scale, torch_type):
     return X, X_scale, X_zero_point
 
 def _quantize_fp8e4m3(t: torch.Tensor, channelwise: bool, scale: torch.Tensor | None = None):
+    # [FUNCTION DOC] HELPER: Quantizes a float tensor to float8_e4m3fn. When channelwise, the
+    # scale is per first-dimension channel (absolute max divided by the fp8 max, or a given
+    # scale); otherwise per tensor. Scales are floored at float32 epsilon. Values are divided by
+    # the scale, clamped to +-448 and converted through half precision to fp8. Returns (quantized
+    # tensor, scale).
+    # KNOWN ISSUE: the boolean-or fallback on a caller-supplied multi-element tensor scale raises
+    # an ambiguous truth value error; only None or single-element scales work.
     quant_max = torch.finfo(torch.float8_e4m3fn).max
     eps = torch.Tensor([torch.finfo(torch.float32).eps])
     if channelwise:
@@ -187,6 +226,9 @@ def _quantize_fp8e4m3(t: torch.Tensor, channelwise: bool, scale: torch.Tensor | 
     return qt, scale
 
 def _dequantize_fp8e4m3(qt: torch.Tensor, scale: torch.Tensor):
+    # [FUNCTION DOC] HELPER: Converts an fp8 tensor back to float32 and multiplies by scale. A
+    # one-element scale is applied per tensor; otherwise the scale is reshaped to broadcast along
+    # the first dimension (per channel). Returns the float tensor.
     dqt = qt.float()
     if scale.numel() == 1:
         # per tensor
@@ -199,6 +241,13 @@ def _dequantize_fp8e4m3(qt: torch.Tensor, scale: torch.Tensor):
 
 
 def _test_qlinear_pt2e_fast_path_helper(error_conn=None):
+    # [FUNCTION DOC] HELPER: Body of the oneDNN qlinear pointwise fast-path check, intended to run
+    # in a child process. Sets the environment flag enabling the oneDNN cache context, quantizes a
+    # random 1x4 input and 16x4 weight to uint8/int8, prepacks the weight, warms up the op once,
+    # then for the original input and a row-repeated copy compares the op output against a
+    # dequantized float linear reference (zero decimals) and dims. If error_conn is given, sends an
+    # empty string on success or the formatted traceback on failure (then re-raises), and always
+    # closes the connection.
     try:
         os.environ["ONEDNN_CACHE_CONTEXT_UNSAFE"] = "1"
 
@@ -282,13 +331,22 @@ def _test_qlinear_pt2e_fast_path_helper(error_conn=None):
 
 
 def _test_qlinear_fp8_fast_path_helper(error_conn=None):
+    # [FUNCTION DOC] HELPER: fp8 counterpart of the qlinear pt2e fast-path check, meant for a child
+    # process. Sets the oneDNN cache-context environment flag, quantizes random input and weight to
+    # float8 with per-tensor scales, prepacks, warms up, then for the input and a row-repeated copy
+    # compares the oneDNN pointwise output to an fp8-quantized float reference (exact equality and
+    # dims) and asserts no NaNs. Reports success (empty string) or the traceback through
+    # error_conn, re-raising on failure, and always closes it.
     try:
         os.environ["ONEDNN_CACHE_CONTEXT_UNSAFE"] = "1"
 
         def _quantize_fp8_for_process(tensor, scale):
+            # [FUNCTION DOC] HELPER: Divides the tensor by scale, clamps to +-448, and converts
+            # through half precision to float8_e4m3fn; returns the fp8 tensor.
             return (tensor / scale).clamp(-448, 448).half().to(torch.float8_e4m3fn)
 
         def _dequantize_fp8_for_process(qtensor, scale):
+            # [FUNCTION DOC] HELPER: Converts the fp8 tensor to float and multiplies by scale.
             return qtensor.float() * scale
 
         qlinear_op = torch.ops.onednn.qlinear_pointwise
@@ -372,9 +430,20 @@ def _test_qlinear_fp8_fast_path_helper(error_conn=None):
             error_conn.close()
 
 class TestQuantizedOps(TestCase):
+    # [CLASS DOC] Tests for the functional quantized ops (activations, binary ops, matmul, softmax,
+    # pooling, concat, interpolation, mean/std, normalization, indexing, custom quantizable modules
+    # and oneDNN int8 binary ops) on per-tensor quantized inputs.
 
     """Helper function to test quantized activation functions."""
     def _test_activation_function(self, X, fn_name, test_configs):
+        # [FUNCTION DOC] HELPER: Shared checker for quantized activation ops. X is a pair of the
+        # data and (scale, zero_point, dtype). For every config in test_configs (a list of mappings
+        # with reference_fn, quantized_fn list and optional extra_kwargs, output_range,
+        # change_zero_point, output_is_observed) and for contiguous and channels_last layouts
+        # (channels_last only for 4-D input) it quantizes/dequantizes the input, applies the
+        # reference to get the expected result, requantizes it with the (possibly adjusted) output
+        # scale/zero point and compares to each quantized op with assertEqual. Returns early for
+        # CUDA input under the qnnpack engine.
         r"""
             When writing a unit test for the activation function,
             instead of specifying the test routines only applicable to the activation function itself,
@@ -470,6 +539,10 @@ class TestQuantizedOps(TestCase):
     """Tests the correctness of the quantized::relu op."""
     @override_qengines
     def test_qrelu(self):
+        # [FUNCTION DOC] Checks quantized relu variants (the torch relu functions, in-place and
+        # functional forms) against float relu of the dequantized input. Iterates over CPU (and
+        # CUDA when available), shapes of 1 to 4 dims, quint8/qint8, two scales and two zero
+        # points, delegating each case to _test_activation_function.
         relu_test_configs = [
             {
                 'quantized_fn': [
@@ -505,6 +578,9 @@ class TestQuantizedOps(TestCase):
 
     """Tests the correctness of the quantized::relu6 op."""
     def test_qrelu6(self):
+        # [FUNCTION DOC] Checks the quantized relu6 op and the quantized ReLU6 module (in-place and
+        # not) against float relu6 for 1-4 dim shapes, quint8/qint8, two scales and zero points,
+        # using inputs scaled by 10 so values exceed the clamp; delegates to the shared checker.
         relu6_test_configs = [
             {
                 'quantized_fn': [
@@ -530,6 +606,9 @@ class TestQuantizedOps(TestCase):
     @given(X=hu.tensor(shapes=hu.array_shapes(1, 5, 1, 5),
                        qparams=hu.qparams()))
     def test_sigmoid_non_observed(self, X):
+        # [FUNCTION DOC] Hypothesis test: applies torch.sigmoid to a quantized tensor (output
+        # params not observed) for every qengine and compares with float sigmoid requantized over
+        # output range 0 to 1 with the zero point set to the dtype minimum, via the shared checker.
         sigmoid_test_configs = [
             {
                 'quantized_fn': [
@@ -549,6 +628,9 @@ class TestQuantizedOps(TestCase):
     @given(X=hu.tensor(shapes=hu.array_shapes(1, 5, 1, 5),
                        qparams=hu.qparams()))
     def test_sigmoid(self, X):
+        # [FUNCTION DOC] Hypothesis test (FBGEMM only): checks the quantized sigmoid op that takes
+        # explicit output scale and zero point (output_is_observed) against float sigmoid
+        # requantized over output range 0 to 1. A TODO notes qnnpack lacks observed-output support.
         sigmoid_test_configs = [
             {
                 'quantized_fn': [
@@ -564,6 +646,9 @@ class TestQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_sigmoid_dequantize_rounding_error(self):
+        # [FUNCTION DOC] Regression test for a sigmoid rounding issue (issue 107030): runs the
+        # observed quantized sigmoid on a 64-element constant tensor (value 514, scale 1028.02,
+        # zero point 255, quint8) through the shared activation checker. FBGEMM only.
         # issue #107030
         sigmoid_test_configs = [
             {
@@ -582,6 +667,9 @@ class TestQuantizedOps(TestCase):
     """Tests the correctness of the quantized::hardsigmoid op."""
     @override_qengines
     def test_qhardsigmoid(self):
+        # [FUNCTION DOC] Checks the quantized hardsigmoid functional (regular and in-place) against
+        # float hardsigmoid, with output range 0 to 1 and the output zero point reset, over 1-4 dim
+        # random numpy inputs of quint8/qint8 with scale 1.0 and zero point 0.
         hardsigmoid_test_configs = [
             {
                 'quantized_fn': [
@@ -614,6 +702,9 @@ class TestQuantizedOps(TestCase):
     @given(X=hu.tensor(shapes=hu.array_shapes(1, 5, 1, 5),
                        qparams=hu.qparams()))
     def test_leaky_relu_observed_output(self, X):
+        # [FUNCTION DOC] Hypothesis test: quantized leaky_relu op with explicit output scale and
+        # zero point (negative slope 0.1, not in place) compared to float leaky_relu through the
+        # shared activation checker, for all qengines.
         leaky_relu_test_configs = [
             {
                 'quantized_fn': [
@@ -631,6 +722,9 @@ class TestQuantizedOps(TestCase):
 
     """Tests the correctness of the quantized::relu op."""
     def test_leaky_relu(self):
+        # [FUNCTION DOC] Checks the quantized functional leaky_relu (slope 0.01, scale 0.1, zero
+        # point 0) against float leaky_relu on the dequantized input, requantized, for shapes of
+        # 1-4 dims, quint8/qint8 and contiguous/channels_last layout (channels_last only for 4-D).
         shapes = ((4,), (4, 4), (4, 4, 4), (4, 4, 4, 4))
         dtypes = (torch.quint8, torch.qint8)
         memory_formats = (torch.channels_last, torch.contiguous_format)
@@ -661,6 +755,9 @@ class TestQuantizedOps(TestCase):
                        qparams=hu.qparams()),
            alpha=st.floats(0.01, 10.0, allow_nan=False, allow_infinity=False))
     def test_qelu(self, X, alpha):
+        # [FUNCTION DOC] Hypothesis test: quantized functional elu with output scale 0.5 and zero
+        # point 1 and a random alpha, compared with float elu of the dequantized input then
+        # requantized with the same output parameters; compared via assertEqual.
         X, (scale, zero_point, torch_type) = X
         output_scale = 0.5
         output_zero_point = 1
@@ -686,6 +783,9 @@ class TestQuantizedOps(TestCase):
                        qparams=hu.qparams(scale_max=9.999999747378752e-06)),
            alpha=st.floats(0.01, 100.0, allow_nan=False, allow_infinity=False))
     def test_qcelu(self, X, alpha):
+        # [FUNCTION DOC] Hypothesis test: the quantized celu op (output scale 0.5, zero point 1,
+        # random alpha) is compared with float celu of the dequantized input requantized with the
+        # same output parameters.
         X, (scale, zero_point, torch_type) = X
         output_scale = 0.5
         output_zero_point = 1
@@ -707,6 +807,11 @@ class TestQuantizedOps(TestCase):
 
     """Tests the correctness of the quantized::gelu op."""
     def test_qgelu(self):
+        # [FUNCTION DOC] Checks the quantized gelu on CPU (and CUDA when available) for 1-4 dim
+        # shapes, quint8/qint8, both memory formats (channels_last only for 4-D) and the none and
+        # tanh approximation modes, comparing dequantized results to float gelu then requantized.
+        # KNOWN ISSUE: the quantized call is made without the approximation mode, so the tanh
+        # variant is compared against a quantized op using the default mode.
         shapes = ((4,), (4, 4), (4, 4, 4), (4, 4, 4, 4))
         dtypes = (torch.quint8, torch.qint8)
         memory_formats = (torch.channels_last, torch.contiguous_format)
@@ -736,6 +841,9 @@ class TestQuantizedOps(TestCase):
 
     """Tests the correctness of the quantized::prelu op."""
     def test_qprelu(self):
+        # [FUNCTION DOC] Checks the quantized prelu op against float prelu on dequantized values.
+        # Covers 1-4 dim shapes, either a single shared weight or one weight per channel, both
+        # memory formats (channels_last only for 4-D), quint8/qint8; compares dequantized outputs.
         shapes = ((4,), (4, 4), (4, 4, 4), (4, 4, 4, 4))
         num_params = (0, 1)  # 0: num_parameter = num_channels
         dtypes = (torch.quint8, torch.qint8)
@@ -771,6 +879,11 @@ class TestQuantizedOps(TestCase):
     """Tests the correctness of the quantized::qlayer_norm op."""
     @skipIfNoFBGEMM
     def test_qlayer_norm(self):
+        # [FUNCTION DOC] Checks quantized layer_norm (FBGEMM engine) against float layer_norm over
+        # a manual grid: side length, dtype, output scale/zero point, channels_last or not, affine
+        # weight and bias or none. Inputs are non-hypothesis random 4-D tensors filtered by assume
+        # to be non-homogeneous. Because mean/variance use integer arithmetic, it allows a tiny
+        # fraction of too-large differences and under one percent off-by-one-scale errors.
         # hypothesis is flaky for this test, create test cases manually
         side_lens = (1, 8, 11)
         torch_types = (torch.qint8, torch.quint8)
@@ -868,6 +981,9 @@ class TestQuantizedOps(TestCase):
         "this is broken without changes to any relevant code, "
         "we need to remove hypothesis testing in CI")
     def test_qtanh(self, X):
+        # [FUNCTION DOC] Hypothesis test (currently skipped as flaky) for the quantized tanh:
+        # output is compared with the float tanh requantized using scale 2/(range) and the midpoint
+        # zero point of the dtype. QNNPACK is tested elsewhere.
         # Note: QNNPACK is tested separately in TestQNNPackOps
         X, (scale, zero_point, torch_type) = X
 
@@ -899,6 +1015,9 @@ class TestQuantizedOps(TestCase):
            threshold=hu.floats(-1e3, 1e3, allow_nan=False, allow_infinity=False),
            value=hu.floats(-1e3, 1e3, allow_nan=False, allow_infinity=False))
     def test_qthreshold(self, X, threshold, value):
+        # [FUNCTION DOC] Hypothesis test: threshold op with random threshold and replacement value,
+        # via the native, nn.functional and ao quantized functional entry points. Each is compared
+        # to float threshold on the dequantized input, requantized with the input parameters.
         X, (scale, zero_point, torch_type) = X
         X = torch.from_numpy(X)
         qX = torch.quantize_per_tensor(X, scale=scale, zero_point=zero_point,
@@ -928,6 +1047,9 @@ class TestQuantizedOps(TestCase):
            min_val=hu.floats(-1e6, 1e6, allow_nan=False),
            max_val=hu.floats(-1e6, 1e6, allow_nan=False))
     def test_qclamp(self, X, min_val, max_val):
+        # [FUNCTION DOC] Hypothesis test: quantized clamp with random min/max (filtered so min is
+        # not above max) versus float clamp requantized with the input scale. When the active
+        # engine is fbgemm it also checks one-sided clamps (only min, only max).
         X, (scale, zero_point, torch_type) = X
 
         assume(min_val <= max_val)
@@ -971,6 +1093,9 @@ class TestQuantizedOps(TestCase):
            min_val=hu.floats(-1e6, 1e6, allow_nan=False, allow_infinity=False),
            max_val=hu.floats(-1e6, 1e6, allow_nan=False, allow_infinity=False))
     def test_hardtanh(self, X, min_val, max_val):
+        # [FUNCTION DOC] Hypothesis test (FBGEMM only): ao quantized functional hardtanh with
+        # random min/max (assumed ordered), both out-of-place and in-place on a clone, versus a
+        # numpy clip of the float input that is then quantized with the same parameters.
         with override_quantized_engine('fbgemm'):
             X, (scale, zero_point, torch_type) = X
 
@@ -1006,6 +1131,10 @@ class TestQuantizedOps(TestCase):
     """Tests the correctness of the quantized::hardswish op."""
     @override_qengines
     def test_hardswish(self):
+        # [FUNCTION DOC] Checks the ao quantized functional hardswish against float hardswish on
+        # the dequantized input requantized with output scale 0.1 and zero point 1. Grid over dims
+        # 3 or 4, side length, quint8/qint8 (qnnpack skips qint8) and both memory formats;
+        # channels_last applied only for 4-D inputs. Runs for every qengine.
         max_sides = (3, 4)
         side_lens = (1, 7)
         torch_types = (torch.quint8, torch.qint8)
@@ -1042,6 +1171,11 @@ class TestQuantizedOps(TestCase):
 
     """Tests the correctness of the binary op + scalar."""
     def _test_binary_op_scalar_relu(self, A, b, binary_op_name, binary_op, quantized_op, quantized_op_relu):
+        # [FUNCTION DOC] HELPER: Compares a quantized binary-op-with-scalar and its relu-fused form
+        # against float references. A is a hypothesis pair of data and quantization params, b the
+        # scalar. For add the scalar is first rounded to a multiple of the scale. The reference
+        # (and its clamp-at-zero relu version) is quantized with the scale and zero point the
+        # quantized op chose for its output; dequantized results are compared with assertEqual.
         import copy
         op_scalar = quantized_op
         op_scalar_relu = quantized_op_relu
@@ -1076,6 +1210,8 @@ class TestQuantizedOps(TestCase):
                        qparams=hu.qparams()),
            b=hu.floats(-1e6, 1e6, allow_nan=False, allow_infinity=False))
     def test_add_scalar_relu(self, A, b):
+        # [FUNCTION DOC] Hypothesis test (skipped on macOS): runs the scalar-add helper with the
+        # quantized add and add_relu ops against float addition.
         self._test_binary_op_scalar_relu(A, b, "add", operator.add, torch.ops.quantized.add, torch.ops.quantized.add_relu)
 
     @unittest.skipIf(IS_MACOS, "skipping macos test")
@@ -1084,10 +1220,16 @@ class TestQuantizedOps(TestCase):
                        qparams=hu.qparams()),
            b=hu.floats(-1e6, 1e6, allow_nan=False, allow_infinity=False))
     def test_mul_scalar_relu(self, A, b):
+        # [FUNCTION DOC] Hypothesis test (skipped on macOS): runs the scalar-multiply helper with
+        # the quantized mul and mul_relu ops against float multiplication.
         self._test_binary_op_scalar_relu(A, b, "mul", operator.mul, torch.ops.quantized.mul, torch.ops.quantized.mul_relu)
 
     """Tests the correctness of the add and add_relu op."""
     def test_qadd_relu_same_qparams(self):
+        # [FUNCTION DOC] Checks add and add_relu (functional and out variants of the quantized ops)
+        # for quint8, qint8 and qint32 when both inputs share the same scale and zero point. Uses a
+        # 258-element ramp so both vectorized and scalar code paths run; compares to a float add
+        # (with a clamp at zero for relu) after requantization.
         for dtype in [torch.quint8, torch.qint8, torch.qint32]:
             add_relu = torch.ops.quantized.add_relu
             add = torch.ops.quantized.add
@@ -1141,6 +1283,9 @@ class TestQuantizedOps(TestCase):
     @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
     @unittest.skip("not currently working and feature isn't used")
     def test_qadd_relu_cudnn(self):
+        # [FUNCTION DOC] Skipped test (needs cuDNN, SM80+, not ROCm; marked not working): quantized
+        # add and add_relu on CUDA qint8 tensors with different input/output scales, compared on
+        # CPU against a float sum quantized with the output parameters, and the relu variant.
         dtype = torch.qint8
         add_relu = torch.ops.quantized.add_relu
         add = torch.ops.quantized.add
@@ -1176,6 +1321,9 @@ class TestQuantizedOps(TestCase):
     @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
     @unittest.skip("not currently working and feature isn't used")
     def test_qadd_relu_cudnn_nhwc(self):
+        # [FUNCTION DOC] Skipped test (needs cuDNN, SM80+, not ROCm; marked not working): same as
+        # the cudnn add test but with random 4-D CUDA inputs of shape 16x8x4x12 for the nhwc case;
+        # checks quantized add and add_relu against the quantized float reference.
         dtype = torch.qint8
         add_relu = torch.ops.quantized.add_relu
         add = torch.ops.quantized.add
@@ -1207,6 +1355,10 @@ class TestQuantizedOps(TestCase):
 
     """Tests the correctness of the add and add_relu op."""
     def test_qadd_relu_different_qparams(self):
+        # [FUNCTION DOC] Checks add, add_relu and their out forms for quint8, qint8 and qint32
+        # where inputs and output have different scales and zero points, on a 258-element ramp
+        # (vectorized and scalar paths). Compares the integer representation to a numpy float
+        # reference quantized with the output params, and the out result to the returned one.
         for dtype in [torch.quint8, torch.qint8, torch.qint32]:
             add_relu = torch.ops.quantized.add_relu
             add = torch.ops.quantized.add
@@ -1261,6 +1413,10 @@ class TestQuantizedOps(TestCase):
 
     """Tests the correctness of the mul and mul_relu op."""
     def test_qmul_relu_same_qparams(self):
+        # [FUNCTION DOC] Checks mul, mul_relu and their out forms for quint8, qint8 and qint32
+        # with identical qparams on both inputs and the output (scale 2, zero point 127), against a
+        # numpy float product reference. Then loops over every element of B as a Python scalar and
+        # checks scalar multiplication and scalar multiplication with relu on dequantized values.
         for dtype in [torch.quint8, torch.qint8, torch.qint32]:
             mul_relu = torch.ops.quantized.mul_relu
             mul = torch.ops.quantized.mul
@@ -1321,6 +1477,10 @@ class TestQuantizedOps(TestCase):
 
     """Tests the correctness of the mul and mul_relu op."""
     def test_qmul_relu_different_qparams(self):
+        # [FUNCTION DOC] Checks mul, mul_relu and their out forms for quint8, qint8 and
+        # qint32 where inputs and output use different scales and zero points, comparing
+        # integer representation to a numpy reference of the float product requantized with
+        # the output params.
         for dtype in [torch.quint8, torch.qint8, torch.qint32]:
             mul_relu = torch.ops.quantized.mul_relu
             mul = torch.ops.quantized.mul
@@ -1379,6 +1539,10 @@ class TestQuantizedOps(TestCase):
            dtypes=st.sampled_from(((torch.qint8, np.int8),
                                    (torch.quint8, np.uint8))))
     def test_qmatmul(self, num_dims, outer_dims, m, k, n, dtypes):
+        # [FUNCTION DOC] Hypothesis test of quantized matmul for 2 to 5 dims with random batch
+        # dims, qint8 or quint8: compares the integer output with float matmul of dequantized
+        # inputs requantized to output scale 1.3 / zero point 5. Also asserts that per-channel
+        # quantized inputs raise a RuntimeError whose message mentions per-tensor.
         (torch_dtype, np_dtype) = dtypes
 
         size_a = outer_dims[:num_dims - 2] + [m, k]
@@ -1442,6 +1606,10 @@ class TestQuantizedOps(TestCase):
     """Tests the correctness of the quantized softmax op."""
     @given(dims=st.lists(st.integers(2, 5), min_size=5, max_size=5))
     def test_qsoftmax(self, dims):
+        # [FUNCTION DOC] Hypothesis test of quantized softmax on quint8 inputs with output scale
+        # 1/256 and zero point 0. Cycles through (rank, softmax dim, memory format) combinations
+        # covering 2-D, 4-D and 5-D, non-last dims and channels_last layouts, comparing against
+        # float softmax of the dequantized input quantized the same way.
         for (num_dims, dim, memory_format) in [
             (2, 1, torch.contiguous_format),  # 2d softmax over last dim
             (4, 3, torch.contiguous_format),  # >2 dims, softmax along last dim
@@ -1482,11 +1650,16 @@ class TestQuantizedOps(TestCase):
     """Tests the correctness of the quantized softmax op using qnnpack."""
     @skipIfNoQNNPACK
     def test_qsoftmax_qnnpack(self):
+        # [FUNCTION DOC] Reruns the quantized softmax test with the qnnpack engine selected
+        # (skipped without QNNPACK); the engine override is restored on exit.
         with override_quantized_engine('qnnpack'):
             self.test_qsoftmax()
 
     """Tests the correctness of the mul and mul_relu op."""
     def test_qmul_broadcast(self):
+        # [FUNCTION DOC] Checks quantized mul with broadcasting between inputs of shape 8x1x6x1 and
+        # 7x1x5 (quint8, different qparams) against the broadcast float product quantized with
+        # output scale 0.5 and zero point 5; compared on integer representation.
         mul_relu = torch.ops.quantized.mul_relu
         mul = torch.ops.quantized.mul
         mul_out = torch.ops.quantized.mul
@@ -1518,6 +1691,9 @@ class TestQuantizedOps(TestCase):
 
     """Tests that quantized add works with broadcasting"""
     def test_qadd_broadcast(self):
+        # [FUNCTION DOC] Checks that quantized add broadcasts (1x1x4x4 with 2x1x4x4, quint8,
+        # different qparams) in both argument orders, matching a float add requantized to the
+        # output params.
         A = torch.randn(1, 1, 4, 4)
         B = torch.randn(2, 1, 4, 4)
         qA = torch.quantize_per_tensor(A, 0.02, 0, torch.quint8)
@@ -1543,6 +1719,9 @@ class TestQuantizedOps(TestCase):
                        qparams=hu.qparams(dtypes=[torch.quint8])),
            groups=st.integers(2, 6))
     def test_channel_shuffle(self, X, groups):
+        # [FUNCTION DOC] Hypothesis test: channel_shuffle with a random group count on a 4-D tensor
+        # (only when channel count divides evenly). The quantized channel_shuffle output,
+        # dequantized, must equal channel_shuffle of the float data requantized with same params.
         X, (scale, zero_point, torch_type) = X
         channels = X.shape[-3]
         iH, iW = X.shape[-2:]
@@ -1572,6 +1751,11 @@ class TestQuantizedOps(TestCase):
            padding=st.integers(0, 2),
            ceil_mode=st.booleans())
     def test_max_pool1d(self, X, kernel, stride, dilation, padding, ceil_mode):
+        # [FUNCTION DOC] Hypothesis test of 1-D max pooling on quantized tensors with random
+        # kernel, stride (maybe None), dilation, padding and ceil_mode; constraints (padding not
+        # exceeding half the kernel, positive output size) are enforced with assume. Checks the
+        # torch, nn.functional and ao quantized functional entry points and the quantized op with
+        # explicit tuple arguments against float pooling requantized with the input params.
         X, (scale, zero_point, torch_type) = X
         # Check constraints
         assume(kernel // 2 >= padding)  # Kernel cannot be overhanging!
@@ -1628,6 +1812,9 @@ class TestQuantizedOps(TestCase):
     @unittest.skipIf(not TEST_CUDNN, "cudnn is not enabled.")
     @unittest.skipIf(TEST_ROCM, "not supported on rocm.")
     def test_max_pool2d_cudnn(self, X, kernel, stride, dilation, padding, ceil_mode):
+        # [FUNCTION DOC] Hypothesis test (needs cuDNN, not ROCm) of 2-D max pooling of qint8
+        # tensors on CUDA; dilation is fixed at one. Compares the quantized max_pool2d op, called
+        # with explicit pair arguments, against float pooling requantized with the input params.
         X, (scale, zero_point, torch_type) = X
         assume(kernel // 2 >= padding)  # Kernel cannot be overhanging!
         iH, iW = X.shape[-2:]
@@ -1665,6 +1852,10 @@ class TestQuantizedOps(TestCase):
            padding=st.integers(0, 2),
            ceil_mode=st.booleans())
     def test_max_pool2d(self, X, kernel, stride, dilation, padding, ceil_mode):
+        # [FUNCTION DOC] Hypothesis test of 2-D max pooling on quantized CPU tensors with random
+        # kernel, stride, dilation, padding and ceil_mode under the usual validity assumptions.
+        # Checks the torch, nn.functional, ao quantized functional and quantized op entry points
+        # against float max pooling requantized with the input scale and zero point.
         X, (scale, zero_point, torch_type) = X
         # Check constraints
         assume(kernel // 2 >= padding)  # Kernel cannot be overhanging!
@@ -1707,6 +1898,10 @@ class TestQuantizedOps(TestCase):
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     def test_max_pool2d_pt2e(self):
+        # [FUNCTION DOC] Checks quantized max_pool2d on plain uint8 tensors (pt2e style, no
+        # qparams; skipped in fbcode) across kernel, stride, padding, dilation, ceil_mode and
+        # channels_last choices, skipping invalid padding. Output must equal float max pool cast to
+        # uint8, and keep the same contiguity as the input.
         kernel_list = [2, 3]
         stride_list = [1, 2]
         padding_list = [0, 2]
@@ -1735,6 +1930,11 @@ class TestQuantizedOps(TestCase):
 
     """Tests 3D max pool operation on quantized tensors."""
     def test_max_pool3d(self):
+        # [FUNCTION DOC] Checks 3-D max pooling on quantized 5-D tensors (random ints 20..39, scale
+        # 15, zero point 20) over qint8/quint8 and grids of kernel, stride, dilation, padding and
+        # ceil_mode, skipping invalid combinations (padding above half the kernel, non-positive
+        # output extents). torch and nn.functional entry points are compared to float pooling
+        # requantized with the same params.
         torch_types = [torch.qint8, torch.quint8]
         kernels = [1, 3]
         strides = [1, 3]
@@ -1789,6 +1989,11 @@ class TestQuantizedOps(TestCase):
            padding=st.integers(0, 2),
            ceil_mode=st.booleans())
     def test_max_pool2d_nhwc(self, X, kernel, stride, dilation, padding, ceil_mode):
+        # [FUNCTION DOC] Hypothesis test of 2-D max pooling on channels_last style quantized
+        # tensors (permuted from an NHWC layout so strides are not sorted). Channels are repeated
+        # to reach at least 176 so vectorized, interleaved and scalar paths are hit. Checks torch,
+        # nn.functional, ao quantized functional and the quantized op; results must keep a
+        # non-contiguous-NCHW stride order and match float pooling requantized.
         X, (scale, zero_point, torch_type) = X
         # Ensure we hit the vectorized paths
         # 176 = 128 + 32 + 16
@@ -1840,6 +2045,10 @@ class TestQuantizedOps(TestCase):
 
     """Tests 3D max pool operation on quantized channel_last tensors."""
     def test_max_pool3d_nhwc(self):
+        # [FUNCTION DOC] Checks 3-D max pooling of quantized tensors in channels_last_3d layout (67
+        # channels, qint8/quint8, scale 15, zero point 20). The float reference is pooled from a
+        # channels_last_3d float tensor, the quantized input is built from an untouched copy and
+        # made channels_last_3d; invalid kernel/padding/output-size combos are skipped.
         torch_types = [torch.qint8, torch.quint8]
         kernels = [1, 3]
         strides = [1, 3]
@@ -1897,6 +2106,12 @@ class TestQuantizedOps(TestCase):
            count_include_pad=st.sampled_from((True, False)),
            divisor_override=st.sampled_from((None, None)))
     def test_avg_pool2d(self, X, kernel, stride, padding, ceil_mode, count_include_pad, divisor_override):
+        # [FUNCTION DOC] Hypothesis test of 2-D average pooling on quint8 tensors (3 or 4 dims)
+        # for random kernel, stride, padding, ceil_mode and count_include_pad; divisor_override
+        # is always None. The float reference runs on the dequantized input and is requantized
+        # with the output params. Compares integer values within an absolute tolerance of one for
+        # the nn.functional and ao quantized functional paths, and asserts scale and zero point
+        # are kept.
         """
         Note: we currently cannot test the divisor_override, because quantized op will clamp the result
         within range. However, the float op will not.
@@ -1946,6 +2161,10 @@ class TestQuantizedOps(TestCase):
            count_include_pad=st.sampled_from((True, False)),
            divisor_override=st.sampled_from((None, None)))
     def test_avg_pool2d_nhwc(self, X, kernel, stride, padding, ceil_mode, count_include_pad, divisor_override):
+        # [FUNCTION DOC] Hypothesis test of 2-D average pooling on qint8 channels_last style 4-D
+        # tensors (channels repeated to at least 176, permuted from NHWC so strides are not
+        # sorted). Same checks as the plain average pool test: integer values within one, preserved
+        # scale and zero point, and output stride order that stays non-contiguous.
         """
         Note: 1) we currently cannot test the divisor_override, because quantized op will clamp the result
         within range. However, the float op will not.
@@ -2008,6 +2227,10 @@ class TestQuantizedOps(TestCase):
            count_include_pad=st.sampled_from((True, False)),
            divisor_override=st.sampled_from((None, None)))
     def test_avg_pool3d(self, X, kernel, stride, padding, ceil_mode, count_include_pad, divisor_override):
+        # [FUNCTION DOC] Hypothesis test of 3-D average pooling on quint8 5-D tensors for random
+        # kernel, stride, padding, ceil_mode and count_include_pad (divisor_override always None).
+        # Compares the integer output of nn.functional and ao quantized functional against float
+        # average pooling requantized, within one, and checks scale and zero point are preserved.
         """
         Note: we currently cannot test the divisor_override, because quantized op will clamp the result
         within range. However, the float op will not.
@@ -2060,6 +2283,9 @@ class TestQuantizedOps(TestCase):
            count_include_pad=st.sampled_from((True, False)),
            divisor_override=st.sampled_from((None, None)))
     def test_avg_pool3d_nhwc(self, X, kernel, stride, padding, ceil_mode, count_include_pad, divisor_override):
+        # [FUNCTION DOC] Hypothesis test of 3-D average pooling on qint8 5-D channels-last-3d style
+        # tensors (channels repeated to at least 176, permuted from an NDHWC layout). Same checks
+        # as the contiguous 3-D test, plus the stride order of input and output must not be sorted.
         """
         Note: 1) we currently cannot test the divisor_override, because quantized op will clamp the result
         within range. However, the float op will not.
@@ -2116,6 +2342,13 @@ class TestQuantizedOps(TestCase):
 
     """Tests adaptive average pool operation on NHWC quantized tensors."""
     def test_adaptive_avg_pool2d_nhwc(self):
+        # [FUNCTION DOC] Checks adaptive average pool 2-D on qint8 NHWC-style tensors with random
+        # output sizes clamped to the spatial size (an int when both are equal, otherwise a pair).
+        # Channels are repeated to at least 176 and inputs may be 3-D or 4-D. Reference is adaptive
+        # pooling of the integer representation in double precision, rounded; outputs compared
+        # within one, with scale 1, preserved zero point and non-sorted strides.
+        # KNOWN ISSUE: the zero point value (0 or 1) is passed to the random-tensor helper where a
+        # dtype is expected, so only its default branch is used.
         side_lens = (range(1, 10))
         dim_lens = (range(3, 4))
         torch_type = torch.qint8
@@ -2182,6 +2415,12 @@ class TestQuantizedOps(TestCase):
 
     @unittest.skip("not currently working and feature isn't used")
     def test_adaptive_avg_pool(self):
+        # [FUNCTION DOC] Skipped test (marked not working): adaptive average pooling over 2-D and
+        # 3-D spatial dims on qint8 inputs of 3 or 4 dims with random output sizes, comparing the
+        # nn.functional and ao quantized functional versions (on CUDA too for the 2-D case when
+        # available) against pooling of the integer representation in float, rounded, within one.
+        # KNOWN ISSUE: the zero point value is passed to the random-tensor helper where a dtype
+        # is expected.
 
         side_lens = (range(1, 10))
         dim_lens = (range(3, 5))
@@ -2262,6 +2501,10 @@ class TestQuantizedOps(TestCase):
 
     """Tests adaptive average pool operation on NHWC quantized tensors."""
     def test_adaptive_avg_pool3d_ndhwc(self):
+        # [FUNCTION DOC] Checks adaptive average pool 3-D on qint8 NDHWC-style 4-D or 5-D tensors
+        # (scale 1, zero point 0) with random output sizes clamped to input extents and channels
+        # repeated to at least 176. Reference is adaptive pooling of the integer representation in
+        # double precision, rounded; compares within one, preserved qparams and non-sorted strides.
         side_lens = (range(1, 10))
         dim_lens = (range(4, 5))
         torch_type = torch.qint8
@@ -2330,6 +2573,11 @@ class TestQuantizedOps(TestCase):
                                  X_hat.q_zero_point())))
 
     def test_qtopk(self):
+        # [FUNCTION DOC] Checks topk on quantized tensors over a grid of rank 3 or 4, side, dim,
+        # largest, sorted, dtype and NHWC layout (k is 2; invalid dim/layout combos are skipped).
+        # Quantized topk values (dequantized) and indices must match topk of the dequantized input.
+        # KNOWN ISSUE: the local sort flag shadows the builtin, and the values and indices
+        # variables built from the float data are never used.
         x_dims = [3, 4]  # Num elements in the shape
         sides = [3, 5]  # Side of the tensor generated
         dims = [0, 1, 2, 3]  # dimension over which to perform topk
@@ -2376,6 +2624,12 @@ class TestQuantizedOps(TestCase):
            dim=st.integers(1, 4),
            relu=st.booleans())
     def test_cat(self, X, num, dim, relu):
+        # [FUNCTION DOC] Hypothesis test of quantized concatenation (plain and fused with relu).
+        # Builds a list of identical quantized tensors, concatenates along a random dim (skipped
+        # when the dim is out of range) and compares the dequantized result with a float concat
+        # requantized and optionally relu'd. Also exercises the out variant into a preallocated
+        # affine quantized tensor, and asserts that per-channel quantized input raises a
+        # RuntimeError mentioning supported cat.
         tensors_q = []
         tensors_ref = []
         X, (scale, zero_point, torch_type) = X
@@ -2434,6 +2688,11 @@ class TestQuantizedOps(TestCase):
            align_corners=st.sampled_from((True, False)),
            nhwc_layout=st.sampled_from((True, False)))
     def test_interpolate(self, X, size, mode, scale_factor, align_corners, nhwc_layout):
+        # [FUNCTION DOC] Hypothesis test of 2-D interpolation (nearest, nearest-exact, bilinear) on
+        # 4-D quantized tensors, contiguous or NHWC style (channels repeated to at least 176). size
+        # is dropped when scale_factor is set and align_corners is dropped for the nearest modes.
+        # Reference is float interpolation of the integer representation; nn.functional and ao
+        # quantized functional results must match within one and keep scale and zero point.
         """
         This test cover upsample_nearest2d and upsample_bilinear2d
         """
@@ -2488,6 +2747,11 @@ class TestQuantizedOps(TestCase):
            align_corners=st.sampled_from((True, False)),
            nhwc_layout=st.sampled_from((True, False)))
     def test_interpolate3d(self, X, size, mode, scale_factor, align_corners, nhwc_layout):
+        # [FUNCTION DOC] Hypothesis test of 3-D nearest and nearest-exact interpolation on 5-D
+        # quantized tensors, contiguous or NDHWC style (channels repeated to at least 176);
+        # align_corners is always cleared and size is dropped when a scale factor is given. Integer
+        # outputs must match float interpolation of the integer representation within one, and
+        # scale and zero point must be preserved.
         """
         This test cover upsample_nearest3d
         """
@@ -2537,6 +2801,10 @@ class TestQuantizedOps(TestCase):
                        qparams=hu.qparams()),
            relu=st.booleans())
     def test_cat_nhwc(self, X, relu):
+        # [FUNCTION DOC] Hypothesis test of cat on NHWC-laid-out quantized tensors with more than
+        # 64 channels. Covers the same-qparams fast path and a different-scale case, optional relu
+        # fusion, comparing with concat of dequantized inputs requantized to the output params, and
+        # asserts the output keeps a non-sorted (channels-last) stride order.
         # X is NHWC
         X, (scale, zero_point, torch_type) = X
 
@@ -2570,6 +2838,10 @@ class TestQuantizedOps(TestCase):
 
     @override_qengines
     def test_mean(self):
+        # [FUNCTION DOC] Checks mean over many dim lists (empty, negative, single and pairs) for
+        # quantized tensors of rank 1 to 5, scales, zero points and quint8/qint8 under every
+        # qengine. Reference is mean of dequantized input requantized with the same params;
+        # combinations whose dims exceed the rank are skipped.
         scale_list = (1, 0.25)
         zero_point_list = (0, 2)
         shapes = ((4,), (4, 4), (4, 4, 4), (4, 4, 4, 4), (4, 4, 4, 4, 4))
@@ -2590,6 +2862,9 @@ class TestQuantizedOps(TestCase):
     @skipIfNoQNNPACK
     @given(keep=st.booleans())
     def test_quantized_mean_qnnpack(self, keep):
+        # [FUNCTION DOC] Hypothesis test (qnnpack only): mean over the spatial dims of a 4x4x4x4
+        # all-ones quantized tensor, with keepdim on or off, must equal an all-ones quantized
+        # tensor of the expected shape. Sizes are multiples of four for alignment under sanitizers.
         with override_quantized_engine("qnnpack"):
             # using multiple of 4 sizes to satisfy pytorch_q8gavgpool_ukernel_up8xm__sse2() 4-byte alignment demand under ASAN
             in_dim = (4, 4, 4, 4)
@@ -2606,6 +2881,9 @@ class TestQuantizedOps(TestCase):
 
     @override_qengines
     def test_std(self):
+        # [FUNCTION DOC] Checks std on quantized tensors of rank 1 to 5 over many dim lists, with
+        # biased/unbiased and keepdim options, scales, zero points and quint8/qint8, for every
+        # qengine. Reference is std of the dequantized input requantized with the same params.
         scale_list = (1, 0.25)
         zero_point_list = (0, 2)
         shapes = ((4,), (4, 4), (4, 4, 4), (4, 4, 4, 4), (4, 4, 4, 4, 4))
@@ -2634,6 +2912,10 @@ class TestQuantizedOps(TestCase):
            X_per_channel=st.booleans(),
            X2_per_channel=st.booleans())
     def test_equal(self, X, X2, X_per_channel, X2_per_channel):
+        # [FUNCTION DOC] Hypothesis test of the equal method on quantized tensors, each randomly
+        # per-tensor or per-channel quantized (last axis, uniform params). Compares tensor-vs-self
+        # and tensor-vs-other against a Python reference that checks scheme, shape, dtype, qparams
+        # and integer values.
         X, X_params = X
         (scale, zero_point, torch_type) = X_params
         X2, X2_params = X2
@@ -2669,6 +2951,11 @@ class TestQuantizedOps(TestCase):
                                             dtype=torch_type2)
 
         def equal_ref(qX, qX2):
+            # [FUNCTION DOC] HELPER: Reference equality for two quantized tensors: false if
+            # schemes, shapes or dtypes differ, or per-tensor scale/zero point (or any per-channel
+            # scales or zero points) differ, or integer representations differ; true otherwise.
+            # Raises NotImplementedError for any quantization scheme other than per-tensor or
+            # per-channel affine.
             if qX.qscheme() != qX2.qscheme():
                 return False
             if qX.shape != qX2.shape:
@@ -2699,6 +2986,8 @@ class TestQuantizedOps(TestCase):
 
     """Tests quantized equal op with input of non-quantized tensor."""
     def test_quantized_equal(self,):
+        # [FUNCTION DOC] Checks that torch.equal between a float tensor and a quantized tensor
+        # returns false in both argument orders.
         x = torch.rand(1)
         y = torch.quantize_per_tensor(x, scale=0.5, zero_point=0, dtype=torch.qint8)
         self.assertTrue(not torch.equal(x, y))
@@ -2706,6 +2995,11 @@ class TestQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_group_norm(self):
+        # [FUNCTION DOC] Checks quantized group_norm (FBGEMM engine) against float group_norm over
+        # a manual grid of batch, group count, channels per group, elements per channel, dtype,
+        # output qparams, channels_last and affine weight/bias. Non-homogeneous inputs are enforced
+        # with assume. Because integer sums differ from float sums, allows a tiny fraction of
+        # too-large differences and under one percent off-by-one-scale errors.
         # hypothesis is flaky for this test, create test cases manually
         batches_list = (1, 7)
         num_groups_list = (1, 4)
@@ -2801,6 +3095,11 @@ class TestQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_instance_norm(self):
+        # [FUNCTION DOC] Checks quantized instance_norm (FBGEMM engine) against float instance_norm
+        # over shapes, dtypes, output qparams, channels_last and affine options, plus one large 5-D
+        # overflow case added unless running on Sandcastle. Rank-5 channels_last cases are skipped.
+        # Uses the same tolerance policy as the group norm test: nearly no large errors and under
+        # one percent off-by-one-scale errors.
         max_sides = (4, 5)
         shape_list = ([2, 2, 2, 2], [8, 8, 8, 8], [11, 11, 11, 11])
         torch_types = (torch.qint8, torch.quint8)
@@ -2900,6 +3199,10 @@ class TestQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_batch_norm_relu(self):
+        # [FUNCTION DOC] Checks the fused quantized batch_norm relu ops (1d, 2d, 3d chosen by rank,
+        # FBGEMM engine) for rank 2 to 5, side lengths and qint8/quint8 using random running stats,
+        # weight and bias. The result is compared exactly on integer representation with an
+        # inference-mode float batch norm, clamped at zero, requantized with the output params.
         # hypothesis too slow for this test, create test cases manually
         max_sides = (2, 3, 4, 5)
         side_lens = (1, 8, 11)
@@ -2951,6 +3254,10 @@ class TestQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_batch_norm(self):
+        # [FUNCTION DOC] Checks the quantized batch_norm ops (1d, 2d, 3d chosen by rank, FBGEMM
+        # engine) for rank 2 to 5, side lengths and qint8/quint8 with random running stats, weight
+        # and bias, comparing integer representation exactly with an inference-mode float batch
+        # norm requantized with the output params.
         # hypothesis too slow for this test, create test cases manually
         max_sides = (2, 3, 4, 5)
         side_lens = (1, 8, 11)
@@ -2996,6 +3303,12 @@ class TestQuantizedOps(TestCase):
 
     @override_qengines
     def test_empty_batch(self):
+        # [FUNCTION DOC] Checks that quantized ops accept an empty batch (zero-size first dim)
+        # under every qengine. Starting from a 0x2x4x4 quint8 tensor it asserts output sizes for
+        # nearest upsampling, relu, tanh, sigmoid, interpolate in three modes, average pool,
+        # adaptive average pool, max pool, hardtanh, mul and add. It then prepacks a 2x2x2x2
+        # qint8 weight and checks conv2d, then linear and dynamic linear on a 0x2 input (shape
+        # 0x2 results).
         scale = 1.0
         zero_point = 0
         X = torch.ones((0, 2, 4, 4), dtype=torch.float32)
@@ -3093,6 +3406,9 @@ class TestQuantizedOps(TestCase):
 
     @override_qengines
     def test_zero_dim_interpolate(self):
+        # [FUNCTION DOC] Verifies that nn.functional interpolate on quantized tensors with a
+        # zero-size height, width or channel dimension raises a RuntimeError, for the nearest,
+        # bilinear and nearest-exact modes, under every qengine.
         """
         Verifies the correctness of interpolate with zero input height or input width.
         """
@@ -3112,6 +3428,9 @@ class TestQuantizedOps(TestCase):
 
     @override_qengines
     def test_linear_bias_unpack(self):
+        # [FUNCTION DOC] Verifies that a prepacked quantized linear weight returns its float bias
+        # and that unpacking returns the original quantized weight (first element of the result),
+        # under every qengine.
         """
         Verifies the correctness of bias() and unpack() API for LinearPackedParamBase.
         """
@@ -3125,6 +3444,9 @@ class TestQuantizedOps(TestCase):
         self.assertEqual(w_packed.unpack()[0], qw)
 
     def test_advanced_indexing(self):
+        # [FUNCTION DOC] Checks advanced (list) indexing on quantized tensors for qint8, quint8 and
+        # qint32: single or multiple dims with single or multiple indices must equal indexing the
+        # dequantized tensor and requantizing with the same scale and zero point.
         """
         Verifies that the x[:, [0], :, :] syntax works for quantized tensors.
         """
@@ -3166,9 +3488,21 @@ class TestQuantizedOps(TestCase):
 
     @override_qengines
     def test_custom_module_lstm(self):
+        # [FUNCTION DOC] End-to-end check of the quantizable-to-quantized LSTM flow under each
+        # qengine, over bias, batch_first, bidirectional and split_gates options (a 2-layer LSTM,
+        # dropout 0). Prepares and calibrates with observers (output must equal the float LSTM, and
+        # the layer cell must carry the split_gates setting), converts to the quantized LSTM,
+        # checks the quantized output against the float reference via SNR thresholds, then traces
+        # and scripts the quantized module. Split-gates cases use a custom module mapping.
         class QuantizableLSTMSplitGates(torch.ao.nn.quantizable.LSTM):
+            # [CLASS DOC] HELPER: Quantizable LSTM subclass whose from_float conversion
+            # always requests split gates, used through the custom-module mapping for the
+            # split_gates cases.
             @classmethod
             def from_float(cls, other, qconfig=None):
+                # [FUNCTION DOC] HELPER: Class method building the observed module from a float
+                # LSTM by calling the parent from_float with the given qconfig and split_gates
+                # forced on; returns the result.
                 return super().from_float(other, qconfig, split_gates=True)
 
         qengine = torch.backends.quantized.engine
@@ -3281,8 +3615,18 @@ class TestQuantizedOps(TestCase):
 
     @override_qengines
     def test_custom_module_multi_head_attention(self):
+        # [FUNCTION DOC] End-to-end check of the quantizable-to-quantized MultiheadAttention flow
+        # under each qengine, with and without distinct key/value embedding dims, over bias,
+        # add_bias_kv and add_zero_attn options. Calibrated float outputs must equal the reference,
+        # converted parameters must no longer include the packed input projection weight, the
+        # quantized output must meet SNR/MSE thresholds against the dequantized reference, and the
+        # quantized model must be scriptable.
         class MultiheadAttentionModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module holding a single float MultiheadAttention built
+            # from the constructor arguments; its forward delegates to that layer.
             def __init__(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Builds the wrapper by creating the contained
+                # MultiheadAttention layer from the forwarded positional and keyword arguments.
                 super().__init__()
                 self.layer = torch.nn.MultiheadAttention(*args, **kwargs)
 
@@ -3295,6 +3639,9 @@ class TestQuantizedOps(TestCase):
                 need_weights: bool = True,
                 attn_mask: torch.Tensor | None = None,
             ):
+                # [FUNCTION DOC] HELPER: Runs the wrapped attention layer on query, key, value
+                # with optional key padding mask, need_weights flag and attention mask, and
+                # returns its outputs.
                 return self.layer(query, key, value, key_padding_mask, need_weights, attn_mask)
 
         qengine = torch.backends.quantized.engine
@@ -3394,6 +3741,11 @@ class TestQuantizedOps(TestCase):
 
     @skipIfNoONEDNN
     def test_int8_mul_onednn(self):
+        # [FUNCTION DOC] Checks the oneDNN int8 qmul op on tensor-form inputs (shapes 16x64 and
+        # 15x63, output uint8, float, bfloat16 or half). Reference is the product of the
+        # dequantized inputs, quantized with the decomposed per-tensor op for uint8 output and
+        # cast to the output dtype; compared to the op applied to the integer representations with
+        # their qparams.
         output_dtype_list = [torch.uint8, torch.float, torch.bfloat16, torch.half]
         shape_list = [(16, 64), (15, 63)]
         cases = itertools.product(shape_list, output_dtype_list)
@@ -3423,6 +3775,10 @@ class TestQuantizedOps(TestCase):
     @skipIfNoONEDNN
     @given(relu_fused=st.booleans())
     def test_int8_add_onednn(self, relu_fused):
+        # [FUNCTION DOC] Hypothesis test of the oneDNN int8 qadd op, or qadd_relu when relu_fused,
+        # on tensor inputs of two shapes for uint8, float, bfloat16 and half outputs. The reference
+        # is the sum of dequantized inputs (with relu if fused), quantized by the decomposed op for
+        # uint8 output and cast to the output dtype.
         output_dtype_list = [torch.uint8, torch.float, torch.bfloat16, torch.half]
         shape_list = [(16, 64), (15, 63)]
         cases = itertools.product(shape_list, output_dtype_list)
@@ -3456,6 +3812,10 @@ class TestQuantizedOps(TestCase):
 
     @skipIfNoONEDNN
     def test_int8_batch_norm_onednn(self):
+        # [FUNCTION DOC] Checks the oneDNN int8 qbatch_norm2d op on a uint8 4-D input of various
+        # channel counts and uint8, float, bfloat16 or half outputs. The reference dequantizes the
+        # input with the decomposed op, runs inference-mode float batch norm with random stats,
+        # then quantizes (uint8 only) and casts to the output dtype; compared with assertEqual.
         # hypothesis too slow for this test, create test cases manually
         channel_len_list = (8, 64, 100, 120, 128)
         output_dtype_list = [torch.uint8, torch.float, torch.bfloat16, torch.half]
@@ -3493,6 +3853,10 @@ class TestQuantizedOps(TestCase):
 
 
 class TestDynamicQuantizedOps(TestCase):
+    # [CLASS DOC] Tests for dynamically quantized ops: linear (int8 and fp16 weights, legacy FBGEMM
+    # path, wrapped FBGEMM fp16 ops), LSTM/GRU and RNN cells, dynamic conv/conv-transpose and the
+    # oneDNN fp16 dynamic linear. In dynamic quantization activations are quantized on the fly, so
+    # references quantize the input with the same calculated qparams first.
     """Tests the correctness of the dynamic quantized linear and linear_relu op."""
     @override_qengines
     @given(
@@ -3506,6 +3870,12 @@ class TestDynamicQuantizedOps(TestCase):
         reduce_range=st.booleans())
     def test_qlinear(self, batch_size, input_channels, output_channels,
                      use_bias, use_relu, use_multi_dim_input, use_channelwise, reduce_range):
+        # [FUNCTION DOC] Hypothesis test of the dynamic quantized linear op (or
+        # linear_relu_dynamic) on every qengine, with options for bias, relu, multi-dim input,
+        # channelwise weights and reduce_range (forced off for qnnpack). Builds integer inputs and
+        # weights with fixed extremes, avoids int16 overflow for x86-style engines, prepacks the
+        # weight, and compares the result with float linear on the dequantized quantized input and
+        # weight (relu applied when requested).
         if torch.backends.quantized.engine == 'qnnpack':
             reduce_range = False
 
@@ -3615,6 +3985,10 @@ class TestDynamicQuantizedOps(TestCase):
         output_channels=st.integers(4, 8),
     )
     def test_qlinear_legacy(self, batch_size, input_channels, output_channels):
+        # [FUNCTION DOC] Hypothesis test (FBGEMM only) of the legacy FBGEMM dynamic linear path:
+        # quantizes weights to int8 via the fbgemm weight quantizer, packs the matrix, runs the
+        # int8-weight linear op, and compares to float linear of the dequantized quantized input
+        # and weight with bias.
         X_scale = 1.0
         X_zp = 0
         X_value_min = 0
@@ -3689,6 +4063,9 @@ class TestDynamicQuantizedOps(TestCase):
         output_channels=st.integers(4, 8),
         exponent=st.integers(0, 8))
     def test_linear_prepack_fp16_numerics(self, input_channels, output_channels, exponent):
+        # [FUNCTION DOC] Hypothesis test (FBGEMM only): fp16 prepack then unpack of a float weight
+        # scaled by ten to a random power must exactly equal the weight rounded through float16
+        # and back.
         w = torch.randn(output_channels, input_channels) * 10**exponent
         bias = None
         w_packed_fp16 = torch.ops.quantized.linear_prepack_fp16(w, bias)
@@ -3698,6 +4075,10 @@ class TestDynamicQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_qlinear_dynamic_fp16(self):
+        # [FUNCTION DOC] Checks the fp16-weight dynamic linear (and relu variant) over grids of
+        # batch, input and output sizes, with and without bias (FBGEMM only). Weights are
+        # prepacked in fp16; the reference is float linear with fp16-rounded weights, relu applied
+        # if requested.
 
         options = itertools.product(
             (2, 4),         # batch_size
@@ -3731,6 +4112,9 @@ class TestDynamicQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_unpacked_qlinear_dynamic_fp16(self):
+        # [FUNCTION DOC] Checks the dynamic fp16 linear that takes an unpacked weight and a bias
+        # over a grid of batch, input and output sizes (FBGEMM only), against float linear with the
+        # weight rounded through float16.
 
         options = itertools.product(
             (2, 4),         # batch_size
@@ -3756,6 +4140,8 @@ class TestDynamicQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_unpacked_qlinear_dynamic_fp16_opcheck(self):
+        # [FUNCTION DOC] Runs the operator checking utility on the unpacked-weight fp16 dynamic
+        # linear op with random 4x4 CPU input, weight and bias (FBGEMM only).
         qlinear_dynamic = torch.ops.quantized.linear_dynamic_fp16_unpacked_weight.default
 
         x = torch.randn(4, 4, device='cpu')
@@ -3766,6 +4152,10 @@ class TestDynamicQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_wrapped_fbgemm_linear_fp16(self):
+        # [FUNCTION DOC] Checks the wrapped FBGEMM fp16 pack and linear ops over a grid of
+        # batch, input and output sizes, with and without bias (FBGEMM only): pack the weight,
+        # apply the linear op with the output channel count, and compare to float linear with
+        # fp16-rounded weights.
         options = itertools.product(
             (2, 4),         # batch_size
             (4, 5),     # input_channels
@@ -3790,6 +4180,10 @@ class TestDynamicQuantizedOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_wrapped_fbgemm_pack_gemm_matrix_fp16_pt2_compliant(self):
+        # [FUNCTION DOC] Checks that the wrapped FBGEMM pack and fp16 linear ops give the
+        # same result in eager mode and under torch.compile, with a bias and without (FBGEMM
+        # only). Opcheck is not used because the packed output is a non-deterministic native
+        # struct handle.
         # We are not using opcheck over here because the output for the op we're testing
         # (_quantized.wrapped_fbgemm_pack_gemm_matrix_fp16) is not deterministic
         # due to the C-struct it's producing. This would fail the check when we're trying
@@ -3798,6 +4192,9 @@ class TestDynamicQuantizedOps(TestCase):
         # This is only a temporary solution, long term, we should be able to support PT2
         # with torchbind natively.
         def func(X, W, B):
+            # [FUNCTION DOC] HELPER: Packs weight W with the wrapped FBGEMM fp16 pack op and
+            # applies the wrapped fp16 linear op with bias B and output size equal to the first dim
+            # of W. Returns the output tensor.
             packed_W = torch.ops._quantized.wrapped_fbgemm_pack_gemm_matrix_fp16(W)
             return torch.ops._quantized.wrapped_fbgemm_linear_fp16_weight(X, packed_W, B, W.size(0))
 
@@ -3813,6 +4210,9 @@ class TestDynamicQuantizedOps(TestCase):
         self.assertEqual(ref_out, compiled_out)
 
         def func(X, W):
+            # [FUNCTION DOC] HELPER: Same as the earlier function of this name but without a
+            # bias: packs W with the wrapped FBGEMM fp16 pack op and applies the fp16 linear op
+            # with no bias.
             packed_W = torch.ops._quantized.wrapped_fbgemm_pack_gemm_matrix_fp16(W)
             return torch.ops._quantized.wrapped_fbgemm_linear_fp16_weight(X, packed_W, None, W.size(0))
 
@@ -3827,6 +4227,10 @@ class TestDynamicQuantizedOps(TestCase):
     """Tests the correctness of the dynamic quantized lstm/gru."""
 
     def _get_rnn_inputs(self, seq_len, num_batches, input_size, hidden_size, num_directions, reduce_range):
+        # [FUNCTION DOC] HELPER: Builds quantized RNN test inputs: a random input of shape sequence
+        # by batch by input size, and hidden and cell states with the first (direction) dimension
+        # set by num_directions (random for one direction, zeros for two). Each is quantized to
+        # quint8 with dynamically calculated qparams honoring reduce_range. Returns (Xq, Hq, Cq).
         # For Input (seq_len, batch, input_size)
         X = torch.randn(seq_len, num_batches, input_size)
         s, z = _calculate_dynamic_qparams(X, torch.quint8, reduce_range)
@@ -3848,6 +4252,11 @@ class TestDynamicQuantizedOps(TestCase):
         return Xq, Hq, Cq
 
     def _get_rnn_weights_and_bias(self, input_size, hidden_size, num_directions, per_channel_quant, rnn_type):
+        # [FUNCTION DOC] HELPER: Builds random float input-hidden and hidden-hidden weights for the
+        # given rnn type (gate multiplier 4 for LSTM kinds, 3 for GRU kinds, 1 for plain RNN)
+        # quantized to qint8 with fixed scales (0.1 and 0.3) and zero points, per channel or per
+        # tensor, plus a zero bias. Returns (Wq1, Wq2, b1, b1): the same bias object is returned
+        # for both slots. num_directions is unused.
         hidden_mult_map = {'LSTM': 4, 'LSTMCell': 4, 'GRU': 3, 'GRUCell': 3, 'RNNTanh': 1, 'RNNReLU': 1}
         hidden_mult = hidden_mult_map[rnn_type]
         weights1 = torch.randn(hidden_mult * hidden_size, input_size)
@@ -3875,6 +4284,12 @@ class TestDynamicQuantizedOps(TestCase):
     @override_qengines
     def test_qlstmGRU(self, num_batches, input_size, hidden_size,
                       num_directions, per_channel_quant):
+        # [FUNCTION DOC] Hypothesis test comparing dynamic quantized LSTM and GRU (sequence length
+        # one, one layer, one or two directions, per-tensor or per-channel weights) against the
+        # float _VF reference using weights dequantized from the same quantized values, for qint8
+        # and fp16 weights (fp16 skipped on qnnpack and onednn). Only the first output is compared.
+        # KNOWN ISSUE: the LSTM calls always pass the qint8 dtype even when fp16 cell params
+        # are used.
         # We test only for seq length of 1 and num layers of 1 as dynamic quantization occurs multiple times
         # within the LSTM op and we do not model the quantization between multiple calls of the linear op within the
         # lstm op
@@ -4009,6 +4424,11 @@ class TestDynamicQuantizedOps(TestCase):
         per_channel_quant=st.booleans())
     @override_qengines
     def test_qrnncell(self, num_batches, input_size, hidden_size, per_channel_quant):
+        # [FUNCTION DOC] Hypothesis test comparing dynamic quantized RNN cells (LSTM, GRU, tanh and
+        # relu RNN cells; qint8 and fp16 weights, fp16 skipped on qnnpack and onednn) with the
+        # float _VF cell functions using dequantized weights, for sequence length one. Compares the
+        # first element of the result.
+        # KNOWN ISSUE: the reference-weights mapping built per dtype is never used.
         # We test only for seq length of 1 and num layers of 1 as dynamic quantization occurs multiple times
         # within the LSTM op and we do not model the quantization between multiple calls of the linear op within the
         # lstm op
@@ -4060,6 +4480,12 @@ class TestDynamicQuantizedOps(TestCase):
                 self.assertEqual(result_ref[0], result_dynamic[0], msg="torch.quantized_rnncell results are off")
 
     def _test_qconv_op_impl(self, q_mod, dq_op, dim, dtype):
+        # [FUNCTION DOC] HELPER: Verifies a dynamic conv op equals calc params, quantize input, run
+        # the quantized conv module, dequantize. Takes the quantized module class, the dynamic op,
+        # the input rank and quant dtype. Returns early for qnnpack on PPC. Builds a 2-input,
+        # 3-output, kernel-1 module, sets its scale and zero point from the dynamically computed
+        # qparams (reduce_range off for qnnpack), and compares the dynamic op on the dequantized
+        # input with the dequantized module output.
         # The goal here is to show that the dynamic op is the same as
         # calc params->quantize_input->quantized op->dequantize output
 
@@ -4090,6 +4516,8 @@ class TestDynamicQuantizedOps(TestCase):
 
     @override_qengines
     def test_dynamic_conv1d(self):
+        # [FUNCTION DOC] Checks the dynamic Conv1d op against the quantized module path
+        # (3-D input).
         q_mod = torch.ao.nn.quantized.Conv1d
         dq_op = torch.ops.quantized.conv1d_dynamic
         dim = 3
@@ -4099,6 +4527,8 @@ class TestDynamicQuantizedOps(TestCase):
 
     @override_qengines
     def test_dynamic_conv2d(self):
+        # [FUNCTION DOC] Checks the dynamic Conv2d op against the quantized module path
+        # (4-D input).
         q_mod = torch.ao.nn.quantized.Conv2d
         dq_op = torch.ops.quantized.conv2d_dynamic
         dim = 4
@@ -4108,6 +4538,8 @@ class TestDynamicQuantizedOps(TestCase):
 
     @override_qengines
     def test_dynamic_conv3d(self):
+        # [FUNCTION DOC] Checks the dynamic Conv3d op against the quantized module path
+        # (5-D input).
         q_mod = torch.ao.nn.quantized.Conv3d
         dq_op = torch.ops.quantized.conv3d_dynamic
         dim = 5
@@ -4117,6 +4549,7 @@ class TestDynamicQuantizedOps(TestCase):
 
     @override_qengines
     def test_dynamic_convtranspose1d(self):
+        # [FUNCTION DOC] Checks the dynamic ConvTranspose1d op against the quantized module path.
         q_mod = torch.ao.nn.quantized.ConvTranspose1d
         dq_op = torch.ops.quantized.conv_transpose1d_dynamic
         dim = 3
@@ -4126,6 +4559,7 @@ class TestDynamicQuantizedOps(TestCase):
 
     @override_qengines
     def test_dynamic_convtranspose2d(self):
+        # [FUNCTION DOC] Checks the dynamic ConvTranspose2d op against the quantized module path.
         q_mod = torch.ao.nn.quantized.ConvTranspose2d
         dq_op = torch.ops.quantized.conv_transpose2d_dynamic
         dim = 4
@@ -4135,6 +4569,8 @@ class TestDynamicQuantizedOps(TestCase):
 
     @override_qengines
     def test_dynamic_convtranspose3d(self):
+        # [FUNCTION DOC] Checks the dynamic ConvTranspose3d op against the quantized module path;
+        # returns without testing for the qnnpack engine (TODO about output-shape overflow).
         q_mod = torch.ao.nn.quantized.ConvTranspose3d
         dq_op = torch.ops.quantized.conv_transpose3d_dynamic
         dim = 5
@@ -4146,6 +4582,9 @@ class TestDynamicQuantizedOps(TestCase):
 
     @skipIfNoONEDNN
     def test_linear_dynamic_fp16_onednn(self):
+        # [FUNCTION DOC] Checks the oneDNN fp16 dynamic linear (and relu variant) over a grid of
+        # batch, input and output sizes, with and without bias. The weight is prepacked given the
+        # input shape; the reference is float linear with fp16-rounded weights, relu if requested.
 
         options = itertools.product(
             (2, 4),         # batch_size
@@ -4179,8 +4618,22 @@ class TestDynamicQuantizedOps(TestCase):
 
 
 class TestQuantizedLinear(TestCase):
+    # [CLASS DOC] Tests for statically quantized linear ops: qlinear and relu fusion, the cudnn
+    # variant (currently skipped), weight pack/unpack, wrapped FBGEMM int8 linear, qnnpack memory
+    # freeing, oneDNN fusions and the pt2e/fp8 oneDNN qlinear pointwise ops.
     def _test_qlinear_impl(self, batch_size, input_channels, output_channels, use_bias,
                            post_op, use_multi_dim_input, use_channelwise, **post_op_kwargs):
+        # [FUNCTION DOC] HELPER: Shared checker for quantized linear. Selects the plain, relu or
+        # leaky_relu quantized linear op from post_op, builds random integer activations, int8
+        # weights (per-tensor or per-channel scales, symmetric zero points for qint8 and oneDNN)
+        # and optional bias, avoids int16 overflow on x86-style engines, prepacks the weight and
+        # runs the op with extra keyword arguments. For per-tensor none/relu it compares with the
+        # numpy qlinear_ref reference, and always against float linear of dequantized inputs
+        # requantized to the output params. Dtypes: quint8, plus qint8 on qnnpack with xnnpack or
+        # oneDNN on ARM64; off-by-one is tolerated on qnnpack. Returns early (ending the whole
+        # check) when a qint8 case uses channelwise weights.
+        # KNOWN ISSUE: any other post_op name (such as tanh) falls through to the plain linear op
+        # and the float reference applies no activation, so those names are not actually tested.
         decimal_val = 4
         dtypes = [torch.quint8]
         if torch.backends.quantized.engine == 'qnnpack':
@@ -4322,6 +4775,9 @@ class TestQuantizedLinear(TestCase):
     """Tests the correctness of the quantized linear op."""
     @override_qengines
     def test_qlinear(self):
+        # [FUNCTION DOC] Runs the shared qlinear checker with no post-op over a grid of batch
+        # size, input and output channels, bias, multi-dim input and channelwise weights, for
+        # every qengine.
         batch_size_list = [1, 4]
         input_channels_list = [16, 32]
         output_channels_list = [4, 8]
@@ -4339,6 +4795,9 @@ class TestQuantizedLinear(TestCase):
     """Tests the correctness of the quantized linear_relu op."""
     @override_qengines
     def test_qlinear_relu(self):
+        # [FUNCTION DOC] Runs the shared qlinear checker with the relu post-op (the fused
+        # linear_relu op) over the same grid of sizes and options as the plain test, for
+        # every qengine.
         batch_size_list = [1, 4]
         input_channels_list = [16, 32]
         output_channels_list = [4, 8]
@@ -4364,6 +4823,11 @@ class TestQuantizedLinear(TestCase):
     def test_qlinear_with_input_q_dq_qweight_dq_output_fp32(
             self, batch_size, input_channels, output_channels, use_bias,
             use_relu, use_multi_dim_input, use_channelwise):
+        # [FUNCTION DOC] Hypothesis test (FBGEMM only) of the quantized linear variant that takes a
+        # float input, quantizes and dequantizes it internally and returns float output (optionally
+        # with fused relu). Builds integer weights/bias as in the other linear tests (quint8 input
+        # only), runs the op with the input scale and zero point, and compares to float linear of
+        # the dequantized quantized input and weight, to one decimal place.
         decimal_val = 4
         dtypes = [torch.quint8]
         for dtype in dtypes:
@@ -4492,6 +4956,12 @@ class TestQuantizedLinear(TestCase):
     @unittest.skip("not currently working and feature isn't used")
     def test_qlinear_cudnn(self, batch_size, input_channels, output_channels, use_bias,
                            use_relu, use_multi_dim_input, use_channelwise):
+        # [FUNCTION DOC] Skipped test (needs FBGEMM, cuDNN other than 9.1.0, SM80+, not ROCm;
+        # marked not working): qint8 linear or linear_relu on CUDA tensors with the weight
+        # prepacked, channelwise off, compared with the numpy qlinear_ref reference on the integer
+        # outputs (exact).
+        # KNOWN ISSUE: the bias is dequantized with the weight zero point instead of the weight
+        # scale, and the bias integers are generated twice.
         qlinear_prepack = torch.ops.quantized.linear_prepack
         if use_relu:
             qlinear_op = torch.ops.quantized.linear_relu
@@ -4572,6 +5042,10 @@ class TestQuantizedLinear(TestCase):
            use_channelwise=st.booleans())
     @override_qengines
     def test_qlinear_unpack(self, W, use_channelwise):
+        # [FUNCTION DOC] Hypothesis test of linear prepack then unpack on qint8 weights (per-tensor
+        # or per-channel with random scales and zero points), for every qengine. oneDNN forces zero
+        # zero-points. Asserts the unpacked weight has the same integer values, and the same scale
+        # and zero point (or per-channel scales within four decimals and identical zero points).
         W, (W_scale, W_zp, torch_type) = W
         if use_channelwise:
             output_channels = W.shape[0]
@@ -4622,6 +5096,9 @@ class TestQuantizedLinear(TestCase):
         n=st.integers(2, 6),
     )
     def test_wrapped_quantized_linear(self, m, n, k):
+        # [FUNCTION DOC] Hypothesis test (FBGEMM only) of the wrapped quantized linear op that
+        # takes float input and weight with tensor scales and zero points. Compared with prepacking
+        # the quantized weight, running the quantized linear op and dequantizing.
         input = torch.randn(m, k, dtype=torch.float32)
         input_scale = torch.tensor(0.1)
         input_zero_point = torch.tensor(0)
@@ -4662,6 +5139,9 @@ class TestQuantizedLinear(TestCase):
         n=st.integers(2, 6),
     )
     def test_wrapped_quantized_linear_prepacked(self, m, n, k):
+        # [FUNCTION DOC] Hypothesis test (FBGEMM only) of the wrapped linear prepack op followed by
+        # the wrapped prepacked quantized linear op on float input; the result must equal the
+        # dequantized output of the regular quantized prepack and linear ops.
         input = torch.randn(m, k, dtype=torch.float32)
         input_scale = torch.tensor(0.1)
         input_zero_point = torch.tensor(0)
@@ -4701,6 +5181,13 @@ class TestQuantizedLinear(TestCase):
                        qparams=hu.qparams(dtypes=torch.qint8)))
     @override_qengines
     def test_qlinear_qnnpack_free_memory_and_unpack(self, W):
+        # [FUNCTION DOC] Hypothesis test (needs QNNPACK, run for each qengine) that a
+        # qnnpack-prepacked weight can be unpacked after the original weight memory is freed. Runs
+        # dynamic linear twice on a dummy input to trigger the freeing, then unpacks and compares
+        # integer values, scale and zero point with the original quantized weight (zero point
+        # forced to 0 for oneDNN).
+        # KNOWN ISSUE: the guard tests the function object itself rather than calling it, so it can
+        # never fail.
         if not qengine_is_qnnpack:
             raise AssertionError("Expected qengine_is_qnnpack to be True")
         W, (W_scale, W_zp, torch_type) = W
@@ -4729,6 +5216,9 @@ class TestQuantizedLinear(TestCase):
 
     @skipIfNoONEDNN
     def test_qlinear_leaky_relu(self):
+        # [FUNCTION DOC] Runs the shared qlinear checker with the leaky_relu post-op on the oneDNN
+        # engine over a grid of sizes, bias, multi-dim input, channelwise weights and two negative
+        # slopes passed as a keyword argument.
         with override_quantized_engine('onednn'):
             batch_size_list = [1, 4]
             input_channels_list = [16, 32]
@@ -4749,6 +5239,10 @@ class TestQuantizedLinear(TestCase):
 
     @skipIfNoONEDNN
     def test_qlinear_tanh(self):
+        # [FUNCTION DOC] Runs the shared qlinear checker on the oneDNN engine with post-op name
+        # tanh over a grid of sizes, bias, multi-dim input and channelwise weights.
+        # KNOWN ISSUE: the shared checker does not implement tanh, so this exercises the plain
+        # linear op against a reference with no activation.
         with override_quantized_engine('onednn'):
             batch_size_list = [1, 4]
             input_channels_list = [16, 32]
@@ -4773,6 +5267,17 @@ class TestQuantizedLinear(TestCase):
         unary_post_op_args=(),
         post_op_algorithms=("none",),
     ):
+        # [FUNCTION DOC] HELPER: Shared pt2e checker for the oneDNN qlinear pointwise ops.
+        # qlinear_op is the op under test, post_op one of none, relu, gelu, sum, sum_relu, add,
+        # add_relu; the unary args and gelu algorithms are passed through. On the oneDNN engine it
+        # loops over input and output channels, bias, per-tensor or per-channel weight scales,
+        # output dtype (uint8 default, float32, bfloat16) and 2-D or 3-D inputs. Float inputs and
+        # weights are quantized (uint8 and int8), the weight is prepacked, and the op runs on
+        # integer tensors. The reference is float linear plus the post-op (for sum a second
+        # quantized operand accumulated into a clone; for add a second float operand with unit
+        # output scale; the add forms skip non-default output dtypes), requantized to uint8. Float
+        # or bfloat16 outputs are requantized before comparison. Checks dims and integer outputs to
+        # zero decimals.
         qlinear_prepack = torch.ops.onednn.qlinear_prepack
         linear_op = F.linear
         in_channels_list = [4, 8]
@@ -4899,12 +5404,17 @@ class TestQuantizedLinear(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_pt2e(self):
+        # [FUNCTION DOC] pt2e check (skipped in fbcode, needs oneDNN) of the oneDNN qlinear
+        # pointwise op with no post-op, via the shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise
         self._test_qlinear_pt2e_helper(qlinear, "none")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_prepack_meta(self):
+        # [FUNCTION DOC] pt2e check (skipped in fbcode, needs oneDNN) that the oneDNN qlinear
+        # prepack op works on a meta-device int8 16x8 weight: the packed result must have shape
+        # 8x16, int8 dtype and the meta device.
         qlinear_prepack = torch.ops.onednn.qlinear_prepack
         N, K = 16, 8
 
@@ -4917,12 +5427,16 @@ class TestQuantizedLinear(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_relu_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN qlinear pointwise op with fused relu, via the
+        # shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise
         self._test_qlinear_pt2e_helper(qlinear, "relu")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_gelu_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN qlinear pointwise op with fused gelu in both the
+        # none and tanh approximation modes, via the shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise
         post_op_algorithms = ['none', 'tanh']
         self._test_qlinear_pt2e_helper(qlinear, "gelu", post_op_algorithms=post_op_algorithms)
@@ -4930,30 +5444,42 @@ class TestQuantizedLinear(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_sum_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN qlinear pointwise binary op with sum post-op
+        # (accumulating into a second quantized operand), via the shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise.binary
         self._test_qlinear_pt2e_helper(qlinear, "sum")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_sum_relu_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN qlinear pointwise binary op with sum followed by
+        # relu, via the shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise.binary
         self._test_qlinear_pt2e_helper(qlinear, "sum_relu")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_add_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN qlinear pointwise binary op with add post-op
+        # (float second operand), via the shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise.binary
         self._test_qlinear_pt2e_helper(qlinear, "add")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_add_relu_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN qlinear pointwise binary op with add followed by
+        # relu, via the shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise.binary
         self._test_qlinear_pt2e_helper(qlinear, "add_relu")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_fast_path_pt2e(self):
+        # [FUNCTION DOC] Runs the module-level oneDNN qlinear fast-path validation in a spawned
+        # child process connected by a one-way pipe, because it sets a process-wide environment
+        # flag. Waits for the child, reads any traceback sent back, and asserts exit code zero,
+        # showing the traceback in the failure message.
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         process = ctx.Process(
@@ -4981,6 +5507,13 @@ class TestQuantizedLinear(TestCase):
         unary_post_op_args=(),
         post_op_algorithms=("none",),
     ):
+        # [FUNCTION DOC] HELPER: Shared fp8 checker for the oneDNN qlinear pointwise ops, mirroring
+        # the pt2e helper but with float8_e4m3fn tensors: input per-tensor, weight per-tensor or
+        # per-channel, optional bias (bfloat16 when output is bfloat16). The reference is float
+        # linear on fp8-dequantized values plus the post-op (none, relu, gelu, sum, sum_relu, add,
+        # add_relu; add forms skip non-default output dtypes). The reference is quantized to fp8
+        # when output dtype is default, otherwise cast to the output dtype; compares as float and
+        # asserts no NaNs and matching dims.
         qlinear_prepack = torch.ops.onednn.qlinear_prepack
         linear_op = F.linear
         in_channels_list = [4, 8]
@@ -5093,18 +5626,24 @@ class TestQuantizedLinear(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_fp8(self):
+        # [FUNCTION DOC] fp8 check of the oneDNN qlinear pointwise op with no post-op, via the
+        # shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise
         self._test_qlinear_fp8_helper(qlinear, "none")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_relu_fp8(self):
+        # [FUNCTION DOC] fp8 check of the oneDNN qlinear pointwise op with fused relu, via the
+        # shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise
         self._test_qlinear_fp8_helper(qlinear, "relu")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_gelu_fp8(self):
+        # [FUNCTION DOC] fp8 check of the oneDNN qlinear pointwise op with fused gelu (none and
+        # tanh modes), via the shared helper.
         qlinear = torch.ops.onednn.qlinear_pointwise
         post_op_algorithms = ['none', 'tanh']
         self._test_qlinear_fp8_helper(qlinear, "gelu", post_op_algorithms=post_op_algorithms)
@@ -5112,30 +5651,41 @@ class TestQuantizedLinear(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_sum_fp8(self):
+        # [FUNCTION DOC] fp8 check of the oneDNN qlinear pointwise binary op with sum post-op, via
+        # the helper.
         qlinear = torch.ops.onednn.qlinear_pointwise.binary
         self._test_qlinear_fp8_helper(qlinear, "sum")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_sum_relu_fp8(self):
+        # [FUNCTION DOC] fp8 check of the oneDNN qlinear pointwise binary op with sum then relu,
+        # via the helper.
         qlinear = torch.ops.onednn.qlinear_pointwise.binary
         self._test_qlinear_fp8_helper(qlinear, "sum_relu")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_add_fp8(self):
+        # [FUNCTION DOC] fp8 check of the oneDNN qlinear pointwise binary op with add post-op, via
+        # the helper.
         qlinear = torch.ops.onednn.qlinear_pointwise.binary
         self._test_qlinear_fp8_helper(qlinear, "add")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_add_relu_fp8(self):
+        # [FUNCTION DOC] fp8 check of the oneDNN qlinear pointwise binary op with add then relu,
+        # via the helper.
         qlinear = torch.ops.onednn.qlinear_pointwise.binary
         self._test_qlinear_fp8_helper(qlinear, "add_relu")
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qlinear_fast_path_fp8(self):
+        # [FUNCTION DOC] Runs the module-level fp8 oneDNN qlinear fast-path validation in a spawned
+        # child process (one-way pipe for the traceback) and asserts it exits with code zero,
+        # reporting the child's traceback on failure.
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         process = ctx.Process(
@@ -5159,8 +5709,18 @@ class TestQuantizedLinear(TestCase):
 
 @unittest.skipIf(IS_MACOS, "Known test failure on Mac.")
 class TestQuantizedEmbeddingOps(TestCase):
+    # [CLASS DOC] Tests for quantized embedding and embedding bag ops: byte, 4-bit and 2-bit
+    # rowwise offsets lookup (with sparsity pruning, per-sample weights and 32/64-bit indices),
+    # pack and unpack round trips, CUDA availability of the rowwise op, and 2-D index handling. The
+    # whole class is skipped on macOS.
 
     def _test_embedding_bag_unpack_impl(self, pack_fn, unpack_fn, bit_rate, optimized_qparams, weights):
+        # [FUNCTION DOC] HELPER: Packs a float weight tensor with pack_fn (passing the optimized
+        # qparams flag for bit rates other than eight), unpacks it with unpack_fn, and, for 8 and 4
+        # bit non-fp16 data, also checks the prepack and unpack ops that take a quantized tensor:
+        # the weights are quantized per row with a min-max float-qparams observer (3-D weights are
+        # stacked into 2-D), prepacked into a script object, unpacked, and the integer values,
+        # scales and zero points must equal the quantized originals.
         data_type = weights.dtype
 
         qtype = torch.quint8
@@ -5203,6 +5763,10 @@ class TestQuantizedEmbeddingOps(TestCase):
 
     def _test_embedding_bag_unpack_fn(self, pack_fn, unpack_fn, num_embeddings, embedding_dim, bit_rate,
                                       optimized_qparams, num_batches, data_type=np.float32):
+        # [FUNCTION DOC] HELPER: Builds a random positive float weight of shape batches by
+        # embeddings by dim (squeezed, so one batch gives a 2-D tensor), runs the unpack checker on
+        # it and then on each slice produced by splitting along the embedding dim so the memory
+        # layout is not contiguous. data_type is accepted but unused.
 
         # when num_batches = 1, it will create a 2D tensor
         unsplit_weight = torch.from_numpy((np.random.random_sample((
@@ -5225,6 +5789,13 @@ class TestQuantizedEmbeddingOps(TestCase):
             use_32bit_indices, use_32bit_offsets,
             enable_per_sample_weights,
             include_last_offset, fallback_to_no_sparse, sparsity, atol, rtol):
+        # [FUNCTION DOC] HELPER: Compares a quantized embedding bag rowwise-offsets op (8, 4 or 2
+        # bit) with the float EmbeddingBag in sum mode. Builds random weights, random segment
+        # lengths, offsets (optionally with a trailing offset), indices (32 or 64 bit) and optional
+        # per-sample weights; with sparsity it prunes rows (zeroing weights and building a
+        # compressed index mapping, or uses a trivial mapping to force the non-sparse fallback).
+        # Compares with the given tolerances. For 8 and 4 bit it also checks the op taking
+        # script-object packed weights built via a per-row observer. num_offsets is unused.
         pt_op = torch.ops.quantized.embedding_bag_byte_rowwise_offsets
         pt_prepack_op = torch.ops.quantized.embedding_bag_byte_prepack
         if bit_rate == 4:
@@ -5245,6 +5816,9 @@ class TestQuantizedEmbeddingOps(TestCase):
         num_indices = np.sum(lengths)
 
         def lengths_to_offsets(t, offset_type=np.int64, use_begin_offset=True):
+            # [FUNCTION DOC] HELPER: Converts a numpy array of segment lengths into a tensor of
+            # offsets using a cumulative sum of the given integer type; returns the begin offsets
+            # (all but the last cumulative value) or, if requested otherwise, the end offsets.
             """
             Convert lengths to offsets
             """
@@ -5273,6 +5847,9 @@ class TestQuantizedEmbeddingOps(TestCase):
                 num_embeddings, embedding_dim,
                 include_last_offset, weights, per_sample_weights,
                 indices, offsets):
+            # [FUNCTION DOC] HELPER: Builds a float EmbeddingBag (sum mode) from the given weights
+            # and include_last_offset flag, and returns its output for the indices, offsets and
+            # optional per-sample weights.
             embedding_bag = torch.nn.EmbeddingBag(
                 num_embeddings=num_embeddings,
                 embedding_dim=embedding_dim,
@@ -5362,6 +5939,9 @@ class TestQuantizedEmbeddingOps(TestCase):
                                 include_last_offset,
                                 fallback_to_no_sparse,
                                 sparsity):
+        # [FUNCTION DOC] Hypothesis test of the 8-bit rowwise-offsets embedding bag op over random
+        # sizes, index/offset widths, per-sample weights, last-offset flag and sparsity, using the
+        # shared runner with absolute tolerance 0.005 and relative 1e-3.
         self.embedding_bag_rowwise_offsets_run(
             8, num_embeddings, embedding_dim, num_offsets,
             use_32bit_indices, use_32bit_offsets,
@@ -5387,6 +5967,10 @@ class TestQuantizedEmbeddingOps(TestCase):
                                 include_last_offset,
                                 fallback_to_no_sparse,
                                 sparsity):
+        # [FUNCTION DOC] Hypothesis test of the 4-bit rowwise-offsets embedding bag op (embedding
+        # dim multiple of 4) over random sizes, index/offset widths, per-sample weights,
+        # last-offset flag and sparsity, using the shared runner with absolute tolerance 0.1 and
+        # relative 1e-2.
         self.embedding_bag_rowwise_offsets_run(4, num_embeddings,
                                                embedding_dim, num_offsets,
                                                use_32bit_indices, use_32bit_offsets,
@@ -5414,6 +5998,10 @@ class TestQuantizedEmbeddingOps(TestCase):
                                 include_last_offset,
                                 fallback_to_no_sparse,
                                 sparsity):
+        # [FUNCTION DOC] Hypothesis test of the 2-bit rowwise-offsets embedding bag op (embedding
+        # dim multiple of 8) over random sizes, index/offset widths, per-sample weights,
+        # last-offset flag and sparsity, using the shared runner with absolute tolerance 1.0 and
+        # relative 1e-1.
         self.embedding_bag_rowwise_offsets_run(2, num_embeddings,
                                                embedding_dim, num_offsets,
                                                use_32bit_indices, use_32bit_offsets,
@@ -5428,6 +6016,10 @@ class TestQuantizedEmbeddingOps(TestCase):
         path is built on, which is shared by both bit widths. """
     @unittest.skipIf(not TEST_CUDA, "CUDA is not available")
     def test_embedding_bag_rowwise_offsets_cuda(self):
+        # [FUNCTION DOC] Checks (skipped without CUDA) that the byte and 4-bit rowwise-offsets
+        # embedding bag ops on CUDA agree with the CPU results for a fixed 32x24 weight, small
+        # fixed indices and offsets: the CUDA output must be finite and match CPU within a
+        # per-bit-width tolerance.
         # 24 satisfies both ops: the byte op requires D % 4 == 0, the 4-bit op
         # requires D % 8 == 0.
         num_embeddings, embedding_dim = 32, 24
@@ -5445,6 +6037,9 @@ class TestQuantizedEmbeddingOps(TestCase):
             q_weights = prepack_op(weights)
 
             def run(device, q_weights=q_weights, op=op):
+                # [FUNCTION DOC] HELPER: Runs the current loop iteration's embedding bag op (bound
+                # by default arguments) with packed weights, indices and offsets moved to the given
+                # device, in sum mode without pruning or last offset; returns the output tensor.
                 return op(q_weights.to(device), indices.to(device),
                           offsets.to(device), mode=0, pruned_weights=False,
                           include_last_offset=False)
@@ -5460,6 +6055,10 @@ class TestQuantizedEmbeddingOps(TestCase):
     @given(num_embeddings=st.integers(10, 100),
            embedding_dim=st.integers(5, 50).filter(lambda x: x % 4 == 0))
     def test_embedding(self, num_embeddings, embedding_dim):
+        # [FUNCTION DOC] Hypothesis test of the quantized embedding lookup ops (byte and 4-bit
+        # variants) on weights quantized per row with a float-qparams observer and packed as script
+        # objects. For random indices the lookup must match the float embedding within the dtype's
+        # tolerance (0.005 for 8 bit, 0.1 for 4 bit).
         dtypes = [torch.quint8, torch.quint4x2]
         quant_ops = [torch.ops.quantized.embedding_byte, torch.ops.quantized.embedding_4bit]
         atols = [0.005, 0.1]
@@ -5492,6 +6091,9 @@ class TestQuantizedEmbeddingOps(TestCase):
             torch.testing.assert_close(ref, qresult, atol=atol, rtol=rtol)
 
     def test_embedding_2d_indices(self):
+        # [FUNCTION DOC] Checks that the quantized byte embedding lookup accepts a 2-D index tensor
+        # and returns the same shape and values (absolute tolerance 0.05) as the float embedding
+        # for a 10x12 random weight quantized per row.
         """
         Tests the case where 2D indices are passed into the operator
         In this case the operator computes the correct offsets argument.
@@ -5514,6 +6116,9 @@ class TestQuantizedEmbeddingOps(TestCase):
         torch.testing.assert_close(ref, qresult, atol=0.05, rtol=1e-3)
 
     def test_embedding_bag_2d_indices(self):
+        # [FUNCTION DOC] Checks that the byte rowwise-offsets embedding bag op and the
+        # script-object embedding bag op accept 2-D indices (offsets computed implicitly), matching
+        # the float EmbeddingBag in sum mode within absolute tolerance 0.05.
         """
         Tests the case where 2D indices are passed into the operator
         In this case the operator computes the correct offsets argument.
@@ -5551,8 +6156,18 @@ class TestQuantizedEmbeddingOps(TestCase):
 
 
 class TestQuantizedConv(TestCase):
+    # [CLASS DOC] Tests for statically quantized convolution ops (1d, 2d, 3d, transposed, relu and
+    # add fusions, cudnn variants that are skipped, prepack/unpack round trips, oneDNN reorder
+    # regressions and pt2e oneDNN conv ops). Shared helpers generate small-integer data, compute a
+    # float reference conv from the dequantized values and compare the integer outputs.
     def _test_qconv_unpack_impl(self, qconv_prepack_fn, qconv_unpack_fn, inputs,
                                 strides, i_pads, o_pads, channelwise):
+        # [FUNCTION DOC] HELPER: Round-trip check for conv weight prepack and unpack. inputs holds
+        # the input, weight and bias data with quantization params, groups and a transposed flag.
+        # Returns early for channelwise transposed weights (unsupported); for oneDNN the weight
+        # zero point and output padding are forced to zero. Quantizes the weight per tensor or per
+        # channel (axis follows transposition), prepacks with the given function, unpacks, and
+        # asserts equal integer values and equal scales and zero points.
         (X_data, W_data, bias_data, groups, transposed) = inputs
         (X, (X_scale, X_zero_point, X_qtype)) = X_data
         (W, (W_scale, W_zero_point, W_qtype)) = W_data
@@ -5619,6 +6234,13 @@ class TestQuantizedConv(TestCase):
         input_dtype=torch.quint8,
         weight_dtype=torch.qint8,
     ):
+        # [FUNCTION DOC] HELPER: Generates matching float and quantized conv test data. Raises an
+        # assertion error for channelwise transposed requests. Uses assume to skip combinations
+        # where the padded input is smaller than the dilated kernel. Weight scale/zero point
+        # lists are repeated and cut to the output channel count. Weights are small random
+        # integers in minus five to five, bias integers 0 to 9 and inputs 0 to 3, kept small to
+        # avoid overflow in x86 kernels. Returns ((float X, float W), (quantized X, quantized W),
+        # float bias or None).
         if use_channelwise and use_transpose:
             raise AssertionError("Cannot generate channelwise qconv_transpose_tensors ")
         input_channels = input_channels_per_group * groups
@@ -5707,6 +6329,13 @@ class TestQuantizedConv(TestCase):
         X2_scale=1.0,
         X2_zero_point=128
     ):
+        # [FUNCTION DOC] HELPER: Shared conv checker. Builds data with the tensor maker, assigns
+        # the dequantized weight and bias to the given float conv module as the reference (oneDNN
+        # forces zero weight zero points), applies relu or adds a second quantized operand (add,
+        # add_relu) per post_op (relu on transposed conv is rejected), and quantizes the float
+        # result with the output params. Runs the quantized op with prepacked weights (or directly
+        # when no prepack function is given), and asserts integer outputs equal within one. Returns
+        # (quantized X, quantized W, float bias).
         # ONEDNN only supports symmetric quantization of weight
         if qengine_is_onednn() and W_zero_point is not None:
             W_zero_point = len(W_zero_point) * [0]
@@ -5855,6 +6484,10 @@ class TestQuantizedConv(TestCase):
             use_bias,
             use_channelwise,
     ):
+        # [FUNCTION DOC] Hypothesis test of the quantized conv2d op with prepacked weights for
+        # every qengine over random batch, channels, groups, spatial size, kernel, stride, padding,
+        # dilation, qparams, bias and channelwise options. Also runs with qint8 activations (zero
+        # weight zero points) when qnnpack with xnnpack is available.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         kernels = (kernel_h, kernel_w)
@@ -5936,6 +6569,9 @@ class TestQuantizedConv(TestCase):
             use_bias,
             use_channelwise,
     ):
+        # [FUNCTION DOC] Same as the quantized conv2d test but for the fused conv2d_relu op: float
+        # reference is conv followed by relu; covers uint8 and, on qnnpack with xnnpack, qint8
+        # activations, for every qengine.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         kernels = (kernel_h, kernel_w)
@@ -5973,6 +6609,10 @@ class TestQuantizedConv(TestCase):
 
     @skipIfNoONEDNN
     def test_qconv2d_add(self):
+        # [FUNCTION DOC] Checks the oneDNN fused conv2d_add op (conv plus a second quantized
+        # operand) over groups 1 and 10, with and without bias, per-tensor and channelwise weights
+        # and two second-operand zero points, using fixed shapes and qparams through the shared
+        # conv checker.
         batch_size = 3
         groups_list = [1, 10]
         input_channels_per_group = 2
@@ -6029,6 +6669,9 @@ class TestQuantizedConv(TestCase):
 
     @skipIfNoONEDNN
     def test_qconv2d_add_relu(self):
+        # [FUNCTION DOC] Checks the oneDNN fused conv2d_add_relu op (conv, add of a second
+        # quantized operand, then relu) over groups 1 and 10, with and without bias, per-tensor and
+        # channelwise weights and two second-operand zero points, through the shared conv checker.
         batch_size = 3
         height = 10
         width = 10
@@ -6143,6 +6786,10 @@ class TestQuantizedConv(TestCase):
             use_bias,
             use_channelwise,
     ):
+        # [FUNCTION DOC] Skipped hypothesis test (needs FBGEMM, cuDNN, SM80+, not ROCm; marked not
+        # working) of the quantized conv2d with prepacked weights on CUDA with qint8 input, weight
+        # and output, groups fixed at one, dilation one, zero input and output zero points and no
+        # channelwise weights; runs the shared conv checker.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         kernels = (kernel_h, kernel_w)
@@ -6226,6 +6873,9 @@ class TestQuantizedConv(TestCase):
             use_bias,
             use_channelwise,
     ):
+        # [FUNCTION DOC] Skipped hypothesis test (same cuDNN and device constraints as the cudnn
+        # conv2d test) of the fused conv2d_relu op on CUDA with qint8 tensors through the shared
+        # conv checker with the relu post-op.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         kernels = (kernel_h, kernel_w)
@@ -6254,6 +6904,11 @@ class TestQuantizedConv(TestCase):
 
     @unittest.skip("used for local benchmarking, comment when we want to run it")
     def test_benchmark(self):
+        # [FUNCTION DOC] Skipped manual benchmark (CUDA): profiles 30 steps each of float32,
+        # float16 and int8 channels_last conv2d on a 16x64x256x256 input with a profiler
+        # schedule, printing parameter and result tables and writing a chrome trace per step to a
+        # temp directory.
+        # KNOWN ISSUE: the fp16 weight is built from the input tensor instead of the conv weight.
         batch_size = 16
         in_channel = 64
         out_channel = 64
@@ -6281,6 +6936,9 @@ class TestQuantizedConv(TestCase):
         from torch.profiler import profile, ProfilerActivity
 
         def trace_handler(p):
+            # [FUNCTION DOC] HELPER: Profiler callback that builds the key-averages table (unused
+            # result) and exports the chrome trace for the current profiler step into a file under
+            # the temp directory.
             output = p.key_averages().table(sort_by="self_cpu_time_total", row_limit=10)
             p.export_chrome_trace("/tmp/trace_" + str(p.step_num) + ".json")
 
@@ -6336,6 +6994,11 @@ class TestQuantizedConv(TestCase):
     """Tests the correctness of quantized convolution op."""
     @override_qengines
     def test_qconv_transpose1d(self):
+        # [FUNCTION DOC] Checks the quantized conv_transpose1d op and module (qnnpack only; returns
+        # immediately for other engines or PPC) over channels, groups, kernel, stride and bias,
+        # with quint8 and, when xnnpack is available, qint8 activations. Runs the shared checker,
+        # verifies a small module runs, then compares a quantized ConvTranspose1d module loaded
+        # with the same weight against float ConvTranspose1d of the dequantized input, requantized.
         if not qengine_is_qnnpack():
             return  # Currently only the QNNPACK is supported
         if qengine_is_qnnpack() and IS_PPC:
@@ -6483,6 +7146,11 @@ class TestQuantizedConv(TestCase):
             Y_scale,
             Y_zero_point,
             use_bias):
+        # [FUNCTION DOC] Skipped hypothesis test (flaky, per its skip reason) of quantized
+        # conv_transpose2d with output padding and the corresponding quantized module, for every
+        # qengine. Returns early for qnnpack on PPC and for oneDNN with non-zero output padding;
+        # output padding must be below stride and dilation (assume). Compares the op via the shared
+        # checker and the module against float ConvTranspose2d requantized.
         if qengine_is_qnnpack() and IS_PPC:
             return  # QNNPACK doesn't support these
         # ONEDNN does not support output paddings
@@ -6618,6 +7286,12 @@ class TestQuantizedConv(TestCase):
             Y_scale,
             Y_zero_point,
             use_bias):
+        # [FUNCTION DOC] Skipped hypothesis test (flaky, per its skip reason) of quantized
+        # conv_transpose3d and the quantized module, for every qengine. Returns early for qnnpack
+        # and for oneDNN with non-zero output padding. Runs the shared checker and compares the
+        # module output with float ConvTranspose3d requantized to quint8.
+        # KNOWN ISSUE: the output-padding assumptions use a logical or between stride and dilation
+        # conditions, whereas the 2-D test requires both.
         if qengine_is_qnnpack():
             return  # QNNPACK doesn't support this
         # ONEDNN doesn't support output paddings
@@ -6706,6 +7380,11 @@ class TestQuantizedConv(TestCase):
         channelwise=st.booleans())
     @override_qengines
     def test_qconv1d_unpack(self, inputs, stride, pad, o_pad, channelwise):
+        # [FUNCTION DOC] Hypothesis test of conv1d weight prepack and unpack (or transposed conv1d
+        # when the generated input is transposed) across quint8, qint8 and qint32 inputs. Returns
+        # for unsupported engines. Constraints via assume: qnnpack forbids channelwise, other
+        # engines forbid transposed. Delegates to the shared unpack round-trip checker with
+        # one-element stride, padding and output padding lists.
         transposed = inputs[-1]
         qengine = torch.backends.quantized.engine
         if qengine not in supported_qengines:
@@ -6746,6 +7425,10 @@ class TestQuantizedConv(TestCase):
         channelwise=st.booleans())
     @override_qengines
     def test_qconv2d_unpack(self, inputs, stride, pad, o_pad, channelwise):
+        # [FUNCTION DOC] Hypothesis test of conv2d weight prepack and unpack (transposed variants
+        # when generated) with random stride, padding, output padding and channelwise flag. Returns
+        # for unsupported engines; qnnpack forbids channelwise. Delegates to the shared unpack
+        # round-trip checker with two-element lists.
         transposed = inputs[-1]
         qengine = torch.backends.quantized.engine
         if qengine not in supported_qengines:
@@ -6801,6 +7484,11 @@ class TestQuantizedConv(TestCase):
         use_bias,
         use_channelwise,
     ):
+        # [FUNCTION DOC] Hypothesis test of the quantized conv1d op with prepacked weights for
+        # every qengine over random channels, groups, length, kernel, stride, padding,
+        # dilation, qparams and bias (channelwise is turned off for qnnpack). Runs the shared
+        # conv checker with quint8 and, on qnnpack with xnnpack, qint8 activations (weight zero
+        # points set to zero).
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         if torch.backends.quantized.engine == 'qnnpack':
@@ -6872,6 +7560,8 @@ class TestQuantizedConv(TestCase):
         use_bias,
         use_channelwise,
     ):
+        # [FUNCTION DOC] Same as the quantized conv1d test but for the fused conv1d_relu op with
+        # the relu post-op in the shared conv checker.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         if torch.backends.quantized.engine == 'qnnpack':
@@ -6957,6 +7647,9 @@ class TestQuantizedConv(TestCase):
         use_bias,
         use_channelwise,
     ):
+        # [FUNCTION DOC] Skipped hypothesis test (needs FBGEMM, cuDNN, SM80+, not ROCm; marked not
+        # working) of quantized conv1d on CUDA with qint8 tensors, groups one, dilation one,
+        # symmetric zero points and no channelwise weights, through the shared conv checker.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
 
@@ -7031,6 +7724,8 @@ class TestQuantizedConv(TestCase):
         use_bias,
         use_channelwise,
     ):
+        # [FUNCTION DOC] Skipped hypothesis test (same constraints as the cudnn conv1d test) of the
+        # fused conv1d_relu op on CUDA with qint8 tensors through the shared conv checker.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
 
@@ -7110,6 +7805,10 @@ class TestQuantizedConv(TestCase):
         use_channelwise,
         qengine
     ):
+        # [FUNCTION DOC] Hypothesis test of the quantized conv3d op with prepacked weights, with
+        # the engine (qnnpack or fbgemm) drawn as a parameter and skipped if unsupported. Runs
+        # under that engine override over random sizes, kernels, strides, padding, dilation,
+        # qparams, bias and channelwise options through the shared conv checker.
         if qengine not in supported_qengines:
             return
 
@@ -7194,6 +7893,8 @@ class TestQuantizedConv(TestCase):
         use_channelwise,
         qengine
     ):
+        # [FUNCTION DOC] Same as the quantized conv3d test but for the fused conv3d_relu op with
+        # the relu post-op in the shared conv checker.
         if qengine not in supported_qengines:
             return
 
@@ -7250,6 +7951,10 @@ class TestQuantizedConv(TestCase):
         self, inputs, stride_d, stride_h, stride_w, pad_d, pad_h, pad_w, o_pad,
         channelwise
     ):
+        # [FUNCTION DOC] Hypothesis test of conv3d weight prepack and unpack (transposed variant
+        # when the generated input is transposed) for quint8, qint8 and qint32, for every qengine.
+        # Returns immediately for qnnpack. Delegates to the shared unpack round-trip checker with
+        # three-element stride, padding and output padding.
         if qengine_is_qnnpack():
             return  # QNNPACK doesn't support this
         transposed = inputs[-1]
@@ -7265,6 +7970,10 @@ class TestQuantizedConv(TestCase):
             channelwise)
 
     def test_conv_reorder_issue_onednn(self):
+        # [FUNCTION DOC] Regression test for a oneDNN reorder failure with dynamic input shapes
+        # (fixed in an upstream PR): on the oneDNN engine (returns if unsupported) prepacks a 1x1
+        # conv weight for groups one and two, runs the quantized conv2d on a 28x28 input, then
+        # again on a 5x4 input with the same packed weight; both runs must not raise.
         """ Ensure reorder failure issue in conv is fixed for onednn backend.
             Onednn backend used to encounter reorder failure
             when running conv with dynamic input shapes.
@@ -7296,6 +8005,9 @@ class TestQuantizedConv(TestCase):
 
     @skipIfNoONEDNN
     def test_conv_transpose_reorder_issue_onednn(self):
+        # [FUNCTION DOC] Regression test (needs oneDNN) for a reorder failure in transposed conv:
+        # prepacks a transposed conv2d weight, runs the quantized conv_transpose2d on a 50x100
+        # input and then on a 5x4 input with the same packed weight; neither call may raise.
         with override_quantized_engine('onednn'):
             bs = 1
             ic, oc = 16, 33
@@ -7345,6 +8057,18 @@ class TestQuantizedConv(TestCase):
         weight_in_channel_last_format=False,
         qconv_x2_dtype=None,
     ):
+        # [FUNCTION DOC] HELPER: Shared checker for the oneDNN pt2e conv ops that work on plain
+        # integer CPU tensors. Weight zero points are always forced to zero; float32 and bfloat16
+        # outputs force unit output and second-operand scales and zero output zero points. It
+        # builds non-transposed random conv data (batch of three), computes a float reference with
+        # the given float conv module (sum with a second quantized operand, relu, hardtanh with two
+        # bounds, hardswish or swish per the PointwisePostOp description), and quantizes it to
+        # uint8. It then prepacks the integer weight (optionally channels-last, per-tensor or
+        # per-channel scales) and calls the pointwise conv (the binary form when the post op is a
+        # sum, with the second operand in channels_last). Reduced-precision outputs are
+        # requantized, and the integer results are compared to the reference to zero decimals.
+        # Returns (quantized X, quantized W, float bias). The transposed-conv rejection branches
+        # are unreachable because use_transpose is fixed to false.
         # ONEDNN only supports symmetric quantization of weight
         if W_zero_point is not None:
             W_zero_point = len(W_zero_point) * [0]
@@ -7555,6 +8279,10 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv1d_pt2e(self):
+        # [FUNCTION DOC] pt2e check (skipped in fbcode, needs oneDNN) of the oneDNN
+        # pointwise conv1d op with no post-op over groups one and three, bias and
+        # channelwise options, and output dtype (default, float32, bfloat16; non-default
+        # dtypes only with bias and channelwise).
         groups_list = [1, 3]
         input_channels_per_group = 2
         output_channels_per_group = 2
@@ -7608,6 +8336,9 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise conv2d op with no post-op over groups,
+        # bias, channelwise, channels_last weight format and output dtype options (reduced
+        # combinations run only with bias and channelwise).
         groups_list = [1, 3]
         input_channels_per_group = 2
         output_channels_per_group = 2
@@ -7669,6 +8400,9 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv3d_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise conv3d op with no post-op over groups,
+        # bias, channelwise, channels_last weight format and output dtype options (reduced
+        # combinations run only with bias and channelwise).
         input_channels_per_group = 2
         input_feature_map_shape = (6, 6, 6)
         output_channels_per_group = 2
@@ -7731,6 +8465,8 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_relu_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise conv2d op with the relu unary post-op
+        # over groups, bias, channelwise and output dtype options.
         input_channels_per_group = 2
         output_channels_per_group = 2
         groups_list = [1, 10]
@@ -7782,6 +8518,8 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_hardtanh_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise conv2d op with hardtanh (bounds zero
+        # and six) over groups, bias, channelwise and output dtype options.
         input_channels_per_group = 2
         output_channels_per_group = 2
         groups_list = [1, 10]
@@ -7833,6 +8571,8 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_swish_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise conv2d op with the swish (silu) unary
+        # post-op over groups, bias, channelwise and output dtype options.
         input_channels_per_group = 2
         output_channels_per_group = 2
         groups_list = [1, 10]
@@ -7884,6 +8624,8 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_hardswish_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise conv2d op with the hardswish unary
+        # post-op over groups, bias, channelwise and output dtype options.
         input_channels_per_group = 2
         output_channels_per_group = 2
         groups_list = [1, 10]
@@ -7936,6 +8678,9 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_sum_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise binary conv2d op with sum post-op over
+        # groups, bias, channelwise, two second-operand zero points and output dtype (the second
+        # operand uses the same dtype as the output).
         groups_list = [1, 3]
         input_channels_per_group = 2
         output_channels_per_group = 2
@@ -7992,6 +8737,9 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_sum_relu_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise binary conv2d op with sum followed by
+        # relu over groups, bias, channelwise and two second-operand zero points, with the default
+        # (uint8) output.
         groups_list = [1, 3]
         input_channels_per_group = 2
         output_channels_per_group = 2
@@ -8045,6 +8793,9 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_sum_relu_float_output_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise binary conv2d op with sum (and with or
+        # without relu) producing float32 or bfloat16 output, for single group, channelwise weights
+        # and with or without bias, with the second operand in the output dtype.
         groups = 1
         input_channels_per_group = 2
         output_channels_per_group = 2
@@ -8106,6 +8857,11 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_binary_no_output_aliasing(self):
+        # [FUNCTION DOC] pt2e regression test (skipped in fbcode, needs oneDNN): the oneDNN binary
+        # pointwise conv2d with sum post-op, both with and without relu, must write its result
+        # into the accumulator operand in place (accumulator contents change) but return a tensor
+        # with a different storage address. Uses a 1x4x5x5 channels_last uint8 input and a packed
+        # 3x3 weight.
         # Verify that qconv2d_pointwise.binary mutates qaccum in-place
         # but returns a tensor that does not alias it.
         groups = 1
@@ -8139,6 +8895,9 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_binary_tensor_no_output_aliasing(self):
+        # [FUNCTION DOC] Same aliasing check as the plain binary test but for the overload that
+        # takes the input scale and zero point as tensors: the accumulator is modified in place and
+        # the returned tensor does not share its storage.
         # Same as above but for the .binary_tensor overload (tensor scale/zp).
         groups = 1
         in_ch, out_ch = 4, 4
@@ -8170,6 +8929,9 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_binary_empty_output_no_aliasing(self):
+        # [FUNCTION DOC] Regression test (needs oneDNN) of the early-return path in the binary
+        # pointwise conv2d when the output is empty (batch size zero) with a sum post-op: the call
+        # must succeed and return an empty tensor.
         # Trigger the early return path when output has 0 elements.
         # Use batch_size=0 so the convolution output has numel == 0.
         groups = 1
@@ -8196,6 +8958,8 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_empty_output_no_binary(self):
+        # [FUNCTION DOC] Regression test (needs oneDNN) of the early-return path of the non-binary
+        # pointwise conv2d with a zero batch size: the result must have no elements.
         # Exercise the early return path with has_accum_postop_sum=false.
         groups = 1
         in_ch, out_ch = 4, 4
@@ -8216,6 +8980,9 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv1d_sum_exercises_1d_path(self):
+        # [FUNCTION DOC] Regression test (needs oneDNN) running the pointwise op on a 3-D (1d conv)
+        # uint8 input without a binary post-op to exercise the one-dimensional squeeze path (the
+        # sum path is not reachable for 1-D input); the result must stay 3-D.
         # Exercise the is_1d squeeze path via a 1d convolution without
         # binary postop (has_accum_postop_sum is unreachable for 1d since
         # run_pointwise_binary enforces act.dim()==4).
@@ -8238,6 +9005,8 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv1d_relu_pt2e(self):
+        # [FUNCTION DOC] pt2e check of the oneDNN pointwise conv1d op with the relu unary post-op
+        # over groups one and ten, bias, channelwise and output dtype options.
         input_channels_per_group = 2
         output_channels_per_group = 2
         groups_list = [1, 10]
@@ -8291,6 +9060,12 @@ class TestQuantizedConv(TestCase):
         use_bias, use_channelwise, use_transpose, bfloat16_output,
         device=torch.device("cpu"),
     ):
+        # [FUNCTION DOC] HELPER: Generates fp8 conv test data on the device. Raises an assertion
+        # error for channelwise transposed requests and uses assume to skip combinations where the
+        # padded input is smaller than the dilated kernel. Input is uniform random in zero to one,
+        # weights are normal scaled by 0.1; both are quantized to float8 (input per tensor, weight
+        # per tensor or per channel). Bias is random, in bfloat16 when requested. Returns (X, W,
+        # X_q, W_q, X_scale, W_scale, bias).
         if use_channelwise and use_transpose:
             raise AssertionError("Cannot generate channelwise qconv_transpose_tensors ")
         input_channels = input_channels_per_group * groups
@@ -8344,6 +9119,14 @@ class TestQuantizedConv(TestCase):
         qconv_output_dtype=None,  # None, torch.float32, torch.bfloat16
         weight_in_channel_last_format=False,
     ):
+        # [FUNCTION DOC] HELPER: Shared fp8 checker for the oneDNN pointwise conv ops. Generates
+        # float8 data, assigns the dequantized weight and bias to the float conv module as the
+        # reference and applies the post-op (sum with a second operand quantized to fp8 or kept in
+        # the output dtype, relu, hardtanh, hardswish, swish). The reference is quantized to fp8
+        # when the output dtype is default, otherwise cast. Then prepacks the weight (optionally
+        # channels_last), calls the pointwise op (binary form for sum) and compares as float with
+        # small tolerances, also asserting the output dtype and absence of NaN. Float32 and
+        # bfloat16 outputs use unit scales.
         # We assume FP8 quantization is always symmetric
         fp32_output = qconv_output_dtype is torch.float32
         bfloat16_output = qconv_output_dtype is torch.bfloat16
@@ -8502,6 +9285,11 @@ class TestQuantizedConv(TestCase):
             raise AssertionError("Output result contains NaN values")
 
     def _test_qconv_fp8_helper(self, nd, pointwise_post_op):
+        # [FUNCTION DOC] HELPER: Runs the fp8 conv checker for the given spatial rank (1, 2 or 3)
+        # and post-op description over groups one and three, bias, channelwise and output dtype
+        # options (non-default dtypes only with bias and channelwise). Binary post-ops are only
+        # allowed for rank two, else an assertion error is raised; binary post-ops use the binary
+        # conv2d op.
         # nd = 1,2,3 -> conv1d/2d/3d
         if pointwise_post_op.binary_attr != "none":
             # Only conv2d supports binary post op
@@ -8559,6 +9347,8 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv1d_fp8(self):
+        # [FUNCTION DOC] fp8 conv1d check with no post-op via the shared helper (needs oneDNN, not
+        # in fbcode).
         pointwise_post_op = PointwisePostOp()
         self._test_qconv_fp8_helper(1, pointwise_post_op)
 
@@ -8566,54 +9356,66 @@ class TestQuantizedConv(TestCase):
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv1d_relu_fp8(self):
+        # [FUNCTION DOC] fp8 conv1d check with the relu post-op via the shared helper.
         pointwise_post_op = PointwisePostOp(unary_attr="relu")
         self._test_qconv_fp8_helper(1, pointwise_post_op)
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_fp8(self):
+        # [FUNCTION DOC] fp8 conv2d check with no post-op via the shared helper.
         pointwise_post_op = PointwisePostOp()
         self._test_qconv_fp8_helper(2, pointwise_post_op)
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_relu_fp8(self):
+        # [FUNCTION DOC] fp8 conv2d check with the relu post-op via the shared helper.
         pointwise_post_op = PointwisePostOp(unary_attr="relu")
         self._test_qconv_fp8_helper(2, pointwise_post_op)
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_hardtanh_fp8(self):
+        # [FUNCTION DOC] fp8 conv2d check with the hardtanh post-op (bounds zero and six) via
+        # the helper.
         pointwise_post_op = PointwisePostOp(unary_attr="hardtanh", scalars=[0.0, 6.0])
         self._test_qconv_fp8_helper(2, pointwise_post_op)
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_swish_fp8(self):
+        # [FUNCTION DOC] fp8 conv2d check with the swish post-op via the shared helper.
         pointwise_post_op = PointwisePostOp(unary_attr="swish")
         self._test_qconv_fp8_helper(2, pointwise_post_op)
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_hardswish_fp8(self):
+        # [FUNCTION DOC] fp8 conv2d check with the hardswish post-op via the shared helper.
         pointwise_post_op = PointwisePostOp(unary_attr="hardswish")
         self._test_qconv_fp8_helper(2, pointwise_post_op)
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_sum_fp8(self):
+        # [FUNCTION DOC] fp8 conv2d check with the sum binary post-op via the shared helper.
         pointwise_post_op = PointwisePostOp(binary_attr="sum")
         self._test_qconv_fp8_helper(2, pointwise_post_op)
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv2d_sum_relu_fp8(self):
+        # [FUNCTION DOC] fp8 conv2d check with the sum binary post-op followed by relu via
+        # the helper.
         pointwise_post_op = PointwisePostOp(binary_attr="sum", unary_attr="relu")
         self._test_qconv_fp8_helper(2, pointwise_post_op)
 
     @unittest.skipIf(IS_FBCODE, "Skip pt2e ops in fbcode")
     @skipIfNoONEDNN
     def test_qconv3d_fp8(self):
+        # [FUNCTION DOC] fp8 conv3d check with no post-op via the shared helper; seeds the random
+        # generator with zero first for reproducibility.
         pointwise_post_op = PointwisePostOp()
         torch.manual_seed(0)  # For reproducibility in 3D conv tests
         self._test_qconv_fp8_helper(3, pointwise_post_op)
@@ -8621,11 +9423,17 @@ class TestQuantizedConv(TestCase):
 
 
 class TestPadding(TestCase):
+    # [CLASS DOC] Tests that padding modules (reflection pad 1d and 2d, constant pad 1d to 3d) work
+    # on per-tensor quantized tensors by matching quantized float padding results.
     @given(batch_size=st.integers(1, 64),
            channels=st.integers(1, 64),
            width=st.integers(16, 128),
            qtype=st.sampled_from(hu._ALL_QINT_TYPES))
     def test_reflection_pad1d(self, batch_size, channels, width, qtype):
+        # [FUNCTION DOC] Hypothesis test: reflection pad 1d with padding of a quarter of the width
+        # on a ramp tensor quantized per tensor with each integer quantized dtype. The quantized
+        # result must equal the float result requantized with the same params, for the module and
+        # for the out variant of the underlying op.
         padding = width // 4
 
         x = torch.arange(batch_size * channels * width).to(torch.float)
@@ -8651,6 +9459,9 @@ class TestPadding(TestCase):
            width=st.integers(16, 128),
            qtype=st.sampled_from(hu._ALL_QINT_TYPES))
     def test_reflection_pad2d(self, batch_size, channels, height, width, qtype):
+        # [FUNCTION DOC] Hypothesis test: reflection pad 2d with quarter-size padding on each side
+        # of a ramp tensor quantized per tensor with each integer quantized dtype; module and out
+        # variant must equal the requantized float padding result.
         padding = (width // 4, width // 4, height // 4, height // 4)
 
         x = torch.arange(batch_size * channels * height * width).to(torch.float)
@@ -8677,6 +9488,9 @@ class TestPadding(TestCase):
            value=st.floats(-5, 5, allow_nan=False, allow_infinity=False),
            qtype=st.sampled_from(hu._ALL_QINT_TYPES))
     def test_constant_padNd(self, batch_size, channels, d, hwd, value, qtype):
+        # [FUNCTION DOC] Hypothesis test: constant padding (1d, 2d or 3d chosen by d) with a random
+        # fill value and padding of a quarter of the extent, on a ramp tensor quantized per tensor
+        # with each integer quantized dtype; must equal the requantized float padding result.
         padding = hwd // 4
 
         shape = [batch_size, channels, hwd]
@@ -8707,12 +9521,16 @@ class TestPadding(TestCase):
 @unittest.skipUnless('qnnpack' in supported_qengines,
                      "This Pytorch Build has not been built with or does not support QNNPACK")
 class TestQNNPackOps(TestCase):
+    # [CLASS DOC] Tests for QNNPACK-specific quantized ops (relu, tanh, sigmoid, and others); the
+    # class is skipped unless the build supports the qnnpack quantized engine.
     """Tests the correctness of the quantized::qnnpack_relu op."""
     @given(X=hu.tensor(shapes=hu.array_shapes(1, 5, 1, 5),
                        qparams=hu.qparams(dtypes=torch.quint8,
                                           zero_point_min=0,
                                           zero_point_max=0)))
     def test_qnnpack_relu(self, X):
+        # [FUNCTION DOC] Hypothesis test: relu on quint8 tensors with zero zero-point under the
+        # qnnpack engine must equal requantized float relu.
         with override_quantized_engine('qnnpack'):
             X, (scale, zero_point, torch_type) = X
             relu = torch.nn.functional.relu
@@ -8729,6 +9547,10 @@ class TestQNNPackOps(TestCase):
     """Tests the correctness of the quantized::qnnpack_tanh op."""
     @skipIfNoFBGEMM
     def test_qnnpack_tanh(self):
+        # [FUNCTION DOC] Checks that the qnnpack engine tanh on quint8 tensors (shapes of 1 to 4
+        # dims, both memory formats for 4-D) equals both a float tanh quantized with scale 1/128
+        # and zero point 128 (the lookup table output params) and the FBGEMM engine result.
+        # Requires FBGEMM.
         # Note: In QNNPACK the output scale and zero_point can only be
         #       2.0/256, 128 respectively, as it uses a LUT with 256 bins.
 
@@ -8762,6 +9584,9 @@ class TestQNNPackOps(TestCase):
     """Tests the correctness of the quantized::qnnpack_sigmoid op."""
     @skipIfNoFBGEMM
     def test_qnnpack_sigmoid(self):
+        # [FUNCTION DOC] Checks that the qnnpack engine sigmoid on quint8 tensors (shapes of 1 to 4
+        # dims, both memory formats for 4-D) equals both a float sigmoid quantized with scale 1/256
+        # and zero point 0 and the FBGEMM engine result. Requires FBGEMM.
         # Note: In QNNPACK the output scale and zero_point can only be
         #       1.0/256, 0 respectively, as it uses a LUT with 256 bins.
         shapes = ((4,), (4, 4), (4, 4, 4), (4, 4, 4, 4))
@@ -8793,6 +9618,9 @@ class TestQNNPackOps(TestCase):
 
     @skipIfNoFBGEMM
     def test_qnnpack_sigmoid_sweep(self):
+        # [FUNCTION DOC] Sweeps quint8 inputs spanning minus four to four at half the quantization
+        # step, and checks that qnnpack sigmoid equals both the float reference quantized with
+        # scale 1/256 and the FBGEMM sigmoid result. Requires FBGEMM.
         # Input parameters
         f_min = -4.0
         f_max = 4.0
@@ -8830,6 +9658,12 @@ class TestQNNPackOps(TestCase):
            scale_B=st.sampled_from([0.008, 0.0821, 0.67, 7]),
            scale_C=st.sampled_from([0.003, 0.07821, 0.457, 7.34]),)
     def test_qnnpack_add(self, A, zero_point, scale_A, scale_B, scale_C):
+        # [FUNCTION DOC] Hypothesis test of qnnpack quantized add and add_relu for quint8 and qint8
+        # (qint8 only with xnnpack) with contiguous and, for 4-D, channels_last layouts. Both
+        # operands are the same generated data quantized with sampled input scales and zero point;
+        # assume bounds the input/output scale ratios. Output uses zero point 127 (quint8) or 0
+        # (qint8). Integer results must equal a numpy reference of the float sum, and the relu
+        # variant must equal the quantized relu'd sum.
         with override_quantized_engine('qnnpack'):
             A_temp = A
             for channels_last in [True, False]:
@@ -8890,6 +9724,10 @@ class TestQNNPackOps(TestCase):
            scale_B=st.sampled_from([0.8, 0.821, 0.67]),
            scale_C=st.sampled_from([0.3, 0.7821, 0.457]),)
     def test_qnnpack_mul(self, A, zero_point, scale_A, scale_B, scale_C):
+        # [FUNCTION DOC] Hypothesis test of qnnpack quantized mul and mul_relu with the same
+        # structure as the add test: both operands are the same data quantized with sampled scales
+        # and zero point, integer results compared with a numpy reference of the float product and
+        # relu variant.
         with override_quantized_engine('qnnpack'):
             A_temp = A
             for channels_last in [True, False]:
@@ -8943,7 +9781,15 @@ class TestQNNPackOps(TestCase):
 
     """Tests that quantized add works with broadcasting """
     def test_qnnpack_add_broadcast(self):
+        # [FUNCTION DOC] Checks qnnpack quantized add with broadcasting for qint8 (with xnnpack)
+        # and quint8, contiguous and channels_last, for a 4-D tensor added to a 1x1x1x1 tensor and
+        # a 5-D tensor added to a 1x1x1x1x1 tensor, in both argument orders, via a local
+        # comparison helper.
         def _run_test(A, B):
+            # [FUNCTION DOC] HELPER: Quantizes the two inputs (scales 0.02 and 0.04, zero points 0
+            # and 2, in the enclosing loop's dtype), adds them with the quantized op in both
+            # argument orders (output scale 0.01, zero point 1) and asserts both match the
+            # requantized float sum.
             qA = torch.quantize_per_tensor(A, 0.02, 0, dtype)
             qB = torch.quantize_per_tensor(B, 0.04, 2, dtype)
 
@@ -8990,6 +9836,9 @@ class TestQNNPackOps(TestCase):
            stride=st.sampled_from([1, 2]),
            padding=st.sampled_from([1, 2]))
     def test_qnnpack_maxpool2d(self, A, kernel, stride, padding):
+        # [FUNCTION DOC] Hypothesis test of the quantized max_pool2d op under qnnpack on 4-D quint8
+        # input with random kernel, stride and padding; constraints are enforced with assume. The
+        # dequantized output must exactly equal float max pooling of the dequantized input.
         import torch.nn.functional as F
 
         with override_quantized_engine('qnnpack'):
@@ -9054,6 +9903,10 @@ class TestQNNPackOps(TestCase):
             zero_point
 
     ):
+        # [FUNCTION DOC] Hypothesis test of the ao quantized functional avg_pool2d under qnnpack on
+        # random integer-valued input with random kernel, stride, padding, scale and zero point
+        # (valid shapes via assume). Compares integer output within a tolerance of about one with
+        # float average pooling requantized with the same scale and zero point.
         with override_quantized_engine('qnnpack'):
             import torch.nn.functional as F
             X_init = torch.from_numpy(np.random.randint(
@@ -9109,6 +9962,9 @@ class TestQNNPackOps(TestCase):
             zero_point
 
     ):
+        # [FUNCTION DOC] Hypothesis test of the ao quantized functional adaptive_avg_pool2d under
+        # qnnpack with random output sizes not larger than the input; compares integer output
+        # within about one with float adaptive average pooling requantized with the same params.
         with override_quantized_engine('qnnpack'):
             # Check constraints
             assume(height >= output_height)
@@ -9143,6 +9999,9 @@ class TestQNNPackOps(TestCase):
            scale=st.floats(0.02, 2.6),
            zero_point=st.integers(0, 25))
     def test_mean(self, batch_size, channels, height, width, scale, zero_point):
+        # [FUNCTION DOC] Hypothesis test of mean over spatial dims two and three on random quint8
+        # tensors under qnnpack; integer output must be within about one of float mean requantized
+        # with the same scale and zero point.
         with override_quantized_engine('qnnpack'):
             dim = (2, 3)
             X_init = torch.from_numpy(np.random.randint(
@@ -9157,6 +10016,10 @@ class TestQNNPackOps(TestCase):
 
     """Tests the correctness of the quantized::hardtanh op."""
     def test_hardtanh(self):
+        # [FUNCTION DOC] Checks the ao quantized functional hardtanh under qnnpack (returns if
+        # qnnpack is unsupported) for shapes of 1 to 4 dims, both memory formats for 4-D, and
+        # several min/max pairs (some with min above max), against clamped float values quantized
+        # with the same params.
         if 'qnnpack' not in torch.backends.quantized.supported_engines:
             return
         with override_quantized_engine('qnnpack'):
@@ -9185,12 +10048,18 @@ class TestQNNPackOps(TestCase):
 
 """Tests the correctness of the tensor comparators."""
 class TestComparatorOps(TestCase):
+    # [CLASS DOC] Tests that element-wise comparison operators on per-tensor quantized tensors
+    # behave like the same comparisons on the dequantized values, for tensor and scalar operands.
     """Tests the element-wise equality ops."""
     @given(A=hu.tensor(shapes=((3, 4, 5),),
                        qparams=hu.qparams()),
            B=hu.tensor(shapes=((5,), (1, 5), (1, 1, 5), (4, 5), (3, 4, 5)),
                        qparams=hu.qparams()))
     def test_compare_tensor_tensor(self, A, B):
+        # [FUNCTION DOC] Hypothesis test of tensor-tensor comparison operators (dunder and named
+        # forms of equal, not equal, greater or equal, less or equal, greater, less) on quantized
+        # tensors with broadcasting, in both operand orders. Results must equal comparing the
+        # dequantized tensors.
         A, (scale_a, zero_point_a, dtype_a) = A
         B, (scale_b, zero_point_b, dtype_b) = B
         tA = torch.from_numpy(A)
@@ -9221,6 +10090,10 @@ class TestComparatorOps(TestCase):
                        qparams=hu.qparams()),
            b=hu.floats(allow_infinity=False, allow_nan=False))
     def test_compare_tensor_scalar(self, A, b):
+        # [FUNCTION DOC] Hypothesis test of comparison operators between a quantized tensor and a
+        # Python float scalar. The dunder forms are checked as tensor-vs-scalar and
+        # scalar-vs-tensor, the named forms only tensor-vs-scalar; all results must equal the
+        # comparison on the dequantized tensor.
         A, (scale_a, zero_point_a, dtype_a) = A
         tA = torch.from_numpy(A)
 
@@ -9257,8 +10130,14 @@ class TestComparatorOps(TestCase):
 
 """Tests the correctness of the quantized::embedding_bag_(byte|4bit|2bit)_prepack_with_rowwise_min_max ops."""
 class TestQuantizedWithMinMax(TestCase):
+    # [CLASS DOC] Tests that the embedding bag prepack variants taking precomputed rowwise min and
+    # max values are consistent with the ordinary prepack ops.
     """Validates that the *rowwsie_min_max* quantization functions are equivalent to the ones without it."""
     def test_quantize_tensor_with_min_max(self):
+        # [FUNCTION DOC] Validates the embedding bag prepack variants that take explicit rowwise
+        # min and max against the ones that compute them, for 8, 4 and 2 bit and float16 and
+        # float32 weights over several shapes: with the true row min/max the uint8 output must
+        # equal the plain prepack; with both columns set to the row maximum the output must differ.
         num_rows_list = [1, 2, 10, 100]
         num_cols_list = [4, 8, 16, 32, 64, 128]
         # Map of quantization bit rate to tuple of quantize function (with rowwise_min_max) and
